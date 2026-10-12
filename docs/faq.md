@@ -73,3 +73,27 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Diagnosis:** Check whether accepted candidates are echoed by the reviewer and whether a correction model runs for every target.
 - **Resolution:** Use a compact judge that returns only `ok` or `rewrite` plus categorical issue codes. Invoke a rewriter only for `rewrite`, validate the correction, and confirm it with another compact judgment.
 - **Prevention:** Set per-task output limits, retain focused scene/character evidence, record provider usage metadata, and compare quality and cost on synthetic representative evaluations before changing the configured roles.
+
+## A managed Unity patch builds but does not load in another project
+
+- **Symptom:** A compiled localization assembly works with one mod-enabled Unity player but is ignored or rejected by another.
+- **General cause:** Unity does not define one universal managed mod entry point. Native project loaders, BepInEx, and MelonLoader have different manifests, base classes, attributes, lifecycle methods, and dependency locations.
+- **Diagnosis:** Confirm the exact Unity series and backend first, then compare the target loader's public entry contract with the private bridge source. Do not infer compatibility from the `Mods` directory name alone.
+- **Resolution:** Keep the common discovery, payload, compilation, packaging, and verification stages, but implement the loader entry bridge in the private workspace against that loader's documented API.
+- **Prevention:** Test one synthetic bridge per supported loader and keep loader-specific references explicit in the patch specification.
+
+## A Unity localization patch changes identifiers or executable metadata
+
+- **Symptom:** Text appears translated, but a table lookup, Smart String, TextAsset lookup, or dynamic UI path stops working.
+- **General cause:** A display string was confused with its stable key, or extraction omitted engine metadata needed by the runtime bridge.
+- **Diagnosis:** Compare source and rebuilt inventories by String Table collection and entry ID, TextAsset key, Smart String flag, and approved UI path. Treat keys and paths as protected fields.
+- **Resolution:** Restore the original identifiers and compile only reviewed target text into the runtime payload. Reject duplicate or conflicting runtime locations.
+- **Prevention:** Give every segment a stable framework ID plus explicit `unity_kind` location metadata, and validate the complete set before packing.
+
+## A Unity patch ZIP accidentally contains player runtime assemblies
+
+- **Symptom:** A patch is unexpectedly large or includes assemblies copied from the installed player's managed directory.
+- **General cause:** Build references were staged as distributable dependencies instead of remaining read-only compiler inputs.
+- **Diagnosis:** Inspect the ZIP manifest and reject game assemblies, Unity engine modules, localization packages, and base framework assemblies.
+- **Resolution:** Package only the newly built entry assembly, the loader manifest, approved redistributable dependencies, and the localization payload.
+- **Prevention:** Keep build references outside the staging tree and run the adapter verifier before presenting the patch.

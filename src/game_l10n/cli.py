@@ -25,6 +25,7 @@ from .workspace import (
     publish_sdk_profile,
     update_repository_policy,
 )
+from .unity.cli import register_unity_parser
 
 
 def _sdk_root() -> Path:
@@ -439,6 +440,8 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="Check workspace configuration without sending game data")
     doctor.add_argument("--workspace", required=True)
     doctor.set_defaults(func=cmd_doctor)
+
+    register_unity_parser(sub)
     return parser
 
 
