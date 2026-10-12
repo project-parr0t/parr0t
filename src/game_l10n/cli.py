@@ -17,6 +17,7 @@ from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from .privacy import is_within, require_external_workdir
 from .providers import ProviderRegistry
 from .tooling import run_cached_tool
+from .wolf.cli import register_wolf_parser
 from .workspace import (
     initialize_workspace,
     load_config,
@@ -387,6 +388,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="Check workspace configuration without sending game data")
     doctor.add_argument("--workspace", required=True)
     doctor.set_defaults(func=cmd_doctor)
+    register_wolf_parser(sub)
     return parser
 
 

@@ -150,3 +150,15 @@ python -m unittest discover -s tests -t . -v
 ```
 
 OpenAI 연동은 Responses API의 strict JSON Schema 출력을 사용합니다. 구조화 출력은 거부를 명시적으로 감지할 수 있어 폴백 라우팅에 적합합니다. 공급자 정책을 우회하지 않으며, 정상적인 게임 번역 요청이 특정 제공자에서 처리되지 않을 때 구성된 다른 제공자로 넘깁니다.
+
+## WOLF RPG / WolfDawn
+
+`sdk-wolf-rpg-pro` 브랜치는 WOLF RPG Editor의 공개 파일 구조를 다루는 재사용 가능한 SDK 어댑터를 제공합니다.
+
+- WolfDawn 추출 JSON에서 화자·앞뒤 문맥·원본 위치를 보존한 번역 배치를 생성합니다.
+- 번역기와 수동 번역가가 같은 배치 포맷을 사용하며, 별도의 동일 포맷 샘플 JSON을 만들 수 있습니다.
+- `S[]`/`CSelf[]` 문자열 분기 키, 이벤트 호출명, 데이터베이스 조회 키, 리소스 경로를 번역 대상에서 복원하거나 주입 후 비교 검사합니다.
+- `@putselect` 같은 화면 표시 명령의 문구는 허용하면서 `@voice` 같은 런타임 명령 변경은 차단합니다.
+- WOLF Pro 게임은 `BasicData.wolf`, `MapData.wolf`, `Text_Script.wolf`를 하나의 원본 `Game.wolf`를 기준으로 모두 다시 묶어 암호화 버전 불일치를 방지합니다.
+
+외부 WolfDawn 및 Pro 패커 실행 파일은 라이선스·게임 키 경계를 지키기 위해 포함하지 않습니다. 실제 명령과 안전한 실행 순서는 [WOLF RPG Pro 가이드](docs/wolf-rpg-pro.md)를 참고하십시오.
