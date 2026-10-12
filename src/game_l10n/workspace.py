@@ -124,6 +124,7 @@ translations/
 localized/
 batches/
 audit/
+wolf-json/
 build/
 logs/
 .game-l10n/

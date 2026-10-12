@@ -50,6 +50,22 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Resolution:** Keep text-bearing envelopes in the private workspace, normalize the explanation to a category such as `provider_refusal`, and continue the configured fallback route. If every route fails, preserve the exact source without removing the target.
 - **Prevention:** Make workers read/write private artifacts directly and require metadata-only completion envelopes at every parent boundary.
 
+## A translated WOLF project loads but runtime behavior changes
+
+- **Symptom:** Text appears localized, but a choice, branch, event call, database lookup, resource reference, or script command behaves differently.
+- **General cause:** A display string is also used as a runtime identifier, comparison key, selector, or resource path.
+- **Diagnosis:** Decompile and compare the original and rebuilt runtime structures; inspect identifiers and command skeletons independently from visible text.
+- **Resolution:** Restore non-display identifiers from the source data and rebuild. Translate only payloads explicitly classified as display text.
+- **Prevention:** Run the WOLF runtime integrity audit before packing and treat every mismatch as a build failure.
+
+## WOLF Pro replacement archives are rejected or inconsistent
+
+- **Symptom:** Individually rebuilt archives are not accepted together or do not match the expected encryption behavior.
+- **General cause:** Related archives were packed with different source key material or incompatible packer settings.
+- **Diagnosis:** Confirm all replacement archives were produced in one operation with the same public engine contract and the same user-supplied key archive.
+- **Resolution:** Rebuild the complete archive set together. Do not distribute the key archive or packer with the SDK.
+- **Prevention:** Stage all outputs atomically and verify that every expected archive is non-empty before publishing the build.
+
 ## A resumed review refers to an older translation candidate
 
 - **Symptom:** Review appears complete even though a retry or rewriter changed the candidate afterward.

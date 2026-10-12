@@ -40,3 +40,9 @@ Actively record reusable problems in `docs/faq.md`, but only after removing all 
 - Update or merge an existing FAQ entry instead of accumulating job narratives.
 
 API keys belong in environment variables. Do not print or persist them.
+
+## WOLF RPG Pro SDK branch
+
+This branch attaches the WOLF RPG Pro data-plane SDK to the engine-neutral framework inherited from `main`. WOLF extraction, batching, runtime-key protection, archive packing, WOLF-only ignore rules, synthetic tests, and WOLF FAQ entries belong on this branch only. Never copy them back into `main`.
+
+Run the core suite and all `test_wolf_*` tests before publishing. Treat source game data and key archives as read-only inputs, keep external extractor/packer binaries out of the repository, and create replacement archives only in the private workspace.
