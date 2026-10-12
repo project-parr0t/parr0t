@@ -1,0 +1,43 @@
+# FAQ
+
+This FAQ contains only provenance-free issues that can recur across independent SDK or engine integrations. It must not identify any localization job, game, source file, asset, dialogue, translation, workspace, model, or execution result.
+
+## A private repository returns 404 even though it exists
+
+- **Symptom:** A browser, connector, or agent cannot open a known private repository and reports `404 Not Found`.
+- **General cause:** Git hosting services may hide private resources from unauthenticated or unauthorized clients. Browser, connector, and terminal Git credentials can have different scopes.
+- **Diagnosis:** Verify the remote with authenticated Git and confirm the connector or token explicitly includes the repository.
+- **Resolution:** Authenticate the relevant client or grant the Git application access to that repository. Prefer a repository-scoped credential with the minimum required permission.
+- **Prevention:** Validate repository access at task startup without placing credentials in prompts, configuration, or logs.
+
+## An identical unpack or pack step runs again
+
+- **Symptom:** A cached tool stage executes even though its source and tool appear unchanged.
+- **General cause:** The cache fingerprint includes a generated output, an unstable path, or other state that changes after the first run.
+- **Diagnosis:** Compare only the normalized command, source content, reusable tool files, and relevant configuration used to construct the fingerprint.
+- **Resolution:** Exclude generated outputs and volatile metadata from the fingerprint, then regenerate the stage state.
+- **Prevention:** Test every cached stage by running it twice and requiring the second run to report `skipped`.
+
+## A translated WOLF project loads but runtime behavior changes
+
+- **Symptom:** Text appears localized, but a choice, branch, event call, database lookup, resource reference, or script command behaves differently.
+- **General cause:** A display string is also used as a runtime identifier, comparison key, selector, or resource path.
+- **Diagnosis:** Decompile and compare the original and rebuilt runtime structures; inspect identifiers and command skeletons independently from visible text.
+- **Resolution:** Restore non-display identifiers from the source data and rebuild. Translate only payloads explicitly classified as display text.
+- **Prevention:** Run the runtime integrity audit before packing and treat every mismatch as a build failure.
+
+## WOLF Pro replacement archives are rejected or inconsistent
+
+- **Symptom:** Individually rebuilt archives are not accepted together or do not match the expected encryption behavior.
+- **General cause:** Related archives were packed with different source key material or incompatible packer settings.
+- **Diagnosis:** Confirm all replacement archives were produced in one operation with the same public engine contract and the same user-supplied key archive.
+- **Resolution:** Rebuild the complete archive set together. Do not distribute the key archive or packer with the SDK.
+- **Prevention:** Stage all outputs atomically and verify that every expected archive is non-empty before publishing the build.
+
+## A model refuses fictional game localization
+
+- **Symptom:** A context, translation, or review provider refuses a bounded transformation because the fictional text contains mature themes.
+- **General cause:** The provider does not recognize the request as inert, user-supplied fictional content or its policy disallows the transformation.
+- **Diagnosis:** Check the structured refusal status without persisting the source text in repository logs.
+- **Resolution:** Retry once with the bounded transformation context clarified; if refusal remains, route to the next configured provider. Do not obfuscate content or weaken safeguards.
+- **Prevention:** Configure independent provider chains and test refusal routing with synthetic fixtures.

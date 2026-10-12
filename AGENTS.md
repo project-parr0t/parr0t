@@ -15,4 +15,21 @@ This repository contains reusable orchestration code only. Never place actual ga
 9. Engine branches are named `sdk-<engine>-<version>`, branch from `main`, and contain only reusable SDK/tool files. Example: `sdk-unity-2023.1`.
 10. Run `python scripts/check_repo_privacy.py` and `python -m unittest discover -s tests -t . -v` before committing.
 
+## Zero-provenance SDK rule
+
+The SDK repository must reveal nothing about any localization job. This applies to the current tree, documentation, tests, fixtures, commit messages, branch descriptions, tags, and retained history.
+
+- Never retain a real game title, developer/publisher, character or location name, dialogue, translation, source filename, asset/resource path, map/event identifier, job-specific tool/workspace path, model/provider used for a job, run count, timestamp, hash, report, or description of what private game data was edited.
+- Engine-defined canonical names may appear only when required to implement or document the public file format. Test-only identifiers and text must be unmistakably synthetic (`fixture`, `synthetic`, `SOURCE_*`, `TARGET_*`) and must not be copied from a game.
+- Reimplement the minimal reusable behavior from a private workspace; never copy its notes, examples, exclusions, fixtures, logs, or reports. Before publishing, inspect both the final diff and branch history. If provenance entered an unpublished branch, amend/squash it; if it reached a remote branch, rewrite that branch with `--force-with-lease` after explicit authorization.
+
+## Neutral FAQ maintenance
+
+Actively record reusable problems in `docs/faq.md`, but only after removing all provenance. An entry is eligible only when it follows from the SDK/engine design or can reasonably recur across independent projects.
+
+- Use the format: symptom, general cause, diagnosis, resolution, prevention.
+- Do not mention where or when the issue occurred, the affected game or files, actual job commands/paths, source or translated text, specific model/provider identities, counts, hashes, screenshots, or outcomes from a particular job.
+- Keep project-specific incidents only in the external private workspace. If an issue cannot be useful without private details, do not add it to the repository FAQ.
+- Update or merge an existing FAQ entry instead of accumulating job narratives.
+
 API keys belong in environment variables. Do not print or persist them.

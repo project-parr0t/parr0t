@@ -15,5 +15,7 @@ Read the repository `AGENTS.md` and the target workspace `AGENTS.md` before acti
 6. Treat a provider refusal as a routing event. Let the SDK perform the bounded clarification retry and then use the next configured context, translation, or review provider. Do not obfuscate text or weaken provider safeguards.
 7. Pack to a new output path in the agent workspace and validate it without overwriting the installed game unless the user explicitly asks.
 8. Only after the user confirms the patch succeeded, prepare a sanitized engine profile with `promote-sdk`. Ask separately before commit/push, record approval, and only then use `publish-sdk` to create `sdk-<engine>-<version>` from `main`.
+9. Keep the SDK provenance-free. Do not carry real game/project names, filenames, asset paths, map/event identifiers, dialogue, translations, private exclusions, job metadata, tool paths, hashes, counts, or reports into code, docs, fixtures, commit messages, or history. Use only public engine-format names and unmistakably synthetic fixtures.
+10. Add recurring engine/SDK problems to `docs/faq.md` using symptom, general cause, diagnosis, resolution, and prevention. Remove all job provenance first. Do not record an incident that cannot be explained without private details; leave it in the external workspace instead.
 
 Never copy source game data, extracted strings, translations, caches, logs, prompts, or keys into the SDK repository.

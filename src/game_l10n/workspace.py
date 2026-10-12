@@ -69,10 +69,12 @@ This directory contains private game data and translation artifacts. It is inten
 6. Preserve placeholders, tags, control codes, glossary terms, names, character voice, and scene context.
 7. A toolchain may be promoted only after the user explicitly states that the translation/patch succeeded. Then ask separately whether the sanitized SDK profile may be committed/pushed.
 8. Engine profiles use branch names `sdk-<engine>-<version>` (for example `sdk-unity-2023.1`). Export only reusable files from `tools/`; the privacy scan must pass first.
+9. Keep promoted SDK content provenance-free. Never transfer real game/project names, filenames, asset paths, map/event identifiers, dialogue, translations, project-specific exclusions, job metadata, tool paths, counts, hashes, reports, or execution history. Use only public engine-format identifiers and unmistakably synthetic fixtures.
+10. Record only recurring engine/SDK problems in the repository `docs/faq.md`, after reducing them to neutral symptom, general cause, diagnosis, resolution, and prevention. Keep one-off or project-specific incidents in this private workspace.
 
 ## Data boundary
 
-- Private here: `game-data/`, `inputs/`, `translations/`, `.game-l10n/`, `logs/`.
+- Private here: `game-data/`, `inputs/`, `translations/`, `batches/`, `audit/`, `.game-l10n/`, `logs/`.
 - Paths in `game_roots` are read-only source locations. Never write patched files into them unless the user explicitly authorizes installation after reviewing the packed output.
 - Reusable SDK only: orchestration source, documentation, tests, and sanitized engine-specific unpack/pack tooling.
 - API keys are environment variables only. Never place keys in configuration or logs.
@@ -83,6 +85,10 @@ game-data/
 inputs/
 translations/
 localized/
+batches/
+audit/
+wolf-json/
+build/
 logs/
 .game-l10n/
 sdk-export/

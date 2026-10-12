@@ -132,6 +132,8 @@ results = orchestrator.translate_many(segments)
 
 ## 검사
 
+여러 작업에서 반복될 수 있는 문제와 중립적인 해결법은 [FAQ](docs/faq.md)에 유지합니다. 특정 게임·파일·대사·번역·작업 결과를 식별할 수 있는 내용은 FAQ와 SDK 기록에 남기지 않습니다.
+
 ```powershell
 python scripts/check_repo_privacy.py
 python -m unittest discover -s tests -t . -v

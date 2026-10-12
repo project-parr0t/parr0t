@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -12,11 +13,55 @@ DENIED_PARTS = {
     "inputs",
     "translations",
     "localized",
+    "batches",
+    "audit",
+    "wolf-json",
     "logs",
     "sdk-export",
 }
 DENIED_SUFFIXES = {".jsonl", ".csv", ".po", ".mo", ".locres", ".assets", ".bundle"}
 MAX_FILE_BYTES = 2 * 1024 * 1024
+TEXT_SUFFIXES = {
+    ".md",
+    ".py",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+CJK_LITERAL_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7a3]")
+RESOURCE_PATH_RE = re.compile(
+    r"(?:[A-Za-z0-9_.-]+[/\\])+[A-Za-z0-9_.-]+"
+    r"\.(?:bmp|gif|jpe?g|mp3|mp4|ogg|ogv|otf|png|ttf|wav|webp)\b",
+    re.IGNORECASE,
+)
+
+
+def is_provenance_text_scope(relative: Path) -> bool:
+    normalized = relative.as_posix().casefold()
+    return (
+        normalized.startswith("src/game_l10n/wolf/")
+        or normalized.startswith("tests/test_wolf")
+        or normalized == "docs/wolf-rpg-pro.md"
+        or normalized == "docs/faq.md"
+    )
+
+
+def content_violations(relative: Path, text: str) -> list[str]:
+    if not is_provenance_text_scope(relative):
+        return []
+
+    violations: list[str] = []
+    if CJK_LITERAL_RE.search(text):
+        violations.append(f"literal localization content in protected SDK scope: {relative}")
+
+    for match in RESOURCE_PATH_RE.finditer(text):
+        candidate = match.group(0).casefold()
+        components = re.split(r"[/\\]", candidate)
+        if not any(part.startswith(("fixture", "synthetic")) for part in components):
+            violations.append(f"non-synthetic resource path in protected SDK scope: {relative}")
+            break
+    return violations
 
 
 def tracked_files() -> list[Path]:
@@ -44,12 +89,19 @@ def main() -> int:
             violations.append(f"game/translation data extension: {relative}")
         if path.exists() and path.stat().st_size > MAX_FILE_BYTES:
             violations.append(f"unexpectedly large file: {relative}")
+        if path.exists() and path.suffix.casefold() in TEXT_SUFFIXES:
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                violations.append(f"non-UTF-8 text file: {relative}")
+            else:
+                violations.extend(content_violations(relative, text))
     if violations:
         print("Repository privacy check failed:", file=sys.stderr)
         for item in violations:
             print(f"- {item}", file=sys.stderr)
         return 1
-    print("Repository privacy check passed; no game/translation data paths detected.")
+    print("Repository privacy check passed; no game data or provenance markers detected.")
     return 0
 
 
