@@ -11,6 +11,7 @@ from .privacy import require_external_workdir, scan_tools
 
 
 CONFIG_TEMPLATE: dict[str, Any] = {
+    "provider_preset": "openai-deepseek",
     "project": {
         "game_title": "CHANGE_ME",
         "source_language": "ja",
@@ -23,25 +24,36 @@ CONFIG_TEMPLATE: dict[str, Any] = {
     },
     "providers": [
         {
-            "name": "translator-primary",
+            "name": "openai-luna",
             "type": "openai_responses",
-            "model": "CHANGE_ME",
+            "model": "gpt-6-luna",
             "api_key_env": "OPENAI_API_KEY",
         },
         {
-            "name": "reviewer-primary",
+            "name": "deepseek",
+            "type": "compatible_chat",
+            "model": "deepseek-flash",
+            "base_url": "https://api.deepseek.com",
+            "api_key_env": "DEEPSEEK_API_KEY",
+            "response_format": "json_object",
+            "temperature": 0.0,
+        },
+        {
+            "name": "openai-sol",
             "type": "openai_responses",
-            "model": "CHANGE_ME",
+            "model": "gpt-6.1-sol",
             "api_key_env": "OPENAI_API_KEY",
         },
     ],
     "routing": {
-        "context_analyzers": ["translator-primary"],
-        "translators": ["translator-primary"],
-        "reviewers": ["reviewer-primary"],
+        "context_analyzers": ["openai-sol", "deepseek"],
+        "translators": ["openai-luna", "deepseek"],
+        "reviewers": ["openai-sol", "deepseek"],
         "require_review": True,
-        "max_workers": 1,
-        "retry_refusals_once": True,
+        "max_workers": 4,
+        "retry_refusals_once": False,
+        "defer_fallbacks_until_primary_complete": True,
+        "preserve_source_on_failure": True,
     },
     "files": {
         "glossary": "context/glossary.json",
@@ -71,6 +83,12 @@ This directory contains private game data and translation artifacts. It is inten
 8. Engine profiles use branch names `sdk-<engine>-<version>` (for example `sdk-unity-2023.1`). Export only reusable files from `tools/`; the privacy scan must pass first.
 9. Keep promoted SDK content provenance-free. Never transfer real game/project names, filenames, asset paths, map/event identifiers, dialogue, translations, project-specific exclusions, job metadata, tool paths, counts, hashes, reports, or execution history. Use only public engine-format identifiers and unmistakably synthetic fixtures.
 10. Record only recurring engine/SDK problems in the repository `docs/faq.md`, after reducing them to neutral symptom, general cause, diagnosis, resolution, and prevention. Keep one-off or project-specific incidents in this private workspace.
+11. Treat translation as a faithful transformation of existing user-provided text, never as new scene generation, continuation, roleplay, or endorsement. Do not censor, soften, intensify, or invent content. A refusal applies only to the individual target segment and must never cancel unrelated segments.
+12. With the `openai-deepseek` preset, finish the complete GPT-6 Luna pass first, queue only refused/failed segments for DeepSeek, then finish the GPT-6.1 Sol review pass and queue only refused/failed reviews for DeepSeek. If every permitted route fails, emit the unchanged source with `source_preserved`; never silently claim it was reviewed.
+13. Selecting a provider preset and supplying its API-key environment variables authorizes its automatic context, translation, review, and fallback calls. Do not pause for another per-segment API or cost approval. Keep configured game roots read-only; create translated data, rebuilt archives, and installable patches only under this workspace. Never overwrite an installed or source game in place.
+14. Distinguish OpenAI API + DeepSeek API from Codex App + DeepSeek API. In App mode, use native GPT-6 Luna translator subagents and a separate native GPT-6.1 Sol reviewer, with only `DEEPSEEK_API_KEY` used for external fallback. The top-level Sol agent remains orchestration-only and follows the SDK's `docs/codex-app-deepseek.md` workflow.
+15. Keep a strict data-plane/control-plane boundary. The top-level agent may receive target IDs, categorical status/error codes, counts, queue transitions, artifact paths, and deterministic issue codes only. It must not open dialogue/input/result files or receive source, candidate, translated text, or provider prose refusal explanations. Workers read and write private workspace files and return metadata-only envelopes.
+16. A translation or review refusal is a routing event, not a content judgment and not grounds to omit a target or cancel patch creation. Normalize explanations before returning metadata to the parent. Use the configured faithful-transformation prompt and supported deterministic low-creativity settings for DeepSeek; never claim or attempt to disable provider safeguards.
 
 ## Data boundary
 
@@ -131,12 +149,41 @@ def initialize_workspace(
     *,
     git_choice: str = "pending",
     game_roots: list[Path] | None = None,
+    provider_preset: str = "openai-deepseek",
 ) -> None:
     work_dir = work_dir.resolve()
     sdk_root = sdk_root.resolve()
     require_external_workdir(work_dir, sdk_root)
     work_dir.mkdir(parents=True, exist_ok=True)
     config = json.loads(json.dumps(CONFIG_TEMPLATE))
+    if provider_preset not in {"openai-deepseek", "custom"}:
+        raise ConfigurationError("provider_preset must be openai-deepseek or custom")
+    config["provider_preset"] = provider_preset
+    if provider_preset == "custom":
+        config["providers"] = [
+            {
+                "name": "translator-primary",
+                "type": "openai_responses",
+                "model": "CHANGE_ME",
+                "api_key_env": "OPENAI_API_KEY",
+            },
+            {
+                "name": "reviewer-primary",
+                "type": "openai_responses",
+                "model": "CHANGE_ME",
+                "api_key_env": "OPENAI_API_KEY",
+            },
+        ]
+        config["routing"] = {
+            "context_analyzers": ["translator-primary"],
+            "translators": ["translator-primary"],
+            "reviewers": ["reviewer-primary"],
+            "require_review": True,
+            "max_workers": 1,
+            "retry_refusals_once": True,
+            "defer_fallbacks_until_primary_complete": False,
+            "preserve_source_on_failure": False,
+        }
     config["sdk_root"] = str(sdk_root)
     config["game_roots"] = [str(path.resolve()) for path in (game_roots or [])]
     config["repository"]["initial_choice"] = git_choice

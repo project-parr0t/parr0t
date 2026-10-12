@@ -79,6 +79,10 @@ def _orchestrator(work_dir: Path, context_pack: ContextPack) -> LocalizationOrch
         use_style_memory=bool(routing.get("use_style_memory", True)),
         style_anchor_limit=int(routing.get("style_anchor_limit", 6)),
         retry_refusals_once=bool(routing.get("retry_refusals_once", True)),
+        defer_fallbacks_until_primary_complete=bool(
+            routing.get("defer_fallbacks_until_primary_complete", False)
+        ),
+        preserve_source_on_failure=bool(routing.get("preserve_source_on_failure", False)),
     )
     file_config = config.get("files", {})
     glossary = _load_dataclass_list(
@@ -127,6 +131,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         Path(args.sdk_root or _sdk_root()),
         git_choice=args.git_choice,
         game_roots=[Path(item) for item in args.game_root],
+        provider_preset=args.provider_preset,
     )
     print(f"Initialized private agent workspace: {Path(args.workspace).resolve()}")
     if args.git_choice == "pending":
@@ -148,6 +153,8 @@ def cmd_translate(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     destination = _path_in_workspace(work_dir, args.output)
+    if destination == source:
+        raise ValueError("Translation output must be a separate patch file; the source is read-only")
     segments = read_segments(source)
     context_source = _path_in_workspace(
         work_dir, args.context_input or args.input, must_exist=True
@@ -159,12 +166,14 @@ def cmd_translate(args: argparse.Namespace) -> int:
     results = orchestrator.translate_many(segments, force=args.force)
     write_results(destination, results)
     failed = sum(item.status == "failed" for item in results)
+    source_preserved = sum(item.status == "source_preserved" for item in results)
     cached = sum(item.from_cache for item in results)
     print(
         json.dumps(
             {
                 "segments": len(results),
                 "failed": failed,
+                "source_preserved": source_preserved,
                 "cached": cached,
                 "context_cached": context_cached,
                 "output": str(destination),
@@ -316,6 +325,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Read-only source game folder; may be provided more than once",
     )
     init.add_argument("--git-choice", choices=["pending", "enabled", "disabled"], default="pending")
+    init.add_argument(
+        "--provider-preset",
+        choices=["openai-deepseek", "custom"],
+        default="openai-deepseek",
+        help="Ready-to-run OpenAI/DeepSeek routing or a manually configured provider chain",
+    )
     init.set_defaults(func=cmd_init)
 
     policy = sub.add_parser("policy", help="Record explicit user Git/publish choices")

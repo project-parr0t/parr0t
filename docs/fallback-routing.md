@@ -1,0 +1,61 @@
+# OpenAI API + DeepSeek API fallback preset
+
+The `openai-deepseek` preset is the default for new private workspaces. Codex or ChatGPT Work may act as the top-level operator, but provider calls use API credentials from environment variables. A ChatGPT subscription is not treated as an API credential.
+
+For native Luna/Sol workers supplied by the signed-in desktop app plus DeepSeek API fallback, use the separate [Codex App + DeepSeek API workflow](codex-app-deepseek.md).
+
+## Ready-to-run setup
+
+Set both keys in the agent environment, then initialize a workspace:
+
+```powershell
+$env:OPENAI_API_KEY = "<openai-api-key>"
+$env:DEEPSEEK_API_KEY = "<deepseek-api-key>"
+
+game-l10n init-workspace <agent-workspace> `
+  --provider-preset openai-deepseek `
+  --game-root <read-only-game-root>
+
+game-l10n doctor --workspace <agent-workspace>
+```
+
+The preset uses the current public API model identifiers `gpt-6-luna`, `deepseek-flash`, and `gpt-6.1-sol`. DeepSeek uses its OpenAI-compatible endpoint with JSON Object output. Model names remain editable in the private workspace configuration if account availability changes.
+
+Selecting this preset and supplying its key environment variables authorizes its configured automatic provider calls. The agent must not pause for a second approval whenever an individual segment enters fallback. Keys remain in environment variables and are never written into the SDK, workspace configuration, audit log, or prompts.
+
+## Ordered routing
+
+1. Analyze the complete ordered script with the context chain. The resulting context pack records story flow, scene state, relationship changes, and character voice.
+2. Send one translation target per GPT-6 Luna request. Run up to `routing.max_workers` independent requests concurrently. Every request still receives the relevant full-script analysis, character guide, scene state, adjacent lines, glossary, and control-code rules as context-only evidence.
+3. Record refusal/error metadata without source or translated text. Finish the entire Luna stage before releasing only failed target IDs to DeepSeek.
+4. After all translation routes finish, review candidates with GPT-6.1 Sol in script order. Approved lines from the same speaker become style anchors for later reviews.
+5. Finish the complete Sol review stage before releasing only refused, errored, or invalid review IDs to DeepSeek review.
+6. If every permitted route fails, including provider quota or rate-limit exhaustion, emit the exact source text with status `source_preserved`. This is an explicit unresolved state, never a claim that the line was translated or reviewed.
+
+The top-level Codex/Sol operator observes completion, categorical refusals/errors, deterministic validation codes, counts, and queue transitions. It does not replace the independent semantic reviewer and must not open the input, candidate, or patch files. Provider prose explanations are normalized to codes such as `provider_refusal`, `quota_exhausted`, and `rate_limited` before control-plane logging.
+
+## Refusal isolation
+
+Translation is a bounded transformation of existing user-provided text, not generation of a new scene. Provider prompts explicitly prohibit continuation, roleplay, invention, censorship, and intensity changes. Mature content in neighboring or narrative context must not turn an otherwise permitted target into a blanket refusal.
+
+One provider request contains exactly one output target. Context remains available but is labeled as non-target evidence. A refusal therefore queues only that target; the orchestrator continues every unrelated target and never resubmits the refused collection as one larger fallback batch.
+
+Provider policy still applies. The SDK does not obfuscate content or bypass safeguards; it minimizes unnecessary refusals and limits the effect of a genuine refusal to one target.
+
+The DeepSeek-compatible request uses JSON Object output and `temperature: 0.0`. This is a deterministic, low-creativity translation configuration, not a vendor safety-disable switch. The system prompt identifies the request as faithful transformation/review of pre-existing text and forbids continuation, roleplay, invention, censorship, and intensity changes.
+
+## Control-plane isolation
+
+The CLI is the boundary between the top-level agent and game text. It prints aggregate counts and output paths only. Source, candidates, reviewed text, provider explanations, and context packs stay under the private workspace. The audit stream contains target IDs and categorical status/issue codes without dialogue. A refusal is therefore interpreted only as “route this target,” never as advice to omit it or abandon the patch.
+
+If a run is interrupted, provider-stage state is retained under `.game-l10n/deferred/`. With unchanged input, context, settings, and provider fingerprints, resuming skips complete Luna, DeepSeek, or Sol stages and continues at the first incomplete stage. `--force` deliberately discards that staged resume decision.
+
+## Read-only source and patch output
+
+Configured game roots are input-only. Translation output must be a different file under the private agent workspace. Unpack and pack tools reject an output equal to, or nested inside, their input tree. Build translated data and replacement archives under the workspace, validate them there, and give the user a recoverable patch without modifying the installed game.
+
+## Custom combinations
+
+Use `--provider-preset custom` to create placeholder providers, then edit `providers` and the ordered `routing` lists in the private `game-l10n.json`. The same staged fallback, source preservation, review independence, and read-only source rules can be retained with any supported provider combination.
+
+API references: [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna), [OpenAI models](https://developers.openai.com/api/docs/models), and [DeepSeek API quick start](https://api-docs.deepseek.com/guides/codex).

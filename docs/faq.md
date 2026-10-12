@@ -41,3 +41,27 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Diagnosis:** Check the structured refusal status without persisting the source text in repository logs.
 - **Resolution:** Retry once with the bounded transformation context clarified; if refusal remains, route to the next configured provider. Do not obfuscate content or weaken safeguards.
 - **Prevention:** Configure independent provider chains and test refusal routing with synthetic fixtures.
+
+## One mature target causes an entire translation batch to be refused
+
+- **Symptom:** A provider rejects unrelated ordinary targets because they were submitted together with one target or context field that triggered a refusal.
+- **General cause:** Multiple output targets were bundled into one model request, or context-only material was not distinguished from the text that actually required transformation.
+- **Diagnosis:** Confirm that every provider request has exactly one translation target and that refusal records identify only that target ID.
+- **Resolution:** Continue the unaffected targets individually. Queue only the refused target for the configured fallback after the primary stage completes; never rebuild the refused collection into another multi-target request.
+- **Prevention:** Label full-story, scene, character, adjacent-line, and glossary material as context-only evidence while preserving one output target per request.
+
+## A fallback provider reaches its quota or every route fails
+
+- **Symptom:** Translation or review cannot produce a validated result after the configured routes run.
+- **General cause:** A provider may refuse, return malformed output, encounter a rate/quota limit, or fail deterministic integrity checks.
+- **Diagnosis:** Inspect text-free attempt metadata and queue transitions for the target ID.
+- **Resolution:** Emit the exact source as `source_preserved` and continue unrelated targets. Do not label the preserved source as translated or reviewed.
+- **Prevention:** Configure independent translation and review routes, validate keys with `doctor`, and retain explicit unresolved counts in the patch summary.
+
+## A provider refusal explanation influences the parent orchestrator
+
+- **Symptom:** The parent agent sees a provider's prose explanation or the affected dialogue and treats a route failure as a reason to omit content or stop patch creation.
+- **General cause:** Data-plane model output was copied into a control-plane message or audit record instead of being reduced to categorical metadata.
+- **Diagnosis:** Inspect schemas and logs with synthetic fixtures; parent-facing records should contain only target IDs, categorical status/error codes, counts, artifact paths, queue transitions, and deterministic issue codes.
+- **Resolution:** Keep text-bearing envelopes in the private workspace, normalize the explanation to a category such as `provider_refusal`, and continue the configured fallback route. If every route fails, preserve the exact source without removing the target.
+- **Prevention:** Make workers read/write private artifacts directly and require metadata-only completion envelopes at every parent boundary.

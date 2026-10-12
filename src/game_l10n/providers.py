@@ -103,19 +103,19 @@ class OpenAIResponsesProvider(ModelProvider):
                             "text": "",
                             "meaning_preserved": False,
                             "issues": [],
-                            "reason": content.get("refusal", "provider refusal"),
+                            "reason": "provider_refusal",
                         }
                     if "context" in schema_name:
                         return {
                             "status": "refused",
-                            "reason": content.get("refusal", "provider refusal"),
+                            "reason": "provider_refusal",
                             "story_summary": "",
                             "global_style_rules": [],
                             "scenes": [],
                             "characters": [],
                             "relationship_timeline": [],
                         }
-                    return {"status": "refused", "text": "", "reason": content.get("refusal", "provider refusal")}
+                    return {"status": "refused", "text": "", "reason": "provider_refusal"}
                 if content.get("type") == "output_text":
                     try:
                         return json.loads(content.get("text", ""))
@@ -138,26 +138,45 @@ class CompatibleChatProvider(ModelProvider):
         api_key_env: str,
         base_url: str,
         timeout: int = 120,
+        response_format: str = "json_schema",
+        temperature: float | None = None,
     ):
         super().__init__(name)
+        if response_format not in {"json_schema", "json_object"}:
+            raise ConfigurationError(
+                f"Compatible provider {name!r} response_format must be json_schema or json_object"
+            )
         self.model = model
         self.api_key_env = api_key_env
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.response_format = response_format
+        if temperature is not None and not 0 <= temperature <= 2:
+            raise ConfigurationError(
+                f"Compatible provider {name!r} temperature must be between 0 and 2"
+            )
+        self.temperature = temperature
 
     def generate_json(
         self, *, system: str, user: str, schema: dict[str, Any], schema_name: str
     ) -> dict[str, Any]:
         api_key = os.environ.get(self.api_key_env, "")
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        response_format: dict[str, Any]
+        if self.response_format == "json_object":
+            response_format = {"type": "json_object"}
+        else:
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {"name": schema_name, "strict": True, "schema": schema},
+            }
         payload = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {"name": schema_name, "strict": True, "schema": schema},
-            },
+            "response_format": response_format,
         }
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
         data = _post_json(f"{self.base_url}/chat/completions", headers, payload, self.timeout)
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
@@ -168,19 +187,19 @@ class CompatibleChatProvider(ModelProvider):
                     "text": "",
                     "meaning_preserved": False,
                     "issues": [],
-                    "reason": str(message["refusal"]),
+                    "reason": "provider_refusal",
                 }
             if "context" in schema_name:
                 return {
                     "status": "refused",
-                    "reason": str(message["refusal"]),
+                    "reason": "provider_refusal",
                     "story_summary": "",
                     "global_style_rules": [],
                     "scenes": [],
                     "characters": [],
                     "relationship_timeline": [],
                 }
-            return {"status": "refused", "text": "", "reason": str(message["refusal"])}
+            return {"status": "refused", "text": "", "reason": "provider_refusal"}
         if choice.get("finish_reason") in {"content_filter", "length"}:
             raise ProviderError(f"Incomplete compatible response: {choice.get('finish_reason')}")
         try:
@@ -189,7 +208,13 @@ class CompatibleChatProvider(ModelProvider):
             raise ProviderError("Compatible provider response was not valid JSON") from exc
 
     def fingerprint(self) -> dict[str, Any]:
-        return {**super().fingerprint(), "model": self.model, "base_url": self.base_url}
+        return {
+            **super().fingerprint(),
+            "model": self.model,
+            "base_url": self.base_url,
+            "response_format": self.response_format,
+            "temperature": self.temperature,
+        }
 
 
 class CommandProvider(ModelProvider):
@@ -293,6 +318,10 @@ class ProviderRegistry:
                     api_key_env=item.get("api_key_env", "COMPATIBLE_API_KEY"),
                     base_url=item["base_url"],
                     timeout=int(item.get("timeout", 120)),
+                    response_format=item.get("response_format", "json_schema"),
+                    temperature=(
+                        float(item["temperature"]) if item.get("temperature") is not None else None
+                    ),
                 )
             elif kind == "command":
                 cwd = item.get("cwd")

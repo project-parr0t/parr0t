@@ -19,13 +19,17 @@
 
 - 컨텍스트 분석이 전부 거부되거나 실패하면 번역을 시작하지 않습니다.
 - 번역기와 검수기는 서로 다른 제공자/모델 체인을 쓸 수 있습니다.
-- 허구의 폭력·욕설·공포·로맨스·성인 등급 요소를 이유로 임의 순화/거부하지 않도록 변환 작업의 성격을 명시합니다. 한 번의 명확화 재시도 뒤에도 거부하면 다음 제공자로 넘깁니다.
+- 허구의 폭력·욕설·공포·로맨스·성인 등급 요소를 이유로 임의 순화/거부하지 않도록 기존 문장의 언어 변환이라는 작업 성격을 명시합니다. 기본 프리셋에서는 거부 항목만 기록해 1차 단계 완료 후 다음 제공자로 넘깁니다.
 - 검수기가 거부하거나 잘못된 결과를 내면 다음 검수기로 라우팅합니다.
 - `{name}`, `%s`, `<tag>`, `\\n`, 엔진 제어 코드와 사전 지정어를 결정론적으로 검사합니다.
 - 원문에 없던 `<script>`, `javascript:`, `eval(` 등의 삽입을 차단합니다.
 - 이전에 승인된 동일 화자의 번역을 후속 대사의 스타일 앵커로 제공합니다.
 - 동일 원문·컨텍스트·사전·모델·설정은 콘텐츠 해시 캐시로 다시 처리하지 않습니다.
 - unpack/pack도 입력과 도구 지문이 같으면 다시 실행하지 않습니다.
+- 기본 `openai-deepseek` 프리셋은 문장별 GPT-6 Luna 번역을 먼저 모두 수행한 뒤, 거부·오류 문장만 DeepSeek으로 넘깁니다. 이후 GPT-6.1 Sol 검수 전체를 마치고 검수 실패 항목만 DeepSeek으로 넘깁니다.
+- 모든 허용 경로 또는 DeepSeek 쿼타가 소진되면 해당 항목은 `source_preserved` 상태로 정확한 원문을 유지합니다. 다른 문장의 진행은 중단하지 않습니다.
+- DeepSeek 요청은 JSON Object 출력과 `temperature: 0.0`을 사용해 창작성을 낮추고 충실한 변환에 집중합니다. 공급자 안전장치를 비활성화하는 옵션으로 가장하지 않으며, 실제 거부는 문장별 폴백으로 격리합니다.
+- 상위 오케스트레이터에는 건별 상태·범주 코드·개수만 노출합니다. 원문, 번역문, 후보문, 공급자가 작성한 거부 설명은 비공개 데이터 평면에만 남고 감사 로그나 표준 출력으로 전달되지 않습니다.
 
 ## 데이터 격리 원칙
 
@@ -35,6 +39,8 @@ SDK 저장소에는 게임 데이터와 번역 데이터가 들어가지 않습�
 python -m pip install -e .
 game-l10n init-workspace C:\agent-work\my-game --sdk-root C:\src\agent-game-translation-sdk
 ```
+
+새 작업공간은 기본적으로 `openai-deepseek` 프리셋을 사용합니다. `OPENAI_API_KEY`와 `DEEPSEEK_API_KEY`를 환경변수에 지정하면 별도의 문장별 폴백 승인 없이 설정된 체인을 실행합니다. 자세한 순서와 사용자 정의 조합은 [API + API 폴백 라우팅 가이드](docs/fallback-routing.md)를 참고하십시오. Codex App의 네이티브 Luna/Sol 서브에이전트와 DeepSeek API를 조합할 때는 [Codex App + DeepSeek API 가이드](docs/codex-app-deepseek.md)를 사용하십시오.
 
 생성되는 작업공간의 `game-data/`, `inputs/`, `translations/`, `.game-l10n/`에는 원문·결과·캐시·감사 로그가 남습니다. SDK 저장소의 `.gitignore`, `AGENTS.md`, 개인정보 검사 스크립트가 이 경계를 보조합니다.
 
@@ -98,25 +104,29 @@ game-l10n translate --workspace C:\agent-work\my-game `
 ```json
 {
   "providers": [
-    {"name": "t1", "type": "openai_responses", "model": "YOUR_MODEL", "api_key_env": "OPENAI_API_KEY"},
-    {"name": "t2", "type": "compatible_chat", "model": "local-model", "base_url": "http://127.0.0.1:8000/v1", "api_key_env": "LOCAL_API_KEY"},
-    {"name": "r1", "type": "command", "command": ["python", "tools/model_adapter.py"]}
+    {"name": "openai-luna", "type": "openai_responses", "model": "gpt-6-luna", "api_key_env": "OPENAI_API_KEY"},
+    {"name": "deepseek", "type": "compatible_chat", "model": "deepseek-flash", "base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY", "response_format": "json_object", "temperature": 0.0},
+    {"name": "openai-sol", "type": "openai_responses", "model": "gpt-6.1-sol", "api_key_env": "OPENAI_API_KEY"}
   ],
   "routing": {
-    "context_analyzers": ["t1", "t2"],
-    "translators": ["t1", "t2"],
-    "reviewers": ["r1", "t2"],
+    "context_analyzers": ["openai-sol", "deepseek"],
+    "translators": ["openai-luna", "deepseek"],
+    "reviewers": ["openai-sol", "deepseek"],
     "require_review": true,
     "use_style_memory": true,
     "style_anchor_limit": 6,
-    "retry_refusals_once": true,
+    "retry_refusals_once": false,
+    "defer_fallbacks_until_primary_complete": true,
+    "preserve_source_on_failure": true,
     "context_chunk_chars": 30000,
-    "max_workers": 1
+    "max_workers": 4
   }
 }
 ```
 
 `command` 제공자는 Codex/OpenCode/사내 에이전트 하네스를 연결하는 중립 어댑터입니다. 셸을 거치지 않고 stdin으로 요청 JSON을 받아 stdout으로 결과 JSON 하나를 반환합니다. 자세한 규약은 [docs/provider-protocol.md](docs/provider-protocol.md)를 참고하십시오.
+
+번역 호출 하나에는 출력 대상 문장 하나만 들어갑니다. 다만 전체 대본 분석, 장면 상태, 관계 변화, 캐릭터 말투, 앞뒤 문장과 용어집은 `context-only` 근거로 계속 전달됩니다. 따라서 거부 범위는 한 문장으로 제한하면서도 흐름과 어체 판단은 유지됩니다.
 
 ## Python API
 

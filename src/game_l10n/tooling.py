@@ -39,6 +39,17 @@ def run_cached_tool(
 ) -> dict[str, Any]:
     if stage not in {"unpack", "pack"}:
         raise ToolExecutionError("stage must be 'unpack' or 'pack'")
+    resolved_input = input_path.resolve()
+    resolved_output = output_path.resolve()
+    if resolved_input == resolved_output:
+        raise ToolExecutionError("Tool output must be separate from its read-only input")
+    if resolved_input.is_dir():
+        try:
+            resolved_output.relative_to(resolved_input)
+        except ValueError:
+            pass
+        else:
+            raise ToolExecutionError("Tool output cannot be created inside its read-only input tree")
     expanded = _expand(command, input_path=input_path, output_path=output_path, work_dir=work_dir)
     tool_files: list[Path] = []
     excluded = {input_path.resolve(), output_path.resolve()}
