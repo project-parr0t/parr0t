@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import tempfile
 import urllib.error
@@ -10,7 +11,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable
 
-from .errors import ConfigurationError, ProviderError
+from .errors import ConfigurationError, ProviderError, ProviderFailure
 
 
 class ModelProvider(ABC):
@@ -40,10 +41,27 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeo
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:2000]
-        raise ProviderError(f"HTTP {exc.code} from {url}: {detail}") from exc
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise ProviderError(f"Request to {url} failed: {exc}") from exc
+        detail = exc.read().decode("utf-8", errors="replace").casefold()
+        if exc.code in {401, 403}:
+            code, retryable = "authentication_error", False
+        elif exc.code == 429 and any(token in detail for token in ("quota", "balance", "credit")):
+            code, retryable = "quota_exhausted", False
+        elif exc.code == 429:
+            code, retryable = "rate_limited", True
+        elif exc.code in {408, 504}:
+            code, retryable = "timeout", True
+        elif 500 <= exc.code < 600:
+            code, retryable = "provider_error", True
+        else:
+            code, retryable = "provider_error", False
+        raise ProviderFailure(code, retryable=retryable, status_code=exc.code) from exc
+    except json.JSONDecodeError as exc:
+        raise ProviderFailure("malformed_response", retryable=True) from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise ProviderFailure("timeout", retryable=True) from exc
+    except urllib.error.URLError as exc:
+        code = "timeout" if isinstance(exc.reason, (TimeoutError, socket.timeout)) else "provider_error"
+        raise ProviderFailure(code, retryable=True) from exc
 
 
 class OpenAIResponsesProvider(ModelProvider):
@@ -57,19 +75,23 @@ class OpenAIResponsesProvider(ModelProvider):
         api_key_env: str = "OPENAI_API_KEY",
         base_url: str = "https://api.openai.com/v1",
         timeout: int = 120,
+        reasoning_effort: str | None = None,
+        max_output_tokens: int | None = None,
     ):
         super().__init__(name)
         self.model = model
         self.api_key_env = api_key_env
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.reasoning_effort = reasoning_effort
+        self.max_output_tokens = max_output_tokens
 
     def generate_json(
         self, *, system: str, user: str, schema: dict[str, Any], schema_name: str
     ) -> dict[str, Any]:
         api_key = os.environ.get(self.api_key_env)
         if not api_key:
-            raise ProviderError(f"Required environment variable is not set: {self.api_key_env}")
+            raise ProviderFailure("authentication_error", retryable=False)
         payload = {
             "model": self.model,
             "instructions": system,
@@ -84,6 +106,10 @@ class OpenAIResponsesProvider(ModelProvider):
                 }
             },
         }
+        if self.reasoning_effort is not None:
+            payload["reasoning"] = {"effort": self.reasoning_effort}
+        if self.max_output_tokens is not None:
+            payload["max_output_tokens"] = self.max_output_tokens
         data = _post_json(
             f"{self.base_url}/responses",
             {"Authorization": f"Bearer {api_key}"},
@@ -91,7 +117,12 @@ class OpenAIResponsesProvider(ModelProvider):
             self.timeout,
         )
         if data.get("status") in {"failed", "cancelled", "incomplete"}:
-            raise ProviderError(f"Response status was {data.get('status')}: {data.get('error') or data.get('incomplete_details')}")
+            details = json.dumps(
+                data.get("error") or data.get("incomplete_details") or {},
+                ensure_ascii=False,
+            ).casefold()
+            code = "quota_exhausted" if "quota" in details else "provider_error"
+            raise ProviderFailure(code, retryable=code == "provider_error")
         for item in data.get("output", []):
             if item.get("type") != "message":
                 continue
@@ -120,11 +151,17 @@ class OpenAIResponsesProvider(ModelProvider):
                     try:
                         return json.loads(content.get("text", ""))
                     except json.JSONDecodeError as exc:
-                        raise ProviderError("OpenAI response was not valid JSON") from exc
-        raise ProviderError("OpenAI response contained no output_text")
+                        raise ProviderFailure("malformed_response", retryable=True) from exc
+        raise ProviderFailure("malformed_response", retryable=True)
 
     def fingerprint(self) -> dict[str, Any]:
-        return {**super().fingerprint(), "model": self.model, "base_url": self.base_url}
+        return {
+            **super().fingerprint(),
+            "model": self.model,
+            "base_url": self.base_url,
+            "reasoning_effort": self.reasoning_effort,
+            "max_output_tokens": self.max_output_tokens,
+        }
 
 
 class CompatibleChatProvider(ModelProvider):
@@ -140,6 +177,12 @@ class CompatibleChatProvider(ModelProvider):
         timeout: int = 120,
         response_format: str = "json_schema",
         temperature: float | None = None,
+        thinking: str | None = None,
+        reasoning_effort: str | None = None,
+        max_tokens: int | None = None,
+        max_tokens_per_source_char: float | None = None,
+        min_output_tokens: int = 96,
+        max_output_tokens: int = 2048,
     ):
         super().__init__(name)
         if response_format not in {"json_schema", "json_object"}:
@@ -156,11 +199,38 @@ class CompatibleChatProvider(ModelProvider):
                 f"Compatible provider {name!r} temperature must be between 0 and 2"
             )
         self.temperature = temperature
+        if thinking not in {None, "enabled", "disabled"}:
+            raise ConfigurationError(
+                f"Compatible provider {name!r} thinking must be enabled or disabled"
+            )
+        self.thinking = thinking
+        self.reasoning_effort = reasoning_effort
+        self.max_tokens = max_tokens
+        self.max_tokens_per_source_char = max_tokens_per_source_char
+        self.min_output_tokens = min_output_tokens
+        self.max_output_tokens = max_output_tokens
+
+    def _request_max_tokens(self, user: str) -> int | None:
+        if self.max_tokens is not None:
+            return self.max_tokens
+        if self.max_tokens_per_source_char is None:
+            return None
+        source_length = len(user)
+        try:
+            payload = json.loads(user)
+            target = payload.get("translation_target", {})
+            source_length = len(str(target.get("source") or payload.get("candidate_translation") or ""))
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+        estimate = int(max(1, source_length) * self.max_tokens_per_source_char)
+        return max(self.min_output_tokens, min(self.max_output_tokens, estimate))
 
     def generate_json(
         self, *, system: str, user: str, schema: dict[str, Any], schema_name: str
     ) -> dict[str, Any]:
         api_key = os.environ.get(self.api_key_env, "")
+        if self.api_key_env and not api_key:
+            raise ProviderFailure("authentication_error", retryable=False)
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         response_format: dict[str, Any]
         if self.response_format == "json_object":
@@ -177,10 +247,17 @@ class CompatibleChatProvider(ModelProvider):
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
+        if self.thinking is not None:
+            payload["thinking"] = {"type": self.thinking}
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
+        request_max_tokens = self._request_max_tokens(user)
+        if request_max_tokens is not None:
+            payload["max_tokens"] = request_max_tokens
         data = _post_json(f"{self.base_url}/chat/completions", headers, payload, self.timeout)
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
-        if message.get("refusal"):
+        if message.get("refusal") or choice.get("finish_reason") == "content_filter":
             if "review" in schema_name:
                 return {
                     "decision": "refused",
@@ -200,12 +277,14 @@ class CompatibleChatProvider(ModelProvider):
                     "relationship_timeline": [],
                 }
             return {"status": "refused", "text": "", "reason": "provider_refusal"}
-        if choice.get("finish_reason") in {"content_filter", "length"}:
-            raise ProviderError(f"Incomplete compatible response: {choice.get('finish_reason')}")
+        if choice.get("finish_reason") == "length":
+            raise ProviderFailure("malformed_response", retryable=True)
+        if choice.get("finish_reason") in {"insufficient_system_resource", "aborted"}:
+            raise ProviderFailure("provider_error", retryable=True)
         try:
             return json.loads(message.get("content") or "")
         except json.JSONDecodeError as exc:
-            raise ProviderError("Compatible provider response was not valid JSON") from exc
+            raise ProviderFailure("malformed_response", retryable=True) from exc
 
     def fingerprint(self) -> dict[str, Any]:
         return {
@@ -214,6 +293,12 @@ class CompatibleChatProvider(ModelProvider):
             "base_url": self.base_url,
             "response_format": self.response_format,
             "temperature": self.temperature,
+            "thinking": self.thinking,
+            "reasoning_effort": self.reasoning_effort,
+            "max_tokens": self.max_tokens,
+            "max_tokens_per_source_char": self.max_tokens_per_source_char,
+            "min_output_tokens": self.min_output_tokens,
+            "max_output_tokens": self.max_output_tokens,
         }
 
 
@@ -310,6 +395,12 @@ class ProviderRegistry:
                     api_key_env=item.get("api_key_env", "OPENAI_API_KEY"),
                     base_url=item.get("base_url", "https://api.openai.com/v1"),
                     timeout=int(item.get("timeout", 120)),
+                    reasoning_effort=item.get("reasoning_effort"),
+                    max_output_tokens=(
+                        int(item["max_output_tokens"])
+                        if item.get("max_output_tokens") is not None
+                        else None
+                    ),
                 )
             elif kind == "compatible_chat":
                 provider = CompatibleChatProvider(
@@ -322,6 +413,16 @@ class ProviderRegistry:
                     temperature=(
                         float(item["temperature"]) if item.get("temperature") is not None else None
                     ),
+                    thinking=item.get("thinking"),
+                    reasoning_effort=item.get("reasoning_effort"),
+                    max_tokens=(int(item["max_tokens"]) if item.get("max_tokens") is not None else None),
+                    max_tokens_per_source_char=(
+                        float(item["max_tokens_per_source_char"])
+                        if item.get("max_tokens_per_source_char") is not None
+                        else None
+                    ),
+                    min_output_tokens=int(item.get("min_output_tokens", 96)),
+                    max_output_tokens=int(item.get("max_output_tokens", 2048)),
                 )
             elif kind == "command":
                 cwd = item.get("cwd")

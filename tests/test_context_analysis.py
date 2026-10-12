@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from game_l10n.context_analysis import ContextAnalyzer, analyze_with_cache
+from game_l10n.errors import ProviderError
 from game_l10n.models import Segment
 from game_l10n.providers import ProviderRegistry, ScriptedProvider
 
@@ -74,6 +75,24 @@ class ContextAnalysisTests(unittest.TestCase):
         self.assertTrue(second_cached)
         self.assertEqual(first.story_summary, second.story_summary)
         self.assertEqual(provider.call_count, 1)
+
+    def test_context_gate_rejects_missing_named_character_coverage(self) -> None:
+        def incomplete(**_kwargs):
+            payload = successful_context(user='{"lines": [{"id": "fixture-1"}]}')
+            payload["characters"] = []
+            return payload
+
+        provider = ScriptedProvider("context", incomplete)
+        analyzer = ContextAnalyzer(ProviderRegistry({"context": provider}), ["context"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(ProviderError, "character coverage"):
+                analyze_with_cache(
+                    analyzer=analyzer,
+                    segments=[Segment("fixture-1", "SOURCE", speaker="A", scene="S")],
+                    output_path=root / "context.json",
+                    state_path=root / "state.json",
+                )
 
 
 if __name__ == "__main__":

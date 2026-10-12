@@ -25,8 +25,14 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(providers["openai-luna"]["model"], "gpt-6-luna")
         self.assertEqual(providers["deepseek"]["model"], "deepseek-flash")
         self.assertEqual(providers["deepseek"]["temperature"], 0.0)
+        self.assertEqual(providers["deepseek"]["thinking"], "disabled")
+        self.assertEqual(providers["deepseek"]["reasoning_effort"], "none")
         self.assertEqual(providers["openai-sol"]["model"], "gpt-6.1-sol")
+        self.assertEqual(providers["openai-luna"]["reasoning_effort"], "none")
+        self.assertEqual(providers["openai-sol"]["reasoning_effort"], "low")
         self.assertEqual(config["routing"]["translators"], ["openai-luna", "deepseek"])
+        self.assertEqual(config["routing"]["grace_retries"], 3)
+        self.assertEqual(config["routing"]["review_refusal_policy"], "fallback")
         self.assertTrue(config["routing"]["defer_fallbacks_until_primary_complete"])
         self.assertTrue(config["routing"]["preserve_source_on_failure"])
 
@@ -54,12 +60,12 @@ class WorkspaceTests(unittest.TestCase):
             second = run_cached_tool(
                 stage="unpack", command=command, input_path=source, output_path=output, work_dir=work
             )
-            profile = prepare_sdk_profile(work, "unity", "2023.1", user_confirmed_success=True)
+            profile = prepare_sdk_profile(work, "fixture-engine", "1.0", user_confirmed_success=True)
             manifest = json.loads((profile / "profile.json").read_text(encoding="utf-8"))
             exported = {path.relative_to(profile).as_posix() for path in profile.rglob("*") if path.is_file()}
         self.assertEqual(first["status"], "completed")
         self.assertEqual(second["status"], "skipped")
-        self.assertEqual(manifest["profile"], "sdk-unity-2023.1")
+        self.assertEqual(manifest["profile"], "sdk-fixture-engine-1.0")
         self.assertEqual(exported, {"profile.json", "tools/pack.py", "tools/unpack.py"})
 
     def test_tool_output_cannot_overwrite_its_input(self) -> None:

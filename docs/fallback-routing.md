@@ -42,13 +42,25 @@ One provider request contains exactly one output target. Context remains availab
 
 Provider policy still applies. The SDK does not obfuscate content or bypass safeguards; it minimizes unnecessary refusals and limits the effect of a genuine refusal to one target.
 
-The DeepSeek-compatible request uses JSON Object output and `temperature: 0.0`. This is a deterministic, low-creativity translation configuration, not a vendor safety-disable switch. The system prompt identifies the request as faithful transformation/review of pre-existing text and forbids continuation, roleplay, invention, censorship, and intensity changes.
+The DeepSeek-compatible request uses JSON Object output, `thinking: {"type":"disabled"}`, `reasoning_effort: "none"`, `temperature: 0.0`, and a source-length-bounded output limit. These are supported low-creativity and non-thinking settings, not a vendor safety-disable switch. The system prompt identifies the request as faithful transformation/review of pre-existing text and forbids continuation, roleplay, invention, censorship, and intensity changes.
 
 ## Control-plane isolation
 
 The CLI is the boundary between the top-level agent and game text. It prints aggregate counts and output paths only. Source, candidates, reviewed text, provider explanations, and context packs stay under the private workspace. The audit stream contains target IDs and categorical status/issue codes without dialogue. A refusal is therefore interpreted only as “route this target,” never as advice to omit it or abandon the patch.
 
 If a run is interrupted, provider-stage state is retained under `.game-l10n/deferred/`. With unchanged input, context, settings, and provider fingerprints, resuming skips complete Luna, DeepSeek, or Sol stages and continues at the first incomplete stage. `--force` deliberately discards that staged resume decision.
+
+Every valid candidate carries a content digest and monotonically increasing generation. A revised candidate advances the generation, and review attempts record which generation they examined. Resume state with a missing or mismatched candidate digest is discarded before review so an older decision cannot approve changed text.
+
+Retryable malformed responses, temporary provider failures, rate limits, timeouts, and integrity-invalid outputs receive the configured `routing.grace_retries` attempts on the same isolated target. Explicit provider refusals, authentication failures, and exhausted quota move directly to the next route. Every attempt records its ordinal, model, categorical issue code, candidate generation, and duration without provider prose or game text.
+
+`routing.review_refusal_policy` is explicit:
+
+- `fallback`: use the next reviewer and preserve source after exhaustion when configured;
+- `accept_candidate_unreviewed`: keep the translation candidate with `review_outcome=refused`, `acceptance_authority=user_policy`, and `user_accepted_after_review_refusal` rather than falsely marking it approved;
+- `source_preserve`: keep the exact source after review exhaustion.
+
+For Codex App native workers, import exclusive JSONL shards with `game-l10n import-native-shard`, then use `game-l10n merge-native-pass` to enforce unique target IDs, stable source ordering, candidate digests, and completeness before releasing fallback work.
 
 ## Read-only source and patch output
 

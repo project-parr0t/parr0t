@@ -28,6 +28,8 @@ CONFIG_TEMPLATE: dict[str, Any] = {
             "type": "openai_responses",
             "model": "gpt-6-luna",
             "api_key_env": "OPENAI_API_KEY",
+            "reasoning_effort": "none",
+            "max_output_tokens": 2048,
         },
         {
             "name": "deepseek",
@@ -37,12 +39,19 @@ CONFIG_TEMPLATE: dict[str, Any] = {
             "api_key_env": "DEEPSEEK_API_KEY",
             "response_format": "json_object",
             "temperature": 0.0,
+            "thinking": "disabled",
+            "reasoning_effort": "none",
+            "max_tokens_per_source_char": 4.0,
+            "min_output_tokens": 128,
+            "max_output_tokens": 8192,
         },
         {
             "name": "openai-sol",
             "type": "openai_responses",
             "model": "gpt-6.1-sol",
             "api_key_env": "OPENAI_API_KEY",
+            "reasoning_effort": "low",
+            "max_output_tokens": 8192,
         },
     ],
     "routing": {
@@ -50,10 +59,19 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "translators": ["openai-luna", "deepseek"],
         "reviewers": ["openai-sol", "deepseek"],
         "require_review": True,
-        "max_workers": 4,
+        "max_workers": 8,
         "retry_refusals_once": False,
+        "grace_retries": 3,
+        "grace_retry_codes": [
+            "malformed_response",
+            "provider_error",
+            "rate_limited",
+            "timeout",
+            "integrity_invalid"
+        ],
         "defer_fallbacks_until_primary_complete": True,
         "preserve_source_on_failure": True,
+        "review_refusal_policy": "fallback",
     },
     "files": {
         "glossary": "context/glossary.json",
@@ -80,7 +98,7 @@ This directory contains private game data and translation artifacts. It is inten
 5. Treat model refusals, malformed output, timeouts, and failed integrity checks as route failures. Continue through the configured fallback chain and keep the audit record free of game text.
 6. Preserve placeholders, tags, control codes, glossary terms, names, character voice, and scene context.
 7. A toolchain may be promoted only after the user explicitly states that the translation/patch succeeded. Then ask separately whether the sanitized SDK profile may be committed/pushed.
-8. Engine profiles use branch names `sdk-<engine>-<version>` (for example `sdk-unity-2023.1`). Export only reusable files from `tools/`; the privacy scan must pass first.
+8. Engine profiles use branch names `sdk-<engine>-<version>`. Export only reusable files from `tools/`; the privacy scan must pass first.
 9. Keep promoted SDK content provenance-free. Never transfer real game/project names, filenames, asset paths, map/event identifiers, dialogue, translations, project-specific exclusions, job metadata, tool paths, counts, hashes, reports, or execution history. Use only public engine-format identifiers and unmistakably synthetic fixtures.
 10. Record only recurring engine/SDK problems in the repository `docs/faq.md`, after reducing them to neutral symptom, general cause, diagnosis, resolution, and prevention. Keep one-off or project-specific incidents in this private workspace.
 11. Treat translation as a faithful transformation of existing user-provided text, never as new scene generation, continuation, roleplay, or endorsement. Do not censor, soften, intensify, or invent content. A refusal applies only to the individual target segment and must never cancel unrelated segments.
@@ -89,6 +107,7 @@ This directory contains private game data and translation artifacts. It is inten
 14. Distinguish OpenAI API + DeepSeek API from Codex App + DeepSeek API. In App mode, use native GPT-6 Luna translator subagents and a separate native GPT-6.1 Sol reviewer, with only `DEEPSEEK_API_KEY` used for external fallback. The top-level Sol agent remains orchestration-only and follows the SDK's `docs/codex-app-deepseek.md` workflow.
 15. Keep a strict data-plane/control-plane boundary. The top-level agent may receive target IDs, categorical status/error codes, counts, queue transitions, artifact paths, and deterministic issue codes only. It must not open dialogue/input/result files or receive source, candidate, translated text, or provider prose refusal explanations. Workers read and write private workspace files and return metadata-only envelopes.
 16. A translation or review refusal is a routing event, not a content judgment and not grounds to omit a target or cancel patch creation. Normalize explanations before returning metadata to the parent. Use the configured faithful-transformation prompt and supported deterministic low-creativity settings for DeepSeek; never claim or attempt to disable provider safeguards.
+17. The checked-out `main` branch is an engine-neutral control framework. Engine-specific discovery, unpack, apply, pack, verification, FAQ, ignore rules, and fixtures must come from the selected `sdk-<engine>-<version>` branch and must never be copied back into `main`.
 
 ## Data boundary
 
@@ -105,7 +124,6 @@ translations/
 localized/
 batches/
 audit/
-wolf-json/
 build/
 logs/
 .game-l10n/
@@ -181,8 +199,10 @@ def initialize_workspace(
             "require_review": True,
             "max_workers": 1,
             "retry_refusals_once": True,
+            "grace_retries": 0,
             "defer_fallbacks_until_primary_complete": False,
             "preserve_source_on_failure": False,
+            "review_refusal_policy": "fallback",
         }
     config["sdk_root"] = str(sdk_root)
     config["game_roots"] = [str(path.resolve()) for path in (game_roots or [])]

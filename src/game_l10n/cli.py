@@ -13,6 +13,7 @@ from .errors import GameL10nError
 from .context_analysis import ContextAnalyzer, analyze_with_cache
 from .formats import read_segments, write_results
 from .models import CharacterProfile, ContextPack, GlossaryEntry, ProjectContext
+from .native_pass import import_native_shard, merge_native_pass
 from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from .privacy import is_within, require_external_workdir
 from .providers import ProviderRegistry
@@ -79,10 +80,24 @@ def _orchestrator(work_dir: Path, context_pack: ContextPack) -> LocalizationOrch
         use_style_memory=bool(routing.get("use_style_memory", True)),
         style_anchor_limit=int(routing.get("style_anchor_limit", 6)),
         retry_refusals_once=bool(routing.get("retry_refusals_once", True)),
+        grace_retries=int(routing.get("grace_retries", 0)),
+        grace_retry_codes=list(
+            routing.get(
+                "grace_retry_codes",
+                [
+                    "malformed_response",
+                    "provider_error",
+                    "rate_limited",
+                    "timeout",
+                    "integrity_invalid",
+                ],
+            )
+        ),
         defer_fallbacks_until_primary_complete=bool(
             routing.get("defer_fallbacks_until_primary_complete", False)
         ),
         preserve_source_on_failure=bool(routing.get("preserve_source_on_failure", False)),
+        review_refusal_policy=str(routing.get("review_refusal_policy", "fallback")),
     )
     file_config = config.get("files", {})
     glossary = _load_dataclass_list(
@@ -222,6 +237,23 @@ def cmd_run_tool(args: argparse.Namespace) -> int:
     )
     print(json.dumps(result))
     return 0
+
+
+def cmd_import_native_shard(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    source = _path_in_workspace(work_dir, args.input, must_exist=True)
+    result = import_native_shard(work_dir, source, args.name)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_merge_native_pass(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    source = _path_in_workspace(work_dir, args.input, must_exist=True)
+    destination = _path_in_workspace(work_dir, args.output)
+    result = merge_native_pass(work_dir, read_segments(source), destination)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["complete"] else 1
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -364,6 +396,24 @@ def build_parser() -> argparse.ArgumentParser:
     tool.add_argument("--output", required=True)
     tool.add_argument("--force", action="store_true")
     tool.set_defaults(func=cmd_run_tool)
+
+    native_import = sub.add_parser(
+        "import-native-shard",
+        help="Import one exclusive native-agent result shard into the private workspace",
+    )
+    native_import.add_argument("--workspace", required=True)
+    native_import.add_argument("--input", required=True)
+    native_import.add_argument("--name", required=True)
+    native_import.set_defaults(func=cmd_import_native_shard)
+
+    native_merge = sub.add_parser(
+        "merge-native-pass",
+        help="Merge exclusive native-agent shards in stable source order",
+    )
+    native_merge.add_argument("--workspace", required=True)
+    native_merge.add_argument("--input", required=True, help="Ordered source segment file")
+    native_merge.add_argument("--output", required=True)
+    native_merge.set_defaults(func=cmd_merge_native_pass)
 
     status = sub.add_parser("status", help="Report the next safe action for a Codex orchestrator")
     status.add_argument("--workspace", required=True)

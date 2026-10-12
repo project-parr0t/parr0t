@@ -8,13 +8,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, TypeVar
 
-from .errors import ProviderError
+from .errors import ProviderError, ProviderFailure
 from .models import (
     AgentEnvelope,
     AgentStatus,
     AttemptRecord,
     CharacterProfile,
     ContextPack,
+    FailureCode,
     GlossaryEntry,
     ProjectContext,
     ReviewDecision,
@@ -39,8 +40,19 @@ class OrchestratorConfig:
     use_style_memory: bool = True
     style_anchor_limit: int = 6
     retry_refusals_once: bool = True
+    grace_retries: int = 0
+    grace_retry_codes: list[str] = field(
+        default_factory=lambda: [
+            FailureCode.MALFORMED_RESPONSE.value,
+            FailureCode.PROVIDER_ERROR.value,
+            FailureCode.RATE_LIMITED.value,
+            FailureCode.TIMEOUT.value,
+            FailureCode.INTEGRITY_INVALID.value,
+        ]
+    )
     defer_fallbacks_until_primary_complete: bool = False
     preserve_source_on_failure: bool = False
+    review_refusal_policy: str = "fallback"
 
 
 T = TypeVar("T")
@@ -64,6 +76,16 @@ class LocalizationOrchestrator:
             raise ValueError("translator_chain must not be empty")
         if config.require_review and not config.reviewer_chain:
             raise ValueError("reviewer_chain must not be empty when require_review is true")
+        if config.grace_retries < 0:
+            raise ValueError("grace_retries must be zero or greater")
+        if config.review_refusal_policy not in {
+            "fallback",
+            "accept_candidate_unreviewed",
+            "source_preserve",
+        }:
+            raise ValueError(
+                "review_refusal_policy must be fallback, accept_candidate_unreviewed, or source_preserve"
+            )
         self.registry = registry
         self.config = config
         self.project = project
@@ -101,7 +123,7 @@ class LocalizationOrchestrator:
                 entries.append(item)
 
     def _remember_result(self, segment: Segment, result: TranslationResult) -> None:
-        if result.status in {"translated", "reviewed"}:
+        if result.status in {"translated", "reviewed", "accepted_unreviewed"}:
             self._remember(segment, result.text)
 
     def _cache_key(self, segment: Segment, anchors: list[dict[str, str]]) -> str:
@@ -161,27 +183,33 @@ class LocalizationOrchestrator:
         # Provider explanations and reviewer prose can echo private game dialogue, so
         # they must remain inside the short-lived provider call and never propagate.
         reason = record.reason.casefold()
+        if not record.ordinal:
+            record.ordinal = 1
         if record.status == "refused":
-            record.reason = "provider_refusal"
+            record.reason = FailureCode.EXPLICIT_PROVIDER_REFUSAL.value
         elif record.status == "error":
-            if "quota" in reason or "insufficient" in reason:
-                record.reason = "quota_exhausted"
+            if record.issue_code in {item.value for item in FailureCode}:
+                record.reason = record.issue_code
+            elif "quota" in reason or "insufficient" in reason:
+                record.reason = FailureCode.QUOTA_EXHAUSTED.value
             elif "rate" in reason and "limit" in reason:
-                record.reason = "rate_limited"
+                record.reason = FailureCode.RATE_LIMITED.value
             elif any(token in reason for token in ("auth", "api key", "unauthorized", "forbidden")):
-                record.reason = "authentication_error"
+                record.reason = FailureCode.AUTHENTICATION_ERROR.value
             elif any(token in reason for token in ("timeout", "timed out")):
-                record.reason = "timeout"
+                record.reason = FailureCode.TIMEOUT.value
             elif any(token in reason for token in ("json", "schema", "format")):
-                record.reason = "malformed_response"
+                record.reason = FailureCode.MALFORMED_RESPONSE.value
             else:
-                record.reason = "provider_error"
+                record.reason = FailureCode.PROVIDER_ERROR.value
         elif record.status == "queued":
             record.reason = "fallback_queued"
         elif record.status == "rejected":
-            record.reason = "validation_rejected"
+            record.reason = record.issue_code or FailureCode.INTEGRITY_INVALID.value
         else:
             record.reason = ""
+            record.issue_code = ""
+        record.issue_code = record.reason
         if record.provider != "deterministic-validator" and record.issues:
             record.issues = [f"provider_reported_issues:{len(record.issues)}"]
         result.attempts.append(record)
@@ -194,8 +222,44 @@ class LocalizationOrchestrator:
                 "reason": record.reason,
                 "issues": record.issues,
                 "duration_ms": record.duration_ms,
+                "ordinal": record.ordinal,
+                "model": record.model,
+                "issue_code": record.issue_code,
+                "candidate_generation": record.candidate_generation,
+                "usage": record.usage,
             }
         )
+
+    @staticmethod
+    def _provider_model(provider: ModelProvider) -> str:
+        return str(provider.fingerprint().get("model", ""))
+
+    @staticmethod
+    def _failure(exc: Exception) -> tuple[str, bool]:
+        if isinstance(exc, ProviderFailure):
+            return exc.code, exc.retryable
+        reason = str(exc).casefold()
+        if "quota" in reason or "insufficient balance" in reason:
+            return FailureCode.QUOTA_EXHAUSTED.value, False
+        if "rate" in reason and "limit" in reason:
+            return FailureCode.RATE_LIMITED.value, True
+        if any(token in reason for token in ("auth", "api key", "unauthorized", "forbidden")):
+            return FailureCode.AUTHENTICATION_ERROR.value, False
+        if any(token in reason for token in ("timeout", "timed out")):
+            return FailureCode.TIMEOUT.value, True
+        if any(token in reason for token in ("json", "schema", "format")):
+            return FailureCode.MALFORMED_RESPONSE.value, True
+        return FailureCode.PROVIDER_ERROR.value, True
+
+    def _can_grace_retry(self, code: str, ordinal: int) -> bool:
+        return ordinal <= self.config.grace_retries and code in self.config.grace_retry_codes
+
+    @staticmethod
+    def _set_candidate(result: TranslationResult, text: str) -> None:
+        digest = stable_hash(text)
+        if digest != result.candidate_digest:
+            result.candidate_generation = max(1, result.candidate_generation + 1)
+            result.candidate_digest = digest
 
     def _call_translation(
         self,
@@ -258,27 +322,85 @@ class LocalizationOrchestrator:
         segment: Segment,
         anchors: list[dict[str, str]],
     ) -> AgentEnvelope | None:
-        tries = 2 if self.config.retry_refusals_once else 1
-        for retry_index in range(tries):
+        ordinal = 0
+        refusal_retried = False
+        retry_stage = "translate-grace-retry"
+        while True:
+            ordinal += 1
             started = time.monotonic()
-            stage = "translate" if retry_index == 0 else "translate-refusal-retry"
+            stage = "translate" if ordinal == 1 else retry_stage
             try:
                 envelope = self._call_translation(
-                    provider, segment, anchors, refusal_retry=retry_index > 0
+                    provider, segment, anchors, refusal_retry=ordinal > 1
                 )
                 duration = int((time.monotonic() - started) * 1000)
                 self._record(
                     result,
-                    AttemptRecord(stage, provider.name, envelope.status.value, envelope.reason, duration_ms=duration),
+                    AttemptRecord(
+                        stage,
+                        provider.name,
+                        envelope.status.value,
+                        envelope.reason,
+                        duration_ms=duration,
+                        ordinal=ordinal,
+                        model=self._provider_model(provider),
+                        candidate_generation=result.candidate_generation,
+                    ),
                 )
             except Exception as exc:
                 duration = int((time.monotonic() - started) * 1000)
-                self._record(result, AttemptRecord(stage, provider.name, "error", str(exc), duration_ms=duration))
+                code, retryable = self._failure(exc)
+                self._record(
+                    result,
+                    AttemptRecord(
+                        stage,
+                        provider.name,
+                        "error",
+                        code,
+                        duration_ms=duration,
+                        ordinal=ordinal,
+                        model=self._provider_model(provider),
+                        issue_code=code,
+                        candidate_generation=result.candidate_generation,
+                    ),
+                )
+                if retryable and self._can_grace_retry(code, ordinal):
+                    retry_stage = "translate-grace-retry"
+                    continue
                 return None
-            if envelope.status is AgentStatus.REFUSED and retry_index + 1 < tries:
+            if envelope.status is AgentStatus.REFUSED:
+                if self.config.retry_refusals_once and not refusal_retried:
+                    refusal_retried = True
+                    retry_stage = "translate-refusal-retry"
+                    continue
+                return envelope
+            if envelope.status is not AgentStatus.SUCCESS:
+                return envelope
+            integrity = validate_integrity(
+                segment,
+                envelope.text,
+                self.glossary,
+                extra_patterns=self.config.extra_protected_patterns,
+                max_length_ratio=self.config.max_length_ratio,
+            )
+            if not integrity:
+                return envelope
+            self._record(
+                result,
+                AttemptRecord(
+                    "integrity",
+                    "deterministic-validator",
+                    "rejected",
+                    issues=[item.code for item in integrity],
+                    ordinal=ordinal,
+                    issue_code=FailureCode.INTEGRITY_INVALID.value,
+                    candidate_generation=result.candidate_generation,
+                ),
+            )
+            if self._can_grace_retry(FailureCode.INTEGRITY_INVALID.value, ordinal):
+                retry_stage = "translate-grace-retry"
                 continue
-            return envelope
-        return None
+            return None
 
     def _review_with_refusal_retry(
         self,
@@ -288,17 +410,20 @@ class LocalizationOrchestrator:
         candidate: str,
         anchors: list[dict[str, str]],
     ) -> ReviewEnvelope | None:
-        tries = 2 if self.config.retry_refusals_once else 1
-        for retry_index in range(tries):
+        ordinal = 0
+        refusal_retried = False
+        retry_stage = "review-grace-retry"
+        while True:
+            ordinal += 1
             started = time.monotonic()
-            stage = "review" if retry_index == 0 else "review-refusal-retry"
+            stage = "review" if ordinal == 1 else retry_stage
             try:
                 review = self._call_review(
                     provider,
                     segment,
                     candidate,
                     anchors,
-                    refusal_retry=retry_index > 0,
+                    refusal_retry=ordinal > 1,
                 )
                 duration = int((time.monotonic() - started) * 1000)
                 self._record(
@@ -310,16 +435,79 @@ class LocalizationOrchestrator:
                         review.reason,
                         review.issues,
                         duration,
+                        ordinal=ordinal,
+                        model=self._provider_model(provider),
+                        candidate_generation=result.candidate_generation,
                     ),
                 )
             except Exception as exc:
                 duration = int((time.monotonic() - started) * 1000)
-                self._record(result, AttemptRecord(stage, provider.name, "error", str(exc), duration_ms=duration))
+                code, retryable = self._failure(exc)
+                self._record(
+                    result,
+                    AttemptRecord(
+                        stage,
+                        provider.name,
+                        "error",
+                        code,
+                        duration_ms=duration,
+                        ordinal=ordinal,
+                        model=self._provider_model(provider),
+                        issue_code=code,
+                        candidate_generation=result.candidate_generation,
+                    ),
+                )
+                if retryable and self._can_grace_retry(code, ordinal):
+                    retry_stage = "review-grace-retry"
+                    continue
                 return None
-            if review.decision is ReviewDecision.REFUSED and retry_index + 1 < tries:
+            if review.decision is ReviewDecision.REFUSED:
+                if self.config.retry_refusals_once and not refusal_retried:
+                    refusal_retried = True
+                    retry_stage = "review-refusal-retry"
+                    continue
+                return review
+            if review.decision is ReviewDecision.ERROR:
+                return review
+            if not review.meaning_preserved or not review.text.strip():
+                self._record(
+                    result,
+                    AttemptRecord(
+                        "review-gate",
+                        provider.name,
+                        "rejected",
+                        ordinal=ordinal,
+                        model=self._provider_model(provider),
+                        issue_code=FailureCode.MEANING_NOT_PRESERVED.value,
+                        candidate_generation=result.candidate_generation,
+                    ),
+                )
+                return None
+            integrity = validate_integrity(
+                segment,
+                review.text,
+                self.glossary,
+                extra_patterns=self.config.extra_protected_patterns,
+                max_length_ratio=self.config.max_length_ratio,
+            )
+            if not integrity:
+                return review
+            self._record(
+                result,
+                AttemptRecord(
+                    "integrity",
+                    "deterministic-validator",
+                    "rejected",
+                    issues=[item.code for item in integrity],
+                    ordinal=ordinal,
+                    issue_code=FailureCode.INTEGRITY_INVALID.value,
+                    candidate_generation=result.candidate_generation,
+                ),
+            )
+            if self._can_grace_retry(FailureCode.INTEGRITY_INVALID.value, ordinal):
+                retry_stage = "review-grace-retry"
                 continue
-            return review
-        return None
+            return None
 
     def translate_one(self, segment: Segment, *, force: bool = False) -> TranslationResult:
         anchors = self._anchors(segment.speaker)
@@ -335,86 +523,76 @@ class LocalizationOrchestrator:
             source=segment.source,
             metadata=segment.metadata.copy(),
         )
+        candidate = ""
         for translator_name in self.config.translator_chain:
             translator = self.registry.get(translator_name)
             envelope = self._translate_with_refusal_retry(result, translator, segment, anchors)
             if envelope is None or envelope.status is not AgentStatus.SUCCESS:
                 continue
-
-            integrity = validate_integrity(
-                segment,
-                envelope.text,
-                self.glossary,
-                extra_patterns=self.config.extra_protected_patterns,
-                max_length_ratio=self.config.max_length_ratio,
-            )
-            if integrity:
-                self._record(
-                    result,
-                    AttemptRecord(
-                        "integrity",
-                        "deterministic-validator",
-                        "rejected",
-                        issues=[item.code for item in integrity],
-                    ),
-                )
-                continue
-
             result.translator = translator_name
-            if not self.config.require_review:
-                result.text = envelope.text
-                result.status = "translated"
-                self.store.put(cache_key, result)
-                self._remember(segment, result.text)
-                return result
+            candidate = envelope.text
+            self._set_candidate(result, candidate)
+            break
 
+        if not candidate:
+            result.errors.append("All translation routes were exhausted")
+        elif not self.config.require_review:
+            result.text = candidate
+            result.status = "translated"
+        else:
             for reviewer_name in self.config.reviewer_chain:
                 reviewer = self.registry.get(reviewer_name)
                 review = self._review_with_refusal_retry(
-                    result, reviewer, segment, envelope.text, anchors
+                    result, reviewer, segment, candidate, anchors
                 )
-                if review is None or review.decision in {ReviewDecision.REFUSED, ReviewDecision.ERROR}:
+                if review is None or review.decision in {
+                    ReviewDecision.REFUSED,
+                    ReviewDecision.ERROR,
+                }:
                     continue
-                if not review.meaning_preserved or not review.text.strip():
-                    self._record(
-                        result,
-                        AttemptRecord(
-                            "review-gate",
-                            reviewer_name,
-                            "rejected",
-                            "Reviewer did not attest that meaning was preserved",
-                        ),
-                    )
-                    continue
-                reviewed_text = review.text
-                integrity = validate_integrity(
-                    segment,
-                    reviewed_text,
-                    self.glossary,
-                    extra_patterns=self.config.extra_protected_patterns,
-                    max_length_ratio=self.config.max_length_ratio,
-                )
-                if integrity:
-                    self._record(
-                        result,
-                        AttemptRecord(
-                            "integrity",
-                            "deterministic-validator",
-                            "rejected",
-                            issues=[item.code for item in integrity],
-                        ),
-                    )
-                    continue
-                result.text = reviewed_text
+                candidate = review.text
+                self._set_candidate(result, candidate)
+                result.text = candidate
                 result.status = "reviewed"
                 result.reviewer = reviewer_name
-                self.store.put(cache_key, result)
-                self._remember(segment, result.text)
-                return result
+                result.review_outcome = review.decision.value
+                result.acceptance_authority = "reviewer"
+                break
+            if result.status != "reviewed":
+                result.errors.append("All review routes were exhausted")
+                self._accept_after_review_refusal(result, candidate)
 
-        result.errors.append("All translator/reviewer routes were exhausted")
-        self.audit.append({"segment_id": result.segment_id, "stage": "complete", "status": "failed"})
+        if result.status in {"translated", "reviewed", "accepted_unreviewed"}:
+            self.store.put(cache_key, result)
+            self._remember(segment, result.text)
+            return result
+        if self.config.preserve_source_on_failure or (
+            candidate and self.config.review_refusal_policy == "source_preserve"
+        ):
+            result.text = segment.source
+            result.status = "source_preserved"
+            result.resolution_code = FailureCode.SOURCE_PRESERVED.value
+            self.store.put(cache_key, result)
+        self.audit.append(
+            {"segment_id": result.segment_id, "stage": "complete", "status": result.status}
+        )
         return result
+
+    def _accept_after_review_refusal(
+        self, result: TranslationResult, candidate: str
+    ) -> bool:
+        refused = any(
+            item.stage.startswith("review") and item.status == ReviewDecision.REFUSED.value
+            for item in result.attempts
+        )
+        if not refused or self.config.review_refusal_policy != "accept_candidate_unreviewed":
+            return False
+        result.text = candidate
+        result.status = "accepted_unreviewed"
+        result.review_outcome = ReviewDecision.REFUSED.value
+        result.acceptance_authority = "user_policy"
+        result.resolution_code = FailureCode.USER_ACCEPTED_AFTER_REVIEW_REFUSAL.value
+        return True
 
     def _run_deferred_stage(
         self, indexes: list[int], operation: Callable[[int], T]
@@ -458,7 +636,7 @@ class LocalizationOrchestrator:
         completed_reviewers: set[str],
     ) -> None:
         payload = {
-            "version": 1,
+            "version": 2,
             "batch_key": batch_key,
             "completed_translators": [
                 name for name in self.config.translator_chain if name in completed_translators
@@ -470,6 +648,8 @@ class LocalizationOrchestrator:
                 str(index): {
                     "text": text,
                     "translator": results[index].translator if results[index] else "",
+                    "generation": results[index].candidate_generation if results[index] else 0,
+                    "digest": results[index].candidate_digest if results[index] else "",
                 }
                 for index, text in candidates.items()
             },
@@ -503,7 +683,7 @@ class LocalizationOrchestrator:
         if not force and state_path.exists():
             try:
                 loaded = json.loads(state_path.read_text(encoding="utf-8"))
-                if loaded.get("version") == 1 and loaded.get("batch_key") == batch_key:
+                if loaded.get("version") == 2 and loaded.get("batch_key") == batch_key:
                     state = loaded
             except (OSError, json.JSONDecodeError, AttributeError):
                 state = {}
@@ -553,8 +733,16 @@ class LocalizationOrchestrator:
                 )
             saved_candidate = saved_candidates.get(str(index))
             if isinstance(saved_candidate, dict) and isinstance(saved_candidate.get("text"), str):
-                candidates[index] = saved_candidate["text"]
-                results[index].translator = str(saved_candidate.get("translator", ""))
+                text = saved_candidate["text"]
+                digest = str(saved_candidate.get("digest", ""))
+                if digest and stable_hash(text) == digest:
+                    candidates[index] = text
+                    results[index].translator = str(saved_candidate.get("translator", ""))
+                    results[index].candidate_generation = int(saved_candidate.get("generation", 1))
+                    results[index].candidate_digest = digest
+                else:
+                    completed_reviewers.clear()
+                    pending_translation.append(index)
             else:
                 pending_translation.append(index)
 
@@ -574,24 +762,6 @@ class LocalizationOrchestrator:
                 )
                 if envelope is None or envelope.status is not AgentStatus.SUCCESS:
                     return None
-                integrity = validate_integrity(
-                    segment,
-                    envelope.text,
-                    self.glossary,
-                    extra_patterns=self.config.extra_protected_patterns,
-                    max_length_ratio=self.config.max_length_ratio,
-                )
-                if integrity:
-                    self._record(
-                        result,
-                        AttemptRecord(
-                            "integrity",
-                            "deterministic-validator",
-                            "rejected",
-                            issues=[item.code for item in integrity],
-                        ),
-                    )
-                    return None
                 return envelope.text
 
             next_pending: list[int] = []
@@ -602,6 +772,7 @@ class LocalizationOrchestrator:
                     next_pending.append(index)
                     continue
                 result.translator = translator_name
+                self._set_candidate(result, candidate)
                 candidates[index] = candidate
             pending_translation = next_pending
             completed_translators.add(translator_name)
@@ -651,7 +822,7 @@ class LocalizationOrchestrator:
                     continue
                 reviewer = self.registry.get(reviewer_name)
 
-                def review_at(index: int) -> str | None:
+                def review_at(index: int) -> tuple[str, str] | None:
                     result = results[index]
                     assert result is not None
                     segment = items[index]
@@ -672,36 +843,7 @@ class LocalizationOrchestrator:
                         ReviewDecision.ERROR,
                     }:
                         return None
-                    if not review.meaning_preserved or not review.text.strip():
-                        self._record(
-                            result,
-                            AttemptRecord(
-                                "review-gate",
-                                reviewer_name,
-                                "rejected",
-                                "Reviewer did not attest that meaning was preserved",
-                            ),
-                        )
-                        return None
-                    integrity = validate_integrity(
-                        segment,
-                        review.text,
-                        self.glossary,
-                        extra_patterns=self.config.extra_protected_patterns,
-                        max_length_ratio=self.config.max_length_ratio,
-                    )
-                    if integrity:
-                        self._record(
-                            result,
-                            AttemptRecord(
-                                "integrity",
-                                "deterministic-validator",
-                                "rejected",
-                                issues=[item.code for item in integrity],
-                            ),
-                        )
-                        return None
-                    return review.text
+                    return review.text, review.decision.value
 
                 next_pending = []
                 if self.config.use_style_memory:
@@ -712,15 +854,20 @@ class LocalizationOrchestrator:
                     reviewed_items = iter(
                         self._run_deferred_stage(pending_review, review_at)
                     )
-                for index, reviewed_text in reviewed_items:
+                for index, reviewed in reviewed_items:
                     result = results[index]
                     assert result is not None
-                    if reviewed_text is None:
+                    if reviewed is None:
                         next_pending.append(index)
                         continue
+                    reviewed_text, review_outcome = reviewed
+                    self._set_candidate(result, reviewed_text)
+                    candidates[index] = reviewed_text
                     result.text = reviewed_text
                     result.status = "reviewed"
                     result.reviewer = reviewer_name
+                    result.review_outcome = review_outcome
+                    result.acceptance_authority = "reviewer"
                     self.store.put(cache_keys[index], result)
                     self._remember(items[index], result.text)
                 pending_review = next_pending
@@ -757,9 +904,21 @@ class LocalizationOrchestrator:
                 result.errors.append("All translation routes were exhausted")
             else:
                 result.errors.append("All review routes were exhausted")
-            if self.config.preserve_source_on_failure:
+            accepted_unreviewed = (
+                index in failed_review
+                and index in candidates
+                and self._accept_after_review_refusal(result, candidates[index])
+            )
+            if not accepted_unreviewed and (
+                self.config.preserve_source_on_failure
+                or (
+                    index in failed_review
+                    and self.config.review_refusal_policy == "source_preserve"
+                )
+            ):
                 result.text = items[index].source
                 result.status = "source_preserved"
+                result.resolution_code = FailureCode.SOURCE_PRESERVED.value
             self.audit.append(
                 {
                     "segment_id": result.segment_id,
