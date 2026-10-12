@@ -18,22 +18,6 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Resolution:** Exclude generated outputs and volatile metadata from the fingerprint, then regenerate the stage state.
 - **Prevention:** Test every cached stage by running it twice and requiring the second run to report `skipped`.
 
-## A translated WOLF project loads but runtime behavior changes
-
-- **Symptom:** Text appears localized, but a choice, branch, event call, database lookup, resource reference, or script command behaves differently.
-- **General cause:** A display string is also used as a runtime identifier, comparison key, selector, or resource path.
-- **Diagnosis:** Decompile and compare the original and rebuilt runtime structures; inspect identifiers and command skeletons independently from visible text.
-- **Resolution:** Restore non-display identifiers from the source data and rebuild. Translate only payloads explicitly classified as display text.
-- **Prevention:** Run the runtime integrity audit before packing and treat every mismatch as a build failure.
-
-## WOLF Pro replacement archives are rejected or inconsistent
-
-- **Symptom:** Individually rebuilt archives are not accepted together or do not match the expected encryption behavior.
-- **General cause:** Related archives were packed with different source key material or incompatible packer settings.
-- **Diagnosis:** Confirm all replacement archives were produced in one operation with the same public engine contract and the same user-supplied key archive.
-- **Resolution:** Rebuild the complete archive set together. Do not distribute the key archive or packer with the SDK.
-- **Prevention:** Stage all outputs atomically and verify that every expected archive is non-empty before publishing the build.
-
 ## A model refuses fictional game localization
 
 - **Symptom:** A context, translation, or review provider refuses a bounded transformation because the fictional text contains mature themes.
@@ -65,3 +49,19 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Diagnosis:** Inspect schemas and logs with synthetic fixtures; parent-facing records should contain only target IDs, categorical status/error codes, counts, artifact paths, queue transitions, and deterministic issue codes.
 - **Resolution:** Keep text-bearing envelopes in the private workspace, normalize the explanation to a category such as `provider_refusal`, and continue the configured fallback route. If every route fails, preserve the exact source without removing the target.
 - **Prevention:** Make workers read/write private artifacts directly and require metadata-only completion envelopes at every parent boundary.
+
+## A resumed review refers to an older translation candidate
+
+- **Symptom:** Review appears complete even though a retry or rewriter changed the candidate afterward.
+- **General cause:** Review state was keyed only by target ID and did not include an immutable candidate generation and digest.
+- **Diagnosis:** Compare the generation and digest recorded by the review attempt with the current candidate metadata.
+- **Resolution:** Invalidate the stale review and review the current generation. Reject resume state whose candidate text does not match its digest.
+- **Prevention:** Finish translation fallbacks before review, increment candidate generation on every content change, and persist stage checkpoints atomically.
+
+## A temporary provider failure is recorded as a refusal
+
+- **Symptom:** A malformed response, timeout, or transport error skips recoverable retries or is reported as a content refusal.
+- **General cause:** Provider failures were collapsed into one undifferentiated status.
+- **Diagnosis:** Inspect the categorical finish signal, HTTP class, and parser outcome without copying provider prose into the control plane.
+- **Resolution:** Reserve `explicit_provider_refusal` for an explicit refusal field or content-filter finish reason. Apply bounded grace retries to retryable parser, transport, rate-limit, timeout, and integrity failures.
+- **Prevention:** Keep a stable failure taxonomy and test each category with synthetic provider responses.

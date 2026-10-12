@@ -1,6 +1,10 @@
-# Agent Game Translation SDK
+# Agent Game Translation Framework
 
-게임 전체 맥락과 캐릭터 말투를 먼저 분석한 뒤, 번역 AI와 독립 검수 AI를 폴백 체인으로 운용하는 Python SDK입니다. 최상위 오케스트레이터는 의미를 직접 판단하지 않고 각 에이전트가 정상 완료했는지, 거부·오류·형식 위반이 있었는지, 결정론적 무결성 검사를 통과했는지만 확인합니다.
+`main`은 특정 게임 엔진에 의존하지 않는 중앙 제어 프레임워크입니다. 게임 전체 맥락과 캐릭터 말투를 먼저 분석한 뒤, 번역 AI와 독립 검수 AI를 폴백 체인으로 운용합니다. 최상위 오케스트레이터는 의미를 직접 판단하지 않고 각 에이전트가 정상 완료했는지, 거부·오류·형식 위반이 있었는지, 결정론적 무결성 검사를 통과했는지만 확인합니다.
+
+엔진별 SDK는 `sdk-<engine>-<version>` 브랜치가 소유합니다. 해당 브랜치는 `main`의 오케스트레이션·프로바이더·상태 머신을 상속하고, 엔진 고유의 추출·적용·패킹·검증 구현과 그 엔진에만 해당하는 문서·FAQ·합성 테스트를 추가합니다. `main`은 SDK 브랜치의 구현이나 주의사항을 역으로 포함하지 않습니다.
+
+정확한 소유 범위와 병합 규칙은 [코어/엔진 SDK 브랜치 계약](docs/sdk-branch-contract.md)을 따릅니다.
 
 ## 핵심 동작
 
@@ -28,7 +32,9 @@
 - unpack/pack도 입력과 도구 지문이 같으면 다시 실행하지 않습니다.
 - 기본 `openai-deepseek` 프리셋은 문장별 GPT-6 Luna 번역을 먼저 모두 수행한 뒤, 거부·오류 문장만 DeepSeek으로 넘깁니다. 이후 GPT-6.1 Sol 검수 전체를 마치고 검수 실패 항목만 DeepSeek으로 넘깁니다.
 - 모든 허용 경로 또는 DeepSeek 쿼타가 소진되면 해당 항목은 `source_preserved` 상태로 정확한 원문을 유지합니다. 다른 문장의 진행은 중단하지 않습니다.
-- DeepSeek 요청은 JSON Object 출력과 `temperature: 0.0`을 사용해 창작성을 낮추고 충실한 변환에 집중합니다. 공급자 안전장치를 비활성화하는 옵션으로 가장하지 않으며, 실제 거부는 문장별 폴백으로 격리합니다.
+- DeepSeek 요청은 JSON Object 출력, `thinking=disabled`, `reasoning_effort=none`, `temperature=0.0`, 원문 길이 기반 출력 상한을 사용해 불필요한 추론과 창작성을 낮춥니다. 공급자 안전장치를 비활성화하는 옵션으로 가장하지 않으며, 실제 거부는 문장별 폴백으로 격리합니다.
+- 명시적 거절은 바로 다음 경로로 보내고, 형식 오류·일시적 공급자 오류·속도 제한·타임아웃·무결성 실패만 설정된 grace retry를 수행합니다.
+- 번역 후보가 바뀔 때마다 세대와 해시가 갱신되므로, 이전 후보를 본 검수 결과를 재사용하지 않습니다.
 - 상위 오케스트레이터에는 건별 상태·범주 코드·개수만 노출합니다. 원문, 번역문, 후보문, 공급자가 작성한 거부 설명은 비공개 데이터 평면에만 남고 감사 로그나 표준 출력으로 전달되지 않습니다.
 
 ## 데이터 격리 원칙
@@ -59,20 +65,20 @@ game-l10n policy --workspace C:\agent-work\my-game --git-choice enabled
 
 ```powershell
 game-l10n promote-sdk --workspace C:\agent-work\my-game `
-  --engine unity --version 2023.1 --user-confirmed-success
+  --engine fixture-engine --version 1.0 --user-confirmed-success
 ```
 
-이 단계는 작업공간의 `sdk-export/sdk-unity-2023.1/`에 `tools/`와 해시 manifest만 만듭니다. 원문과 번역문은 복사하지 않습니다. 그 후 에이전트가 커밋/푸시 여부를 다시 묻고 승인받아야 합니다.
+이 단계는 작업공간의 `sdk-export/sdk-fixture-engine-1.0/`에 `tools/`와 해시 manifest만 만듭니다. 원문과 번역문은 복사하지 않습니다. 그 후 에이전트가 커밋/푸시 여부를 다시 묻고 승인받아야 합니다.
 
 ```powershell
 game-l10n policy --workspace C:\agent-work\my-game --publish-approved yes
 game-l10n publish-sdk --workspace C:\agent-work\my-game `
   --sdk-root C:\src\agent-game-translation-sdk `
-  --profile C:\agent-work\my-game\sdk-export\sdk-unity-2023.1 `
+  --profile C:\agent-work\my-game\sdk-export\sdk-fixture-engine-1.0 `
   --commit --push
 ```
 
-`publish-sdk`는 깨끗한 `main`에서 `sdk-unity-2023.1` 브랜치를 만들며, 저장소가 없을 때 임의로 `git init`하지 않습니다.
+`publish-sdk`는 깨끗한 `main`에서 해당 `sdk-<engine>-<version>` 브랜치를 만들며, 저장소가 없을 때 임의로 `git init`하지 않습니다.
 
 ## 전체 맥락 번역
 
@@ -104,9 +110,9 @@ game-l10n translate --workspace C:\agent-work\my-game `
 ```json
 {
   "providers": [
-    {"name": "openai-luna", "type": "openai_responses", "model": "gpt-6-luna", "api_key_env": "OPENAI_API_KEY"},
-    {"name": "deepseek", "type": "compatible_chat", "model": "deepseek-flash", "base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY", "response_format": "json_object", "temperature": 0.0},
-    {"name": "openai-sol", "type": "openai_responses", "model": "gpt-6.1-sol", "api_key_env": "OPENAI_API_KEY"}
+    {"name": "openai-luna", "type": "openai_responses", "model": "gpt-6-luna", "api_key_env": "OPENAI_API_KEY", "reasoning_effort": "none"},
+    {"name": "deepseek", "type": "compatible_chat", "model": "deepseek-flash", "base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY", "response_format": "json_object", "thinking": "disabled", "reasoning_effort": "none", "temperature": 0.0},
+    {"name": "openai-sol", "type": "openai_responses", "model": "gpt-6.1-sol", "api_key_env": "OPENAI_API_KEY", "reasoning_effort": "low"}
   ],
   "routing": {
     "context_analyzers": ["openai-sol", "deepseek"],
@@ -116,10 +122,12 @@ game-l10n translate --workspace C:\agent-work\my-game `
     "use_style_memory": true,
     "style_anchor_limit": 6,
     "retry_refusals_once": false,
+    "grace_retries": 3,
     "defer_fallbacks_until_primary_complete": true,
     "preserve_source_on_failure": true,
+    "review_refusal_policy": "fallback",
     "context_chunk_chars": 30000,
-    "max_workers": 4
+    "max_workers": 8
   }
 }
 ```

@@ -5,7 +5,7 @@ from typing import Any
 
 from .models import CharacterProfile, ContextPack, GlossaryEntry, ProjectContext, Segment
 
-PROMPT_VERSION = "2026-10-13.3"
+PROMPT_VERSION = "2026-10-13.4"
 
 TRANSLATION_SCHEMA: dict[str, Any] = {
     "type": "object",

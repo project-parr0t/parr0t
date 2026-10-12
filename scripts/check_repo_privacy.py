@@ -15,7 +15,6 @@ DENIED_PARTS = {
     "localized",
     "batches",
     "audit",
-    "wolf-json",
     "logs",
     "sdk-export",
 }
@@ -40,10 +39,12 @@ RESOURCE_PATH_RE = re.compile(
 def is_provenance_text_scope(relative: Path) -> bool:
     normalized = relative.as_posix().casefold()
     return (
-        normalized.startswith("src/game_l10n/wolf/")
-        or normalized.startswith("tests/test_wolf")
-        or normalized == "docs/wolf-rpg-pro.md"
-        or normalized == "docs/faq.md"
+        normalized.startswith("docs/")
+        or normalized.startswith("tests/")
+        or (
+            normalized.startswith("src/game_l10n/")
+            and len(relative.parts) > 3
+        )
     )
 
 

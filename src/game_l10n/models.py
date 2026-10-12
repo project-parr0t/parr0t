@@ -18,6 +18,22 @@ class ReviewDecision(str, Enum):
     ERROR = "error"
 
 
+class FailureCode(str, Enum):
+    EXPLICIT_PROVIDER_REFUSAL = "explicit_provider_refusal"
+    MALFORMED_RESPONSE = "malformed_response"
+    PROVIDER_ERROR = "provider_error"
+    RATE_LIMITED = "rate_limited"
+    QUOTA_EXHAUSTED = "quota_exhausted"
+    AUTHENTICATION_ERROR = "authentication_error"
+    TIMEOUT = "timeout"
+    INTEGRITY_INVALID = "integrity_invalid"
+    MEANING_NOT_PRESERVED = "meaning_not_preserved"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    BUDGET_ACCOUNTING_UNCERTAIN = "budget_accounting_uncertain"
+    USER_ACCEPTED_AFTER_REVIEW_REFUSAL = "user_accepted_after_review_refusal"
+    SOURCE_PRESERVED = "source_preserved"
+
+
 @dataclass(slots=True, frozen=True)
 class GlossaryEntry:
     source: str
@@ -108,6 +124,11 @@ class AttemptRecord:
     reason: str = ""
     issues: list[str] = field(default_factory=list)
     duration_ms: int = 0
+    ordinal: int = 1
+    model: str = ""
+    issue_code: str = ""
+    candidate_generation: int = 0
+    usage: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -122,6 +143,11 @@ class TranslationResult:
     attempts: list[AttemptRecord] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    candidate_generation: int = 0
+    candidate_digest: str = ""
+    review_outcome: str = ""
+    acceptance_authority: str = ""
+    resolution_code: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

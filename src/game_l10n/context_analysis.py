@@ -161,6 +161,47 @@ def _merge(parts: list[dict[str, Any]]) -> ContextPack:
     )
 
 
+def context_attestation(
+    segments: list[Segment],
+    context_pack: ContextPack,
+    analyzer: "ContextAnalyzer",
+) -> dict[str, Any]:
+    required_scenes = sorted({item.scene for item in segments if item.scene})
+    required_characters = sorted({item.speaker for item in segments if item.speaker})
+    covered_scenes = sorted(set(required_scenes) & set(context_pack.scene_summaries))
+    covered_characters = sorted(set(required_characters) & set(context_pack.character_guides))
+    return {
+        "ordered_script_hash": stable_hash([asdict(item) for item in segments]),
+        "context_pack_hash": stable_hash(asdict(context_pack)),
+        "segment_count": len(segments),
+        "scene_coverage": {
+            "required": len(required_scenes),
+            "covered": len(covered_scenes),
+            "complete": covered_scenes == required_scenes,
+        },
+        "character_coverage": {
+            "required": len(required_characters),
+            "covered": len(covered_characters),
+            "complete": covered_characters == required_characters,
+        },
+        "story_summary_present": bool(context_pack.story_summary.strip()),
+        "global_style_rules_present": bool(context_pack.global_style_rules),
+        "relationship_timeline_present": bool(context_pack.relationship_timeline),
+        "analyzer_routes": analyzer.registry.fingerprints(analyzer.provider_chain),
+    }
+
+
+def require_complete_context(attestation: dict[str, Any]) -> None:
+    if not attestation["story_summary_present"]:
+        raise ProviderError("Context gate failed: story summary is missing")
+    if not attestation["global_style_rules_present"]:
+        raise ProviderError("Context gate failed: global style rules are missing")
+    if not attestation["scene_coverage"]["complete"]:
+        raise ProviderError("Context gate failed: scene coverage is incomplete")
+    if not attestation["character_coverage"]["complete"]:
+        raise ProviderError("Context gate failed: character coverage is incomplete")
+
+
 class ContextAnalyzer:
     def __init__(self, registry: ProviderRegistry, provider_chain: list[str], *, max_chunk_chars: int = 30000):
         if not provider_chain:
@@ -215,10 +256,24 @@ def analyze_with_cache(
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if state.get("fingerprint") == fingerprint:
             data = json.loads(output_path.read_text(encoding="utf-8"))
-            return ContextPack(**data), True
+            context_pack = ContextPack(**data)
+            attestation = context_attestation(segments, context_pack, analyzer)
+            require_complete_context(attestation)
+            if state.get("attestation") == attestation:
+                return context_pack, True
     context_pack = analyzer.analyze(segments)
+    attestation = context_attestation(segments, context_pack, analyzer)
+    require_complete_context(attestation)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(asdict(context_pack), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    state_path.write_text(json.dumps({"fingerprint": fingerprint}, indent=2) + "\n", encoding="utf-8")
+    state_path.write_text(
+        json.dumps(
+            {"fingerprint": fingerprint, "attestation": attestation},
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return context_pack, False

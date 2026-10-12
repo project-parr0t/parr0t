@@ -140,7 +140,7 @@ class OrchestratorTests(unittest.TestCase):
             audit = (work_dir / ".game-l10n" / "audit.jsonl").read_text(encoding="utf-8")
 
         self.assertEqual(result.status, "source_preserved")
-        self.assertEqual(result.attempts[0].reason, "provider_refusal")
+        self.assertEqual(result.attempts[0].reason, "explicit_provider_refusal")
         self.assertNotIn("provider explanation", audit)
         self.assertNotIn("PRIVATE_DIALOGUE", audit)
 
@@ -331,7 +331,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(results[0].text, "SOURCE_1")
         self.assertEqual(results[1].status, "reviewed")
         self.assertTrue(any(item.stage == "review-fallback-queued" for item in results[0].attempts))
-        self.assertIn("provider_refusal", {item.reason for item in results[0].attempts})
+        self.assertIn("explicit_provider_refusal", {item.reason for item in results[0].attempts})
         self.assertIn("quota_exhausted", {item.reason for item in results[0].attempts})
 
     def test_translation_and_review_refusals_fall_back(self) -> None:
@@ -450,6 +450,105 @@ class OrchestratorTests(unittest.TestCase):
         issue_text = " ".join(issue for record in result.attempts for issue in record.issues)
         self.assertIn("glossary-missing", issue_text)
         self.assertIn("script-intrusion", issue_text)
+
+    def test_retryable_failure_gets_grace_attempt_before_fallback(self) -> None:
+        calls = 0
+
+        def translator(**_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ProviderError("temporary transport failure")
+            return {"status": "success", "text": "TARGET", "reason": ""}
+
+        provider = ScriptedProvider("fixture-translator", translator)
+        with tempfile.TemporaryDirectory() as directory:
+            orchestrator = LocalizationOrchestrator(
+                registry=ProviderRegistry({provider.name: provider}),
+                config=OrchestratorConfig(
+                    [provider.name],
+                    [],
+                    require_review=False,
+                    retry_refusals_once=False,
+                    grace_retries=1,
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                context_pack=ContextPack(story_summary="STORY"),
+                work_dir=Path(directory),
+            )
+            result = orchestrator.translate_one(Segment("fixture-1", "SOURCE"))
+
+        self.assertEqual(result.status, "translated")
+        self.assertEqual([item.ordinal for item in result.attempts], [1, 2])
+        self.assertEqual(result.attempts[0].reason, "provider_error")
+        self.assertEqual(result.attempts[1].stage, "translate-grace-retry")
+
+    def test_review_refusal_policy_keeps_candidate_without_false_approval(self) -> None:
+        translator = ScriptedProvider(
+            "fixture-translator",
+            lambda **_: {"status": "success", "text": "TARGET", "reason": ""},
+        )
+        reviewer = ScriptedProvider(
+            "fixture-reviewer",
+            lambda **_: {
+                "decision": "refused",
+                "text": "",
+                "meaning_preserved": False,
+                "issues": [],
+                "reason": "provider prose must not escape",
+            },
+        )
+        registry = ProviderRegistry({item.name: item for item in [translator, reviewer]})
+        with tempfile.TemporaryDirectory() as directory:
+            orchestrator = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(
+                    [translator.name],
+                    [reviewer.name],
+                    retry_refusals_once=False,
+                    review_refusal_policy="accept_candidate_unreviewed",
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                context_pack=ContextPack(story_summary="STORY"),
+                work_dir=Path(directory),
+            )
+            result = orchestrator.translate_one(Segment("fixture-1", "SOURCE"))
+
+        self.assertEqual(result.status, "accepted_unreviewed")
+        self.assertEqual(result.review_outcome, "refused")
+        self.assertEqual(result.acceptance_authority, "user_policy")
+        self.assertEqual(result.resolution_code, "user_accepted_after_review_refusal")
+        self.assertNotEqual(result.review_outcome, "approved")
+
+    def test_revised_review_advances_candidate_generation(self) -> None:
+        translator = ScriptedProvider(
+            "fixture-translator",
+            lambda **_: {"status": "success", "text": "TARGET_A", "reason": ""},
+        )
+        reviewer = ScriptedProvider(
+            "fixture-reviewer",
+            lambda **_: {
+                "decision": "revised",
+                "text": "TARGET_B",
+                "meaning_preserved": True,
+                "issues": [],
+                "reason": "",
+            },
+        )
+        registry = ProviderRegistry({item.name: item for item in [translator, reviewer]})
+        with tempfile.TemporaryDirectory() as directory:
+            orchestrator = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig([translator.name], [reviewer.name]),
+                project=ProjectContext("TEST", "src", "dst"),
+                context_pack=ContextPack(story_summary="STORY"),
+                work_dir=Path(directory),
+            )
+            result = orchestrator.translate_one(Segment("fixture-1", "SOURCE"))
+
+        self.assertEqual(result.candidate_generation, 2)
+        self.assertTrue(result.candidate_digest)
+        self.assertEqual(result.review_outcome, "revised")
 
 
 if __name__ == "__main__":
