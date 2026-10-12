@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Game data and agent-workspace artifacts must never enter the SDK repository.
+/game-data/
+/game_data/
+/inputs/
+/translations/
+/localized/
+/logs/
+/.game-l10n/
+/sdk-export/
+*.jsonl
+*.csv
+*.po
+*.mo
+*.locres
+*.assets
+*.bundle
+.env
+*.key
+*.pem

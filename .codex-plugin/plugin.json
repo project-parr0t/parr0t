@@ -1,0 +1,6 @@
+{
+  "name": "agent-game-translation-sdk",
+  "version": "0.1.0",
+  "description": "Context-first, refusal-aware game localization workflow for Codex and ChatGPT Work.",
+  "skills": "./skills/"
+}
