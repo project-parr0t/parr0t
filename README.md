@@ -15,8 +15,10 @@
   → 번역 AI 체인
      (거부·오류·형식 실패 시 다음 모델)
   → 플레이스홀더/태그/스크립트 침범 검사
-  → 독립 검수 AI 체인
-     (의미·누락·첨가·말투·용어를 확인하고 필요 시 수정)
+  → 독립 compact judge 체인
+     (짧은 ok/rewrite 판정, 거부·오류 시 다음 judge)
+  → 문제가 감지된 항목만 rewriter 체인
+     (수정 후 결정론 검사와 compact judge 재확인)
   → 최종 무결성 검사
   → 에이전트 작업 디렉터리에만 결과 저장
 ```
@@ -24,7 +26,8 @@
 - 컨텍스트 분석이 전부 거부되거나 실패하면 번역을 시작하지 않습니다.
 - 번역기와 검수기는 서로 다른 제공자/모델 체인을 쓸 수 있습니다.
 - 허구의 폭력·욕설·공포·로맨스·성인 등급 요소를 이유로 임의 순화/거부하지 않도록 기존 문장의 언어 변환이라는 작업 성격을 명시합니다. 기본 프리셋에서는 거부 항목만 기록해 1차 단계 완료 후 다음 제공자로 넘깁니다.
-- 검수기가 거부하거나 잘못된 결과를 내면 다음 검수기로 라우팅합니다.
+- 검수기는 정상 후보를 다시 출력하지 않고 짧은 판정만 반환합니다. 문제가 감지된 항목만 재작성하므로 출력 토큰과 불필요한 변형을 줄입니다.
+- judge가 거부하거나 잘못된 결과를 내면 다음 judge로 라우팅하며, rewriter도 독립 체인으로 교체할 수 있습니다.
 - `{name}`, `%s`, `<tag>`, `\\n`, 엔진 제어 코드와 사전 지정어를 결정론적으로 검사합니다.
 - 원문에 없던 `<script>`, `javascript:`, `eval(` 등의 삽입을 차단합니다.
 - 이전에 승인된 동일 화자의 번역을 후속 대사의 스타일 앵커로 제공합니다.
@@ -32,7 +35,7 @@
 - unpack/pack도 입력과 도구 지문이 같으면 다시 실행하지 않습니다.
 - 기본 `openai-deepseek` 프리셋은 문장별 GPT-6 Luna 번역을 먼저 모두 수행한 뒤, 거부·오류 문장만 DeepSeek으로 넘깁니다. 이후 GPT-6.1 Sol 검수 전체를 마치고 검수 실패 항목만 DeepSeek으로 넘깁니다.
 - 모든 허용 경로 또는 DeepSeek 쿼타가 소진되면 해당 항목은 `source_preserved` 상태로 정확한 원문을 유지합니다. 다른 문장의 진행은 중단하지 않습니다.
-- DeepSeek 요청은 JSON Object 출력, `thinking=disabled`, `reasoning_effort=none`, `temperature=0.0`, 원문 길이 기반 출력 상한을 사용해 불필요한 추론과 창작성을 낮춥니다. 공급자 안전장치를 비활성화하는 옵션으로 가장하지 않으며, 실제 거부는 문장별 폴백으로 격리합니다.
+- DeepSeek 번역·재작성 요청은 JSON Object 출력과 원문 길이 기반 출력 상한을 사용하고, compact judge는 검증된 plain verdict 모드에서 최대 24토큰만 사용합니다. `thinking=disabled`와 `reasoning_effort=none`으로 불필요한 추론을 끕니다. 비사고 모드에서 효과가 없는 `temperature`는 최적화 수단으로 사용하지 않습니다. 공급자 안전장치를 비활성화하는 옵션으로 가장하지 않으며, 실제 거부는 문장별 폴백으로 격리합니다.
 - 명시적 거절은 바로 다음 경로로 보내고, 형식 오류·일시적 공급자 오류·속도 제한·타임아웃·무결성 실패만 설정된 grace retry를 수행합니다.
 - 번역 후보가 바뀔 때마다 세대와 해시가 갱신되므로, 이전 후보를 본 검수 결과를 재사용하지 않습니다.
 - 상위 오케스트레이터에는 건별 상태·범주 코드·개수만 노출합니다. 원문, 번역문, 후보문, 공급자가 작성한 거부 설명은 비공개 데이터 평면에만 남고 감사 로그나 표준 출력으로 전달되지 않습니다.
@@ -46,7 +49,7 @@ python -m pip install -e .
 game-l10n init-workspace C:\agent-work\my-game --sdk-root C:\src\agent-game-translation-sdk
 ```
 
-새 작업공간은 기본적으로 `openai-deepseek` 프리셋을 사용합니다. `OPENAI_API_KEY`와 `DEEPSEEK_API_KEY`를 환경변수에 지정하면 별도의 문장별 폴백 승인 없이 설정된 체인을 실행합니다. 자세한 순서와 사용자 정의 조합은 [API + API 폴백 라우팅 가이드](docs/fallback-routing.md)를 참고하십시오. Codex App의 네이티브 Luna/Sol 서브에이전트와 DeepSeek API를 조합할 때는 [Codex App + DeepSeek API 가이드](docs/codex-app-deepseek.md)를 사용하십시오.
+권장 운영 구성은 Codex App의 네이티브 번역·판정 에이전트와 독립 API 폴백을 조합하는 방식입니다. CLI만 사용하는 환경에서는 새 작업공간의 기본 `openai-deepseek` API 프리셋을 바로 사용할 수 있습니다. 어느 구성이든 역할별 공급자를 교체할 수 있으며 특정 회사나 모델은 코어 의존성이 아닙니다. 자세한 구조는 [공급자 중립 리뷰 파이프라인](docs/review-pipeline.md), [API + API 폴백 라우팅](docs/fallback-routing.md), [Codex App + DeepSeek API](docs/codex-app-deepseek.md)를 참고하십시오.
 
 생성되는 작업공간의 `game-data/`, `inputs/`, `translations/`, `.game-l10n/`에는 원문·결과·캐시·감사 로그가 남습니다. SDK 저장소의 `.gitignore`, `AGENTS.md`, 개인정보 검사 스크립트가 이 경계를 보조합니다.
 
@@ -111,14 +114,16 @@ game-l10n translate --workspace C:\agent-work\my-game `
 {
   "providers": [
     {"name": "openai-luna", "type": "openai_responses", "model": "gpt-6-luna", "api_key_env": "OPENAI_API_KEY", "reasoning_effort": "none"},
-    {"name": "deepseek", "type": "compatible_chat", "model": "deepseek-flash", "base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY", "response_format": "json_object", "thinking": "disabled", "reasoning_effort": "none", "temperature": 0.0},
-    {"name": "openai-sol", "type": "openai_responses", "model": "gpt-6.1-sol", "api_key_env": "OPENAI_API_KEY", "reasoning_effort": "low"}
+    {"name": "deepseek", "type": "compatible_chat", "model": "deepseek-flash", "base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY", "response_format": "json_object", "thinking": "disabled", "reasoning_effort": "none", "review_verdict_format": "plain", "task_max_output_tokens": {"game_translation_review_judge": 24}},
+    {"name": "openai-sol", "type": "openai_responses", "model": "gpt-6.1-sol", "api_key_env": "OPENAI_API_KEY", "reasoning_effort": "low", "task_max_output_tokens": {"game_translation_review_judge": 512, "game_translation_review_rewrite": 2048}}
   ],
   "routing": {
     "context_analyzers": ["openai-sol", "deepseek"],
     "translators": ["openai-luna", "deepseek"],
     "reviewers": ["openai-sol", "deepseek"],
+    "rewriters": ["deepseek", "openai-sol"],
     "require_review": true,
+    "review_max_rounds": 2,
     "use_style_memory": true,
     "style_anchor_limit": 6,
     "retry_refusals_once": false,
@@ -132,7 +137,7 @@ game-l10n translate --workspace C:\agent-work\my-game `
 }
 ```
 
-`command` 제공자는 Codex/OpenCode/사내 에이전트 하네스를 연결하는 중립 어댑터입니다. 셸을 거치지 않고 stdin으로 요청 JSON을 받아 stdout으로 결과 JSON 하나를 반환합니다. 자세한 규약은 [docs/provider-protocol.md](docs/provider-protocol.md)를 참고하십시오.
+`reviewers`는 짧은 판정만 수행하고 `rewriters`는 `rewrite`로 판정된 항목만 수정합니다. 따라서 강한 모델을 모든 문장의 재출력에 쓰지 않고 실제 오류 후보에 집중할 수 있습니다. `command` 제공자는 Codex/OpenCode/사내 에이전트 하네스를 연결하는 중립 어댑터입니다. 셸을 거치지 않고 stdin으로 요청 JSON을 받아 stdout으로 결과 JSON 하나를 반환합니다. 자세한 규약은 [docs/provider-protocol.md](docs/provider-protocol.md)를 참고하십시오.
 
 번역 호출 하나에는 출력 대상 문장 하나만 들어갑니다. 다만 전체 대본 분석, 장면 상태, 관계 변화, 캐릭터 말투, 앞뒤 문장과 용어집은 `context-only` 근거로 계속 전달됩니다. 따라서 거부 범위는 한 문장으로 제한하면서도 흐름과 어체 판단은 유지됩니다.
 

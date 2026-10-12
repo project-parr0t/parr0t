@@ -18,6 +18,13 @@ class ReviewDecision(str, Enum):
     ERROR = "error"
 
 
+class ReviewVerdict(str, Enum):
+    OK = "ok"
+    REWRITE = "rewrite"
+    REFUSED = "refused"
+    ERROR = "error"
+
+
 class FailureCode(str, Enum):
     EXPLICIT_PROVIDER_REFUSAL = "explicit_provider_refusal"
     MALFORMED_RESPONSE = "malformed_response"
@@ -106,6 +113,14 @@ class ReviewEnvelope:
     meaning_preserved: bool = False
     issues: list[str] = field(default_factory=list)
     reason: str = ""
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ReviewVerdictEnvelope:
+    verdict: ReviewVerdict
+    issues: list[str] = field(default_factory=list)
+    text: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
 

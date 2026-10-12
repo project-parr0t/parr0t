@@ -38,12 +38,13 @@ CONFIG_TEMPLATE: dict[str, Any] = {
             "base_url": "https://api.deepseek.com",
             "api_key_env": "DEEPSEEK_API_KEY",
             "response_format": "json_object",
-            "temperature": 0.0,
             "thinking": "disabled",
             "reasoning_effort": "none",
             "max_tokens_per_source_char": 4.0,
             "min_output_tokens": 128,
             "max_output_tokens": 8192,
+            "review_verdict_format": "plain",
+            "task_max_output_tokens": {"game_translation_review_judge": 24},
         },
         {
             "name": "openai-sol",
@@ -52,13 +53,19 @@ CONFIG_TEMPLATE: dict[str, Any] = {
             "api_key_env": "OPENAI_API_KEY",
             "reasoning_effort": "low",
             "max_output_tokens": 8192,
+            "task_max_output_tokens": {
+                "game_translation_review_judge": 512,
+                "game_translation_review_rewrite": 2048,
+            },
         },
     ],
     "routing": {
         "context_analyzers": ["openai-sol", "deepseek"],
         "translators": ["openai-luna", "deepseek"],
         "reviewers": ["openai-sol", "deepseek"],
+        "rewriters": ["deepseek", "openai-sol"],
         "require_review": True,
+        "review_max_rounds": 2,
         "max_workers": 8,
         "retry_refusals_once": False,
         "grace_retries": 3,
@@ -102,9 +109,9 @@ This directory contains private game data and translation artifacts. It is inten
 9. Keep promoted SDK content provenance-free. Never transfer real game/project names, filenames, asset paths, map/event identifiers, dialogue, translations, project-specific exclusions, job metadata, tool paths, counts, hashes, reports, or execution history. Use only public engine-format identifiers and unmistakably synthetic fixtures.
 10. Record only recurring engine/SDK problems in the repository `docs/faq.md`, after reducing them to neutral symptom, general cause, diagnosis, resolution, and prevention. Keep one-off or project-specific incidents in this private workspace.
 11. Treat translation as a faithful transformation of existing user-provided text, never as new scene generation, continuation, roleplay, or endorsement. Do not censor, soften, intensify, or invent content. A refusal applies only to the individual target segment and must never cancel unrelated segments.
-12. With the `openai-deepseek` preset, finish the complete GPT-6 Luna pass first, queue only refused/failed segments for DeepSeek, then finish the GPT-6.1 Sol review pass and queue only refused/failed reviews for DeepSeek. If every permitted route fails, emit the unchanged source with `source_preserved`; never silently claim it was reviewed.
+12. Follow the configured role chains, not hard-coded provider identities. Finish the complete primary translation pass before translation fallback. Review with compact judges; invoke configured rewriters only for `rewrite` verdicts; confirm corrected candidates; and send only refused/failed judge targets to the next judge. With the recommended OpenAI/DeepSeek preset these roles map to Luna translation, Sol compact judging, and selective DeepSeek/Sol correction, but API, native App, command, local, and compatible providers may be substituted independently. If every permitted route fails, emit the unchanged source with `source_preserved`; never silently claim it was reviewed.
 13. Selecting a provider preset and supplying its API-key environment variables authorizes its automatic context, translation, review, and fallback calls. Do not pause for another per-segment API or cost approval. Keep configured game roots read-only; create translated data, rebuilt archives, and installable patches only under this workspace. Never overwrite an installed or source game in place.
-14. Distinguish OpenAI API + DeepSeek API from Codex App + DeepSeek API. In App mode, use native GPT-6 Luna translator subagents and a separate native GPT-6.1 Sol reviewer, with only `DEEPSEEK_API_KEY` used for external fallback. The top-level Sol agent remains orchestration-only and follows the SDK's `docs/codex-app-deepseek.md` workflow.
+14. Distinguish API providers from native Codex App workers. In the recommended App + DeepSeek mode, use native GPT-6 Luna translator subagents and a separate native GPT-6.1 Sol compact judge; use only `DEEPSEEK_API_KEY` for configured translation fallback, selective rewriting, and judge fallback. This is not a core dependency: API, command, compatible, local, and other native providers may fill each role. The top-level agent remains orchestration-only and follows `docs/codex-app-deepseek.md`.
 15. Keep a strict data-plane/control-plane boundary. The top-level agent may receive target IDs, categorical status/error codes, counts, queue transitions, artifact paths, and deterministic issue codes only. It must not open dialogue/input/result files or receive source, candidate, translated text, or provider prose refusal explanations. Workers read and write private workspace files and return metadata-only envelopes.
 16. A translation or review refusal is a routing event, not a content judgment and not grounds to omit a target or cancel patch creation. Normalize explanations before returning metadata to the parent. Use the configured faithful-transformation prompt and supported deterministic low-creativity settings for DeepSeek; never claim or attempt to disable provider safeguards.
 17. The checked-out `main` branch is an engine-neutral control framework. Engine-specific discovery, unpack, apply, pack, verification, FAQ, ignore rules, and fixtures must come from the selected `sdk-<engine>-<version>` branch and must never be copied back into `main`.
@@ -196,7 +203,9 @@ def initialize_workspace(
             "context_analyzers": ["translator-primary"],
             "translators": ["translator-primary"],
             "reviewers": ["reviewer-primary"],
+            "rewriters": ["reviewer-primary"],
             "require_review": True,
+            "review_max_rounds": 2,
             "max_workers": 1,
             "retry_refusals_once": True,
             "grace_retries": 0,

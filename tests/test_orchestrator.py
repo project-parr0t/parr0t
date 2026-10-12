@@ -12,6 +12,121 @@ from game_l10n.providers import ProviderRegistry, ScriptedProvider
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_compact_review_skips_rewriter_for_approved_candidate(self) -> None:
+        translator = ScriptedProvider(
+            "fixture-translator",
+            lambda **_: {"status": "success", "text": "TARGET", "reason": ""},
+        )
+        judge = ScriptedProvider(
+            "fixture-judge", lambda **_: {"verdict": "ok", "issues": []}
+        )
+        rewriter = ScriptedProvider(
+            "fixture-rewriter",
+            lambda **_: {"status": "success", "text": "UNEXPECTED"},
+        )
+        registry = ProviderRegistry(
+            {item.name: item for item in [translator, judge, rewriter]}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(
+                    [translator.name],
+                    [judge.name],
+                    rewriter_chain=[rewriter.name],
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                context_pack=ContextPack(story_summary="STORY"),
+                work_dir=Path(directory),
+            ).translate_one(Segment("fixture-1", "SOURCE"))
+
+        self.assertEqual(result.status, "reviewed")
+        self.assertEqual(result.text, "TARGET")
+        self.assertEqual(result.review_outcome, "approved")
+        self.assertEqual(judge.call_count, 1)
+        self.assertEqual(rewriter.call_count, 0)
+
+    def test_compact_review_rewrites_only_flagged_candidate_then_confirms(self) -> None:
+        judge_calls = 0
+
+        def judge_handler(**kwargs):
+            nonlocal judge_calls
+            judge_calls += 1
+            payload = json.loads(kwargs["user"])
+            if payload["candidate_translation"] == "TARGET_A":
+                return {"verdict": "rewrite", "issues": ["voice"]}
+            return {"verdict": "ok", "issues": []}
+
+        def rewrite_handler(**kwargs):
+            payload = json.loads(kwargs["user"])
+            self.assertEqual(payload["detected_issue_codes"], ["voice"])
+            return {"status": "success", "text": "TARGET_B"}
+
+        translator = ScriptedProvider(
+            "fixture-translator",
+            lambda **_: {"status": "success", "text": "TARGET_A", "reason": ""},
+        )
+        judge = ScriptedProvider("fixture-judge", judge_handler)
+        rewriter = ScriptedProvider("fixture-rewriter", rewrite_handler)
+        registry = ProviderRegistry(
+            {item.name: item for item in [translator, judge, rewriter]}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(
+                    [translator.name],
+                    [judge.name],
+                    rewriter_chain=[rewriter.name],
+                    review_max_rounds=2,
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                context_pack=ContextPack(story_summary="STORY"),
+                work_dir=Path(directory),
+            ).translate_one(Segment("fixture-1", "SOURCE"))
+
+        self.assertEqual(result.status, "reviewed")
+        self.assertEqual(result.text, "TARGET_B")
+        self.assertEqual(result.review_outcome, "revised")
+        self.assertEqual(result.candidate_generation, 2)
+        self.assertEqual(judge_calls, 2)
+        self.assertEqual(rewriter.call_count, 1)
+        self.assertIn("review-confirm", [item.stage for item in result.attempts])
+        self.assertIn("review-rewrite", [item.stage for item in result.attempts])
+
+    def test_rewriter_refusal_does_not_accept_a_candidate_flagged_for_rewrite(self) -> None:
+        translator = ScriptedProvider(
+            "fixture-translator",
+            lambda **_: {"status": "success", "text": "TARGET_A", "reason": ""},
+        )
+        judge = ScriptedProvider(
+            "fixture-judge", lambda **_: {"verdict": "rewrite", "issues": ["meaning"]}
+        )
+        rewriter = ScriptedProvider(
+            "fixture-rewriter", lambda **_: {"status": "refused", "text": ""}
+        )
+        registry = ProviderRegistry(
+            {item.name: item for item in [translator, judge, rewriter]}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(
+                    [translator.name],
+                    [judge.name],
+                    rewriter_chain=[rewriter.name],
+                    review_refusal_policy="accept_candidate_unreviewed",
+                    preserve_source_on_failure=True,
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                context_pack=ContextPack(story_summary="STORY"),
+                work_dir=Path(directory),
+            ).translate_one(Segment("fixture-1", "SOURCE"))
+
+        self.assertEqual(result.status, "source_preserved")
+        self.assertEqual(result.text, "SOURCE")
+        self.assertNotEqual(result.status, "accepted_unreviewed")
+
     def test_deferred_run_resumes_after_completed_primary_stage(self) -> None:
         first_events: list[str] = []
 

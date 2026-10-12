@@ -73,7 +73,9 @@ def _orchestrator(work_dir: Path, context_pack: ContextPack) -> LocalizationOrch
     orchestrator_config = OrchestratorConfig(
         translator_chain=list(routing["translators"]),
         reviewer_chain=list(routing.get("reviewers", [])),
+        rewriter_chain=list(routing.get("rewriters", [])),
         require_review=bool(routing.get("require_review", True)),
+        review_max_rounds=int(routing.get("review_max_rounds", 2)),
         max_workers=int(routing.get("max_workers", 1)),
         max_length_ratio=float(routing.get("max_length_ratio", 4.0)),
         extra_protected_patterns=list(routing.get("extra_protected_patterns", [])),

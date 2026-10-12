@@ -65,3 +65,11 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Diagnosis:** Inspect the categorical finish signal, HTTP class, and parser outcome without copying provider prose into the control plane.
 - **Resolution:** Reserve `explicit_provider_refusal` for an explicit refusal field or content-filter finish reason. Apply bounded grace retries to retryable parser, transport, rate-limit, timeout, and integrity failures.
 - **Prevention:** Keep a stable failure taxonomy and test each category with synthetic provider responses.
+
+## Review cost is high even when most candidates are already correct
+
+- **Symptom:** The reviewer returns a full copy of every translation and consumes nearly as many output tokens as translation itself.
+- **General cause:** Quality classification and correction were combined into one response contract.
+- **Diagnosis:** Check whether accepted candidates are echoed by the reviewer and whether a correction model runs for every target.
+- **Resolution:** Use a compact judge that returns only `ok` or `rewrite` plus categorical issue codes. Invoke a rewriter only for `rewrite`, validate the correction, and confirm it with another compact judgment.
+- **Prevention:** Set per-task output limits, retain focused scene/character evidence, record provider usage metadata, and compare quality and cost on synthetic representative evaluations before changing the configured roles.

@@ -13,6 +13,93 @@ from typing import Any, Callable
 
 from .errors import ConfigurationError, ProviderError, ProviderFailure
 
+_REVIEW_ISSUE_CODES = {
+    "meaning",
+    "omission",
+    "addition",
+    "voice",
+    "register",
+    "terminology",
+    "consistency",
+    "formatting",
+    "fluency",
+}
+
+
+def _parse_plain_review_verdict(value: str) -> dict[str, Any]:
+    line = value.strip()
+    if not line or "\n" in line or "\r" in line:
+        raise ProviderFailure("malformed_response", retryable=True)
+    head, _, tail = line.partition(" ")
+    verdicts = {"OK": "ok", "REWRITE": "rewrite", "REFUSED": "refused", "ERROR": "error"}
+    verdict = verdicts.get(head.upper())
+    if verdict is None:
+        raise ProviderFailure("malformed_response", retryable=True)
+    issues = [item.strip().casefold() for item in tail.split(",") if item.strip()]
+    if verdict != "rewrite" and issues:
+        raise ProviderFailure("malformed_response", retryable=True)
+    if any(item not in _REVIEW_ISSUE_CODES for item in issues):
+        raise ProviderFailure("malformed_response", retryable=True)
+    return {"verdict": verdict, "issues": list(dict.fromkeys(issues))}
+
+
+def _normalized_usage(data: dict[str, Any]) -> dict[str, int]:
+    usage = data.get("usage") or {}
+    if not isinstance(usage, dict):
+        return {}
+    aliases = {
+        "input_tokens": ("input_tokens", "prompt_tokens"),
+        "output_tokens": ("output_tokens", "completion_tokens"),
+        "total_tokens": ("total_tokens",),
+    }
+    normalized: dict[str, int] = {}
+    for target, names in aliases.items():
+        for name in names:
+            value = usage.get(name)
+            if isinstance(value, int) and value >= 0:
+                normalized[target] = value
+                break
+    details = usage.get("output_tokens_details") or usage.get("completion_tokens_details") or {}
+    if isinstance(details, dict):
+        reasoning = details.get("reasoning_tokens")
+        if isinstance(reasoning, int) and reasoning >= 0:
+            normalized["reasoning_tokens"] = reasoning
+    return normalized
+
+
+def _refusal_payload(schema_name: str) -> dict[str, Any]:
+    if schema_name == "game_translation_review_judge":
+        return {"verdict": "refused", "issues": []}
+    if schema_name == "game_translation_review_rewrite":
+        return {"status": "refused", "text": ""}
+    if "review" in schema_name:
+        return {
+            "decision": "refused",
+            "text": "",
+            "meaning_preserved": False,
+            "issues": [],
+            "reason": "provider_refusal",
+        }
+    if "context" in schema_name:
+        return {
+            "status": "refused",
+            "reason": "provider_refusal",
+            "story_summary": "",
+            "global_style_rules": [],
+            "scenes": [],
+            "characters": [],
+            "relationship_timeline": [],
+        }
+    return {"status": "refused", "text": "", "reason": "provider_refusal"}
+
+
+def _with_usage(payload: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+    result = dict(payload)
+    usage = _normalized_usage(response)
+    if usage:
+        result["_usage"] = usage
+    return result
+
 
 class ModelProvider(ABC):
     """Provider contract. Implementations must return a JSON object, never free-form text."""
@@ -28,6 +115,11 @@ class ModelProvider(ABC):
 
     def fingerprint(self) -> dict[str, Any]:
         return {"name": self.name, "type": type(self).__name__}
+
+    def generate_review_verdict(
+        self, *, system: str, user: str, schema: dict[str, Any], schema_name: str
+    ) -> dict[str, Any]:
+        return self.generate_json(system=system, user=user, schema=schema, schema_name=schema_name)
 
 
 def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeout: int) -> dict[str, Any]:
@@ -65,7 +157,7 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeo
 
 
 class OpenAIResponsesProvider(ModelProvider):
-    """OpenAI Responses API provider using strict Structured Outputs."""
+    """OpenAI Responses provider using strict JSON, with optional compact plain judgments."""
 
     def __init__(
         self,
@@ -77,6 +169,8 @@ class OpenAIResponsesProvider(ModelProvider):
         timeout: int = 120,
         reasoning_effort: str | None = None,
         max_output_tokens: int | None = None,
+        task_max_output_tokens: dict[str, int] | None = None,
+        review_verdict_format: str = "json",
     ):
         super().__init__(name)
         self.model = model
@@ -85,6 +179,12 @@ class OpenAIResponsesProvider(ModelProvider):
         self.timeout = timeout
         self.reasoning_effort = reasoning_effort
         self.max_output_tokens = max_output_tokens
+        self.task_max_output_tokens = {
+            str(key): int(value) for key, value in (task_max_output_tokens or {}).items()
+        }
+        if review_verdict_format not in {"json", "plain"}:
+            raise ConfigurationError("review_verdict_format must be json or plain")
+        self.review_verdict_format = review_verdict_format
 
     def generate_json(
         self, *, system: str, user: str, schema: dict[str, Any], schema_name: str
@@ -108,8 +208,9 @@ class OpenAIResponsesProvider(ModelProvider):
         }
         if self.reasoning_effort is not None:
             payload["reasoning"] = {"effort": self.reasoning_effort}
-        if self.max_output_tokens is not None:
-            payload["max_output_tokens"] = self.max_output_tokens
+        output_limit = self.task_max_output_tokens.get(schema_name, self.max_output_tokens)
+        if output_limit is not None:
+            payload["max_output_tokens"] = output_limit
         data = _post_json(
             f"{self.base_url}/responses",
             {"Authorization": f"Bearer {api_key}"},
@@ -128,28 +229,10 @@ class OpenAIResponsesProvider(ModelProvider):
                 continue
             for content in item.get("content", []):
                 if content.get("type") == "refusal":
-                    if "review" in schema_name:
-                        return {
-                            "decision": "refused",
-                            "text": "",
-                            "meaning_preserved": False,
-                            "issues": [],
-                            "reason": "provider_refusal",
-                        }
-                    if "context" in schema_name:
-                        return {
-                            "status": "refused",
-                            "reason": "provider_refusal",
-                            "story_summary": "",
-                            "global_style_rules": [],
-                            "scenes": [],
-                            "characters": [],
-                            "relationship_timeline": [],
-                        }
-                    return {"status": "refused", "text": "", "reason": "provider_refusal"}
+                    return _with_usage(_refusal_payload(schema_name), data)
                 if content.get("type") == "output_text":
                     try:
-                        return json.loads(content.get("text", ""))
+                        return _with_usage(json.loads(content.get("text", "")), data)
                     except json.JSONDecodeError as exc:
                         raise ProviderFailure("malformed_response", retryable=True) from exc
         raise ProviderFailure("malformed_response", retryable=True)
@@ -161,7 +244,46 @@ class OpenAIResponsesProvider(ModelProvider):
             "base_url": self.base_url,
             "reasoning_effort": self.reasoning_effort,
             "max_output_tokens": self.max_output_tokens,
+            "task_max_output_tokens": self.task_max_output_tokens,
+            "review_verdict_format": self.review_verdict_format,
         }
+
+    def generate_review_verdict(
+        self, *, system: str, user: str, schema: dict[str, Any], schema_name: str
+    ) -> dict[str, Any]:
+        if self.review_verdict_format == "json":
+            return self.generate_json(system=system, user=user, schema=schema, schema_name=schema_name)
+        api_key = os.environ.get(self.api_key_env)
+        if not api_key:
+            raise ProviderFailure("authentication_error", retryable=False)
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "instructions": system,
+            "input": user,
+            "store": False,
+        }
+        if self.reasoning_effort is not None:
+            payload["reasoning"] = {"effort": self.reasoning_effort}
+        output_limit = self.task_max_output_tokens.get(schema_name, self.max_output_tokens)
+        if output_limit is not None:
+            payload["max_output_tokens"] = output_limit
+        data = _post_json(
+            f"{self.base_url}/responses",
+            {"Authorization": f"Bearer {api_key}"},
+            payload,
+            self.timeout,
+        )
+        if data.get("status") in {"failed", "cancelled", "incomplete"}:
+            raise ProviderFailure("provider_error", retryable=True)
+        for item in data.get("output", []):
+            if item.get("type") != "message":
+                continue
+            for content in item.get("content", []):
+                if content.get("type") == "refusal":
+                    return _with_usage(_refusal_payload(schema_name), data)
+                if content.get("type") == "output_text":
+                    return _with_usage(_parse_plain_review_verdict(content.get("text", "")), data)
+        raise ProviderFailure("malformed_response", retryable=True)
 
 
 class CompatibleChatProvider(ModelProvider):
@@ -183,6 +305,8 @@ class CompatibleChatProvider(ModelProvider):
         max_tokens_per_source_char: float | None = None,
         min_output_tokens: int = 96,
         max_output_tokens: int = 2048,
+        task_max_output_tokens: dict[str, int] | None = None,
+        review_verdict_format: str = "json",
     ):
         super().__init__(name)
         if response_format not in {"json_schema", "json_object"}:
@@ -209,8 +333,16 @@ class CompatibleChatProvider(ModelProvider):
         self.max_tokens_per_source_char = max_tokens_per_source_char
         self.min_output_tokens = min_output_tokens
         self.max_output_tokens = max_output_tokens
+        self.task_max_output_tokens = {
+            str(key): int(value) for key, value in (task_max_output_tokens or {}).items()
+        }
+        if review_verdict_format not in {"json", "plain"}:
+            raise ConfigurationError("review_verdict_format must be json or plain")
+        self.review_verdict_format = review_verdict_format
 
-    def _request_max_tokens(self, user: str) -> int | None:
+    def _request_max_tokens(self, user: str, schema_name: str) -> int | None:
+        if schema_name in self.task_max_output_tokens:
+            return self.task_max_output_tokens[schema_name]
         if self.max_tokens is not None:
             return self.max_tokens
         if self.max_tokens_per_source_char is None:
@@ -251,38 +383,20 @@ class CompatibleChatProvider(ModelProvider):
             payload["thinking"] = {"type": self.thinking}
         if self.reasoning_effort is not None:
             payload["reasoning_effort"] = self.reasoning_effort
-        request_max_tokens = self._request_max_tokens(user)
+        request_max_tokens = self._request_max_tokens(user, schema_name)
         if request_max_tokens is not None:
             payload["max_tokens"] = request_max_tokens
         data = _post_json(f"{self.base_url}/chat/completions", headers, payload, self.timeout)
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         if message.get("refusal") or choice.get("finish_reason") == "content_filter":
-            if "review" in schema_name:
-                return {
-                    "decision": "refused",
-                    "text": "",
-                    "meaning_preserved": False,
-                    "issues": [],
-                    "reason": "provider_refusal",
-                }
-            if "context" in schema_name:
-                return {
-                    "status": "refused",
-                    "reason": "provider_refusal",
-                    "story_summary": "",
-                    "global_style_rules": [],
-                    "scenes": [],
-                    "characters": [],
-                    "relationship_timeline": [],
-                }
-            return {"status": "refused", "text": "", "reason": "provider_refusal"}
+            return _with_usage(_refusal_payload(schema_name), data)
         if choice.get("finish_reason") == "length":
             raise ProviderFailure("malformed_response", retryable=True)
         if choice.get("finish_reason") in {"insufficient_system_resource", "aborted"}:
             raise ProviderFailure("provider_error", retryable=True)
         try:
-            return json.loads(message.get("content") or "")
+            return _with_usage(json.loads(message.get("content") or ""), data)
         except json.JSONDecodeError as exc:
             raise ProviderFailure("malformed_response", retryable=True) from exc
 
@@ -299,7 +413,42 @@ class CompatibleChatProvider(ModelProvider):
             "max_tokens_per_source_char": self.max_tokens_per_source_char,
             "min_output_tokens": self.min_output_tokens,
             "max_output_tokens": self.max_output_tokens,
+            "task_max_output_tokens": self.task_max_output_tokens,
+            "review_verdict_format": self.review_verdict_format,
         }
+
+    def generate_review_verdict(
+        self, *, system: str, user: str, schema: dict[str, Any], schema_name: str
+    ) -> dict[str, Any]:
+        if self.review_verdict_format == "json":
+            return self.generate_json(system=system, user=user, schema=schema, schema_name=schema_name)
+        api_key = os.environ.get(self.api_key_env, "")
+        if self.api_key_env and not api_key:
+            raise ProviderFailure("authentication_error", retryable=False)
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        }
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        if self.thinking is not None:
+            payload["thinking"] = {"type": self.thinking}
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
+        request_max_tokens = self._request_max_tokens(user, schema_name)
+        if request_max_tokens is not None:
+            payload["max_tokens"] = request_max_tokens
+        data = _post_json(f"{self.base_url}/chat/completions", headers, payload, self.timeout)
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        if message.get("refusal") or choice.get("finish_reason") == "content_filter":
+            return _with_usage(_refusal_payload(schema_name), data)
+        if choice.get("finish_reason") == "length":
+            raise ProviderFailure("malformed_response", retryable=True)
+        if choice.get("finish_reason") in {"insufficient_system_resource", "aborted"}:
+            raise ProviderFailure("provider_error", retryable=True)
+        return _with_usage(_parse_plain_review_verdict(message.get("content") or ""), data)
 
 
 class CommandProvider(ModelProvider):
@@ -401,6 +550,8 @@ class ProviderRegistry:
                         if item.get("max_output_tokens") is not None
                         else None
                     ),
+                    task_max_output_tokens=item.get("task_max_output_tokens"),
+                    review_verdict_format=item.get("review_verdict_format", "json"),
                 )
             elif kind == "compatible_chat":
                 provider = CompatibleChatProvider(
@@ -423,6 +574,8 @@ class ProviderRegistry:
                     ),
                     min_output_tokens=int(item.get("min_output_tokens", 96)),
                     max_output_tokens=int(item.get("max_output_tokens", 2048)),
+                    task_max_output_tokens=item.get("task_max_output_tokens"),
+                    review_verdict_format=item.get("review_verdict_format", "json"),
                 )
             elif kind == "command":
                 cwd = item.get("cwd")

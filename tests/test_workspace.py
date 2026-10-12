@@ -24,13 +24,23 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(config["provider_preset"], "openai-deepseek")
         self.assertEqual(providers["openai-luna"]["model"], "gpt-6-luna")
         self.assertEqual(providers["deepseek"]["model"], "deepseek-flash")
-        self.assertEqual(providers["deepseek"]["temperature"], 0.0)
+        self.assertNotIn("temperature", providers["deepseek"])
         self.assertEqual(providers["deepseek"]["thinking"], "disabled")
         self.assertEqual(providers["deepseek"]["reasoning_effort"], "none")
+        self.assertEqual(providers["deepseek"]["review_verdict_format"], "plain")
         self.assertEqual(providers["openai-sol"]["model"], "gpt-6.1-sol")
         self.assertEqual(providers["openai-luna"]["reasoning_effort"], "none")
         self.assertEqual(providers["openai-sol"]["reasoning_effort"], "low")
         self.assertEqual(config["routing"]["translators"], ["openai-luna", "deepseek"])
+        self.assertEqual(config["routing"]["reviewers"], ["openai-sol", "deepseek"])
+        self.assertEqual(config["routing"]["rewriters"], ["deepseek", "openai-sol"])
+        self.assertEqual(config["routing"]["review_max_rounds"], 2)
+        self.assertEqual(
+            providers["openai-sol"]["task_max_output_tokens"][
+                "game_translation_review_judge"
+            ],
+            512,
+        )
         self.assertEqual(config["routing"]["grace_retries"], 3)
         self.assertEqual(config["routing"]["review_refusal_policy"], "fallback")
         self.assertTrue(config["routing"]["defer_fallbacks_until_primary_complete"])

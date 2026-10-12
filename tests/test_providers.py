@@ -9,6 +9,81 @@ from game_l10n.providers import CompatibleChatProvider, OpenAIResponsesProvider
 
 
 class CompatibleProviderTests(unittest.TestCase):
+    def test_plain_review_verdict_uses_tiny_contract_without_json_format(self) -> None:
+        captured = {}
+
+        def fake_post(url, headers, payload, timeout):
+            captured.update(payload)
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": "REWRITE meaning,voice"},
+                    }
+                ]
+            }
+
+        provider = CompatibleChatProvider(
+            "fixture-judge",
+            "fixture-model",
+            api_key_env="FIXTURE_API_KEY",
+            base_url="https://fixture.invalid",
+            review_verdict_format="plain",
+            task_max_output_tokens={"game_translation_review_judge": 24},
+        )
+        with patch.dict(os.environ, {"FIXTURE_API_KEY": "fixture-key"}), patch(
+            "game_l10n.providers._post_json", side_effect=fake_post
+        ):
+            result = provider.generate_review_verdict(
+                system="Judge.",
+                user='{"translation_target":{"source":"SOURCE"}}',
+                schema={"type": "object"},
+                schema_name="game_translation_review_judge",
+            )
+
+        self.assertEqual(result, {"verdict": "rewrite", "issues": ["meaning", "voice"]})
+        self.assertEqual(captured["max_tokens"], 24)
+        self.assertNotIn("response_format", captured)
+
+    def test_task_specific_review_cap_and_usage_metadata(self) -> None:
+        captured = {}
+
+        def fake_post(url, headers, payload, timeout):
+            captured.update(payload)
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": '{"verdict":"ok","issues":[]}'},
+                    }
+                ],
+                "usage": {"prompt_tokens": 120, "completion_tokens": 7, "total_tokens": 127},
+            }
+
+        provider = CompatibleChatProvider(
+            "fixture-judge",
+            "fixture-model",
+            api_key_env="FIXTURE_API_KEY",
+            base_url="https://fixture.invalid",
+            response_format="json_object",
+            task_max_output_tokens={"game_translation_review_judge": 64},
+        )
+        with patch.dict(os.environ, {"FIXTURE_API_KEY": "fixture-key"}), patch(
+            "game_l10n.providers._post_json", side_effect=fake_post
+        ):
+            result = provider.generate_json(
+                system="Judge.",
+                user='{"translation_target":{"source":"SOURCE"}}',
+                schema={"type": "object"},
+                schema_name="game_translation_review_judge",
+            )
+
+        self.assertEqual(captured["max_tokens"], 64)
+        self.assertEqual(
+            result["_usage"],
+            {"input_tokens": 120, "output_tokens": 7, "total_tokens": 127},
+        )
+
     def test_json_object_mode_uses_deepseek_compatible_format(self) -> None:
         captured = {}
 
