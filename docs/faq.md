@@ -121,3 +121,11 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Diagnosis:** Compare the tag, source commit, release ID, package/manifest/file digests, embedded versions, compatibility records, release notes, and installer binding checks as one immutable release unit.
 - **Resolution:** Stop distribution, keep the mismatched assets unchanged for diagnosis, rebuild one staged release from the intended clean commit, and request publication approval for the corrected release. Do not silently replace history or broaden compatibility claims.
 - **Prevention:** Follow `docs/instance-release.md`, upload the exact verified bytes, perform one read-only post-upload digest check, enumerate every validated original game build, and preserve the user's README through minimal reviewed edits.
+
+## A release works on the build agent but not on the player's machine
+
+- **Symptom:** The package depends on an absolute workspace path, developer tool, environment variable, host architecture, or command that exists only on the machine that built it.
+- **General cause:** The build environment was treated as the deployment target instead of producing a self-contained package for the player's operating system and supported game build.
+- **Diagnosis:** Inspect the archive, scripts, manifest, prerequisites, and README for build-host paths or tools; test extraction and entry points from a clean target-environment fixture with spaces and non-ASCII characters in its path.
+- **Resolution:** Rebuild the staged package with relative paths, runtime discovery, declared target architecture, and only bundled or explicitly documented redistributable prerequisites. Keep the broken release unchanged until a corrected release receives publication approval.
+- **Prevention:** Default unspecified public distributions to Windows, derive architecture and runtime requirements from the game build rather than the agent host, and validate the exact packaged interface as an end user would receive it.

@@ -77,7 +77,7 @@ Reusable extraction, application, packing, or validation code may be promoted on
 
 After sanitization, ask separately whether the SDK profile may be committed and pushed. A successful translation does not imply publication approval.
 
-A public per-game instance is another, separate publication target. Follow `docs/instance-release.md`: preserve the user's existing README, record every validated original game version/build, build the release once from a clean tagged commit, and upload the exact bytes that passed verification. The repository output, release manifest, release notes, embedded versions, and installer compatibility checks must identify the same release. Do not rebuild after verification or add release-only first-party files.
+A public per-game instance is another, separate publication target. Follow `docs/instance-release.md`: target the player's execution environment rather than the agent/build host and use Windows by default unless another platform is explicitly specified. Derive architecture and prerequisites from the supported game build; do not leak build-machine paths or require agent/developer tooling. Preserve the user's existing README, record every validated original game version/build, build the release once from a clean tagged commit, and upload the exact bytes that passed verification. The repository output, release manifest, release notes, asset name, embedded versions, and installer compatibility checks must identify the same release. Do not rebuild after verification or add release-only first-party files.
 
 ## Codex operation
 

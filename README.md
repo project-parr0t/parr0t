@@ -50,7 +50,7 @@ sdk-<engine>-<version>       재사용 가능한 추출·적용·패킹 구현
 - [`docs/execution-budget.md`](docs/execution-budget.md): 범위 확장·중복 검사·불필요한 위임을 막는 실행 예산
 - [`docs/runtime-approval.md`](docs/runtime-approval.md): 실제 설치·업데이트·제거·실행을 분리하는 일회성 승인 경계
 - [`docs/steam-packaging.md`](docs/steam-packaging.md): Steam 설치 ZIP 제작과 영수증 기반 설치·제거
-- [`docs/instance-release.md`](docs/instance-release.md): 게임별 공개 저장소의 README 보존, 버전 호환성과 릴리스 동일성 계약
+- [`docs/instance-release.md`](docs/instance-release.md): Windows 기본 사용자 환경, README 보존, 버전 호환성과 릴리스 동일성 계약
 - [`docs/review-pipeline.md`](docs/review-pipeline.md): 저토큰 독립 검수와 선택적 재작성
 - [`docs/provider-protocol.md`](docs/provider-protocol.md): 공급자·명령형 워커 연결 규약
 - [`docs/codex-app-deepseek.md`](docs/codex-app-deepseek.md): 권장 App + API 구성 예시

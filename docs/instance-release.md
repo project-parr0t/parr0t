@@ -4,6 +4,20 @@ This contract applies when an agent publishes a completed localization as a sepa
 
 Publication is an external side effect. A successful patch, permission to use Git, SDK publication approval, and permission to publish a per-game release are separate decisions. Do not create a repository, tag, release, or upload until the user explicitly approves that exact instance publication.
 
+## Target the player's environment
+
+Design and validate the release for the environment in which the player will install and run it, not for the agent, CI runner, or developer machine that builds it. Unless the user or target project explicitly names another platform, the default public distribution target is Windows.
+
+- An explicit user/project platform requirement overrides the Windows default. For multiple platforms, produce separately named assets and compatibility records instead of one ambiguous archive.
+- Determine architecture, game paths, runtime, and engine requirements from the supported game build. Never copy the build host's operating system, architecture, absolute paths, usernames, temporary directories, SDK locations, or environment variables into the package.
+- Use relative package paths and runtime discovery. The extracted package must work from an arbitrary user-selected directory, including paths containing spaces and non-ASCII characters.
+- Do not require Git, Codex, Parr0t, a source checkout, build tools, or a developer SDK on the player's machine. Bundle redistributable runtime components when their licenses allow it; otherwise identify the exact prerequisite, supported version, source, and installation requirement before release.
+- Provide a Windows-appropriate user entry point and README instructions when Windows is the target. Do not assume the player will run repository build commands or understand the agent workspace layout.
+- Do not require administrator rights unless the selected install location actually requires elevation. Keep discovery and verification read-only, and request elevation only at the mutating boundary.
+- Validate the packaged interface as a clean target user would receive it. Success on the current build machine is not evidence of target compatibility; use an isolated or synthetic target-environment check plus the engine/build-specific checks required by the instance.
+
+Record the target operating system, architecture, prerequisites, and supported game builds consistently in the README, release notes, manifest, asset name, and installer checks.
+
 ## One immutable release unit
 
 Treat the source commit, tag, release metadata, committed distribution output, and uploaded assets as one immutable release unit.
@@ -51,10 +65,11 @@ Before an agent publishes an instance release, it must verify all of the followi
 2. The user has separately approved publication of this exact instance repository and release.
 3. The source tree is clean, the intended commit is fixed, and the tag/release ID is unused.
 4. The complete supported-build matrix is recorded and matches installer binding checks.
-5. The committed distribution output or deterministic build recipe produces the exact staged assets.
-6. Package validation, required engine/adapter checks, license checks, and one proportional synthetic lifecycle pass.
-7. The existing README is preserved except for reviewed, release-specific edits.
-8. Release notes identify the release ID, source commit, supported builds, changes, installation/update caveats, and asset checksums.
-9. The uploaded assets are the same bytes that passed verification, and their published digests are checked once after upload.
+5. The target operating system, architecture, and prerequisites describe the player's environment rather than the build host; Windows is used when no other platform was specified.
+6. The committed distribution output or deterministic build recipe produces the exact staged assets.
+7. Package validation, required engine/adapter checks, license checks, and one proportional target-environment synthetic lifecycle pass.
+8. The existing README is preserved except for reviewed, release-specific edits.
+9. Release notes identify the release ID, source commit, supported builds, changes, installation/update caveats, and asset checksums.
+10. The uploaded assets are the same bytes that passed verification, and their published digests are checked once after upload.
 
 If any gate fails, keep the staged release in the private workspace and report the mismatch. Do not publish a best-effort or partially documented release.

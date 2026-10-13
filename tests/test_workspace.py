@@ -57,6 +57,8 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("docs/instance-release.md", generated_agents)
         self.assertIn("exact verified bytes", generated_agents)
         self.assertIn("Preserve the user's existing README", generated_agents)
+        self.assertIn("default to Windows", generated_agents)
+        self.assertIn("player's execution environment", generated_agents)
 
     def test_workspace_must_be_outside_sdk(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
