@@ -257,3 +257,11 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Diagnosis:** Compare elapsed tool time with agent reasoning/wait time, count model/context calls, list reread artifacts, and identify whether unchanged targets, source files, installation state, or package layers were revalidated without an invalidating input.
 - **Resolution:** If the user supplied the exact final wording, run `game-l10n apply-user-correction`, then repack only the owning payload and verify the package once. If reverse dependencies are reported, review only those IDs. Use one narrow static lookup only when the stable mapping is ambiguous.
 - **Prevention:** Preserve the full reviewed result and release checkpoint, keep corrections in the current agent, prohibit job-specific correction scripts, and enforce the zero-model exact-correction budget in `docs/minimal-corrections.md`.
+
+## IL2CPP interop generation rejects the metadata version
+
+- **Symptom:** Offline interop generation stops while parsing metadata and reports an unsupported format version.
+- **General cause:** The player metadata format is newer than the Cpp2IL/LibCpp2IL build bundled with the selected BepInEx IL2CPP distribution.
+- **Diagnosis:** Run Unity discovery and compare the reported `metadata_version` with the documented support of the private workspace toolchain. Do not infer the version from the Unity editor version alone.
+- **Resolution:** Replace the private workspace loader toolchain with a compatible release, regenerate into a fresh output directory, and keep the player binary and metadata unchanged.
+- **Prevention:** Pin the loader archive outside the SDK repository and run offline metadata parsing plus interop generation before building or distributing a bridge.

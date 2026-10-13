@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import tempfile
+import struct
 import unittest
 from pathlib import Path
 
-from game_l10n.unity.discovery import discover_unity_installation
+from game_l10n.unity.discovery import discover_unity_installation, read_il2cpp_metadata_version
 
 
 class UnityDiscoveryTests(unittest.TestCase):
@@ -36,11 +37,14 @@ class UnityDiscoveryTests(unittest.TestCase):
         self.assertTrue(result.capabilities["unity_localization"])
         self.assertEqual(result.loader_roots, ("BepInEx/plugins",))
 
-    def test_il2cpp_is_discovered_but_not_marked_supported(self) -> None:
+    def test_discovers_supported_2021_3_il2cpp_layout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             data = root / "FixturePlayer_Data"
             (data / "il2cpp_data").mkdir(parents=True)
+            metadata = data / "il2cpp_data" / "Metadata" / "global-metadata.dat"
+            metadata.parent.mkdir()
+            metadata.write_bytes(struct.pack("<II", 0xFAB11BAF, 31) + b"fixture")
             (root / "GameAssembly.dll").write_bytes(b"fixture")
             (data / "globalgamemanagers").write_bytes(b"2021.3.1f1")
 
@@ -48,6 +52,22 @@ class UnityDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(result.backend, "il2cpp")
         self.assertFalse(result.supports_managed_mod_build)
+        self.assertTrue(result.supports_il2cpp_interop)
+        self.assertEqual(result.metadata_version, 31)
+
+    def test_rejects_invalid_il2cpp_metadata_header(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            metadata = Path(directory) / "global-metadata.dat"
+            metadata.write_bytes(struct.pack("<II", 0xDEADBEEF, 31))
+            with self.assertRaises(ValueError):
+                read_il2cpp_metadata_version(metadata)
+
+    def test_rejects_truncated_il2cpp_metadata_header(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            metadata = Path(directory) / "global-metadata.dat"
+            metadata.write_bytes(b"fixture")
+            with self.assertRaises(ValueError):
+                read_il2cpp_metadata_version(metadata)
 
 
 if __name__ == "__main__":

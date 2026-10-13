@@ -10,6 +10,12 @@ from ..workspace import load_config
 from .build import DEFAULT_REFERENCES, build_managed_mod
 from .bundle import build_patch_bundle, verify_patch_bundle
 from .discovery import discover_unity_installation
+from .il2cpp import (
+    DEFAULT_BRIDGE_REFERENCES,
+    DEFAULT_FRAMEWORK_REFERENCES,
+    build_il2cpp_bridge,
+    generate_il2cpp_interop,
+)
 from .payload import compile_runtime_payload
 
 
@@ -72,13 +78,15 @@ def cmd_discover(args: argparse.Namespace) -> int:
                 "series": installation.unity_series,
                 "backend": installation.backend,
                 "managed_mod_build": installation.supports_managed_mod_build,
+                "il2cpp_interop": installation.supports_il2cpp_interop,
+                "metadata_version": installation.metadata_version,
                 "capabilities": installation.capabilities,
                 "loader_roots": len(installation.loader_roots),
                 "output": str(output),
             }
         )
     )
-    return 0 if installation.supports_managed_mod_build else 1
+    return 0 if (installation.supports_managed_mod_build or installation.supports_il2cpp_interop) else 1
 
 
 def cmd_compile_payload(args: argparse.Namespace) -> int:
@@ -111,6 +119,54 @@ def cmd_build_managed(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_build_il2cpp(args: argparse.Namespace) -> int:
+    work_dir, _ = _workspace(args)
+    sources = [_work_path(work_dir, value, must_exist=True) for value in args.source]
+    references = list(dict.fromkeys([*DEFAULT_BRIDGE_REFERENCES, *args.reference]))
+    framework_references = list(
+        dict.fromkeys([*DEFAULT_FRAMEWORK_REFERENCES, *args.framework_reference])
+    )
+    result = build_il2cpp_bridge(
+        sources,
+        _work_path(work_dir, args.loader_root, must_exist=True),
+        _work_path(work_dir, args.output),
+        loader_reference_names=references,
+        framework_reference_names=framework_references,
+        defines=args.define,
+        reference_pack=_work_path(work_dir, args.reference_pack, must_exist=True)
+        if args.reference_pack
+        else None,
+        dotnet=args.dotnet,
+    )
+    print(json.dumps(result))
+    return 0
+
+
+def cmd_generate_interop(args: argparse.Namespace) -> int:
+    work_dir, config = _workspace(args)
+    installation = discover_unity_installation(_source_root(work_dir, config, args.game_root))
+    if not installation.supports_il2cpp_interop:
+        raise ValueError("The configured player is not a supported Unity 2021.3 IL2CPP layout")
+    if installation.metadata_path is None or installation.metadata_version is None:
+        raise ValueError("The configured player has no readable IL2CPP metadata header")
+    result = generate_il2cpp_interop(
+        loader_root=_work_path(work_dir, args.loader_root, must_exist=True),
+        game_assembly=installation.game_root / "GameAssembly.dll",
+        metadata=installation.metadata_path,
+        unity_base_libs=_work_path(work_dir, args.unity_base_libs, must_exist=True),
+        unity_version=installation.unity_version,
+        metadata_version=installation.metadata_version,
+        output=_work_path(work_dir, args.output),
+        reference_pack=_work_path(work_dir, args.reference_pack, must_exist=True)
+        if args.reference_pack
+        else None,
+        dotnet=args.dotnet,
+        timeout_seconds=args.timeout,
+    )
+    print(json.dumps(result))
+    return 0
+
+
 def cmd_pack(args: argparse.Namespace) -> int:
     work_dir, _ = _workspace(args)
     result = build_patch_bundle(
@@ -137,7 +193,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
 def register_unity_parser(subparsers: argparse._SubParsersAction) -> None:
     unity = subparsers.add_parser(
         "unity",
-        help="Unity 2021.3 Mono managed-mod patch workflow",
+        help="Unity 2021.3 Mono and IL2CPP patch workflow",
     )
     commands = unity.add_subparsers(dest="unity_command", required=True)
 
@@ -171,6 +227,35 @@ def register_unity_parser(subparsers: argparse._SubParsersAction) -> None:
     build.add_argument("--output", required=True)
     build.add_argument("--dotnet", default="dotnet")
     build.set_defaults(func=cmd_build_managed)
+
+    interop = commands.add_parser(
+        "generate-interop",
+        help="Generate IL2CPP interop assemblies offline from read-only player inputs",
+    )
+    interop.add_argument("--workspace", required=True)
+    interop.add_argument("--game-root", required=True)
+    interop.add_argument("--loader-root", required=True)
+    interop.add_argument("--unity-base-libs", required=True)
+    interop.add_argument("--output", required=True)
+    interop.add_argument("--reference-pack")
+    interop.add_argument("--dotnet", default="dotnet")
+    interop.add_argument("--timeout", type=int, default=900)
+    interop.set_defaults(func=cmd_generate_interop)
+
+    il2cpp_build = commands.add_parser(
+        "build-il2cpp",
+        help="Build a workspace-only bridge against BepInEx IL2CPP references",
+    )
+    il2cpp_build.add_argument("--workspace", required=True)
+    il2cpp_build.add_argument("--loader-root", required=True)
+    il2cpp_build.add_argument("--source", action="append", required=True)
+    il2cpp_build.add_argument("--reference", action="append", default=[])
+    il2cpp_build.add_argument("--framework-reference", action="append", default=[])
+    il2cpp_build.add_argument("--define", action="append", default=[])
+    il2cpp_build.add_argument("--reference-pack")
+    il2cpp_build.add_argument("--output", required=True)
+    il2cpp_build.add_argument("--dotnet", default="dotnet")
+    il2cpp_build.set_defaults(func=cmd_build_il2cpp)
 
     pack = commands.add_parser("pack", help="Create a deterministic sidecar patch ZIP in the workspace")
     pack.add_argument("--workspace", required=True)

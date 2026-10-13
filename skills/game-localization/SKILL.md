@@ -38,3 +38,7 @@ Control-plane scope guard: proactively activate the bundled `request-scope-guard
 27. For an exact user-specified typo or wording correction, use `docs/minimal-corrections.md` and `game-l10n apply-user-correction`. Keep the work in the current agent, make no model or context calls, preserve every unnamed result, and reuse the existing SDK/package inputs. Repack the owning payload once and verify once. Do not delegate, repeat discovery, inspect the installation, hash the whole game, re-review unchanged targets, or create task-specific correction scripts. Review only explicitly reported reverse dependencies.
 
 Never copy source game data, extracted strings, translations, caches, logs, prompts, or keys into the SDK repository.
+
+## Unity 2021.3 branch
+
+On `sdk-unity-2021.3`, read `docs/unity-2021.3.md` and run `game-l10n unity discover` before selecting a build path. Keep the existing Mono workflow for Mono players. For IL2CPP players, generate interop assemblies offline with a compatible private-workspace BepInEx toolchain, then compile the private bridge with `build-il2cpp`. Treat the player binary, metadata, loader references, and Unity base libraries as read-only inputs; keep generated assemblies and patch packages outside the SDK repository.

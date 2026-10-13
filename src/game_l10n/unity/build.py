@@ -84,20 +84,29 @@ def build_compile_command(
     output: Path,
     *,
     defines: Sequence[str] = (),
+    target: str = "library",
+    langversion: str = "9.0",
+    nullable: bool = False,
 ) -> list[str]:
     if not sources:
         raise ValueError("At least one C# source file is required")
+    if target not in {"exe", "library"}:
+        raise ValueError(f"Unsupported C# target: {target}")
+    if not re.fullmatch(r"(?:latest|preview|\d+(?:\.\d+)?)", langversion):
+        raise ValueError(f"Invalid C# language version: {langversion}")
     command = [
         dotnet,
         str(compiler),
         "/nologo",
-        "/target:library",
+        f"/target:{target}",
         "/nostdlib+",
         "/optimize+",
         "/deterministic+",
-        "/langversion:9.0",
+        f"/langversion:{langversion}",
         f"/out:{output}",
     ]
+    if nullable:
+        command.append("/nullable:enable")
     for symbol in defines:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", symbol):
             raise ValueError(f"Invalid C# define: {symbol}")
