@@ -17,6 +17,7 @@ from .native_pass import import_native_shard, merge_native_pass, prepare_native_
 from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from .privacy import is_within, require_external_workdir
 from .providers import ProviderRegistry
+from .runtime_approval import create_runtime_approval
 from .steam import build_steam_package, validate_steam_package
 from .tooling import run_cached_tool
 from .workspace import (
@@ -307,6 +308,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "missing_game_roots": missing_roots,
                 "repository": policy,
                 "execution": config.get("execution", {}),
+                "runtime": config.get("runtime", {"default_policy": "deny"}),
                 "next_actions": actions or ["ready"],
             },
             ensure_ascii=False,
@@ -364,6 +366,38 @@ def cmd_verify_steam_package(args: argparse.Namespace) -> int:
     require_external_workdir(work_dir, sdk_root)
     result = validate_steam_package(_path_in_workspace(work_dir, args.package, must_exist=True))
     print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_approve_runtime(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
+    require_external_workdir(work_dir, sdk_root)
+    ttl_minutes = args.ttl_minutes
+    if ttl_minutes is None:
+        ttl_minutes = int(config.get("runtime", {}).get("approval_ttl_minutes", 30))
+    approval_path, approval = create_runtime_approval(
+        work_dir,
+        action=args.action,
+        artifact_path=_path_in_workspace(work_dir, args.artifact, must_exist=True),
+        target_path=Path(args.target),
+        executable_path=Path(args.executable) if args.executable else None,
+        ttl_minutes=ttl_minutes,
+        user_confirmed=args.user_confirmed,
+    )
+    print(
+        json.dumps(
+            {
+                "approval": str(approval_path),
+                "action": approval["action"],
+                "expires_at_utc": approval["expires_at_utc"],
+                "artifact_sha256": approval["artifact"]["sha256"],
+                "status": "recorded_not_executed",
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 
@@ -508,6 +542,30 @@ def build_parser() -> argparse.ArgumentParser:
     verify_steam.add_argument("--workspace", required=True)
     verify_steam.add_argument("--package", required=True)
     verify_steam.set_defaults(func=cmd_verify_steam_package)
+
+    approve_runtime = sub.add_parser(
+        "approve-runtime",
+        help="Record one exact user-approved real install, update, remove, or launch action",
+    )
+    approve_runtime.add_argument("--workspace", required=True)
+    approve_runtime.add_argument(
+        "--action", choices=["install", "update", "remove", "launch"], required=True
+    )
+    approve_runtime.add_argument(
+        "--artifact", required=True, help="Exact patch artifact inside the workspace"
+    )
+    approve_runtime.add_argument("--target", required=True, help="Exact configured game root")
+    approve_runtime.add_argument(
+        "--executable", help="Exact executable inside the game root; required only for launch"
+    )
+    approve_runtime.add_argument("--ttl-minutes", type=int)
+    approve_runtime.add_argument(
+        "--user-confirmed",
+        action="store_true",
+        required=True,
+        help="Assert that the user explicitly requested this exact external action",
+    )
+    approve_runtime.set_defaults(func=cmd_approve_runtime)
 
     doctor = sub.add_parser("doctor", help="Check workspace configuration without sending game data")
     doctor.add_argument("--workspace", required=True)

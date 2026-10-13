@@ -49,3 +49,15 @@ Inspect <public-reference-url> only to learn the public patch format and determi
 ```text
 Read Parr0t's AGENTS.md, docs/execution-budget.md, and docs/steam-packaging.md. Use the completed payload at <payload-directory> and keep every title-specific value in a private Steam spec. Build one deterministic Steam-aware ZIP with receipt-owned install, update, verify, and remove operations. Do not embed an older package, design a legacy migration layer, back up or hash the complete game, or use subagents for this packaging task. Run package validation and one synthetic installer lifecycle, then stop and report the artifact for user validation.
 ```
+
+## Explicitly authorize one real installation action
+
+```text
+I have reviewed <patch-path>. Install this exact artifact into <configured-game-root> once. Record an `install` approval bound to this artifact and target, consume it immediately before installation, and do not launch the game, remove files, delete logs, or repeat the action. Report metadata only after the installer returns.
+```
+
+## Explicitly authorize one real launch
+
+```text
+The patch is already installed. Launch <exact-executable> once using <patch-path> as the approved artifact, solely for the runtime check already described. Record and consume a separate `launch` approval. Do not install, update, remove, clean generated data, modify saves, or launch again without another instruction.
+```

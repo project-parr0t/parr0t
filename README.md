@@ -48,6 +48,7 @@ sdk-<engine>-<version>       재사용 가능한 추출·적용·패킹 구현
 - [`docs/agent-usage.md`](docs/agent-usage.md): Codex 및 OpenCodex 기준 전체 운용 절차
 - [`docs/prompt-examples.md`](docs/prompt-examples.md): 신규 작업, 재개, 검증, SDK 승격 요청 예제
 - [`docs/execution-budget.md`](docs/execution-budget.md): 범위 확장·중복 검사·불필요한 위임을 막는 실행 예산
+- [`docs/runtime-approval.md`](docs/runtime-approval.md): 실제 설치·업데이트·제거·실행을 분리하는 일회성 승인 경계
 - [`docs/steam-packaging.md`](docs/steam-packaging.md): Steam 설치 ZIP 제작과 영수증 기반 설치·제거
 - [`docs/review-pipeline.md`](docs/review-pipeline.md): 저토큰 독립 검수와 선택적 재작성
 - [`docs/provider-protocol.md`](docs/provider-protocol.md): 공급자·명령형 워커 연결 규약
@@ -60,7 +61,7 @@ sdk-<engine>-<version>       재사용 가능한 추출·적용·패킹 구현
 ## 주의
 
 - 이 저장소만으로 모든 게임을 즉시 패치할 수 있는 범용 DLL은 제공하지 않습니다. 대상 형식에 맞는 SDK 브랜치나 비공개 어댑터가 필요합니다.
-- 실제 패치의 설치와 실행 성공 여부는 사용자가 확인해야 합니다. 성공 확인 전에는 작업별 구현을 공개 SDK로 승격하지 않습니다.
+- 실제 패치 설치와 실행은 기본적으로 사용자가 수행합니다. 에이전트에게 맡기는 경우에도 설치·업데이트·제거·실행은 각각 별도 일회성 승인이 필요하며, 성공 확인 전에는 작업별 구현을 공개 SDK로 승격하지 않습니다.
 - 공급자 안전장치를 우회하거나 비활성화한다고 주장하지 않습니다. 정상적인 번역 요청이 거부되면 문장 단위로 격리해 허용된 다른 경로로 넘깁니다.
 
 실험적 에이전트 프레임워크이며 라이선스는 [MIT](LICENSE)입니다.

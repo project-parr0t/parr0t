@@ -50,6 +50,9 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(config["execution"]["same_failure_limit"], 2)
         self.assertFalse(config["execution"]["delegate_simple_tasks"])
         self.assertEqual(config["execution"]["native_shard_records"], 256)
+        self.assertEqual(config["runtime"]["default_policy"], "deny")
+        self.assertTrue(config["runtime"]["separate_install_and_launch"])
+        self.assertTrue(config["runtime"]["user_executes_by_default"])
 
     def test_workspace_must_be_outside_sdk(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

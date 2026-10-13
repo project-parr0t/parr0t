@@ -98,6 +98,12 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "delegate_simple_tasks": False,
         "native_shard_records": 256,
     },
+    "runtime": {
+        "default_policy": "deny",
+        "approval_ttl_minutes": 30,
+        "separate_install_and_launch": True,
+        "user_executes_by_default": True,
+    },
 }
 
 AGENTS_TEXT = """# AGENTS.md — Game localization workspace
@@ -126,11 +132,15 @@ This directory contains private game data and translation artifacts. It is inten
 18. Follow the repository `docs/execution-budget.md`. Build the smallest artifact that satisfies the active request. Do not add speculative rollback archives, legacy migrations, compatibility layers, exhaustive backups, or unrelated generalization. After the required focused checks pass, stop unless inputs changed or a concrete failure justifies more testing.
 19. Handle simple fixes, packaging, documentation, and status inspection in the current agent. Use subagents only for independent bulk translation/review shards or genuinely parallel research. Do not delegate deterministic rechecks or small installer work.
 20. For Steam delivery, use `game-l10n steam-package` with a completed payload and private spec. The generated installer owns only receipt-listed files, skips missing Steam libraries, and falls back to a supplied game directory. Do not embed a previous package or copy Steam/game-specific data into the SDK.
+21. Building, fixing, packing, or validating a patch does not authorize installing, updating, removing, or launching it. Access to a game folder is read-only discovery permission only. Do not infer runtime permission from a request to inspect logs, test a build, or confirm execution data.
+22. Default to handing the recoverable artifact to the user for execution. If the user explicitly asks the agent to act on a real installation, record a separate short-lived one-shot approval for exactly one of `install`, `update`, `remove`, or `launch`. Bind it to the current artifact digest, exact configured game root, and—only for launch—the exact executable. A changed artifact, target, executable, action, expiry, or consumed approval must stop the operation.
+23. Installation approval never authorizes launch, and launch approval never authorizes installation, update, removal, cleanup, log deletion, save modification, or another launch. Consume the matching approval immediately before the external effect. Automated lifecycle tests use temporary synthetic targets; only isolated repository tests may create synthetic approval fixtures for those targets.
 
 ## Data boundary
 
 - Private here: `game-data/`, `inputs/`, `translations/`, `batches/`, `audit/`, `.game-l10n/`, `logs/`.
 - Paths in `game_roots` are read-only source locations. Never write patched files into them unless the user explicitly authorizes installation after reviewing the packed output.
+- Real install/update/remove/launch operations are denied by default. When explicitly authorized, record the exact action with `game-l10n approve-runtime`; do not create that record merely to unblock a test.
 - Reusable SDK only: orchestration source, documentation, tests, and sanitized engine-specific unpack/pack tooling.
 - API keys are environment variables only. Never place keys in configuration or logs.
 """

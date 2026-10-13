@@ -1,13 +1,50 @@
 param(
     [ValidateSet("Menu", "Install", "Remove", "Verify")]
     [string]$Mode = "Menu",
-    [string]$GameRoot
+    [string]$GameRoot,
+    [string]$ApprovalFile
 )
 
 $ErrorActionPreference = "Stop"
-$PackageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$InstallerPath = $MyInvocation.MyCommand.Path
+$PackageRoot = Split-Path -Parent $InstallerPath
 $ManifestPath = Join-Path $PackageRoot "parr0t-patch-manifest.json"
 $PayloadRoot = Join-Path $PackageRoot "payload"
+
+if (-not ("Parr0t.NativePath" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+namespace Parr0t {
+    public static class NativePath {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint GetFinalPathNameByHandle(IntPtr handle, StringBuilder path, uint length, uint flags);
+        [DllImport("kernel32.dll")]
+        public static extern bool CloseHandle(IntPtr handle);
+    }
+}
+"@
+}
+
+function Get-CanonicalPath([string]$Path) {
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $handle = [Parr0t.NativePath]::CreateFile($full, 0, 7, [IntPtr]::Zero, 3, 0x02000000, [IntPtr]::Zero)
+    if ($handle.ToInt64() -ne -1) {
+        try {
+            $buffer = New-Object Text.StringBuilder 32768
+            $length = [Parr0t.NativePath]::GetFinalPathNameByHandle($handle, $buffer, [uint32]$buffer.Capacity, 0)
+            if ($length -gt 0 -and $length -lt $buffer.Capacity) {
+                return $buffer.ToString().TrimEnd([IO.Path]::DirectorySeparatorChar)
+            }
+        } finally {
+            [Parr0t.NativePath]::CloseHandle($handle) | Out-Null
+        }
+    }
+    return $full
+}
 
 function Read-PatchManifest {
     if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
@@ -132,7 +169,75 @@ function Get-Sha256([string]$Path) {
     return ([BitConverter]::ToString($hash)).Replace("-", "").ToLowerInvariant()
 }
 
+function Get-ManifestFingerprint($Manifest) {
+    $lines = [Collections.Generic.List[string]]::new()
+    $lines.Add("schema:$($Manifest.schema)")
+    $lines.Add("patch_id:$($Manifest.patch_id)")
+    $lines.Add("release_id:$($Manifest.release_id)")
+    $lines.Add("display_name:$($Manifest.display_name)")
+    $lines.Add("steam.app_id:$($Manifest.steam.app_id)")
+    $lines.Add("steam.install_dir:$($Manifest.steam.install_dir)")
+    foreach ($required in @($Manifest.steam.required_files)) {
+        $lines.Add("steam.required:$required")
+    }
+    foreach ($file in @($Manifest.files)) {
+        $lines.Add(("file:{0}`t{1}`t{2}" -f $file.path, $file.bytes, $file.sha256))
+    }
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($lines -join "`n") + "`n")
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $hash = $sha.ComputeHash($bytes) }
+    finally { $sha.Dispose() }
+    return ([BitConverter]::ToString($hash)).Replace("-", "").ToLowerInvariant()
+}
+
+function Use-RuntimeApproval([string]$Root, $Manifest, [string]$Action) {
+    if ([string]::IsNullOrWhiteSpace($ApprovalFile)) { throw "E_RUNTIME_APPROVAL_REQUIRED" }
+    if (-not (Test-Path -LiteralPath $ApprovalFile -PathType Leaf)) { throw "E_RUNTIME_APPROVAL_MISSING" }
+    $approvalPath = (Resolve-Path -LiteralPath $ApprovalFile).Path
+    $approvalRoot = Split-Path -Parent $approvalPath
+    if ((Split-Path -Leaf $approvalRoot) -cne "runtime-approvals" -or
+        (Split-Path -Leaf (Split-Path -Parent $approvalRoot)) -cne ".game-l10n") {
+        throw "E_RUNTIME_APPROVAL_INVALID_PATH"
+    }
+    $approval = Get-Content -LiteralPath $approvalPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($approval.schema -ne "parr0t.runtime-approval/v1" -or $approval.one_shot -ne $true) {
+        throw "E_RUNTIME_APPROVAL_SCHEMA"
+    }
+    if ($approval.authorization_source -cne "explicit_user_instruction") {
+        throw "E_RUNTIME_APPROVAL_SOURCE"
+    }
+    if ($null -ne $approval.consumed_at_utc) { throw "E_RUNTIME_APPROVAL_CONSUMED" }
+    if ([string]$approval.action -cne $Action) { throw "E_RUNTIME_APPROVAL_ACTION_MISMATCH" }
+    if ($null -ne $approval.executable) { throw "E_RUNTIME_APPROVAL_EXECUTABLE_MISMATCH" }
+    if ([string]$approval.artifact.fingerprint -cne [string]$Manifest.artifact_fingerprint) {
+        throw "E_RUNTIME_APPROVAL_ARTIFACT_MISMATCH"
+    }
+    if ([string]$approval.artifact.installer_sha256 -cne (Get-Sha256 $InstallerPath)) {
+        throw "E_RUNTIME_APPROVAL_INSTALLER_MISMATCH"
+    }
+    $approvedRootValue = [string]$approval.target
+    if (Test-Path -LiteralPath $approvedRootValue -PathType Container) {
+        $approvedRootValue = (Resolve-Path -LiteralPath $approvedRootValue).Path
+    }
+    $approvedRoot = Get-CanonicalPath $approvedRootValue
+    $actualRoot = Get-CanonicalPath $Root
+    if (-not $approvedRoot.Equals($actualRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "E_RUNTIME_APPROVAL_TARGET_MISMATCH"
+    }
+    try { $expires = [DateTimeOffset]::Parse([string]$approval.expires_at_utc) }
+    catch { throw "E_RUNTIME_APPROVAL_EXPIRY_INVALID" }
+    if ($expires -le [DateTimeOffset]::UtcNow) { throw "E_RUNTIME_APPROVAL_EXPIRED" }
+
+    $approval.consumed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+    $temporary = "$approvalPath.tmp"
+    $approval | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporary -Encoding UTF8
+    Move-Item -LiteralPath $temporary -Destination $approvalPath -Force
+}
+
 function Test-Package($Manifest) {
+    if ((Get-ManifestFingerprint $Manifest) -ne $Manifest.artifact_fingerprint) {
+        throw "E_ARTIFACT_FINGERPRINT"
+    }
     foreach ($file in @($Manifest.files)) {
         $source = Get-SafeTarget $PayloadRoot $file.path
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "E_PAYLOAD_MISSING" }
@@ -146,6 +251,7 @@ function Test-Package($Manifest) {
 function Install-Patch([string]$Root, $Manifest) {
     Test-Package $Manifest
     $oldReceipt = Read-Receipt $Root $Manifest
+    $runtimeAction = if ($oldReceipt) { "update" } else { "install" }
     $owned = @{}
     if ($oldReceipt) { foreach ($file in @($oldReceipt.files)) { $owned[[string]$file.path] = $true } }
     foreach ($file in @($Manifest.files)) {
@@ -154,6 +260,8 @@ function Install-Patch([string]$Root, $Manifest) {
             throw "E_UNOWNED_COLLISION"
         }
     }
+
+    Use-RuntimeApproval $Root $Manifest $runtimeAction
 
     if ($oldReceipt) {
         foreach ($file in @($oldReceipt.files)) {
@@ -198,6 +306,7 @@ function Install-Patch([string]$Root, $Manifest) {
 function Remove-Patch([string]$Root, $Manifest) {
     $receipt = Read-Receipt $Root $Manifest
     if (-not $receipt) { Write-Host "This patch is not installed."; return }
+    Use-RuntimeApproval $Root $Manifest "remove"
     foreach ($file in @($receipt.files)) {
         $target = Get-SafeTarget $Root $file.path
         if (Test-Path -LiteralPath $target -PathType Leaf) { Remove-Item -LiteralPath $target -Force }

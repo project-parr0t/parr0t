@@ -97,3 +97,11 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Diagnosis:** Compare content, tool, and configuration fingerprints between checks.
 - **Resolution:** Reuse the prior pass while its fingerprint remains unchanged. Re-run only the layer invalidated by a changed input or failed check.
 - **Prevention:** Record validation fingerprints and apply the stop conditions in `docs/execution-budget.md`.
+
+## An agent installs or launches a patch while trying to validate it
+
+- **Symptom:** A build, fix, test, or log-inspection request causes files to be written into a real game directory, an installed patch to be changed or removed, or the game/generated code to be launched before the user requests that action.
+- **General cause:** Read access, artifact creation, runtime curiosity, or one external action was incorrectly treated as broad authorization for another external effect.
+- **Diagnosis:** Compare the operation with the recorded runtime approval. A valid record must name exactly one of `install`, `update`, `remove`, or `launch` and match the current artifact digest, configured target, executable when launching, expiry, and unused state.
+- **Resolution:** Stop before the external effect, keep the source and runtime data unchanged, and hand off the recoverable artifact for user execution. If the user explicitly requests agent execution, create and consume only the exact one-shot approval described in `docs/runtime-approval.md`.
+- **Prevention:** Deny runtime mutations and process starts by default, keep installation and launch approvals separate, use only synthetic temporary targets for automated lifecycle tests, and never bypass the shared guard with direct shell copies or process commands.

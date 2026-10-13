@@ -27,6 +27,7 @@ Engine SDK branches may use every public interface from `main`. When `main` chan
 - context, glossary, voice, integrity, and privacy contracts;
 - translation and review fallback policy;
 - source immutability and patch-output requirements;
+- the deny-by-default runtime approval guard for real install, update, remove, and launch actions;
 - engine-neutral delivery packaging and receipt contracts;
 - sanitized SDK promotion and branch lifecycle.
 
@@ -47,5 +48,6 @@ Before an engine SDK branch is published:
 3. Run the core test suite, the adapter test suite, and the privacy scan.
 4. Confirm no private game data, names, paths, text, hashes, counts, logs, or run history appears in the tree or branch-only commits.
 5. Keep engine-only FAQ entries on the engine branch. Keep only framework-generic FAQ entries on `main`.
+6. Call the core runtime approval guard immediately before any real installation write or process launch. Do not add an unguarded direct execution path in an SDK branch.
 
 The framework may be installed without an engine adapter, but it cannot unpack or patch an engine by itself. Once an engine SDK branch supplies its adapter, the same central context, translation, fallback, review, and source-preservation flow becomes executable without duplicating orchestration logic.

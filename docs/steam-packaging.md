@@ -28,7 +28,7 @@ game-l10n steam-package --workspace <external-workspace> --payload <payload-dire
 game-l10n verify-steam-package --workspace <external-workspace> --package <patch.zip>
 ```
 
-The ZIP is deterministic for identical inputs. It contains a payload manifest, a PowerShell installer, a double-click batch launcher, a short README, and the payload. The package validator checks the exact entry set, sizes, and payload digests.
+The ZIP is deterministic for identical inputs. It contains a payload manifest, a PowerShell installer, a double-click batch launcher, a short README, and the payload. The package validator checks the exact entry set, sizes, artifact fingerprint, and payload digests.
 
 ## Installer behavior
 
@@ -39,13 +39,16 @@ The installer:
 - requires the matching app manifest for automatic discovery;
 - asks for a game directory when automatic discovery fails;
 - verifies package payload hashes once before mutation;
+- denies install, update, and remove without an exact unexpired one-shot runtime approval;
 - refuses collisions with files not owned by its receipt;
 - removes only paths listed by its prior receipt when updating;
 - writes one receipt with the stable patch ID, release ID, owned paths, and hashes;
 - supports install/update, remove, and installed-file verification.
 
+`Verify` is read-only and needs no runtime approval. Before a real mutation, the user must explicitly request the exact action and the agent records it with `game-l10n approve-runtime`; pass the resulting file with `-ApprovalFile`. A first install requires `install`, an existing receipt makes the same installer mode require `update`, and removal requires `remove`. Package creation and verification do not authorize any of them. See `docs/runtime-approval.md`.
+
 It deliberately does not embed the previous package, back up the complete game, fingerprint every Steam-managed file, or implement arbitrary legacy migration. If a title needs a special migration, keep it in the private workspace until it proves reusable and receives separate publication approval.
 
 ## Acceptance checks
 
-For an unchanged payload, one package verification is sufficient. When installer logic changes, run one synthetic install/update/verify/remove lifecycle in a temporary directory. A real game install is a separate user-authorized step and should not be repeated after unrelated documentation or packaging changes.
+For an unchanged payload, one package verification is sufficient. When installer logic changes, run one synthetic install/update/verify/remove lifecycle in a temporary directory. A real game install, update, removal, or launch is a separately approved step and must not be inferred or repeated after unrelated documentation or packaging changes.

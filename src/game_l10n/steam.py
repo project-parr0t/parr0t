@@ -15,7 +15,7 @@ MANIFEST_NAME = "parr0t-patch-manifest.json"
 INSTALLER_PS1 = "Install-Translation-Patch.ps1"
 INSTALLER_BAT = "Install-Translation-Patch.bat"
 README_NAME = "README.txt"
-SCHEMA = "parr0t.steam.patch/v1"
+SCHEMA = "parr0t.steam.patch/v2"
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 _RESERVED_ROOTS = {MANIFEST_NAME.casefold(), INSTALLER_PS1.casefold(), INSTALLER_BAT.casefold(), README_NAME.casefold()}
 _ZIP_TIME = (1980, 1, 1, 0, 0, 0)
@@ -29,6 +29,22 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _manifest_fingerprint(manifest: dict[str, Any]) -> str:
+    lines = [
+        f"schema:{manifest['schema']}",
+        f"patch_id:{manifest['patch_id']}",
+        f"release_id:{manifest['release_id']}",
+        f"display_name:{manifest['display_name']}",
+        f"steam.app_id:{manifest['steam']['app_id']}",
+        f"steam.install_dir:{manifest['steam']['install_dir']}",
+    ]
+    lines.extend(f"steam.required:{item}" for item in manifest["steam"]["required_files"])
+    lines.extend(
+        f"file:{item['path']}\t{item['bytes']}\t{item['sha256']}" for item in manifest["files"]
+    )
+    return _sha256(("\n".join(lines) + "\n").encode("utf-8"))
+
+
 def _safe_relative(value: str, *, field: str) -> str:
     normalized = value.replace("\\", "/").strip("/")
     path = PurePosixPath(normalized)
@@ -36,6 +52,8 @@ def _safe_relative(value: str, *, field: str) -> str:
         raise SteamPackageError(f"{field} must be a safe relative path: {value!r}")
     if ":" in normalized or any(not part for part in path.parts):
         raise SteamPackageError(f"{field} must not contain a drive or empty component: {value!r}")
+    if any(ord(character) < 32 for character in normalized):
+        raise SteamPackageError(f"{field} must not contain control characters: {value!r}")
     return path.as_posix()
 
 
@@ -53,6 +71,8 @@ def _load_spec(path: Path) -> dict[str, Any]:
     patch_id = _string(payload, "patch_id")
     release_id = _string(payload, "release_id")
     display_name = _string(payload, "display_name")
+    if any(ord(character) < 32 for character in display_name):
+        raise SteamPackageError("display_name must not contain control characters")
     if not _SAFE_ID.fullmatch(patch_id):
         raise SteamPackageError("patch_id must contain only letters, digits, dot, underscore, and hyphen")
     if not _SAFE_ID.fullmatch(release_id):
@@ -64,7 +84,11 @@ def _load_spec(path: Path) -> dict[str, Any]:
     install_dir = _string(steam, "install_dir")
     if not app_id.isdecimal():
         raise SteamPackageError("steam.app_id must contain decimal digits only")
-    if any(item in install_dir for item in ("/", "\\", ":")) or install_dir in {".", ".."}:
+    if (
+        any(item in install_dir for item in ("/", "\\", ":"))
+        or install_dir in {".", ".."}
+        or any(ord(character) < 32 for character in install_dir)
+    ):
         raise SteamPackageError("steam.install_dir must be one directory name")
     required_files = steam.get("required_files", [])
     if not isinstance(required_files, list) or not all(isinstance(item, str) for item in required_files):
@@ -119,6 +143,7 @@ def _readme(manifest: dict[str, Any]) -> bytes:
         "3. Choose install, remove, or verify.\n\n"
         "The installer discovers Steam libraries and asks for the game directory when discovery fails.\n"
         "It manages only files owned by this patch receipt and does not modify unrelated game files.\n"
+        "Install, update, and remove require a separate unexpired Parr0t runtime approval file.\n"
     )
     return text.encode("utf-8")
 
@@ -149,6 +174,7 @@ def build_steam_package(payload_root: Path, spec_path: Path, output_path: Path) 
         {"path": relative, "bytes": len(data), "sha256": _sha256(data)}
         for relative, data in payload
     ]
+    manifest["artifact_fingerprint"] = _manifest_fingerprint(manifest)
     manifest_bytes = (json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
     entries = [
         (INSTALLER_BAT, _template(INSTALLER_BAT)),
@@ -183,11 +209,15 @@ def validate_steam_package(package_path: Path) -> dict[str, Any]:
         if not required.issubset(names):
             raise SteamPackageError("Package is missing an installer, manifest, or README")
         manifest = json.loads(archive.read(MANIFEST_NAME).decode("utf-8"))
+        installer_sha256 = _sha256(archive.read(INSTALLER_PS1))
         if manifest.get("schema") != SCHEMA:
             raise SteamPackageError("Package manifest schema is not supported")
         files = manifest.get("files")
         if not isinstance(files, list) or not files:
             raise SteamPackageError("Package manifest contains no payload files")
+        fingerprint = manifest.get("artifact_fingerprint")
+        if not isinstance(fingerprint, str) or fingerprint != _manifest_fingerprint(manifest):
+            raise SteamPackageError("Package artifact fingerprint is invalid")
         expected = required | {f"payload/{item['path']}" for item in files}
         if set(names) != expected:
             raise SteamPackageError("Package entries do not match the manifest")
@@ -201,6 +231,8 @@ def validate_steam_package(package_path: Path) -> dict[str, Any]:
         "schema": manifest["schema"],
         "patch_id": manifest["patch_id"],
         "release_id": manifest["release_id"],
+        "artifact_fingerprint": manifest["artifact_fingerprint"],
+        "installer_sha256": installer_sha256,
         "files": len(files),
         "bytes": package_path.stat().st_size,
         "sha256": _sha256(package_path.read_bytes()),

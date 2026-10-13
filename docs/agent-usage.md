@@ -67,7 +67,9 @@ Provider refusal is a routing event, not a semantic verdict. Return a categorica
 
 ## Patch and publication boundaries
 
-Always create a new patch under the external workspace. Do not overwrite or install into the source root unless the user separately requests installation after reviewing a recoverable patch.
+Always create a new patch under the external workspace. Do not overwrite or install into the source root unless the user separately requests installation after reviewing a recoverable patch. “Build,” “fix,” “test,” “validate,” “inspect logs,” and access to the directory are not installation or launch permission.
+
+Follow `docs/runtime-approval.md` for every real external effect. Record `install`, `update`, `remove`, and `launch` separately, bind the record to the exact artifact and target, and consume it once immediately before the effect. Default to user-executed runtime validation. Never launch a game or generated plugin merely to collect execution data, and never delete runtime data or logs without a separate request.
 
 Reusable extraction, application, packing, or validation code may be promoted only after the user confirms that the patch succeeded. Promotion must copy only generic implementation, public-format knowledge, synthetic fixtures, and neutral documentation. It must not copy job data, filenames, paths, dialogue, translations, logs, counts, hashes, or incident history.
 
@@ -127,4 +129,4 @@ game-l10n steam-package --workspace <external-workspace> --payload <payload-dire
 game-l10n verify-steam-package --workspace <external-workspace> --package <patch.zip>
 ```
 
-The generated installer discovers valid Steam libraries, ignores stale library entries, asks for a directory when discovery fails, and manages only files listed in its receipt. Follow `docs/steam-packaging.md` for the private spec and acceptance checks.
+The generated installer discovers valid Steam libraries, ignores stale library entries, asks for a directory when discovery fails, and manages only files listed in its receipt. Its read-only verification needs no runtime approval; install, update, and remove do. Follow `docs/steam-packaging.md` for packaging and `docs/runtime-approval.md` for the external-effect gate.
