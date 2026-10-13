@@ -10,14 +10,21 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .errors import GameL10nError
+from .release_checkpoint import (
+    CHECKPOINT_NAME,
+    CHECKPOINT_SCHEMA,
+    ReleaseCheckpointError,
+    canonical_checkpoint_bytes,
+    validate_release_checkpoint,
+)
 
 MANIFEST_NAME = "parr0t-patch-manifest.json"
 INSTALLER_PS1 = "Install-Translation-Patch.ps1"
 INSTALLER_BAT = "Install-Translation-Patch.bat"
 README_NAME = "README.txt"
 STATUS_FILE_NAME = "parr0t-patch-status.txt"
-SCHEMA = "parr0t.steam.patch/v3"
-INSTALLER_CONTRACT = "parr0t.windows-installer/v1"
+SCHEMA = "parr0t.steam.patch/v4"
+INSTALLER_CONTRACT = "parr0t.windows-installer/v2"
 INSTALLER_UI_LOCALE = "ko-KR"
 INSTALLER_PUBLIC_ERROR_CODES = frozenset(
     {
@@ -50,6 +57,7 @@ _RESERVED_ROOTS = {
     INSTALLER_PS1.casefold(),
     INSTALLER_BAT.casefold(),
     README_NAME.casefold(),
+    CHECKPOINT_NAME.casefold(),
     STATUS_FILE_NAME.casefold(),
     ".parr0t",
 }
@@ -76,6 +84,10 @@ def _manifest_fingerprint(manifest: dict[str, Any]) -> str:
         "installer.operations:" + ",".join(manifest["installer"]["operations"]),
         f"steam.app_id:{manifest['steam']['app_id']}",
         f"steam.install_dir:{manifest['steam']['install_dir']}",
+        f"checkpoint.path:{manifest['checkpoint']['path']}",
+        f"checkpoint.schema:{manifest['checkpoint']['schema']}",
+        f"checkpoint.bytes:{manifest['checkpoint']['bytes']}",
+        f"checkpoint.sha256:{manifest['checkpoint']['sha256']}",
     ]
     lines.extend(
         "installer.custom:{internal_code}\t{public_code}\t{message}\t{resolution}".format(**item)
@@ -221,6 +233,9 @@ def _load_spec(path: Path) -> dict[str, Any]:
         "patch_id": patch_id,
         "release_id": release_id,
         "display_name": display_name,
+        "checkpoint_file": _safe_relative(
+            _string(payload, "checkpoint_file"), field="checkpoint_file"
+        ),
         "installer": {
             "contract": INSTALLER_CONTRACT,
             "ui_locale": INSTALLER_UI_LOCALE,
@@ -282,6 +297,7 @@ def _readme(manifest: dict[str, Any]) -> bytes:
         "에이전트나 스크립트의 비대화형 설치/복원만 별도의 일회성 승인이 필요합니다.\n"
         f"설치 상태와 패치 ID는 게임 폴더의 {STATUS_FILE_NAME}에서 확인합니다.\n"
         "설치기는 이 패치의 영수증에 기록된 파일만 관리하며 다른 게임 파일은 변경하지 않습니다.\n"
+        f"{CHECKPOINT_NAME}은 향후 번역 수정과 게임 업데이트 대응을 위한 배포 체크포인트입니다.\n"
     )
     return text.encode("utf-8")
 
@@ -307,6 +323,28 @@ def build_steam_package(payload_root: Path, spec_path: Path, output_path: Path) 
         raise SteamPackageError("Package output must not be inside the payload directory")
 
     manifest = _load_spec(spec_path)
+    checkpoint_relative = manifest.pop("checkpoint_file")
+    checkpoint_path = (spec_path.parent / checkpoint_relative).resolve()
+    try:
+        checkpoint_path.relative_to(spec_path.parent.resolve())
+    except ValueError as error:
+        raise SteamPackageError("checkpoint_file must stay beside or below the package spec") from error
+    if not checkpoint_path.is_file():
+        raise SteamPackageError(f"Release checkpoint does not exist: {checkpoint_path}")
+    try:
+        checkpoint, checkpoint_bytes = canonical_checkpoint_bytes(
+            checkpoint_path,
+            expected_patch_id=manifest["patch_id"],
+            expected_release_id=manifest["release_id"],
+        )
+    except ReleaseCheckpointError as error:
+        raise SteamPackageError(str(error)) from error
+    manifest["checkpoint"] = {
+        "path": CHECKPOINT_NAME,
+        "schema": checkpoint["schema"],
+        "bytes": len(checkpoint_bytes),
+        "sha256": _sha256(checkpoint_bytes),
+    }
     payload = _payload_files(payload_root)
     payload_paths = {relative.casefold() for relative, _ in payload}
     for replacement in manifest["installer"]["replace_files"]:
@@ -324,6 +362,7 @@ def build_steam_package(payload_root: Path, spec_path: Path, output_path: Path) 
         (INSTALLER_BAT, _template(INSTALLER_BAT)),
         (INSTALLER_PS1, _template(INSTALLER_PS1)),
         (MANIFEST_NAME, manifest_bytes),
+        (CHECKPOINT_NAME, checkpoint_bytes),
         (README_NAME, _readme(manifest)),
         *((f"payload/{relative}", data) for relative, data in payload),
     ]
@@ -349,14 +388,45 @@ def validate_steam_package(package_path: Path) -> dict[str, Any]:
         names = archive.namelist()
         if len(names) != len(set(name.casefold() for name in names)):
             raise SteamPackageError("Package contains duplicate or case-colliding paths")
-        required = {INSTALLER_BAT, INSTALLER_PS1, MANIFEST_NAME, README_NAME}
+        required = {
+            INSTALLER_BAT,
+            INSTALLER_PS1,
+            MANIFEST_NAME,
+            CHECKPOINT_NAME,
+            README_NAME,
+        }
         if not required.issubset(names):
-            raise SteamPackageError("Package is missing an installer, manifest, or README")
+            raise SteamPackageError(
+                "Package is missing an installer, manifest, release checkpoint, or README"
+            )
         manifest = json.loads(archive.read(MANIFEST_NAME).decode("utf-8"))
         installer_bytes = archive.read(INSTALLER_PS1)
         installer_sha256 = _sha256(installer_bytes)
         if manifest.get("schema") != SCHEMA:
             raise SteamPackageError("Package manifest schema is not supported")
+        checkpoint_contract = manifest.get("checkpoint")
+        checkpoint_bytes = archive.read(CHECKPOINT_NAME)
+        if not isinstance(checkpoint_contract, dict) or checkpoint_contract != {
+            "path": CHECKPOINT_NAME,
+            "schema": CHECKPOINT_SCHEMA,
+            "bytes": len(checkpoint_bytes),
+            "sha256": _sha256(checkpoint_bytes),
+        }:
+            raise SteamPackageError("Package release checkpoint binding is invalid")
+        checkpoint = json.loads(checkpoint_bytes.decode("utf-8"))
+        try:
+            validate_release_checkpoint(
+                checkpoint,
+                expected_patch_id=str(manifest.get("patch_id", "")),
+                expected_release_id=str(manifest.get("release_id", "")),
+            )
+        except ReleaseCheckpointError as error:
+            raise SteamPackageError(str(error)) from error
+        canonical_checkpoint = (
+            json.dumps(checkpoint, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        ).encode("utf-8")
+        if checkpoint_bytes != canonical_checkpoint:
+            raise SteamPackageError("Package release checkpoint is not canonical")
         installer_contract = manifest.get("installer")
         if not isinstance(installer_contract, dict):
             raise SteamPackageError("Package installer contract is not supported")
@@ -421,6 +491,7 @@ def validate_steam_package(package_path: Path) -> dict[str, Any]:
         "patch_id": manifest["patch_id"],
         "release_id": manifest["release_id"],
         "installer_contract": manifest["installer"]["contract"],
+        "checkpoint_schema": manifest["checkpoint"]["schema"],
         "artifact_fingerprint": manifest["artifact_fingerprint"],
         "installer_sha256": installer_sha256,
         "files": len(files),

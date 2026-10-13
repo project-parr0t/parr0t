@@ -116,6 +116,12 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "resume_only_after_user_request": True,
         "hold_patch_when_blocking_target_fails": True,
     },
+    "release_checkpoint": {
+        "required_for_distribution": True,
+        "reuse_verified_unchanged_targets": True,
+        "selective_user_corrections": True,
+        "locale_fallback": "best_effort_declared",
+    },
     "runtime": {
         "default_policy": "deny",
         "approval_ttl_minutes": 30,
@@ -162,6 +168,7 @@ This directory contains private game data and translation artifacts. It is inten
 29. Context analysis is complete only when the CLI records a successful per-part execution attestation and evidence coverage gate. A partial artifact, interrupted worker, capacity error, or file left by a failed route cannot unblock translation. Route operational failures through the configured context fallback; if every route fails, stop.
 30. Reusing an existing candidate proves neither quality nor review. When the user requests a complete re-review, run `game-l10n review-existing` so every current target receives a fresh independent semantic verdict under the current context. Do not review only automatically flagged IDs and do not describe identifier, digest, or structure checks as semantic review.
 31. Capacity, timeout, rate-limit, quota, authentication, malformed-response, and other operational failures enter the metadata-only failure queue. Do not retry that queue after the turn ends until the user explicitly requests resumption. Extractors mark indispensable targets with `metadata.blocking_on_failure=true`; if any such target remains unresolved, keep all results in the private held checkpoint and emit no new patch artifact.
+32. Every distributable package includes `parr0t-release-checkpoint.json` as a machine-readable continuation point. When a prior release and a game folder are supplied, validate that checkpoint first and re-extract the current inventories. A new game build invalidates direct installation compatibility, not every translation: reuse a reviewed target only when its source, location, dependency, target-scoped context/review, and compatible SDK-adapter bindings still match. A user-requested correction invalidates only the named target IDs and their declared reverse dependencies unless the user requests a complete review or the global review policy changed. Implement a verified missing-locale fallback to a base locale, source text, or a nonempty placeholder when the selected SDK can do so safely; otherwise record the fallback as unsupported with a reason and never claim it exists.
 
 ## Data boundary
 

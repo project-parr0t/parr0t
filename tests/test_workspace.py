@@ -70,6 +70,13 @@ class WorkspaceTests(unittest.TestCase):
         self.assertTrue(config["coverage"]["separate_static_and_runtime_completion"])
         self.assertTrue(config["failure_queue"]["resume_only_after_user_request"])
         self.assertTrue(config["failure_queue"]["hold_patch_when_blocking_target_fails"])
+        self.assertTrue(config["release_checkpoint"]["required_for_distribution"])
+        self.assertTrue(config["release_checkpoint"]["reuse_verified_unchanged_targets"])
+        self.assertTrue(config["release_checkpoint"]["selective_user_corrections"])
+        self.assertEqual(
+            config["release_checkpoint"]["locale_fallback"],
+            "best_effort_declared",
+        )
         self.assertEqual(config["runtime"]["default_policy"], "deny")
         self.assertTrue(config["runtime"]["separate_install_and_launch"])
         self.assertTrue(config["runtime"]["user_executes_by_default"])
@@ -90,6 +97,9 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("game-l10n verify-inventory", generated_agents)
         self.assertIn("game-l10n review-existing", generated_agents)
         self.assertIn("metadata.blocking_on_failure=true", generated_agents)
+        self.assertIn("parr0t-release-checkpoint.json", generated_agents)
+        self.assertIn("reuse a reviewed target only", generated_agents)
+        self.assertIn("fallback as unsupported", generated_agents)
         self.assertIn("preserve it once", generated_agents)
         self.assertIn("Never read or edit `localconfig.vdf`", generated_agents)
         self.assertIn("ad hoc game-workspace binary", generated_agents)

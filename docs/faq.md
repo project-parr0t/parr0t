@@ -193,3 +193,19 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Diagnosis:** Inspect the metadata-only failure queue for categorical failure codes and `blocking` state; do not expose source text or provider prose to the control plane.
 - **Resolution:** Keep operational failures queued until the user explicitly asks to resume. If any queued target is marked `metadata.blocking_on_failure=true`, retain all results as a private held checkpoint and emit no new patch.
 - **Prevention:** Mark required targets during extraction, preserve the failure queue across turns, bind it to the inventory fingerprint, and resume only through `game-l10n resume-failures`.
+
+## A prior release is available but the agent translates everything again
+
+- **Symptom:** Supplying a released package with the current game folder does not shorten the next translation or a small wording correction triggers a full translation and review pass.
+- **General cause:** The distribution lacks a validated continuation checkpoint, or reuse was decided from filenames and target IDs without comparing source, location, dependency, context, review-policy, SDK, and game-build bindings.
+- **Diagnosis:** Validate `parr0t-release-checkpoint.json`, compare its manifest digest and IDs, regenerate both current inventories, and count exact reusable, invalidated, new, and unresolved targets without exposing text to the control plane.
+- **Resolution:** Reuse only matching `reviewed` targets. Translate and review new, changed, `source_preserved`, or otherwise invalidated targets; for a user-requested correction, add the selected stable IDs and their transitive reverse dependencies. Run a full semantic review only when the user requested one or a global binding changed.
+- **Prevention:** Include the checkpoint in every distribution, keep stable SDK-defined IDs and dependency fingerprints, and follow `docs/release-checkpoint.md` before making model calls.
+
+## A game update introduces a locale key that the patch does not contain
+
+- **Symptom:** A newly updated game displays no text or crashes while resolving a localized key absent from an older patch.
+- **General cause:** The engine requires a complete locale shape or replaces locale data wholesale, and the patch has no verified lookup fallback for unknown keys.
+- **Diagnosis:** In a synthetic SDK fixture, add an unknown key with the same type and container shape as the engine resource and observe whether lookup reaches the base locale, source text, a placeholder, or an invalid state.
+- **Resolution:** When the SDK supports it safely, preserve missing keys through a verified base-locale, exact-source, or nonempty-placeholder fallback while retaining placeholders and data shape. If no safe mechanism exists, record the checkpoint fallback as `unsupported` with a neutral reason and retain strict build binding instead of claiming protection.
+- **Prevention:** Declare and test the fallback mode in the engine SDK, bind it into each release checkpoint, and never treat fallback as permission to install on an unvalidated game build.

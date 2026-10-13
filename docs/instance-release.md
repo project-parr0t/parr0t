@@ -28,6 +28,7 @@ Treat the source commit, tag, release metadata, committed distribution output, a
 
 - Build once from a clean commit, then upload those exact bytes. Do not rebuild between verification and upload.
 - Record the source commit, tag, release ID, package digest, manifest digest, and every released file digest in the instance repository.
+- Include the validated `parr0t-release-checkpoint.json` defined by `docs/release-checkpoint.md`; bind its digest and schema into the package manifest so the release itself can resume future work without retranslating unchanged reviewed targets.
 - If a deployable archive or file is committed, the corresponding release asset must be byte-identical. If only build source is committed, the tagged source must contain the complete deterministic build recipe and the recorded output digest must match the uploaded asset.
 - A release must not contain untracked first-party code, translation data, installers, manifests, or support files absent from the tagged source or its recorded build inputs.
 - A third-party runtime may be release-only when redistribution or repository-size constraints justify it, but its exact name, version, source, license, and digest must be declared in the tagged source and release manifest. Never describe a first-party component as a third-party exception.
@@ -89,6 +90,7 @@ Before an agent publishes an instance release, it must verify all of the followi
 10. Every launcher wrapper matches the approved Parr0t wrapper release and its architecture, source tag, reproducible-build record, Authenticode result, and published hashes; no Steam client configuration is edited and Steam is never terminated.
 11. The existing README is preserved except for reviewed, release-specific edits.
 12. Release notes identify the release ID, source commit, supported builds, changes, installation/update caveats, and asset checksums.
-13. The uploaded assets are the same bytes that passed verification, and their published digests are checked once after upload.
+13. `parr0t-release-checkpoint.json` validates against the package IDs, SDK/build/inventory bindings, target digests, and declared locale-fallback result; it contains no separate raw-source copy or private work records, and any released source-preserved target remains explicitly unresolved.
+14. The uploaded assets are the same bytes that passed verification, and their published digests are checked once after upload.
 
 If any gate fails, keep the staged release in the private workspace and report the mismatch. Do not publish a best-effort or partially documented release.

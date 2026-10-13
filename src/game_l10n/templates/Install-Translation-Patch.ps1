@@ -10,6 +10,7 @@ $ErrorActionPreference = "Stop"
 $InstallerPath = $MyInvocation.MyCommand.Path
 $PackageRoot = Split-Path -Parent $InstallerPath
 $ManifestPath = Join-Path $PackageRoot "parr0t-patch-manifest.json"
+$CheckpointPath = Join-Path $PackageRoot "parr0t-release-checkpoint.json"
 $PayloadRoot = Join-Path $PackageRoot "payload"
 $script:InteractiveRun = $Mode -eq "Menu"
 $script:MutationStarted = $false
@@ -28,7 +29,7 @@ function Get-PublicFailure([string]$InternalCode) {
         }
     }
     switch -Regex ($InternalCode) {
-        '^E_(MANIFEST_MISSING|UNSAFE_PATH|ARTIFACT_FINGERPRINT|PAYLOAD_MISSING|PAYLOAD_SIZE|PAYLOAD_HASH)$' {
+        '^E_(MANIFEST_MISSING|UNSAFE_PATH|ARTIFACT_FINGERPRINT|CHECKPOINT_MISSING|CHECKPOINT_SIZE|CHECKPOINT_HASH|PAYLOAD_MISSING|PAYLOAD_SIZE|PAYLOAD_HASH)$' {
             return @("PARR0T-E001", "설치 패키지가 손상되었거나 구성이 올바르지 않습니다.", "ZIP을 다시 다운로드한 뒤 모든 파일을 한 폴더에 압축 해제해 주세요.")
         }
         '^E_GAME_ROOT_INVALID$' {
@@ -303,6 +304,10 @@ function Get-ManifestFingerprint($Manifest) {
     $lines.Add("installer.operations:$(@($Manifest.installer.operations) -join ',')")
     $lines.Add("steam.app_id:$($Manifest.steam.app_id)")
     $lines.Add("steam.install_dir:$($Manifest.steam.install_dir)")
+    $lines.Add("checkpoint.path:$($Manifest.checkpoint.path)")
+    $lines.Add("checkpoint.schema:$($Manifest.checkpoint.schema)")
+    $lines.Add("checkpoint.bytes:$($Manifest.checkpoint.bytes)")
+    $lines.Add("checkpoint.sha256:$($Manifest.checkpoint.sha256)")
     foreach ($custom in @($Manifest.installer.custom_errors)) {
         $lines.Add(("installer.custom:{0}`t{1}`t{2}`t{3}" -f $custom.internal_code, $custom.public_code, $custom.message, $custom.resolution))
     }
@@ -369,6 +374,13 @@ function Use-RuntimeApproval([string]$Root, $Manifest, [string]$Action) {
 function Test-Package($Manifest) {
     if ((Get-ManifestFingerprint $Manifest) -ne $Manifest.artifact_fingerprint) {
         throw "E_ARTIFACT_FINGERPRINT"
+    }
+    if (-not (Test-Path -LiteralPath $CheckpointPath -PathType Leaf)) { throw "E_CHECKPOINT_MISSING" }
+    if ((Get-Item -LiteralPath $CheckpointPath).Length -ne [int64]$Manifest.checkpoint.bytes) {
+        throw "E_CHECKPOINT_SIZE"
+    }
+    if ((Get-Sha256 $CheckpointPath) -ne [string]$Manifest.checkpoint.sha256) {
+        throw "E_CHECKPOINT_HASH"
     }
     foreach ($file in @($Manifest.files)) {
         $source = Get-SafeTarget $PayloadRoot $file.path

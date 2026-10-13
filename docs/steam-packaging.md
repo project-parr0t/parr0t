@@ -11,6 +11,7 @@ Place the completed files under a payload directory in the external workspace. C
   "patch_id": "fixture-localization",
   "release_id": "r1",
   "display_name": "Fixture localization patch",
+  "checkpoint_file": "release-checkpoint.json",
   "replace_files": [
     {
       "path": "fixture-launcher.exe",
@@ -33,7 +34,7 @@ Place the completed files under a payload directory in the external workspace. C
 }
 ```
 
-`patch_id` is the stable status/receipt identity. `release_id` changes when a new package replaces the previous release. `required_files` is optional and validates a manually selected game root. `replace_files` is optional and is reserved for payload paths that must replace and later restore an original game file; omit `backup_path` to use the private `.parr0t/backups/<patch-id>/...` default. `custom_errors` is optional and uses the isolated `PARR0T-<SCOPE>-E###` namespace. Real identifiers and payload paths stay in the private workspace and generated ZIP; they must not be committed to Parr0t.
+`patch_id` is the stable status/receipt identity. `release_id` changes when a new package replaces the previous release. `checkpoint_file` is required, is resolved beside or below the private spec, and must satisfy `docs/release-checkpoint.md` with matching patch/release IDs. The builder canonicalizes it and places it at ZIP root as `parr0t-release-checkpoint.json`; it is release metadata and is not copied into the game. `required_files` is optional and validates a manually selected game root. `replace_files` is optional and is reserved for payload paths that must replace and later restore an original game file; omit `backup_path` to use the private `.parr0t/backups/<patch-id>/...` default. `custom_errors` is optional and uses the isolated `PARR0T-<SCOPE>-E###` namespace. Real identifiers and payload paths stay in the private workspace and generated ZIP; they must not be committed to Parr0t.
 
 ## Build and verify
 
@@ -42,7 +43,7 @@ game-l10n steam-package --workspace <external-workspace> --payload <payload-dire
 game-l10n verify-steam-package --workspace <external-workspace> --package <patch.zip>
 ```
 
-The ZIP is deterministic for identical inputs. It contains only the fixed files and payload defined by `docs/installer-contract.md`; agent harness files and workspace state are forbidden. The package validator checks the exact entry set, installer contract, result-code registry, sizes, artifact fingerprint, and payload digests.
+The ZIP is deterministic for identical inputs. It contains only the fixed files, release checkpoint, and payload defined by `docs/installer-contract.md`; agent harness files and workspace state are forbidden. The package validator checks the exact entry set, installer contract, result-code registry, sizes, artifact fingerprint, checkpoint schema/binding/digest, and payload digests.
 
 ## Installer behavior
 
