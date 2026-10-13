@@ -107,6 +107,15 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "delegate_simple_tasks": False,
         "native_shard_records": 256,
     },
+    "coverage": {
+        "require_independent_inventory": True,
+        "separate_static_and_runtime_completion": True,
+        "runtime_execution_requires_user_approval": True,
+    },
+    "failure_queue": {
+        "resume_only_after_user_request": True,
+        "hold_patch_when_blocking_target_fails": True,
+    },
     "runtime": {
         "default_policy": "deny",
         "approval_ttl_minutes": 30,
@@ -149,6 +158,10 @@ This directory contains private game data and translation artifacts. It is inten
 25. Player-facing Windows installers follow the repository `docs/installer-contract.md`, not this agent harness. Keep the fixed ZIP layout and the public Install, Restore, and Verify installed-state operations. Use `<game-root>/parr0t-patch-status.txt` as the first patch-ID authority and the matching receipt for owned files. Explicitly declare any original file that must be replaced; preserve it once, verify and reuse that backup on update, and put it back on Restore. Core result codes are fixed; SDK/title-specific failures use a separate `PARR0T-<SCOPE>-E###` registry. Never copy `AGENTS.md`, approval JSON, prompts, task state, logs, or workspace policy into a distribution. An interactive player's menu choice plus final confirmation needs no agent approval; noninteractive mutation still does.
 26. For Steam discovery or integration, follow the repository `docs/steam-faq.md` and `docs/wrapper-executable.md`. Use exact App ID metadata and binding checks and ask when the validated game root is ambiguous. Never read or edit `localconfig.vdf`, Steam launch options, or per-account client configuration, and never require, close, kill, or restart Steam. Integrate the Steam Play button only with exact approved, reproducible, signature/hash-verified Parr0t wrapper bytes for the target architecture at explicitly declared main-executable paths; preserve each real original through `replace_files` and do not use `.lnk` or an ad hoc game-workspace binary. Require the target game to be closed for locked replacements; close only the validated game process after separate player confirmation.
 27. The control plane must proactively use the repository `skills/request-scope-guard/SKILL.md` whenever the user limits or narrows scope, asks for read-only inspection/diagnosis, or a contemplated action is optional, unrequested, destructive, or externally consequential. Prefer a discovered `$request-scope-guard`; otherwise read and apply the bundled file directly. Re-evaluate after every user message and give workers only the exact authorized targets and side effects. No worker may infer permission to expand scope, clean up data, commit/push, publish, deploy, install, launch, or contact an external system.
+28. Do not start context analysis or translation from one extractor's manifest alone. Produce a primary and an independently implemented ordered inventory using the selected SDK, declare user-visible exclusions, and pass `game-l10n verify-inventory`. `manifest_missing=0` describes only result alignment; it must never be reported as zero in-game omissions. Runtime completeness is a separate state and remains `not_run` until metadata from a separately authorized or user-executed runtime observation is recorded.
+29. Context analysis is complete only when the CLI records a successful per-part execution attestation and evidence coverage gate. A partial artifact, interrupted worker, capacity error, or file left by a failed route cannot unblock translation. Route operational failures through the configured context fallback; if every route fails, stop.
+30. Reusing an existing candidate proves neither quality nor review. When the user requests a complete re-review, run `game-l10n review-existing` so every current target receives a fresh independent semantic verdict under the current context. Do not review only automatically flagged IDs and do not describe identifier, digest, or structure checks as semantic review.
+31. Capacity, timeout, rate-limit, quota, authentication, malformed-response, and other operational failures enter the metadata-only failure queue. Do not retry that queue after the turn ends until the user explicitly requests resumption. Extractors mark indispensable targets with `metadata.blocking_on_failure=true`; if any such target remains unresolved, keep all results in the private held checkpoint and emit no new patch artifact.
 
 ## Data boundary
 

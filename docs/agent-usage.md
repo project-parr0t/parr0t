@@ -35,7 +35,8 @@ The external workspace stores extracted content, context packs, translations, ca
 ```text
 instructions and approvals
   -> format discovery and SDK selection
-  -> read-only extraction into the external workspace
+  -> two-method read-only extraction into the external workspace
+  -> independent inventory coverage gate
   -> complete ordered-source typed context analysis
   -> primary translation for every target
   -> fallback translation for refused or failed targets only
@@ -43,8 +44,11 @@ instructions and approvals
   -> selective rewrite for flagged targets only
   -> fallback judgment for refused or failed reviews only
   -> deterministic integrity validation
-  -> new patch and metadata-only completion report
+  -> static/review/runtime completion attestation
+  -> new patch, or a private held checkpoint when a blocking target failed
 ```
+
+Follow `docs/coverage-gates.md`. An extractor's own manifest cannot prove that it found every target. The primary and independent inventories must agree and declare no excluded user-visible scope before context analysis starts. Report result-manifest alignment, semantic review coverage, and runtime coverage separately; never shorten `manifest_missing_count=0` to “no in-game omissions.”
 
 Context analysis must finish before translation. `project.context_mode` defaults to `auto` and may be set to `narrative`, `functional`, `knowledge`, or `hybrid`. Auto mode uses stable segment metadata plus speaker/scene evidence to select the smallest suitable schema. Narrative context covers story, scene, relationship, voice, and supported references. Functional context covers screens, actions, states, conditions, units, controls, and layout constraints. Knowledge context covers ordered nodes, prerequisites, terminology, and cross-entry consistency. Hybrid context combines only the domains present in the source.
 
@@ -52,7 +56,11 @@ The extraction layer should set `metadata.context_mode` or `metadata.context_dom
 
 The compact judge evaluates effect as well as denotational accuracy. It flags mechanical literalism, lost recognition cues, unsuitable tone/rhythm, changed UI function or conditions, unit errors, broken knowledge order, and material layout risk, while receiving only target-relevant evidence to keep token cost bounded.
 
+Stable IDs and digests permit reuse but do not prove semantic quality. When the user requests a complete review of an existing translation, use `game-l10n review-existing`; it sends every current candidate, including previously unflagged entries, through a fresh independent verdict. A flagged-subset pass must be described as targeted review, never full review.
+
 If every context-analysis route fails, stop before translation. If every permitted translation route fails for a target, preserve the exact source and mark it `source_preserved`. Never cancel unrelated targets because one target or batch was refused.
+
+A context artifact is usable only with a matching successful per-part execution attestation. An interrupted worker or operational provider failure cannot be treated as complete merely because it wrote a partial file. Capacity, timeout, rate-limit, quota, authentication, malformed-response, and similar failures enter the metadata-only failure queue. Retry that queue only after a later explicit user request. If an unresolved target has `metadata.blocking_on_failure=true`, hold the entire patch and emit no new distributable artifact.
 
 ## Provider roles
 
@@ -120,6 +128,8 @@ python -m unittest discover -s tests -t . -v
 ```
 
 For a localization job, the agent must also validate format structure, placeholders, markup, control codes, glossary constraints, source immutability, patch recoverability, and output paths using the selected SDK branch.
+
+It must also preserve the four separate completion states from `docs/coverage-gates.md`. Real runtime observation remains optional and separately authorized, but without it the report must say `runtime_complete=false` rather than implying full in-game coverage.
 
 The final report to the parent contains only counts, categorical states, deterministic issue codes, artifact paths, and the next required approval. Private content remains in the external workspace.
 

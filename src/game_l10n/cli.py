@@ -10,8 +10,22 @@ from pathlib import Path
 from typing import Any
 
 from .errors import GameL10nError
+from .coverage import (
+    completion_attestation,
+    record_runtime_coverage,
+    require_inventory_attestation,
+    runtime_coverage_state,
+    save_completion_attestation,
+    save_inventory_attestation,
+)
 from .context_analysis import ContextAnalyzer, analyze_with_cache
-from .formats import read_segments, write_results
+from .failure_queue import held_checkpoint_path, load_failure_queue, update_failure_queue
+from .formats import (
+    read_existing_translations,
+    read_segments,
+    read_translation_results,
+    write_results,
+)
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext
 from .native_pass import import_native_shard, merge_native_pass, prepare_native_tasks
 from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
@@ -149,6 +163,90 @@ def _analyze_context(
     )
 
 
+def _finalize_translation_results(
+    *,
+    work_dir: Path,
+    target_segments: list,
+    inventory_segments: list,
+    results: list,
+    destination: Path,
+    inventory_state: dict[str, Any],
+    review_required: bool,
+) -> tuple[dict[str, Any], int]:
+    queue = update_failure_queue(
+        work_dir,
+        target_segments,
+        results,
+        inventory_fingerprint=inventory_state["primary_fingerprint"],
+    )
+    runtime = runtime_coverage_state(work_dir, inventory_state["primary_fingerprint"])
+    completion = completion_attestation(
+        target_segments,
+        results,
+        inventory_segments=inventory_segments,
+        inventory=inventory_state,
+        runtime=runtime,
+        review_required=review_required,
+    )
+    completion_path = save_completion_attestation(work_dir, completion)
+    failed = sum(item.status == "failed" for item in results)
+    source_preserved = sum(item.status == "source_preserved" for item in results)
+    checkpoint = held_checkpoint_path(work_dir)
+    if queue["pending_count"]:
+        write_results(checkpoint, results)
+    if queue["blocking_count"]:
+        return (
+            {
+                "status": "held",
+                "segments": len(results),
+                "failed": failed,
+                "source_preserved": source_preserved,
+                "failure_queue": {
+                    "pending": queue["pending_count"],
+                    "operational": queue["operational_count"],
+                    "blocking": queue["blocking_count"],
+                },
+                "artifact_emitted": False,
+                "held_checkpoint": str(checkpoint),
+                "completion_attestation": str(completion_path),
+                "target_completion": completion["target_completion"],
+                "static_completion": completion["static_completion"],
+                "runtime_completion": completion["runtime_completion"],
+                "issue_codes": completion["issue_codes"],
+            },
+            3,
+        )
+    write_results(destination, results)
+    static_complete = completion["static_completion"]
+    target_complete = completion["target_completion"]
+    return (
+        {
+            "status": (
+                "static_complete"
+                if static_complete
+                else "target_scope_complete"
+                if target_complete
+                else "incomplete"
+            ),
+            "segments": len(results),
+            "failed": failed,
+            "source_preserved": source_preserved,
+            "failure_queue": {
+                "pending": queue["pending_count"],
+                "operational": queue["operational_count"],
+                "blocking": queue["blocking_count"],
+            },
+            "artifact_emitted": True,
+            "output": str(destination),
+            "resume_checkpoint": str(checkpoint) if queue["pending_count"] else None,
+            "completion_attestation": str(completion_path),
+            "target_completion": target_complete,
+            "static_completion": static_complete,
+            "runtime_completion": completion["runtime_completion"],
+            "issue_codes": completion["issue_codes"],
+        },
+        0 if target_complete else 2,
+    )
 def cmd_init(args: argparse.Namespace) -> int:
     initialize_workspace(
         Path(args.workspace),
@@ -176,7 +274,8 @@ def cmd_policy(args: argparse.Namespace) -> int:
 
 def cmd_translate(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
-    require_sdk_selection(load_config(work_dir))
+    config = load_config(work_dir)
+    require_sdk_selection(config)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     destination = _path_in_workspace(work_dir, args.output)
     if destination == source:
@@ -185,38 +284,170 @@ def cmd_translate(args: argparse.Namespace) -> int:
     context_source = _path_in_workspace(
         work_dir, args.context_input or args.input, must_exist=True
     )
+    if destination == context_source:
+        raise ValueError("Translation output must not overwrite the verified context inventory")
+    inventory_state = require_inventory_attestation(work_dir, context_source)
+    inventory_segments = read_segments(context_source)
     context_pack, context_cached = _analyze_context(
         work_dir,
-        read_segments(context_source),
+        inventory_segments,
         force=args.force_context,
         context_mode=args.context_mode,
     )
     orchestrator = _orchestrator(work_dir, context_pack)
     results = orchestrator.translate_many(segments, force=args.force)
-    write_results(destination, results)
-    failed = sum(item.status == "failed" for item in results)
-    source_preserved = sum(item.status == "source_preserved" for item in results)
-    cached = sum(item.from_cache for item in results)
-    print(
-        json.dumps(
-            {
-                "segments": len(results),
-                "failed": failed,
-                "source_preserved": source_preserved,
-                "cached": cached,
-                "context_cached": context_cached,
-                "context_mode": context_pack.context_mode,
-                "output": str(destination),
-            }
-        )
+    summary, exit_code = _finalize_translation_results(
+        work_dir=work_dir,
+        target_segments=segments,
+        inventory_segments=inventory_segments,
+        results=results,
+        destination=destination,
+        inventory_state=inventory_state,
+        review_required=bool(config.get("routing", {}).get("require_review", True)),
     )
-    return 2 if failed else 0
+    summary.update(
+        {
+            "cached": sum(item.from_cache for item in results),
+            "context_cached": context_cached,
+            "context_mode": context_pack.context_mode,
+        }
+    )
+    print(json.dumps(summary))
+    return exit_code
+
+
+def cmd_review_existing(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_selection(config)
+    source = _path_in_workspace(work_dir, args.input, must_exist=True)
+    existing_path = _path_in_workspace(work_dir, args.existing, must_exist=True)
+    destination = _path_in_workspace(work_dir, args.output)
+    if destination in {source, existing_path}:
+        raise ValueError("Full re-review output must be a new artifact")
+    segments = read_segments(source)
+    context_source = _path_in_workspace(
+        work_dir, args.context_input or args.input, must_exist=True
+    )
+    if destination == context_source:
+        raise ValueError("Full re-review output must not overwrite the verified context inventory")
+    inventory_state = require_inventory_attestation(work_dir, context_source)
+    inventory_segments = read_segments(context_source)
+    context_pack, context_cached = _analyze_context(
+        work_dir,
+        inventory_segments,
+        force=args.force_context,
+        context_mode=args.context_mode,
+    )
+    candidates = read_existing_translations(existing_path)
+    results = _orchestrator(work_dir, context_pack).review_existing_many(segments, candidates)
+    summary, exit_code = _finalize_translation_results(
+        work_dir=work_dir,
+        target_segments=segments,
+        inventory_segments=inventory_segments,
+        results=results,
+        destination=destination,
+        inventory_state=inventory_state,
+        review_required=True,
+    )
+    summary.update(
+        {
+            "mode": "full_existing_candidate_review",
+            "context_cached": context_cached,
+            "context_mode": context_pack.context_mode,
+        }
+    )
+    print(json.dumps(summary))
+    return exit_code
+
+
+def cmd_resume_failures(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_selection(config)
+    source = _path_in_workspace(work_dir, args.input, must_exist=True)
+    destination = _path_in_workspace(work_dir, args.output)
+    context_source = _path_in_workspace(
+        work_dir, args.context_input or args.input, must_exist=True
+    )
+    if destination in {source, context_source}:
+        raise ValueError("Resumed output must not overwrite source or context inventory data")
+    inventory_state = require_inventory_attestation(work_dir, context_source)
+    queue = load_failure_queue(work_dir, inventory_state["primary_fingerprint"])
+    retry_ids = {
+        item["target_id"]
+        for item in queue["entries"]
+        if item.get("retryable_on_user_resume") is True
+    }
+    if not retry_ids:
+        raise ValueError("Failure queue has no targets eligible for user-requested resume")
+    segments = read_segments(source)
+    segment_by_id = {item.id: item for item in segments}
+    if not retry_ids <= set(segment_by_id):
+        raise ValueError("Failure queue contains targets absent from the current source")
+    checkpoint = held_checkpoint_path(work_dir)
+    if not checkpoint.is_file():
+        raise ValueError("Held result checkpoint is missing")
+    previous = {item.segment_id: item for item in read_translation_results(checkpoint)}
+    if set(previous) != set(segment_by_id):
+        raise ValueError("Held result checkpoint does not match the current target set")
+    inventory_segments = read_segments(context_source)
+    context_pack, context_cached = _analyze_context(
+        work_dir,
+        inventory_segments,
+        force=args.force_context,
+        context_mode=args.context_mode,
+    )
+    retry_segments = [item for item in segments if item.id in retry_ids]
+    retried = _orchestrator(work_dir, context_pack).translate_many(retry_segments, force=True)
+    previous.update({item.segment_id: item for item in retried})
+    merged = [previous[item.id] for item in segments]
+    summary, exit_code = _finalize_translation_results(
+        work_dir=work_dir,
+        target_segments=segments,
+        inventory_segments=inventory_segments,
+        results=merged,
+        destination=destination,
+        inventory_state=inventory_state,
+        review_required=bool(config.get("routing", {}).get("require_review", True)),
+    )
+    summary.update(
+        {
+            "mode": "failure_queue_resume",
+            "retried": len(retried),
+            "context_cached": context_cached,
+            "context_mode": context_pack.context_mode,
+        }
+    )
+    print(json.dumps(summary))
+    return exit_code
+
+
+def cmd_verify_inventory(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    require_sdk_selection(load_config(work_dir))
+    primary = _path_in_workspace(work_dir, args.primary, must_exist=True)
+    independent = _path_in_workspace(work_dir, args.independent, must_exist=True)
+    if primary == independent:
+        raise ValueError("Primary and independent inventory files must differ")
+    state = save_inventory_attestation(work_dir, primary, independent)
+    print(json.dumps(state))
+    return 0 if state["static_complete"] else 1
+
+
+def cmd_record_runtime_coverage(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    report = _path_in_workspace(work_dir, args.report, must_exist=True)
+    state = record_runtime_coverage(work_dir, report)
+    print(json.dumps(state))
+    return 0 if state["runtime_complete"] else 1
 
 
 def cmd_analyze_context(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     require_sdk_selection(load_config(work_dir))
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
+    require_inventory_attestation(work_dir, source)
     context_pack, cached = _analyze_context(
         work_dir,
         read_segments(source),
@@ -231,6 +462,7 @@ def cmd_analyze_context(args: argparse.Namespace) -> int:
         json.dumps(
             {
                 "cached": cached,
+                "gate_status": "success",
                 "output": str(output),
                 "context_mode": context_pack.context_mode,
                 "scenes": len(context_pack.scene_summaries),
@@ -327,11 +559,33 @@ def cmd_status(args: argparse.Namespace) -> int:
     else:
         if not any((work_dir / "inputs").glob("*")):
             actions.append("unpack_and_extract_ordered_script")
+        inventory_state_path = work_dir / ".game-l10n" / "inventory-attestation.json"
+        inventory_verified = False
+        if not inventory_state_path.exists():
+            actions.append("verify_independent_source_inventory")
+        else:
+            inventory_state = json.loads(inventory_state_path.read_text(encoding="utf-8"))
+            inventory_verified = inventory_state.get("status") == "static_verified"
+            if not inventory_verified:
+                actions.append("resolve_source_inventory_gaps")
         context_path = _path_in_workspace(
             work_dir, config.get("files", {}).get("context_pack", "context/context-pack.json")
         )
-        if not context_path.exists():
+        context_state_path = work_dir / ".game-l10n" / "context-state.json"
+        context_ready = context_path.exists() and context_state_path.exists()
+        if context_ready:
+            context_state = json.loads(context_state_path.read_text(encoding="utf-8"))
+            context_ready = (
+                context_state.get("status") == "success"
+                and context_state.get("execution", {}).get("status") == "success"
+            )
+        if inventory_verified and not context_ready:
             actions.append("analyze_complete_script_context")
+        failure_queue_path = work_dir / ".game-l10n" / "failure-queue.json"
+        if failure_queue_path.exists():
+            queue = json.loads(failure_queue_path.read_text(encoding="utf-8"))
+            if queue.get("pending_count", 0):
+                actions.append("await_explicit_user_request_to_resume_failure_queue")
     print(
         json.dumps(
             {
@@ -531,6 +785,68 @@ def build_parser() -> argparse.ArgumentParser:
     translate.add_argument("--force", action="store_true")
     translate.add_argument("--force-context", action="store_true")
     translate.set_defaults(func=cmd_translate)
+
+    review_existing = sub.add_parser(
+        "review-existing",
+        help="Independently re-review every reused candidate against the current full context",
+    )
+    review_existing.add_argument("--workspace", required=True)
+    review_existing.add_argument("--input", required=True, help="Current ordered source targets")
+    review_existing.add_argument("--existing", required=True, help="Prior result artifact")
+    review_existing.add_argument(
+        "--context-input",
+        help="Verified complete ordered inventory; defaults to --input",
+    )
+    review_existing.add_argument(
+        "--context-mode",
+        choices=[mode.value for mode in ContextMode],
+        help="Override project.context_mode for this run",
+    )
+    review_existing.add_argument("--output", required=True)
+    review_existing.add_argument("--force-context", action="store_true")
+    review_existing.set_defaults(func=cmd_review_existing)
+
+    resume = sub.add_parser(
+        "resume-failures",
+        help="Retry the metadata-only failure queue after a new explicit user request",
+    )
+    resume.add_argument("--workspace", required=True)
+    resume.add_argument("--input", required=True, help="Current ordered source targets")
+    resume.add_argument(
+        "--context-input",
+        help="Verified complete ordered inventory; defaults to --input",
+    )
+    resume.add_argument(
+        "--context-mode",
+        choices=[mode.value for mode in ContextMode],
+        help="Override project.context_mode for this run",
+    )
+    resume.add_argument("--output", required=True)
+    resume.add_argument("--force-context", action="store_true")
+    resume.add_argument(
+        "--user-requested",
+        action="store_true",
+        required=True,
+        help="Assert that the user explicitly requested resuming the saved failure queue",
+    )
+    resume.set_defaults(func=cmd_resume_failures)
+
+    inventory = sub.add_parser(
+        "verify-inventory",
+        help="Cross-check two independently produced complete source inventories",
+    )
+    inventory.add_argument("--workspace", required=True)
+    inventory.add_argument("--primary", required=True)
+    inventory.add_argument("--independent", required=True)
+    inventory.set_defaults(func=cmd_verify_inventory)
+
+    runtime_coverage = sub.add_parser(
+        "record-runtime-coverage",
+        help="Validate metadata-only runtime observations without launching the game",
+    )
+    runtime_coverage.add_argument("--workspace", required=True)
+    runtime_coverage.add_argument("--report", required=True)
+    runtime_coverage.set_defaults(func=cmd_record_runtime_coverage)
 
     context = sub.add_parser("analyze-context", help="Analyze complete source context before translation")
     context.add_argument("--workspace", required=True)

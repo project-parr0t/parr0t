@@ -169,3 +169,27 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Diagnosis:** Compare `parr0t-patch-status.txt`, the receipt's patch ID and original records, the current replacement set, and the sizes/hashes of both installed targets and backups. Do not move files while diagnosing.
 - **Resolution:** Stop before mutation on any mismatch. Use the original matching installer to Restore, then install a release whose declared replacement and backup paths are correct. Never adopt an unknown existing backup.
 - **Prevention:** Declare every original replacement in the package spec, preserve it only on first install, require the same replacement set on update, verify both copies, and exercise install/update/verify/restore with a synthetic replacement file.
+
+## A report says zero missing entries but visible text is still untranslated
+
+- **Symptom:** Result validation reports no missing IDs, yet runtime screens, descriptions, tooltips, or dynamically assembled labels still contain source-language text.
+- **General cause:** Completeness was measured against the extractor's own manifest, making the denominator circular, or a source class was excluded to avoid overcapture.
+- **Diagnosis:** Compare two independently produced inventories and inspect their declared user-visible exclusions. Keep result alignment separate from runtime observations.
+- **Resolution:** Repair the engine SDK extraction method until both inventories agree without user-visible exclusions, regenerate context and results for the changed fingerprint, and record runtime coverage only from a user-executed or separately authorized observation.
+- **Prevention:** Require `game-l10n verify-inventory`, use the terminology in `docs/coverage-gates.md`, and never restate `manifest_missing_count=0` as zero in-game omissions.
+
+## A partial context file is mistaken for completed analysis
+
+- **Symptom:** Translation starts after a context worker was interrupted, unavailable, or at capacity because an output file happens to exist.
+- **General cause:** Artifact existence was accepted instead of a successful per-part route and evidence-coverage attestation.
+- **Diagnosis:** Check the context-state fingerprint, execution status, completed-part count, and domain coverage rather than the context-pack path alone.
+- **Resolution:** Route the incomplete part through the next configured analyzer. If every route fails, stop without writing a successful context state or starting translation.
+- **Prevention:** Use the CLI context gate, write output and state atomically, and reject partial or stale attestations.
+
+## A transient provider failure leaves a patch partly usable
+
+- **Symptom:** Capacity, timeout, quota, rate-limit, authentication, or malformed-output failure preserves source text and the workflow proceeds as if the patch were complete.
+- **General cause:** Operational failure was collapsed into refusal or final source preservation, and indispensable targets were not identified.
+- **Diagnosis:** Inspect the metadata-only failure queue for categorical failure codes and `blocking` state; do not expose source text or provider prose to the control plane.
+- **Resolution:** Keep operational failures queued until the user explicitly asks to resume. If any queued target is marked `metadata.blocking_on_failure=true`, retain all results as a private held checkpoint and emit no new patch.
+- **Prevention:** Mark required targets during extraction, preserve the failure queue across turns, bind it to the inventory fingerprint, and resume only through `game-l10n resume-failures`.

@@ -16,6 +16,8 @@ validated translation candidate
 
 The judge returns only a verdict and categorical issue codes. It never echoes a correct translation. A rewriter runs only when the judge reports a material `meaning`, `omission`, `addition`, `voice`, `register`, `terminology`, `consistency`, `formatting`, `fluency`, `literalism`, `reference_loss`, `tone_rhythm`, `function`, `condition`, `unit`, `knowledge_order`, or `length_risk` problem. A denotationally accurate candidate still requires rewriting when its phrasing changes the intended effect, UI behavior, condition, measurement, information order, or usable display length. The corrected candidate must pass deterministic validation and another compact judgment before acceptance.
 
+This selective rewrite optimization does not make review selective. Every newly translated candidate receives the initial compact judgment. When an existing translation is reused for a requested full re-review, every existing candidate also receives a fresh initial judgment through `game-l10n review-existing`; only the rewrite call remains selective. IDs, hashes, prior approval, and automatic risk flags cannot exempt a candidate from that pass.
+
 `routing.review_max_rounds` bounds judge/rewrite cycles. The recommended value is `2`: one initial judgment and one confirmation after at most one rewrite. Increase it only when representative evaluations show that another correction cycle improves accepted quality enough to justify the extra calls.
 
 ## Focused evidence, not context removal
@@ -73,5 +75,7 @@ Supported alternatives include:
 - a stronger judge paired with a low-cost rewriter and a stronger rewrite fallback.
 
 Every combination must preserve the same one-target protocol, control-plane isolation, staged fallback, candidate generation/digest checks, deterministic validation, and exact-source preservation after route exhaustion.
+
+The completion attestation counts the review denominator, approved candidate digests, reused candidates, and freshly reviewed reused candidates. A targeted audit may be useful, but it cannot set `semantic_review.complete=true` for candidates it never judged. Static inventory and runtime coverage are separate gates described in `docs/coverage-gates.md`.
 
 The optimization defaults follow the official guidance to choose models by workload, use low reasoning effort for classification or routine rewrites, measure task success and token cost on representative evaluations, provide only relevant context, and use provider-supported thinking controls. References: [OpenAI API deployment checklist](https://developers.openai.com/api/docs/guides/deployment-checklist), [OpenAI model optimization](https://developers.openai.com/api/docs/guides/model-optimization), [DeepSeek thinking mode](https://api-docs.deepseek.com/guides/thinking_mode/).

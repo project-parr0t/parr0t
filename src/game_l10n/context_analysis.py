@@ -600,6 +600,7 @@ class ContextAnalyzer:
         self.provider_chain = provider_chain
         self.max_chunk_chars = max_chunk_chars
         self.context_mode = context_mode
+        self.last_execution: dict[str, Any] | None = None
 
     def domains_by_id(self, segments: list[Segment]) -> dict[str, set[str]]:
         if self.context_mode in CONTEXT_DOMAINS:
@@ -618,13 +619,19 @@ class ContextAnalyzer:
         return _SCHEMAS[self.resolve_mode(segments)]
 
     def analyze(self, segments: list[Segment]) -> ContextPack:
+        if not segments:
+            raise ProviderError("Context gate failed: ordered source inventory is empty")
         mode = self.resolve_mode(segments)
         domains_by_id = self.domains_by_id(segments)
         chunks = _chunks(segments, self.max_chunk_chars)
         completed_parts: list[dict[str, Any]] = []
+        part_routes: list[dict[str, Any]] = []
+        self.last_execution = None
         for index, chunk in enumerate(chunks, start=1):
             last_error = ""
+            attempted = 0
             for name in self.provider_chain:
+                attempted += 1
                 try:
                     raw = self.registry.get(name).generate_json(
                         system=f"{_BASE_SYSTEM_PROMPT}\n\n{_MODE_SYSTEM_PROMPTS[mode]}",
@@ -634,6 +641,14 @@ class ContextAnalyzer:
                     )
                     if raw.get("status") == "success":
                         completed_parts.append(raw)
+                        part_routes.append(
+                            {
+                                "part": index,
+                                "provider": name,
+                                "routes_attempted": attempted,
+                                "status": "success",
+                            }
+                        )
                         break
                     last_error = (
                         "provider_refusal" if raw.get("status") == "refused" else "provider_error"
@@ -642,7 +657,29 @@ class ContextAnalyzer:
                     last_error = "provider_error"
             else:
                 raise ProviderError(f"All context-analysis routes failed for part {index}: {last_error}")
+        self.last_execution = {
+            "status": "success",
+            "total_parts": len(chunks),
+            "completed_parts": len(completed_parts),
+            "fallback_part_count": sum(item["routes_attempted"] > 1 for item in part_routes),
+            "parts": part_routes,
+        }
         return _merge(completed_parts, mode)
+
+
+def _require_successful_execution(execution: Any) -> dict[str, Any]:
+    if not isinstance(execution, dict) or execution.get("status") != "success":
+        raise ProviderError("Context gate failed: successful execution attestation is missing")
+    total = execution.get("total_parts")
+    completed = execution.get("completed_parts")
+    if not isinstance(total, int) or total < 1 or completed != total:
+        raise ProviderError("Context gate failed: not every context part completed")
+    parts = execution.get("parts")
+    if not isinstance(parts, list) or len(parts) != total:
+        raise ProviderError("Context gate failed: per-part route attestation is incomplete")
+    if any(not isinstance(item, dict) or item.get("status") != "success" for item in parts):
+        raise ProviderError("Context gate failed: a context part did not succeed")
+    return execution
 
 
 def analyze_with_cache(
@@ -672,23 +709,34 @@ def analyze_with_cache(
             context_pack = ContextPack(**data)
             attestation = context_attestation(segments, context_pack, analyzer)
             require_complete_context(attestation)
+            _require_successful_execution(state.get("execution"))
             if state.get("attestation") == attestation:
                 return context_pack, True
     context_pack = analyzer.analyze(segments)
+    execution = _require_successful_execution(analyzer.last_execution)
     attestation = context_attestation(segments, context_pack, analyzer)
     require_complete_context(attestation)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(
+    output_temporary = output_path.with_name(f"{output_path.name}.tmp")
+    state_temporary = state_path.with_name(f"{state_path.name}.tmp")
+    output_temporary.write_text(
         json.dumps(asdict(context_pack), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
-    state_path.write_text(
+    state_temporary.write_text(
         json.dumps(
-            {"fingerprint": fingerprint, "attestation": attestation},
+            {
+                "status": "success",
+                "fingerprint": fingerprint,
+                "attestation": attestation,
+                "execution": execution,
+            },
             ensure_ascii=False,
             indent=2,
         )
         + "\n",
         encoding="utf-8",
     )
+    output_temporary.replace(output_path)
+    state_temporary.replace(state_path)
     return context_pack, False

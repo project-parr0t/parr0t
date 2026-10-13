@@ -108,6 +108,45 @@ class ContextAnalysisTests(unittest.TestCase):
         self.assertGreater(success.call_count, 1)
         self.assertEqual(refusing.call_count, success.call_count)
 
+    def test_operational_failure_uses_fallback_and_records_successful_route(self) -> None:
+        failing = ScriptedProvider("capacity", lambda **_: (_ for _ in ()).throw(RuntimeError("capacity")))
+        success = ScriptedProvider("success", successful_context)
+        analyzer = ContextAnalyzer(
+            ProviderRegistry({"capacity": failing, "success": success}),
+            ["capacity", "success"],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            analyze_with_cache(
+                analyzer=analyzer,
+                segments=[Segment("synthetic-1", "SOURCE", speaker="A", scene="S")],
+                output_path=root / "context.json",
+                state_path=root / "state.json",
+            )
+            state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(state["status"], "success")
+        self.assertEqual(state["execution"]["completed_parts"], 1)
+        self.assertEqual(state["execution"]["fallback_part_count"], 1)
+        self.assertEqual(state["execution"]["parts"][0]["provider"], "success")
+
+    def test_all_context_routes_failing_writes_no_success_artifact(self) -> None:
+        failing = ScriptedProvider("capacity", lambda **_: (_ for _ in ()).throw(RuntimeError("capacity")))
+        analyzer = ContextAnalyzer(ProviderRegistry({"capacity": failing}), ["capacity"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "context.json"
+            state = root / "state.json"
+            with self.assertRaisesRegex(ProviderError, "All context-analysis routes failed"):
+                analyze_with_cache(
+                    analyzer=analyzer,
+                    segments=[Segment("synthetic-1", "SOURCE", speaker="A", scene="S")],
+                    output_path=output,
+                    state_path=state,
+                )
+            self.assertFalse(output.exists())
+            self.assertFalse(state.exists())
+
     def test_identical_context_is_cached(self) -> None:
         provider = ScriptedProvider("context", successful_context)
         analyzer = ContextAnalyzer(ProviderRegistry({"context": provider}), ["context"])
