@@ -130,6 +130,22 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Resolution:** Stop distribution, keep the mismatched assets unchanged for diagnosis, rebuild one staged release from the intended clean commit, and request publication approval for the corrected release. Do not silently replace history or broaden compatibility claims.
 - **Prevention:** Follow `docs/instance-release.md`, upload the exact verified bytes, perform one read-only post-upload digest check, enumerate every validated original game build, and preserve the user's README through minimal reviewed edits.
 
+## An agent proposes a repository or release during local work
+
+- **Symptom:** A translation, package build, or local validation report unexpectedly asks whether to commit/push, names a public or private destination repository, or presents tags, GitHub Releases, uploads, or publication gates as the next step.
+- **General cause:** Successful local completion or permission to use Git was incorrectly treated as publication intent, or generated workspace metadata contained an automatic publication prompt.
+- **Diagnosis:** Check the active user request, generated profile metadata, status output, and completion message. If the user did not first command publication of the exact target, every publication-related prompt or state transition is out of scope.
+- **Resolution:** Keep all artifacts local, remove the unsolicited publication step from the active plan and user-facing status, and continue or stop at the requested local deliverable. Do not convert the correction into a new request for publication approval.
+- **Prevention:** Keep publication workflows dormant and silent until activated by a user-originated command. Generated profiles and ordinary status output must not advertise publication; a successful patch, local Git choice, or SDK promotion never activates it.
+
+## A GitHub Release title omits the compatible game version
+
+- **Symptom:** The visible release title contains only a patch version or uses a vague label such as `latest`, leaving players unable to tell which original game version it supports.
+- **General cause:** Patch identity and original-game compatibility were maintained as separate metadata and the title was not validated against the supported-build matrix.
+- **Diagnosis:** Compare the visible title with the README, release notes, manifest, asset metadata, and installer binding checks. The exact supported game-version set must agree everywhere.
+- **Resolution:** Before publication, set the title to `<Game Display Name> Patch <Patch Version> (Game Version <Game Version>)`; use the exact enumerated `Game Versions` form only for multiple validated builds. If the game version is unknown, keep the release private and unresolved.
+- **Prevention:** Make the release-title format a required gate and reject bare patch versions, unverified ranges, and ambiguous compatibility labels.
+
 ## A release works on the build agent but not on the player's machine
 
 - **Symptom:** The package depends on an absolute workspace path, developer tool, environment variable, host architecture, or command that exists only on the machine that built it.

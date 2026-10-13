@@ -4,8 +4,12 @@ import json
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
+from game_l10n.cli import cmd_status
 from game_l10n.privacy import PrivacyViolation
 from game_l10n.tooling import run_cached_tool
 from game_l10n.workspace import (
@@ -64,11 +68,15 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(config["runtime"]["default_policy"], "deny")
         self.assertTrue(config["runtime"]["separate_install_and_launch"])
         self.assertTrue(config["runtime"]["user_executes_by_default"])
+        self.assertNotIn("publish_approved", config["repository"])
         self.assertIn("docs/instance-release.md", generated_agents)
         self.assertIn("exact verified bytes", generated_agents)
         self.assertIn("Preserve the user's existing README", generated_agents)
         self.assertIn("default to Windows", generated_agents)
         self.assertIn("player's execution environment", generated_agents)
+        self.assertIn("workflow is dormant", generated_agents)
+        self.assertIn("do not mention, propose, ask about, preview, or prepare", generated_agents.lower())
+        self.assertIn("<Game Display Name> Patch <Patch Version> (Game Version <Game Version>)", generated_agents)
         self.assertIn("docs/installer-contract.md", generated_agents)
         self.assertIn("docs/steam-faq.md", generated_agents)
         self.assertIn("docs/wrapper-executable.md", generated_agents)
@@ -112,6 +120,8 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(first["status"], "completed")
         self.assertEqual(second["status"], "skipped")
         self.assertEqual(manifest["profile"], "sdk-fixture-engine-1.0")
+        self.assertNotIn("next_step", manifest)
+        self.assertNotIn("publish", json.dumps(manifest).lower())
         self.assertEqual(exported, {"profile.json", "tools/pack.py", "tools/unpack.py"})
 
     def test_existing_sdk_must_be_evaluated_before_private_new(self) -> None:
@@ -208,6 +218,31 @@ class WorkspaceTests(unittest.TestCase):
             initialize_workspace(work, sdk, git_choice="disabled")
             with self.assertRaises(Exception):
                 update_repository_policy(work, publish_approved=True)
+
+    def test_publication_state_exists_only_after_explicit_policy_update(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            initialize_workspace(work, sdk, git_choice="enabled")
+            self.assertNotIn("publish_approved", load_config(work)["repository"])
+            update_repository_policy(work, publish_approved=True)
+            self.assertTrue(load_config(work)["repository"]["publish_approved"])
+
+    def test_ordinary_status_does_not_surface_inactive_publication_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            initialize_workspace(work, sdk, git_choice="enabled")
+            update_repository_policy(work, publish_approved=False)
+            output = StringIO()
+            with redirect_stdout(output):
+                cmd_status(SimpleNamespace(workspace=str(work)))
+            status = json.loads(output.getvalue())
+            self.assertEqual(status["repository"], {"initial_choice": "enabled"})
 
 
 if __name__ == "__main__":

@@ -90,7 +90,7 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "unpack": ["python", "tools/unpack.py", "{input}", "{output}"],
         "pack": ["python", "tools/pack.py", "{input}", "{output}"],
     },
-    "repository": {"initial_choice": "pending", "publish_approved": False},
+    "repository": {"initial_choice": "pending"},
     "sdk_selection": {
         "status": "pending",
         "inventory_fingerprint": "",
@@ -127,7 +127,7 @@ This directory contains private game data and translation artifacts. It is inten
 4. Run translation through the orchestrator. The orchestrator only monitors execution/protocol status and fallback routing. It must not replace the independent review agent.
 5. Treat model refusals, malformed output, timeouts, and failed integrity checks as route failures. Continue through the configured fallback chain and keep the audit record free of game text.
 6. Preserve placeholders, tags, control codes, glossary terms, names, character voice, and scene context. Preserve communicative function, idiomatic target-language phrasing, supported allusions/wordplay, deliberate alterations, and the tone/rhythm expected of dialogue, titles, quest names, slogans, and UI text. Do not approve a mechanically literal result merely because its denotational meaning is correct, and do not invent a reference from weak resemblance.
-7. A toolchain may be promoted only after the user explicitly states that the translation/patch succeeded. Then ask separately whether the sanitized SDK profile may be committed/pushed.
+7. A toolchain may be promoted only after the user explicitly states that the translation/patch succeeded. Keep the sanitized SDK profile local and stop. Do not propose, ask about, preview, stage, or mention commit, push, repository publication, tags, or releases unless the user first gives an explicit publication command.
 8. Engine profiles use branch names `sdk-<engine>-<version>`. Export only reusable files from `tools/`; the privacy scan must pass first.
 9. Keep promoted SDK content provenance-free. Never transfer real game/project names, filenames, asset paths, map/event identifiers, dialogue, translations, project-specific exclusions, job metadata, tool paths, counts, hashes, reports, or execution history. Use only public engine-format identifiers and unmistakably synthetic fixtures.
 10. Record only recurring engine/SDK problems in the repository `docs/faq.md`, after reducing them to neutral symptom, general cause, diagnosis, resolution, and prevention. Keep one-off or project-specific incidents in this private workspace.
@@ -144,7 +144,7 @@ This directory contains private game data and translation artifacts. It is inten
 21. Building, fixing, packing, or validating a patch does not authorize installing, updating, removing, or launching it. Access to a game folder is read-only discovery permission only. Do not infer runtime permission from a request to inspect logs, test a build, or confirm execution data.
 22. Default to handing the recoverable artifact to the user for execution. If the user explicitly asks the agent to act on a real installation, record a separate short-lived one-shot approval for exactly one of `install`, `update`, `remove`, or `launch`. Bind it to the current artifact digest, exact configured game root, and—only for launch—the exact executable. A changed artifact, target, executable, action, expiry, or consumed approval must stop the operation.
 23. Installation approval never authorizes launch, and launch approval never authorizes installation, update, removal, cleanup, log deletion, save modification, or another launch. Consume the matching approval immediately before the external effect. Automated lifecycle tests use temporary synthetic targets; only isolated repository tests may create synthetic approval fixtures for those targets.
-24. Publishing a public per-game instance requires separate explicit approval and the repository `docs/instance-release.md` gate. Target the player's execution environment, not the agent/build host; default to Windows unless the user or project names another platform, and derive architecture and prerequisites from the supported game build. Build once from a clean tagged commit and upload the exact verified bytes; bind the source commit, tag, release ID, package/manifest/file hashes, and embedded versions as one release unit. Record every supported original game version/build and make the README, release notes, manifest, asset name, and installer checks agree. Preserve the user's existing README with minimal reviewed edits instead of replacing or restyling it.
+24. The public per-game instance workflow is dormant until the user first explicitly commands publication. Before that command, do not mention, propose, ask about, preview, or prepare a publication repository, commit/push, tag, GitHub Release, release gate, or upload. Once activated, follow the repository `docs/instance-release.md`, target the player's execution environment, default to Windows unless another platform is named, and derive architecture and prerequisites from the supported game build. Build once from a clean tagged commit and upload the exact verified bytes; bind the source commit, tag, release ID, package/manifest/file hashes, and embedded versions as one release unit. Record every supported original game version/build and make the README, release notes, manifest, asset name, and installer checks agree. Preserve the user's existing README with minimal reviewed edits. Use the visible title `<Game Display Name> Patch <Patch Version> (Game Version <Game Version>)`, or the exact enumerated `Game Versions` form.
 25. Player-facing Windows installers follow the repository `docs/installer-contract.md`, not this agent harness. Keep the fixed ZIP layout and the public Install, Restore, and Verify installed-state operations. Use `<game-root>/parr0t-patch-status.txt` as the first patch-ID authority and the matching receipt for owned files. Explicitly declare any original file that must be replaced; preserve it once, verify and reuse that backup on update, and put it back on Restore. Core result codes are fixed; SDK/title-specific failures use a separate `PARR0T-<SCOPE>-E###` registry. Never copy `AGENTS.md`, approval JSON, prompts, task state, logs, or workspace policy into a distribution. An interactive player's menu choice plus final confirmation needs no agent approval; noninteractive mutation still does.
 26. For Steam discovery or integration, follow the repository `docs/steam-faq.md` and `docs/wrapper-executable.md`. Use exact App ID metadata and binding checks and ask when the validated game root is ambiguous. Never read or edit `localconfig.vdf`, Steam launch options, or per-account client configuration, and never require, close, kill, or restart Steam. Integrate the Steam Play button only with exact approved, reproducible, signature/hash-verified Parr0t wrapper bytes for the target architecture at explicitly declared main-executable paths; preserve each real original through `replace_files` and do not use `.lnk` or an ad hoc game-workspace binary. Require the target game to be closed for locked replacements; close only the validated game process after separate player confirmation.
 
@@ -547,7 +547,7 @@ def update_repository_policy(work_dir: Path, *, initial_choice: str | None = Non
             raise ConfigurationError("initial_choice must be enabled, disabled, or pending")
         policy["initial_choice"] = initial_choice
         if initial_choice != "enabled":
-            policy["publish_approved"] = False
+            policy.pop("publish_approved", None)
     if publish_approved is not None:
         if publish_approved and policy.get("initial_choice") != "enabled":
             raise ConfigurationError("Publishing cannot be approved unless Git use was enabled initially")
@@ -580,10 +580,6 @@ def prepare_sdk_profile(work_dir: Path, engine: str, version: str, *, user_confi
         "version": version,
         "contains_game_data": False,
         "files": manifest,
-        "next_step": (
-            "Ask the user whether this sanitized profile may be committed/pushed. "
-            f"If approved, create branch {profile_name}."
-        ),
     }
     (export_root / "profile.json").write_text(
         json.dumps(profile, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"

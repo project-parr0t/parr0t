@@ -1,8 +1,10 @@
 # Per-game instance release contract
 
-This contract applies when an agent publishes a completed localization as a separate, game-specific repository. An instance repository is distinct from the Parr0t framework and engine SDK branches: it may contain the approved patch payload and title-specific compatibility data, but none of that data may flow back into Parr0t.
+This contract is dormant until the user first explicitly commands publication of a completed localization as a separate, game-specific repository. Before that command, the agent must not invoke or mention this workflow, propose a public or private destination, ask whether to publish, preview release metadata, stage a tag/release, or expose publication as a next step. Ordinary translation, packaging, testing, and successful local validation end with the local artifact.
 
-Publication is an external side effect. A successful patch, permission to use Git, SDK publication approval, and permission to publish a per-game release are separate decisions. Do not create a repository, tag, release, or upload until the user explicitly approves that exact instance publication.
+Once activated, an instance repository is distinct from the Parr0t framework and engine SDK branches: it may contain the approved patch payload and title-specific compatibility data, but none of that data may flow back into Parr0t.
+
+Publication is an external side effect. A successful patch, permission to use Git, SDK publication approval, and permission to publish a per-game release are separate decisions. Silence, completion approval, or permission for local Git use is not publication intent. Do not create a repository, commit/push for publication, tag, release, or upload until the user explicitly requests that exact instance publication.
 
 ## Target the player's environment
 
@@ -30,6 +32,18 @@ Treat the source commit, tag, release metadata, committed distribution output, a
 - A release must not contain untracked first-party code, translation data, installers, manifests, or support files absent from the tagged source or its recorded build inputs.
 - A third-party runtime may be release-only when redistribution or repository-size constraints justify it, but its exact name, version, source, license, and digest must be declared in the tagged source and release manifest. Never describe a first-party component as a third-party exception.
 - Keep the release ID aligned across the tag, release title, package manifest, installer receipt, embedded component versions, and release notes.
+
+## GitHub Release title
+
+The visible GitHub Release title must include both the patch version and the exact compatible original game version:
+
+`<Game Display Name> Patch <Patch Version> (Game Version <Game Version>)`
+
+For an explicitly validated release covering more than one original version, use:
+
+`<Game Display Name> Patch <Patch Version> (Game Versions <Version A>, <Version B>)`
+
+Do not use a bare patch version, `latest`, `current`, an unverified range, or a title that makes the patch version look like the game version. The title's game-version set must exactly match the supported-build matrix, README, release notes, manifest, asset metadata, and installer binding checks. If no exact public game version or equivalent build identifier has been verified, the release gate fails.
 
 After upload, download or query the published asset read-only and compare its digest with the verified local artifact. A mismatch invalidates the release; do not silently replace one side or edit history.
 
@@ -67,13 +81,14 @@ Before an agent publishes an instance release, it must verify all of the followi
 2. The user has separately approved publication of this exact instance repository and release.
 3. The source tree is clean, the intended commit is fixed, and the tag/release ID is unused.
 4. The complete supported-build matrix is recorded and matches installer binding checks.
-5. The target operating system, architecture, and prerequisites describe the player's environment rather than the build host; Windows is used when no other platform was specified.
-6. The committed distribution output or deterministic build recipe produces the exact staged assets.
-7. Package validation, required engine/adapter checks, license checks, and one proportional target-environment synthetic lifecycle pass.
-8. The public installer exposes Install, Restore, and Verify; its `parr0t-patch-status.txt`, receipt, declared original replacements, custom errors, and player messages satisfy `docs/installer-contract.md`.
-9. Every launcher wrapper matches the approved Parr0t wrapper release and its architecture, source tag, reproducible-build record, Authenticode result, and published hashes; no Steam client configuration is edited and Steam is never terminated.
-10. The existing README is preserved except for reviewed, release-specific edits.
-11. Release notes identify the release ID, source commit, supported builds, changes, installation/update caveats, and asset checksums.
-12. The uploaded assets are the same bytes that passed verification, and their published digests are checked once after upload.
+5. The visible GitHub Release title matches `<Game Display Name> Patch <Patch Version> (Game Version <Game Version>)`, or the exact enumerated `Game Versions` form, and agrees with the supported-build matrix.
+6. The target operating system, architecture, and prerequisites describe the player's environment rather than the build host; Windows is used when no other platform was specified.
+7. The committed distribution output or deterministic build recipe produces the exact staged assets.
+8. Package validation, required engine/adapter checks, license checks, and one proportional target-environment synthetic lifecycle pass.
+9. The public installer exposes Install, Restore, and Verify; its `parr0t-patch-status.txt`, receipt, declared original replacements, custom errors, and player messages satisfy `docs/installer-contract.md`.
+10. Every launcher wrapper matches the approved Parr0t wrapper release and its architecture, source tag, reproducible-build record, Authenticode result, and published hashes; no Steam client configuration is edited and Steam is never terminated.
+11. The existing README is preserved except for reviewed, release-specific edits.
+12. Release notes identify the release ID, source commit, supported builds, changes, installation/update caveats, and asset checksums.
+13. The uploaded assets are the same bytes that passed verification, and their published digests are checked once after upload.
 
 If any gate fails, keep the staged release in the private workspace and report the mismatch. Do not publish a best-effort or partially documented release.

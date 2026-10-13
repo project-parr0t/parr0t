@@ -293,6 +293,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     config = load_config(work_dir)
     actions: list[str] = []
     policy = config.get("repository", {})
+    visible_policy = {"initial_choice": policy.get("initial_choice", "pending")}
+    if policy.get("publish_approved") is True:
+        visible_policy["publish_approved"] = True
     if policy.get("initial_choice") == "pending":
         actions.append("ask_user_for_initial_git_choice")
     game_roots = [Path(item) for item in config.get("game_roots", [])]
@@ -322,7 +325,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "sdk_root": config.get("sdk_root"),
                 "game_roots": [str(path) for path in game_roots],
                 "missing_game_roots": missing_roots,
-                "repository": policy,
+                "repository": visible_policy,
                 "sdk_selection": sdk_selection,
                 "execution": config.get("execution", {}),
                 "runtime": config.get("runtime", {"default_policy": "deny"}),
@@ -374,7 +377,6 @@ def cmd_promote(args: argparse.Namespace) -> int:
         user_confirmed_success=args.user_confirmed_success,
     )
     print(f"Sanitized profile prepared: {export_root}")
-    print("ACTION_REQUIRED: ask the user whether it may be committed/pushed, then record approval with `game-l10n policy`.")
     return 0
 
 
