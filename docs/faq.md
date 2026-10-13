@@ -113,3 +113,11 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Diagnosis:** Compare the operation with the recorded runtime approval. A valid record must name exactly one of `install`, `update`, `remove`, or `launch` and match the current artifact digest, configured target, executable when launching, expiry, and unused state.
 - **Resolution:** Stop before the external effect, keep the source and runtime data unchanged, and hand off the recoverable artifact for user execution. If the user explicitly requests agent execution, create and consume only the exact one-shot approval described in `docs/runtime-approval.md`.
 - **Prevention:** Deny runtime mutations and process starts by default, keep installation and launch approvals separate, use only synthetic temporary targets for automated lifecycle tests, and never bypass the shared guard with direct shell copies or process commands.
+
+## A published release differs from the repository output or supports an unclear game build
+
+- **Symptom:** A downloaded asset has a different digest from the verified repository artifact, contains an undocumented first-party file, reports a different release version, or installs against a build not listed consistently in the README and manifest.
+- **General cause:** The package was rebuilt or edited after verification, release metadata was updated independently, or compatibility was described as “latest” without exact build bindings.
+- **Diagnosis:** Compare the tag, source commit, release ID, package/manifest/file digests, embedded versions, compatibility records, release notes, and installer binding checks as one immutable release unit.
+- **Resolution:** Stop distribution, keep the mismatched assets unchanged for diagnosis, rebuild one staged release from the intended clean commit, and request publication approval for the corrected release. Do not silently replace history or broaden compatibility claims.
+- **Prevention:** Follow `docs/instance-release.md`, upload the exact verified bytes, perform one read-only post-upload digest check, enumerate every validated original game build, and preserve the user's README through minimal reviewed edits.

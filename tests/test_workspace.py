@@ -19,6 +19,7 @@ class WorkspaceTests(unittest.TestCase):
             sdk.mkdir()
             initialize_workspace(work, sdk, git_choice="disabled")
             config = load_config(work)
+            generated_agents = (work / "AGENTS.md").read_text(encoding="utf-8")
 
         providers = {item["name"]: item for item in config["providers"]}
         self.assertEqual(config["provider_preset"], "openai-deepseek")
@@ -53,6 +54,9 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(config["runtime"]["default_policy"], "deny")
         self.assertTrue(config["runtime"]["separate_install_and_launch"])
         self.assertTrue(config["runtime"]["user_executes_by_default"])
+        self.assertIn("docs/instance-release.md", generated_agents)
+        self.assertIn("exact verified bytes", generated_agents)
+        self.assertIn("Preserve the user's existing README", generated_agents)
 
     def test_workspace_must_be_outside_sdk(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

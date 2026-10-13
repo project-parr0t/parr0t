@@ -38,6 +38,12 @@ Do not start a new translation pass. Read Parr0t instructions, inspect the recor
 The patch in <external-workspace> has been confirmed successful. Prepare a sanitized sdk-<engine>-<version> profile containing only reusable extraction, application, packing, validation, synthetic fixtures, and neutral documentation. Remove every job-specific name, path, string, translation, log, count, hash, and history reference. Validate privacy and tests, then ask me separately before any commit or push.
 ```
 
+## Publish a per-game instance release
+
+```text
+The patch at <patch-path> has been confirmed successful and I approve publishing this exact instance to <instance-repository>. Read its existing README first and preserve the author's structure, tone, attribution, and unrelated sections. Follow docs/instance-release.md: record every validated original game version/build, build once from a clean tagged commit, verify that committed distribution outputs and release assets are identical or reproducible with matching hashes, and upload only the exact bytes that passed validation. Make the tag, release ID, source commit, manifest, embedded versions, README compatibility table, release notes, and installer checks agree. Report the published asset hashes after one read-only post-upload verification.
+```
+
 ## Inspect a public reference implementation
 
 ```text

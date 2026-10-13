@@ -77,6 +77,8 @@ Reusable extraction, application, packing, or validation code may be promoted on
 
 After sanitization, ask separately whether the SDK profile may be committed and pushed. A successful translation does not imply publication approval.
 
+A public per-game instance is another, separate publication target. Follow `docs/instance-release.md`: preserve the user's existing README, record every validated original game version/build, build the release once from a clean tagged commit, and upload the exact bytes that passed verification. The repository output, release manifest, release notes, embedded versions, and installer compatibility checks must identify the same release. Do not rebuild after verification or add release-only first-party files.
+
 ## Codex operation
 
 Codex discovers repository `AGENTS.md` instructions automatically. Keep the user prompt focused on the desired outcome and paths; do not paste the full policy into every request. Use `docs/prompt-examples.md` as the starting point and let the agent read the repository contract before acting.
