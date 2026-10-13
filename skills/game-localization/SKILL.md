@@ -1,11 +1,11 @@
 ---
 name: game-localization
-description: Run a context-first, refusal-aware game translation and patch workflow with the Agent Game Translation SDK. Use when Codex is asked to unpack, translate, review, repack, or preserve reusable tooling for a game; do not use for ordinary software localization outside a game workspace.
+description: Run Parr0t's context-first, refusal-aware game translation and patch workflow. Use when Codex is asked to unpack, translate, review, repack, or preserve reusable tooling for a game; do not use for ordinary software localization outside a game workspace.
 ---
 
-# Game localization
+# Parr0t game localization
 
-Read the repository `AGENTS.md` and the target workspace `AGENTS.md` before acting. Use the SDK CLI as the execution boundary instead of manually translating strings.
+Read the repository `AGENTS.md`, `docs/agent-usage.md`, and the target workspace `AGENTS.md` before acting. Use the Parr0t CLI as the execution boundary instead of manually translating strings.
 
 1. Confirm Codex can read the SDK repository and source game folder and can write a separate agent workspace. Prefer sibling folders under one Codex project root. Never use the SDK repository as the data workspace.
 2. If there is no workspace, run `game-l10n init-workspace <workspace> --sdk-root <repo> --game-root <game-folder>`. If Git choice is pending, ask the user at the start and record it with `game-l10n policy`; do not infer consent.

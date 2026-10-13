@@ -1,6 +1,6 @@
-# AGENTS.md — SDK repository
+# AGENTS.md — Parr0t repository
 
-This repository contains reusable orchestration code only. Never place actual game files, extracted strings, translations, prompts, caches, logs, or credentials here.
+Parr0t contains reusable orchestration code only. Never place actual game files, extracted strings, translations, prompts, caches, logs, or credentials here.
 
 ## Required agent behavior
 
@@ -21,6 +21,7 @@ This repository contains reusable orchestration code only. Never place actual ga
 15. Separate the data plane from the orchestration control plane. The top-level agent may receive target IDs, categorical status/error codes, counts, queue transitions, artifact paths, and deterministic issue codes only. It must not open dialogue/input/result files, receive candidate text, or receive a provider's prose refusal explanation. Workers read private files themselves, write results under the private workspace, and return metadata-only completion envelopes.
 16. A translation or review refusal is only a routing event, never a content judgment and never grounds for omitting the target or cancelling patch creation. Normalize provider explanations to categorical codes before they reach the parent. DeepSeek requests use the faithful-transformation prompt and deterministic low-creativity settings supported by the API; do not claim or attempt to disable provider safeguards.
 17. Treat `main` as the engine-neutral control framework. Engine discovery, unpacking, application, packing, verification, engine-specific FAQ entries, and engine fixtures belong only to the relevant `sdk-<engine>-<version>` branch. Dependencies flow from `main` to SDK branches, never from an SDK branch back into `main`. Follow `docs/sdk-branch-contract.md`.
+18. When starting or resuming a localization job, follow `docs/agent-usage.md`. Use `docs/prompt-examples.md` when constructing a user-facing task prompt. Keep the public `README.md` concise; detailed execution procedures belong in agent documentation rather than the public landing page.
 
 ## Zero-provenance SDK rule
 
