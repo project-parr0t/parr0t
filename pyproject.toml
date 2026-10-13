@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "game-l10n-sdk"
 version = "0.1.0"
-description = "Provider-neutral, refusal-aware game localization orchestration SDK"
+description = "Parr0t: provider-neutral, refusal-aware game localization orchestration for coding agents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Game L10n SDK contributors" }]
+authors = [{ name = "Parr0t contributors" }]
 dependencies = []
 
 [project.scripts]
@@ -17,6 +17,9 @@ game-l10n = "game_l10n.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+game_l10n = ["templates/*.bat", "templates/*.ps1"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

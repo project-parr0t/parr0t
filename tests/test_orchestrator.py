@@ -665,6 +665,39 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(result.candidate_digest)
         self.assertEqual(result.review_outcome, "revised")
 
+    def test_full_existing_review_judges_every_reused_candidate(self) -> None:
+        translator = ScriptedProvider(
+            "fixture-unused-translator",
+            lambda **_: {"status": "success", "text": "UNEXPECTED", "reason": ""},
+        )
+        reviewer = ScriptedProvider(
+            "fixture-reviewer", lambda **_: {"verdict": "ok", "issues": []}
+        )
+        registry = ProviderRegistry({item.name: item for item in [translator, reviewer]})
+        segments = [
+            Segment("synthetic-1", "SOURCE_ONE"),
+            Segment("synthetic-2", "SOURCE_TWO"),
+        ]
+        candidates = {
+            "synthetic-1": {"source": "SOURCE_ONE", "text": "TARGET_ONE"},
+            "synthetic-2": {"source": "SOURCE_TWO", "text": "TARGET_TWO"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            results = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig([translator.name], [reviewer.name]),
+                project=ProjectContext("TEST", "src", "dst"),
+                context_pack=ContextPack(story_summary="STORY"),
+                work_dir=Path(directory),
+            ).review_existing_many(segments, candidates)
+
+        self.assertEqual(reviewer.call_count, 2)
+        self.assertEqual(translator.call_count, 0)
+        self.assertEqual([item.status for item in results], ["reviewed", "reviewed"])
+        self.assertTrue(
+            all(item.metadata["candidate_origin"] == "existing" for item in results)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

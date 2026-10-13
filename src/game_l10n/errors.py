@@ -31,3 +31,7 @@ class ConfigurationError(GameL10nError):
 
 class ToolExecutionError(GameL10nError):
     """An unpack/pack tool failed."""
+
+
+class RuntimeApprovalError(GameL10nError):
+    """A real installation, removal, update, or launch lacks exact user approval."""

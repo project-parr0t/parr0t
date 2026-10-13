@@ -20,8 +20,8 @@ The SDK repository, Git history, neutral FAQ, and reusable engine branch must no
 ## Native agent topology
 
 - **Top-level Codex/Sol:** owns orchestration state only. It receives target IDs, categorical statuses, counts, queue transitions, artifact paths, and deterministic issue codes. It must not open dialogue/input/result artifacts, receive candidates, read prose refusal explanations, or semantically approve translations.
-- **GPT-6 Luna workers:** use as many native subagent slots as the active Codex host and configured concurrency allow. The parent gives each worker a private workspace path and one target ID, not dialogue in the task message. The worker reads exactly that target plus the relevant full-script context pack, character guide, scene state, adjacent lines, glossary, and immutable formatting rules from private files; it writes its candidate there and returns only a metadata envelope.
-- **GPT-6.1 Sol judge:** must be a separate subagent/session from the top-level orchestrator. It reads the source/candidate by private artifact path and returns only a compact `ok`, `rewrite`, refusal, or error envelope. It never echoes a correct candidate to the parent.
+- **GPT-6 Luna workers:** use no more native subagent slots than the active Codex host and configured concurrency allow. Start every task as a fresh subagent with `fork_turns="none"` or the host's no-history equivalent. Give it one task path, the ordered source/context artifact paths, and the private workspace path—never game text or parent history in the task message. Inside the task, the worker handles one target at a time with only its relevant narrative, functional, or knowledge entries plus adjacent lines, glossary, and immutable formatting rules. It writes one result row per target, returns only a metadata envelope, and ends; never reuse it for the next task.
+- **GPT-6.1 Sol judge:** uses the same fresh-worker/no-history/one-task rule and must be separate from the top-level orchestrator and translators. It reads the source/candidate by private artifact path and returns only a compact `ok`, `rewrite`, refusal, or error envelope. It never echoes a correct candidate to the parent.
 - **DeepSeek API:** receives individual translation requests only for target IDs that the complete Luna stage refused or failed. In review, it may selectively rewrite `rewrite` targets and act as the next compact judge for Sol refusals/errors. Each request includes one target and focused relevant context. Never combine failed targets into a new batch prompt.
 
 Subagent data-plane files use the JSON envelopes in [provider-protocol.md](provider-protocol.md). The message returned to the parent is a separate control envelope containing only `target_id`, categorical `status`, optional issue codes, and a private artifact path. Game text, candidates, results, and provider prose reasons remain in the private workspace.
@@ -29,8 +29,8 @@ Subagent data-plane files use the JSON envelopes in [provider-protocol.md](provi
 ## Required order
 
 1. Analyze the entire ordered script and create the story, scene, relationship, and character-voice context pack.
-2. Dispatch individual target requests across available Luna subagents. A sensitive target may be refused, but its neighboring ordinary targets continue independently.
-3. Wait for every Luna worker. Normalize any refusal explanation to `provider_refusal` before returning control to the parent. Record refused IDs without source text in the audit trail, then send only those targets through DeepSeek as separate requests.
+2. Run `game-l10n prepare-native-pass` once to create cached exclusive ID tasks, then dispatch at most the available concurrency. Use a fresh no-history worker for each task; it processes the bounded task sequentially and records refusal per target. A sensitive target must not cancel the rest of that task.
+3. Use bounded waits for active workers and spawn a new worker for the next task only when a slot becomes available. Do not poll unchanged workers, create a worker per target, or send follow-up tasks to a completed worker. Normalize refusal explanations to `provider_refusal`, then send only refused IDs through DeepSeek as separate requests after every primary task completes.
 4. Collect every valid candidate and start the separate Sol compact judge. Judge one target at a time in script order with accumulated same-speaker style anchors.
 5. Keep `ok` candidates unchanged. Send only `rewrite` candidates to the configured selective rewriter, validate the correction, and have the judge confirm it. After the complete Sol judge stage, send only refused, errored, invalid, or unconfirmed targets to the DeepSeek judge fallback as separate requests.
 6. If DeepSeek quota is exhausted or all permitted routes fail, emit the exact original text with `source_preserved` and continue unrelated targets.
@@ -38,7 +38,7 @@ Subagent data-plane files use the JSON envelopes in [provider-protocol.md](provi
 
 ## Refusal containment
 
-Every worker is instructed that localization is a bounded transformation of already-existing user-provided text, not new content generation, scene continuation, roleplay, or endorsement. Full narrative context remains available but is explicitly labeled as context-only evidence.
+Every worker is instructed that localization is a bounded transformation of already-existing user-provided text, not new content generation, scene continuation, roleplay, or endorsement. Relevant typed context remains available but is explicitly labeled as context-only evidence.
 
 A worker may refuse only its one target. The parent must not:
 
@@ -58,7 +58,7 @@ A refusal from either translation or review is not a semantic verdict. The paren
 
 Keep queue and attempt state only under `.game-l10n/` in the private workspace. On resume, do not repeat completed Luna, DeepSeek, or Sol work whose input/context/provider fingerprint is unchanged. Restart only pending, refused, errored, or invalid target IDs according to the configured stage order.
 
-Native workers write exclusive JSONL shards in the private workspace. Import each shard with `game-l10n import-native-shard`; after the Luna barrier, run `game-l10n merge-native-pass` against the ordered source segment file. The merge rejects overlapping IDs, sorts by source order rather than file append order, adds candidate generation/digest metadata, and reports only aggregate completeness to the parent.
+Create tasks with `game-l10n prepare-native-pass --workspace <workspace> --input <ordered-script> --output <private-task-directory>`. Version 2 defaults to 32 IDs and 12,000 estimated private material tokens per fresh worker task; tune them with `--max-records` and `--max-material-tokens`. Identical ordered input and bounds reuse the task manifest instead of rebuilding it. Each manifest declares no inherited history, no worker reuse, and metadata-only parent results. Native workers write exclusive result JSONL shards in the private workspace. Import each result with `game-l10n import-native-shard`; after the Luna barrier, run `game-l10n merge-native-pass` against the ordered source segment file. The merge rejects overlapping IDs, sorts by source order rather than file append order, adds candidate generation/digest metadata, and reports only aggregate completeness to the parent.
 
 This is the recommended deployment, not a core dependency. Native agents, API providers, command adapters, and local models can independently fill the translator, judge, rewriter, and fallback roles described in [provider-neutral review](review-pipeline.md).
 

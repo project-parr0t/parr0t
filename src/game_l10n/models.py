@@ -25,6 +25,14 @@ class ReviewVerdict(str, Enum):
     ERROR = "error"
 
 
+class ContextMode(str, Enum):
+    AUTO = "auto"
+    NARRATIVE = "narrative"
+    FUNCTIONAL = "functional"
+    KNOWLEDGE = "knowledge"
+    HYBRID = "hybrid"
+
+
 class FailureCode(str, Enum):
     EXPLICIT_PROVIDER_REFUSAL = "explicit_provider_refusal"
     MALFORMED_RESPONSE = "malformed_response"
@@ -76,6 +84,7 @@ class ProjectContext:
     fictional_content_note: str = (
         "This is fictional game localization. Translate faithfully while following the provider's policies."
     )
+    context_mode: str = ContextMode.AUTO.value
 
 
 @dataclass(slots=True, frozen=True)
@@ -88,6 +97,14 @@ class Segment:
     next: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        for field_name in ("speaker", "scene", "previous", "next"):
+            value = getattr(self, field_name)
+            if value is None:
+                object.__setattr__(self, field_name, "")
+            elif not isinstance(value, str):
+                raise TypeError(f"Segment {field_name} must be a string or null")
+
 
 @dataclass(slots=True, frozen=True)
 class ContextPack:
@@ -96,6 +113,14 @@ class ContextPack:
     scene_summaries: dict[str, dict[str, Any]] = field(default_factory=dict)
     character_guides: dict[str, dict[str, Any]] = field(default_factory=dict)
     relationship_timeline: tuple[str, ...] = ()
+    reference_cues: tuple[dict[str, Any], ...] = ()
+    context_mode: str = ContextMode.NARRATIVE.value
+    functional_summary: str = ""
+    knowledge_summary: str = ""
+    terminology_rules: tuple[str, ...] = ()
+    screen_flows: dict[str, dict[str, Any]] = field(default_factory=dict)
+    feature_guides: dict[str, dict[str, Any]] = field(default_factory=dict)
+    knowledge_nodes: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
