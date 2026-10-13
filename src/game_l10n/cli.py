@@ -346,7 +346,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="game-l10n", description="Refusal-aware game localization agent SDK")
+    parser = argparse.ArgumentParser(prog="game-l10n", description="Parr0t game localization agent framework")
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init-workspace", help="Create a private workspace outside the SDK repository")
