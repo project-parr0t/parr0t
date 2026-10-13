@@ -276,7 +276,9 @@ hierarchy, formality, forms of address, cadence, stable speech habits, atmospher
 Every named scene and speaker in the supplied data must receive an evidence-grounded entry.""",
     ContextMode.FUNCTIONAL.value: """Analyze user-facing function rather than inventing a story. Reconstruct
 screens, actions, state transitions, conditions, units, controls, text-length or layout constraints, and stable
-feature terminology. Every supplied line ID must be cited by at least one screen or feature entry.""",
+feature terminology. Identify render-time composition boundaries such as fixed labels plus value/state slots, and
+keep the slot's semantic state distinct from the literal source token. Every supplied line ID must be cited by at
+least one screen or feature entry.""",
     ContextMode.KNOWLEDGE.value: """Analyze information architecture rather than inventing a story. Reconstruct
 ordered knowledge nodes, kinds, prerequisites, terminology, constraints, and cross-entry consistency. Every
 supplied line ID must be cited by a knowledge-node entry.""",
@@ -299,7 +301,15 @@ _SCHEMAS = {
 
 def _metadata_tokens(segment: Segment) -> set[str]:
     values: list[str] = []
-    for key in ("context_mode", "context_type", "text_type", "text_function", "category"):
+    for key in (
+        "context_mode",
+        "context_type",
+        "text_type",
+        "text_function",
+        "category",
+        "ui_slot_role",
+        "ui_state_semantics",
+    ):
         value = segment.metadata.get(key)
         if isinstance(value, str):
             values.append(value)

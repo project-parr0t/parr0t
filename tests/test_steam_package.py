@@ -14,6 +14,7 @@ from pathlib import Path
 from game_l10n.runtime_approval import create_runtime_approval
 from game_l10n.release_checkpoint import CHECKPOINT_NAME, CHECKPOINT_SCHEMA
 from game_l10n.steam import (
+    INSTALLED_STATE_SCHEMA,
     INSTALLER_CONTRACT,
     INSTALLER_MENU_LABELS,
     INSTALLER_PUBLIC_ERROR_CODES,
@@ -23,6 +24,7 @@ from game_l10n.steam import (
     STATUS_FILE_NAME,
     SteamPackageError,
     build_steam_package,
+    inspect_installed_state,
     validate_steam_package,
 )
 from game_l10n.workspace import initialize_workspace
@@ -95,6 +97,64 @@ def write_release_checkpoint(
 
 
 class SteamPackageTests(unittest.TestCase):
+    def test_installed_state_inspection_uses_only_receipt_owned_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = Path(directory) / "fixture-game"
+            game.mkdir()
+
+            absent = inspect_installed_state(game)
+            self.assertEqual(absent["schema"], INSTALLED_STATE_SCHEMA)
+            self.assertEqual(absent["state"], "not_installed")
+
+            installed = game / "fixture-data.bin"
+            backup = game / ".parr0t" / "backups" / "fixture" / "fixture-launcher.exe"
+            installed.write_text("PATCHED_FIXTURE", encoding="utf-8")
+            backup.parent.mkdir(parents=True)
+            backup.write_text("ORIGINAL_FIXTURE", encoding="utf-8")
+            (game / STATUS_FILE_NAME).write_text(
+                "contract=parr0t.patch-status/v1\n"
+                "patch_id=fixture-localization\n"
+                "release_id=r1\n",
+                encoding="utf-8",
+            )
+            receipt = {
+                "patch_id": "fixture-localization",
+                "release_id": "r1",
+                "files": [
+                    {
+                        "path": "fixture-data.bin",
+                        "bytes": installed.stat().st_size,
+                        "sha256": _digest("PATCHED_FIXTURE"),
+                    }
+                ],
+                "originals": [
+                    {
+                        "path": "fixture-launcher.exe",
+                        "backup_path": ".parr0t/backups/fixture/fixture-launcher.exe",
+                        "bytes": backup.stat().st_size,
+                        "sha256": _digest("ORIGINAL_FIXTURE"),
+                    }
+                ],
+            }
+            receipt_path = game / ".parr0t" / "fixture-localization.json"
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+            intact = inspect_installed_state(game)
+            self.assertEqual(intact["state"], "installed_intact")
+            self.assertEqual(intact["tracked_files"]["recorded"], 1)
+
+            installed.write_text("EXTERNAL_CHANGE", encoding="utf-8")
+            changed = inspect_installed_state(game)
+            self.assertEqual(changed["state"], "possible_game_update")
+            self.assertTrue(changed["possible_game_update"])
+            self.assertIn("patched_file_hash_changed", changed["signals"])
+
+            installed.write_text("PATCHED_FIXTURE", encoding="utf-8")
+            backup.write_text("DAMAGED_BACKUP", encoding="utf-8")
+            damaged = inspect_installed_state(game)
+            self.assertEqual(damaged["state"], "damaged_state")
+            self.assertEqual(damaged["recommended_action"], "stop_before_mutation_and_recover_state")
+
     def test_package_is_deterministic_and_manifest_driven(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

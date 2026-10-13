@@ -31,6 +31,7 @@ _REVIEW_ISSUE_CODES = {
     "unit",
     "knowledge_order",
     "length_risk",
+    "slot_composition",
 }
 
 

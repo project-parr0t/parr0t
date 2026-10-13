@@ -36,6 +36,8 @@ A new game build always requires a newly validated patch and compatibility recor
 
 When the user requests a wording or terminology change, resolve it to stable target IDs and invalidate those entries plus the transitive reverse dependency closure declared by the SDK. Examples of dependencies include shared glossary terms, paired UI states, speaker voice anchors, and references whose interpretation depends on another line.
 
+When the user supplies or approves the exact final target wording, use the deterministic `apply-user-correction` flow in `docs/minimal-corrections.md`. This is user-directed correction rather than model translation: do not re-run context analysis or semantic review for the named IDs. The command still verifies the released source/target bindings and all deterministic integrity constraints. If the reverse dependency closure contains unnamed IDs, stop and review only that closure before packaging.
+
 Do not invalidate the full inventory merely because one entry changed. Expand the invalidation set only when evidence shows a wider dependency, a global glossary/voice/context policy changes, or stable mapping is ambiguous. If the user explicitly requests a complete re-review, `docs/coverage-gates.md` still requires a fresh verdict for every current target.
 
 The control plane sees only IDs, fingerprints, counts, invalidation reasons, and queue states. Text comparison and checkpoint materialization remain in the private data plane.

@@ -41,9 +41,12 @@ Place the completed files under a payload directory in the external workspace. C
 ```text
 game-l10n steam-package --workspace <external-workspace> --payload <payload-directory> --spec <steam-spec.json> --output <patch.zip>
 game-l10n verify-steam-package --workspace <external-workspace> --package <patch.zip>
+game-l10n inspect-installed-state --workspace <external-workspace> --target <configured-game-root>
 ```
 
 The ZIP is deterministic for identical inputs. It contains only the fixed files, release checkpoint, and payload defined by `docs/installer-contract.md`; agent harness files and workspace state are forbidden. The package validator checks the exact entry set, installer contract, result-code registry, sizes, artifact fingerprint, checkpoint schema/binding/digest, and payload digests.
+
+`inspect-installed-state` is a separate read-only diagnostic. It hashes only receipt-owned installed files and preserved original backups. It reports `not_installed`, `installed_intact`, `possible_game_update`, or `damaged_state`; it neither installs nor repairs anything. `possible_game_update` means recorded patched bytes changed or disappeared and may also reflect a user or another tool, so revalidate before attributing the cause. A missing or changed preserved-original backup is `damaged_state` and blocks further mutation until recovery is resolved.
 
 ## Installer behavior
 

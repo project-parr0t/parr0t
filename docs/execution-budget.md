@@ -21,6 +21,10 @@ Use the lowest sufficient level:
 
 Stop when the required level passes. Broaden or repeat validation only after input changes, a failed check, or an unresolved concrete risk.
 
+## Exact correction budget
+
+When the user supplies the final replacement wording for a typo or small translation fix, use `docs/minimal-corrections.md`. Resolve its stable IDs, run `game-l10n apply-user-correction`, repack the owning payload once, and verify the package once. The expected model-call and context-analysis budget is zero. Do not delegate the correction, reopen full source discovery, re-read every translation, rehash the game tree, or create a job-specific apply/validation script. If reverse dependencies exist, review only those IDs; if mapping is ambiguous, perform one narrow static lookup before changing anything.
+
 ## Retry and loop limits
 
 - Do not repeat a successful command when its input fingerprint is unchanged.

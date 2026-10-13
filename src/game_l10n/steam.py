@@ -23,6 +23,7 @@ INSTALLER_PS1 = "Install-Translation-Patch.ps1"
 INSTALLER_BAT = "Install-Translation-Patch.bat"
 README_NAME = "README.txt"
 STATUS_FILE_NAME = "parr0t-patch-status.txt"
+INSTALLED_STATE_SCHEMA = "parr0t.installed-state-inspection/v1"
 SCHEMA = "parr0t.steam.patch/v4"
 INSTALLER_CONTRACT = "parr0t.windows-installer/v2"
 INSTALLER_UI_LOCALE = "ko-KR"
@@ -497,4 +498,268 @@ def validate_steam_package(package_path: Path) -> dict[str, Any]:
         "files": len(files),
         "bytes": package_path.stat().st_size,
         "sha256": _sha256(package_path.read_bytes()),
+    }
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _installed_path(root: Path, value: str, *, field: str) -> tuple[str, Path]:
+    relative = _safe_relative(value, field=field)
+    candidate = root.joinpath(*PurePosixPath(relative).parts)
+    try:
+        candidate.resolve(strict=False).relative_to(root)
+    except ValueError as error:
+        raise SteamPackageError(f"{field} resolves outside the game root") from error
+    return relative, candidate
+
+
+def _damaged_state(
+    root: Path,
+    *signals: str,
+    patch_id: str | None = None,
+    release_id: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema": INSTALLED_STATE_SCHEMA,
+        "target": str(root),
+        "state": "damaged_state",
+        "patch_installed": patch_id is not None,
+        "possible_game_update": False,
+        "patch_id": patch_id,
+        "release_id": release_id,
+        "signals": list(signals),
+        "recommended_action": "stop_before_mutation_and_recover_state",
+    }
+
+
+def inspect_installed_state(game_root: Path) -> dict[str, Any]:
+    """Classify a Parr0t installation from receipt hashes without changing it.
+
+    A receipt-owned file mismatch is only an advisory game-update signal: another
+    tool or user edit can produce the same result. A missing or changed preserved
+    original is damaged state because safe Restore can no longer be assumed.
+    """
+
+    root = game_root.resolve()
+    if not root.is_dir():
+        raise SteamPackageError(f"Game root does not exist: {root}")
+    status_path = root / STATUS_FILE_NAME
+    state_root = root / ".parr0t"
+    if not status_path.is_file():
+        orphaned = 0
+        if state_root.is_dir():
+            orphaned = sum(1 for item in state_root.glob("*.json") if item.is_file())
+        if orphaned:
+            result = _damaged_state(root, "receipt_without_status")
+            result["orphaned_receipts"] = orphaned
+            return result
+        return {
+            "schema": INSTALLED_STATE_SCHEMA,
+            "target": str(root),
+            "state": "not_installed",
+            "patch_installed": False,
+            "possible_game_update": False,
+            "patch_id": None,
+            "release_id": None,
+            "signals": ["status_absent"],
+            "recommended_action": "treat_as_unpatched",
+        }
+
+    try:
+        values: dict[str, str] = {}
+        for line in status_path.read_text(encoding="utf-8-sig").splitlines():
+            key, separator, value = line.partition("=")
+            if not separator or not key or key in values:
+                raise ValueError("invalid status line")
+            values[key] = value
+        patch_id = values.get("patch_id")
+        release_id = values.get("release_id")
+        if (
+            values.get("contract") != "parr0t.patch-status/v1"
+            or not isinstance(patch_id, str)
+            or not _SAFE_ID.fullmatch(patch_id)
+            or not isinstance(release_id, str)
+            or not _SAFE_ID.fullmatch(release_id)
+        ):
+            raise ValueError("invalid status values")
+    except (OSError, UnicodeError, ValueError):
+        return _damaged_state(root, "status_invalid")
+
+    receipt_path = state_root / f"{patch_id}.json"
+    if not receipt_path.is_file():
+        return _damaged_state(
+            root, "receipt_missing", patch_id=patch_id, release_id=release_id
+        )
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return _damaged_state(
+            root, "receipt_invalid", patch_id=patch_id, release_id=release_id
+        )
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("patch_id") != patch_id
+        or receipt.get("release_id") != release_id
+        or not isinstance(receipt.get("files"), list)
+        or not receipt["files"]
+        or not isinstance(receipt.get("originals", []), list)
+    ):
+        return _damaged_state(
+            root, "receipt_invalid", patch_id=patch_id, release_id=release_id
+        )
+
+    matched = 0
+    changed: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    try:
+        for index, item in enumerate(receipt["files"]):
+            if not isinstance(item, dict):
+                raise SteamPackageError("receipt file entry must be an object")
+            relative, target = _installed_path(
+                root, str(item.get("path", "")), field=f"receipt.files[{index}].path"
+            )
+            folded = relative.casefold()
+            expected_sha = item.get("sha256")
+            expected_bytes = item.get("bytes")
+            if (
+                folded in seen
+                or not isinstance(expected_sha, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", expected_sha)
+                or not isinstance(expected_bytes, int)
+                or isinstance(expected_bytes, bool)
+                or expected_bytes < 0
+            ):
+                raise SteamPackageError("receipt file entry is invalid")
+            seen.add(folded)
+            if not target.is_file():
+                missing.append({"path": relative, "recorded_sha256": expected_sha})
+                continue
+            current_bytes = target.stat().st_size
+            current_sha = _file_sha256(target)
+            if current_bytes == expected_bytes and current_sha == expected_sha:
+                matched += 1
+            else:
+                changed.append(
+                    {
+                        "path": relative,
+                        "recorded_bytes": expected_bytes,
+                        "current_bytes": current_bytes,
+                        "recorded_sha256": expected_sha,
+                        "current_sha256": current_sha,
+                    }
+                )
+    except (OSError, SteamPackageError):
+        return _damaged_state(
+            root, "receipt_invalid", patch_id=patch_id, release_id=release_id
+        )
+
+    backup_matched = 0
+    backup_changed: list[dict[str, Any]] = []
+    backup_missing: list[dict[str, Any]] = []
+    original_seen: set[str] = set()
+    backup_seen: set[str] = set()
+    try:
+        for index, item in enumerate(receipt.get("originals", [])):
+            if not isinstance(item, dict):
+                raise SteamPackageError("receipt original entry must be an object")
+            original, _ = _installed_path(
+                root, str(item.get("path", "")), field=f"receipt.originals[{index}].path"
+            )
+            backup, backup_path = _installed_path(
+                root,
+                str(item.get("backup_path", "")),
+                field=f"receipt.originals[{index}].backup_path",
+            )
+            expected_sha = item.get("sha256")
+            expected_bytes = item.get("bytes")
+            original_key = original.casefold()
+            backup_key = backup.casefold()
+            if (
+                original_key in original_seen
+                or backup_key in backup_seen
+                or not isinstance(expected_sha, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", expected_sha)
+                or not isinstance(expected_bytes, int)
+                or isinstance(expected_bytes, bool)
+                or expected_bytes < 0
+            ):
+                raise SteamPackageError("receipt original entry is invalid")
+            original_seen.add(original_key)
+            backup_seen.add(backup_key)
+            if not backup_path.is_file():
+                backup_missing.append(
+                    {"path": original, "backup_path": backup, "recorded_sha256": expected_sha}
+                )
+                continue
+            current_bytes = backup_path.stat().st_size
+            current_sha = _file_sha256(backup_path)
+            if current_bytes == expected_bytes and current_sha == expected_sha:
+                backup_matched += 1
+            else:
+                backup_changed.append(
+                    {
+                        "path": original,
+                        "backup_path": backup,
+                        "recorded_bytes": expected_bytes,
+                        "current_bytes": current_bytes,
+                        "recorded_sha256": expected_sha,
+                        "current_sha256": current_sha,
+                    }
+                )
+    except (OSError, SteamPackageError):
+        return _damaged_state(
+            root, "receipt_invalid", patch_id=patch_id, release_id=release_id
+        )
+
+    payload_changed = bool(changed or missing)
+    backup_damaged = bool(backup_changed or backup_missing)
+    if backup_damaged:
+        state = "damaged_state"
+        recommendation = "stop_before_mutation_and_recover_state"
+    elif payload_changed:
+        state = "possible_game_update"
+        recommendation = "revalidate_patch_against_current_game"
+    else:
+        state = "installed_intact"
+        recommendation = "reuse_recorded_patch_state"
+    signals: list[str] = []
+    if changed:
+        signals.append("patched_file_hash_changed")
+    if missing:
+        signals.append("patched_file_missing")
+    if backup_changed:
+        signals.append("original_backup_hash_changed")
+    if backup_missing:
+        signals.append("original_backup_missing")
+    if not signals:
+        signals.append("recorded_hashes_match")
+    return {
+        "schema": INSTALLED_STATE_SCHEMA,
+        "target": str(root),
+        "state": state,
+        "patch_installed": True,
+        "possible_game_update": payload_changed,
+        "patch_id": patch_id,
+        "release_id": release_id,
+        "signals": signals,
+        "tracked_files": {
+            "recorded": len(receipt["files"]),
+            "matched": matched,
+            "changed": changed,
+            "missing": missing,
+        },
+        "original_backups": {
+            "recorded": len(receipt.get("originals", [])),
+            "matched": backup_matched,
+            "changed": backup_changed,
+            "missing": backup_missing,
+        },
+        "recommended_action": recommendation,
     }

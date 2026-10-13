@@ -28,7 +28,10 @@ The selected engine SDK produces two JSON documents in the private workspace. Th
       "source": "SOURCE_TEXT",
       "metadata": {
         "text_type": "label",
-        "blocking_on_failure": true
+        "blocking_on_failure": true,
+        "ui_slot_role": "value",
+        "ui_composed_with_ids": ["synthetic-label-001"],
+        "ui_render_pattern": "{label}: {value}"
       }
     }
   ]
@@ -36,6 +39,8 @@ The selected engine SDK produces two JSON documents in the private workspace. Th
 ```
 
 The two documents must name different methods and carry different implementation fingerprints; copying one manifest and changing its label is not an independent check. An exclusion has `reason_code` and `affects_user_visible_text`. If the latter is true, the inventory cannot pass. Overcapture is resolved inside the engine SDK; it is not a reason to silently omit an entire source class.
+
+When a target is one part of a composed UI string, both inventories must agree on the evidence-backed fields defined by `docs/segment-metadata.md`. A stable source ID without its slot role or composition dependencies is insufficient for safe reuse and review.
 
 Run the gate before context analysis:
 

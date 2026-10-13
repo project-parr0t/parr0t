@@ -91,7 +91,7 @@ class CompatibleProviderTests(unittest.TestCase):
                     {
                         "finish_reason": "stop",
                         "message": {
-                            "content": "REWRITE function,condition,knowledge_order,length_risk"
+                            "content": "REWRITE function,knowledge_order,length_risk,slot_composition"
                         },
                     }
                 ]
@@ -118,7 +118,7 @@ class CompatibleProviderTests(unittest.TestCase):
             result,
             {
                 "verdict": "rewrite",
-                "issues": ["function", "condition", "knowledge_order", "length_risk"],
+                "issues": ["function", "knowledge_order", "length_risk", "slot_composition"],
             },
         )
 
