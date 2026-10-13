@@ -249,3 +249,11 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Diagnosis:** Compare elapsed tool time with agent reasoning/wait time, count model/context calls, list reread artifacts, and identify whether unchanged targets, source files, installation state, or package layers were revalidated without an invalidating input.
 - **Resolution:** If the user supplied the exact final wording, run `game-l10n apply-user-correction`, then repack only the owning payload and verify the package once. If reverse dependencies are reported, review only those IDs. Use one narrow static lookup only when the stable mapping is ambiguous.
 - **Prevention:** Preserve the full reviewed result and release checkpoint, keep corrections in the current agent, prohibit job-specific correction scripts, and enforce the zero-model exact-correction budget in `docs/minimal-corrections.md`.
+
+## Native worker token use grows much faster than target count
+
+- **Symptom:** A large translation or review pass has reasonable unique input and output, but aggregate input is orders of magnitude larger, cached input dominates usage, later workers become slower, or a worker accumulates thousands of model events.
+- **General cause:** Data-plane agents inherit the parent conversation or remain alive across multiple shards. Every next target replays prior targets, tool output, reasoning, and results, so context cost grows superlinearly even when most tokens are cached.
+- **Diagnosis:** Compare root and worker counts, model-event counts, aggregate input, cached input, uncached input, and output without reading game text. Inspect whether workers used parent-history forks or received follow-up tasks after completing a shard.
+- **Resolution:** Regenerate `prepare-native-pass` v2 tasks with bounded ID and estimated-material limits. Start one fresh no-history worker per task, pass only artifact paths and the immutable contract, write results directly to private files, and return metadata only. Do not repair a long worker with more summaries or compaction.
+- **Prevention:** Keep the default 32-ID/12,000-estimated-material-token bounds, never reuse completed native workers, and treat a high cached-input ratio as a rotation signal rather than evidence that long-lived sessions are efficient.

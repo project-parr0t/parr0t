@@ -39,7 +39,19 @@ Use subagents when work divides into independent, non-overlapping bulk translati
 
 Every delegated worker must have an exclusive output and a clear completion envelope. Do not delegate a duplicate review of a deterministic pass merely to increase confidence.
 
-For native bulk localization, create stable exclusive ID shards once with `prepare-native-pass`. A worker may process many IDs sequentially, but each target retains its own candidate and refusal status. Keep only the available worker slots active, use bounded waits, and dispatch the next shard when a slot opens. Do not launch one subagent per target or poll every worker repeatedly.
+For native bulk localization, create stable exclusive ID tasks once with `prepare-native-pass`. Each target retains its own candidate and refusal status. Keep only the available worker slots active, use bounded waits, and dispatch the next task when a slot opens. Do not launch one subagent per target or poll every worker repeatedly.
+
+## Native model context budget
+
+Native workers are data-plane executors, not long-lived chats. Start every translation or review task in a fresh worker with no inherited parent conversation (`fork_turns="none"` or the host equivalent). Give it only the immutable worker contract and private workspace/source/context/task paths. It reads and writes files directly and returns only task ID, counts, categorical states, issue codes, and artifact paths. Never paste source text, candidates, inventories, code listings, or command output into agent messages.
+
+One worker processes one task and then ends. Do not send another shard through a follow-up turn, even when the worker is idle. Long-lived workers accumulate every previous target and tool result; replaying that history on each next target makes input usage grow superlinearly while adding no translation evidence.
+
+`prepare-native-pass` v2 defaults to at most 32 IDs and 12,000 estimated private material tokens per task. The estimate sizes scheduling material only and is not a provider billing claim. Lower either bound when focused context, source records, or expected target output is large. A single oversized target remains isolated in its own task. Reuse the cached task manifest only when the source fingerprint and both bounds match.
+
+An older workspace that still has the former implicit 256-record value and no material-token setting is treated as a legacy default and automatically receives the new 32/12,000 bounds. An explicit `--max-records` or `--max-material-tokens` remains authoritative.
+
+When native usage telemetry is available, record only aggregate input, cached-input, output, reasoning, event, and worker counts in the private workspace. A high cached-input ratio does not justify continued worker reuse: it is evidence that old conversation is being replayed. Rotate workers rather than adding summaries or compactions to an already long data-plane chat.
 
 ## Proportional safety baseline
 

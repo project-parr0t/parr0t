@@ -105,7 +105,10 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "same_failure_limit": 2,
         "reuse_unchanged_checks": True,
         "delegate_simple_tasks": False,
-        "native_shard_records": 256,
+        "native_shard_records": 32,
+        "native_shard_material_tokens": 12000,
+        "native_worker_history": "none",
+        "native_worker_reuse": False,
     },
     "coverage": {
         "require_independent_inventory": True,
@@ -171,6 +174,7 @@ This directory contains private game data and translation artifacts. It is inten
 32. Every distributable package includes `parr0t-release-checkpoint.json` as a machine-readable continuation point. When a prior release and a game folder are supplied, validate that checkpoint first and re-extract the current inventories. A new game build invalidates direct installation compatibility, not every translation: reuse a reviewed target only when its source, location, dependency, target-scoped context/review, and compatible SDK-adapter bindings still match. A user-requested correction invalidates only the named target IDs and their declared reverse dependencies unless the user requests a complete review or the global review policy changed. Implement a verified missing-locale fallback to a base locale, source text, or a nonempty placeholder when the selected SDK can do so safely; otherwise record the fallback as unsupported with a reason and never claim it exists.
 33. Follow the repository `docs/segment-metadata.md` for UI composition. When the selected SDK can prove the call-site structure, emit `ui_slot_role`, semantic state, related IDs, render pattern, fixed target affixes, and hard limits. Translate and review only the slot payload; never duplicate surrounding labels or confuse a semantic enabled/disabled state with a literal source token. Before assuming an installed patch is a new game build or repeating broad extraction, run the read-only `game-l10n inspect-installed-state --workspace <this-directory> --target <configured-game-root>`. Treat `possible_game_update` as an advisory receipt-owned-file mismatch, not proof of cause, and stop before mutation if preserved original backups are damaged.
 34. When the user supplies or approves exact replacement wording for a typo or small fix, follow `docs/minimal-corrections.md` and run `game-l10n apply-user-correction` against the matching verified inventory and release checkpoint; reuse the full result artifact when available, or materialize released candidates from the checkpoint. Keep the correction in the current agent with zero model/context calls, preserve every unnamed result, repack only the owning payload once, and verify the package once. Do not delegate, reopen discovery, inspect or hash the whole game, re-review unchanged targets, or create one-off correction scripts. A reverse dependency or ambiguous mapping expands only to the specifically affected IDs.
+35. Native bulk translation and review use `prepare-native-pass` v2. Run every task in a fresh native worker with no parent conversation history (`fork_turns="none"` or the host equivalent), one task per worker, no follow-up task reuse, and a metadata-only final envelope. Pass only workspace/contract/source/context/task artifact paths in the startup message; never paste source, candidate, inventory, code, or tool output into the conversation. Keep the default 32-ID and 12,000 estimated-material-token task bounds unless a smaller bound is needed. Normalize null speaker, scene, previous, and next values to empty strings before prompting.
 
 ## Data boundary
 
