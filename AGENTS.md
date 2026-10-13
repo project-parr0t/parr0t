@@ -6,6 +6,7 @@ Parr0t contains reusable orchestration code only. Never place actual game files,
 
 1. Create every per-game working directory outside this repository with `game-l10n init-workspace`.
 2. At the beginning of a game task, ask whether Git use is allowed and record the choice with `game-l10n policy`. A refusal means no `git init`, branch, commit, or push for that task.
+2a. Before writing or adapting unpack, apply, pack, or validation code, run the SDK inventory gate in `docs/sdk-selection.md`. Inspect every plausible local and remote-tracking `sdk-*` branch by its public contract, record compatibility with `game-l10n sdk-evaluate`, and select `reuse`, `extend`, or `private-new` with `game-l10n sdk-select`. Reuse is the default, extension is preferred over duplication, and `private-new` is permitted only after every inventoried candidate is categorically incompatible. Do not use branch-name similarity alone and do not copy an existing adapter into a new implementation.
 3. Analyze the complete ordered script before translating. Do not translate from isolated examples or dialogue alone. If all context-analysis routes fail or refuse, stop.
 4. The top-level orchestrator monitors completion, refusal, malformed output, integrity checks, and fallback routing. It does not perform semantic review.
 5. Use independent translation and review routes. A refusal or invalid result must move to the next configured provider.

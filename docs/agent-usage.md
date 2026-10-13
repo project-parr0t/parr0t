@@ -24,7 +24,7 @@ The external workspace stores extracted content, context packs, translations, ca
 ## Startup contract
 
 1. Read the repository `AGENTS.md`, this guide, and any `AGENTS.md` in the external workspace.
-2. Inspect available branches and choose an existing `sdk-<engine>-<version>` branch only when its public format matches the target. Otherwise keep discovery and provisional adapters private.
+2. Follow `docs/sdk-selection.md`. Inventory visible local and remote-tracking SDK branches, inspect plausible public contracts, record categorical evaluations, and select reuse, extension, or a private new adapter before writing format tooling. Reuse is the default and a partial match must be extended rather than duplicated.
 3. Confirm that the source root is readable and the external workspace is writable.
 4. Ask once at the beginning whether Git may be used for this job. Record the answer; do not infer consent.
 5. Initialize or resume the external workspace and inspect `game-l10n status` before performing work.
@@ -89,6 +89,9 @@ The stable internal interface is:
 python -m pip install -e .
 game-l10n init-workspace <external-workspace> --sdk-root <repository> --game-root <source-root>
 game-l10n status --workspace <external-workspace>
+game-l10n sdk-inventory --workspace <external-workspace> --refresh-remote
+game-l10n sdk-evaluate --workspace <external-workspace> --branch <sdk-branch> --result <compatible|partial|incompatible> --reason <reason-code> --evidence-path <public-contract-path>
+game-l10n sdk-select --workspace <external-workspace> --mode <reuse|extend|private-new> [--branch <sdk-branch>]
 ```
 
 These commands are execution boundaries for the agent, not an end-user workflow.

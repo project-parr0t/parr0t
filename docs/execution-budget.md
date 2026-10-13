@@ -12,7 +12,7 @@ Build the minimum working artifact first. If a simpler design satisfies the stat
 
 Use the lowest sufficient level:
 
-1. **Inspect:** batch the necessary reads once and select the existing adapter or private implementation.
+1. **Inspect:** run the SDK reuse gate once, batch the necessary public-contract reads, and select reuse, extension, or a private implementation. Do not spend build time recreating an inventoried compatible adapter.
 2. **Build:** produce one new artifact without mutating the source root.
 3. **Focused validation:** validate changed data, package structure, manifests, placeholders, and hashes once.
 4. **Synthetic lifecycle:** for an installer change, run one isolated install, update, verify, and restore lifecycle against synthetic files. Include one declared original replacement only when that behavior changed.

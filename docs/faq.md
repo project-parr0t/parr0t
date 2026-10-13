@@ -18,6 +18,14 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Resolution:** Exclude generated outputs and volatile metadata from the fingerprint, then regenerate the stage state.
 - **Prevention:** Test every cached stage by running it twice and requiring the second run to report `skipped`.
 
+## An agent rebuilds an adapter even though a usable SDK branch exists
+
+- **Symptom:** The first session starts writing a new unpacker or patcher without inspecting an existing `sdk-*` implementation, producing duplicate code and avoidable validation work.
+- **General cause:** Branch discovery was advisory, only the current checkout was inspected, or a branch name was treated as the complete compatibility test.
+- **Diagnosis:** Inspect the external workspace's SDK inventory, per-candidate commit-bound evaluations, and selected mode. A missing decision or an unevaluated plausible branch means implementation started too early.
+- **Resolution:** Stop the duplicate implementation, refresh visible local and remote-tracking refs, inspect each plausible public contract, and record `reuse` or `extend` when possible. Select `private-new` only after every candidate is categorically incompatible.
+- **Prevention:** Keep the `docs/sdk-selection.md` gate before extraction and let the CLI block data-plane stages and SDK promotion until a current decision exists.
+
 ## A model refuses fictional game localization
 
 - **Symptom:** A context, translation, or review provider refuses a bounded transformation because the fictional text contains mature themes.

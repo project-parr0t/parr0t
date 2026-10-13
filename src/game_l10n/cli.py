@@ -22,9 +22,13 @@ from .steam import build_steam_package, validate_steam_package
 from .tooling import run_cached_tool
 from .workspace import (
     initialize_workspace,
+    refresh_sdk_inventory,
     load_config,
     prepare_sdk_profile,
     publish_sdk_profile,
+    record_sdk_evaluation,
+    record_sdk_selection,
+    require_sdk_selection,
     update_repository_policy,
 )
 
@@ -155,6 +159,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"Initialized private agent workspace: {Path(args.workspace).resolve()}")
     if args.git_choice == "pending":
         print("ACTION_REQUIRED: ask the user whether Git use is allowed, then run `game-l10n policy`.")
+    print("ACTION_REQUIRED: evaluate the inventoried SDK branches and record sdk-select before extraction.")
     return 0
 
 
@@ -170,6 +175,7 @@ def cmd_policy(args: argparse.Namespace) -> int:
 
 def cmd_translate(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
+    require_sdk_selection(load_config(work_dir))
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     destination = _path_in_workspace(work_dir, args.output)
     if destination == source:
@@ -204,6 +210,7 @@ def cmd_translate(args: argparse.Namespace) -> int:
 
 def cmd_analyze_context(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
+    require_sdk_selection(load_config(work_dir))
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     context_pack, cached = _analyze_context(work_dir, read_segments(source), force=args.force)
     config = load_config(work_dir)
@@ -226,6 +233,7 @@ def cmd_analyze_context(args: argparse.Namespace) -> int:
 def cmd_run_tool(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
+    require_sdk_selection(config)
     sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
     require_external_workdir(work_dir, sdk_root)
     command = config.get("tools", {}).get(args.stage)
@@ -254,6 +262,7 @@ def cmd_import_native_shard(args: argparse.Namespace) -> int:
 def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
+    require_sdk_selection(config)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     output = _path_in_workspace(work_dir, args.output)
     max_records = args.max_records or int(
@@ -292,13 +301,20 @@ def cmd_status(args: argparse.Namespace) -> int:
         actions.append("configure_game_root")
     elif missing_roots:
         actions.append("fix_missing_game_root")
-    if not any((work_dir / "inputs").glob("*")):
-        actions.append("unpack_and_extract_ordered_script")
-    context_path = _path_in_workspace(
-        work_dir, config.get("files", {}).get("context_pack", "context/context-pack.json")
-    )
-    if not context_path.exists():
-        actions.append("analyze_complete_script_context")
+    sdk_selection = config.get("sdk_selection", {})
+    if sdk_selection.get("status") != "selected":
+        if not sdk_selection.get("inventory_fingerprint"):
+            actions.append("inventory_sdk_branches")
+        else:
+            actions.append("evaluate_and_select_sdk_branch")
+    else:
+        if not any((work_dir / "inputs").glob("*")):
+            actions.append("unpack_and_extract_ordered_script")
+        context_path = _path_in_workspace(
+            work_dir, config.get("files", {}).get("context_pack", "context/context-pack.json")
+        )
+        if not context_path.exists():
+            actions.append("analyze_complete_script_context")
     print(
         json.dumps(
             {
@@ -307,6 +323,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "game_roots": [str(path) for path in game_roots],
                 "missing_game_roots": missing_roots,
                 "repository": policy,
+                "sdk_selection": sdk_selection,
                 "execution": config.get("execution", {}),
                 "runtime": config.get("runtime", {"default_policy": "deny"}),
                 "next_actions": actions or ["ready"],
@@ -316,6 +333,36 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
     )
     return 1 if missing_roots else 0
+
+
+def cmd_sdk_inventory(args: argparse.Namespace) -> int:
+    selection = refresh_sdk_inventory(
+        Path(args.workspace).resolve(),
+        refresh_remote=args.refresh_remote,
+        remote=args.remote,
+    )
+    print(json.dumps(selection, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_sdk_evaluate(args: argparse.Namespace) -> int:
+    evaluation = record_sdk_evaluation(
+        Path(args.workspace).resolve(),
+        args.branch,
+        args.result,
+        args.reason,
+        args.evidence_path,
+    )
+    print(json.dumps({"branch": args.branch, **evaluation}, ensure_ascii=False))
+    return 0
+
+
+def cmd_sdk_select(args: argparse.Namespace) -> int:
+    decision = record_sdk_selection(
+        Path(args.workspace).resolve(), args.mode, branch=args.branch
+    )
+    print(json.dumps(decision, ensure_ascii=False))
+    return 0
 
 
 def cmd_promote(args: argparse.Namespace) -> int:
@@ -505,6 +552,58 @@ def build_parser() -> argparse.ArgumentParser:
     native_merge.add_argument("--input", required=True, help="Ordered source segment file")
     native_merge.add_argument("--output", required=True)
     native_merge.set_defaults(func=cmd_merge_native_pass)
+
+    sdk_inventory = sub.add_parser(
+        "sdk-inventory",
+        help="Refresh the read-only inventory of existing sdk-* branches",
+    )
+    sdk_inventory.add_argument("--workspace", required=True)
+    sdk_inventory.add_argument(
+        "--refresh-remote",
+        action="store_true",
+        help="Fetch only sdk-* tracking refs before inventorying them",
+    )
+    sdk_inventory.add_argument("--remote", default="origin")
+    sdk_inventory.set_defaults(func=cmd_sdk_inventory)
+
+    sdk_evaluate = sub.add_parser(
+        "sdk-evaluate",
+        help="Record a compatibility evaluation for one inventoried SDK branch",
+    )
+    sdk_evaluate.add_argument("--workspace", required=True)
+    sdk_evaluate.add_argument("--branch", required=True)
+    sdk_evaluate.add_argument(
+        "--result", choices=["compatible", "partial", "incompatible"], required=True
+    )
+    sdk_evaluate.add_argument(
+        "--reason",
+        choices=[
+            "public_contract_match",
+            "reusable_with_extension",
+            "engine_mismatch",
+            "format_mismatch",
+            "version_incompatible",
+            "missing_required_capability",
+            "uninspectable_contract",
+        ],
+        required=True,
+    )
+    sdk_evaluate.add_argument(
+        "--evidence-path",
+        action="append",
+        default=[],
+        help="Inspected path from the candidate's public_contract_paths; repeat when needed",
+    )
+    sdk_evaluate.set_defaults(func=cmd_sdk_evaluate)
+
+    sdk_select = sub.add_parser(
+        "sdk-select",
+        help="Select reuse, extension, or a private new adapter after SDK evaluation",
+    )
+    sdk_select.add_argument("--workspace", required=True)
+    sdk_select.add_argument("--mode", choices=["reuse", "extend", "private-new"], required=True)
+    sdk_select.add_argument("--branch")
+    sdk_select.set_defaults(func=cmd_sdk_select)
 
     status = sub.add_parser("status", help="Report the next safe action for a Codex orchestrator")
     status.add_argument("--workspace", required=True)

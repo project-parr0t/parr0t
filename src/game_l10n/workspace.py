@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -90,6 +91,13 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "pack": ["python", "tools/pack.py", "{input}", "{output}"],
     },
     "repository": {"initial_choice": "pending", "publish_approved": False},
+    "sdk_selection": {
+        "status": "pending",
+        "inventory_fingerprint": "",
+        "candidates": [],
+        "evaluations": {},
+        "decision": None,
+    },
     "execution": {
         "scope_mode": "minimum_requested_artifact",
         "validation_profile": "proportional",
@@ -113,6 +121,7 @@ This directory contains private game data and translation artifacts. It is inten
 ## Mandatory workflow
 
 1. Before any `git init`, remote creation, branch creation, commit, or push, ask the user whether Git use is allowed for this game/tooling task. Record the answer in `game-l10n.json` under `repository.initial_choice`. If refused, do not initialize Git. Run `game-l10n status --workspace <this-directory>` first; it reports the next safe action without sending data.
+1a. Before writing or adapting format tooling, inspect the candidates recorded by `game-l10n sdk-inventory`, evaluate each plausible public contract with `game-l10n sdk-evaluate`, and record exactly one `reuse`, `extend`, or `private-new` decision with `game-l10n sdk-select`. Reuse is the default; extend a partial match instead of reimplementing it. `private-new` is allowed only after every inventoried candidate is incompatible. The CLI blocks extraction, context, translation, and new-profile promotion until this gate is complete.
 2. Never copy source game data, extracted strings, translations, prompts, caches, logs, or credentials into the SDK repository.
 3. Run unpack and pack through `game-l10n run-tool`; identical tool/input/environment fingerprints are skipped automatically.
 4. Run translation through the orchestrator. The orchestrator only monitors execution/protocol status and fallback routing. It must not replace the independent review agent.
@@ -192,6 +201,261 @@ if __name__ == "__main__":
 '''
 
 
+SDK_EVALUATION_REASONS = {
+    "compatible": {"public_contract_match"},
+    "partial": {"reusable_with_extension"},
+    "incompatible": {
+        "engine_mismatch",
+        "format_mismatch",
+        "version_incompatible",
+        "missing_required_capability",
+        "uninspectable_contract",
+    },
+}
+
+
+def _run_git(sdk_root: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=sdk_root,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        shell=False,
+    )
+    if completed.returncode != 0:
+        raise ConfigurationError(f"git {' '.join(args)} failed: {completed.stderr.strip()}")
+    return completed.stdout
+
+
+def inventory_sdk_branches(sdk_root: Path) -> dict[str, Any]:
+    """Return an engine-branch inventory without checking out or changing any ref."""
+
+    sdk_root = sdk_root.resolve()
+    if not (sdk_root / ".git").exists():
+        candidates: list[dict[str, Any]] = []
+    else:
+        output = _run_git(
+            sdk_root,
+            "for-each-ref",
+            "--format=%(refname)%09%(objectname)",
+            "refs/heads/sdk-*",
+            "refs/remotes/*/sdk-*",
+        )
+        grouped: dict[str, list[tuple[str, str]]] = {}
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            ref, commit = line.split("\t", 1)
+            if ref.startswith("refs/heads/"):
+                branch = ref.removeprefix("refs/heads/")
+            else:
+                remainder = ref.removeprefix("refs/remotes/")
+                _, separator, branch = remainder.partition("/")
+                if not separator:
+                    continue
+            if not branch.startswith("sdk-") or branch.endswith("/HEAD"):
+                continue
+            grouped.setdefault(branch, []).append((ref, commit))
+
+        candidates = []
+        for branch in sorted(grouped):
+            refs = sorted(
+                grouped[branch],
+                key=lambda item: (
+                    0
+                    if item[0].startswith("refs/remotes/origin/")
+                    else 1
+                    if item[0].startswith("refs/remotes/")
+                    else 2,
+                    item[0],
+                ),
+            )
+            selected_ref, commit = refs[0]
+            changed = _run_git(
+                sdk_root, "diff", "--name-only", f"main...{selected_ref}"
+            ).splitlines()
+            public_paths = sorted(
+                path
+                for path in changed
+                if path.startswith(("docs/", "profiles/", "src/game_l10n/", "tests/"))
+            )
+            candidates.append(
+                {
+                    "branch": branch,
+                    "commit": commit,
+                    "inspect_ref": selected_ref,
+                    "refs": [{"name": ref, "commit": ref_commit} for ref, ref_commit in refs],
+                    "public_contract_paths": public_paths,
+                }
+            )
+
+    fingerprint_payload = json.dumps(
+        candidates, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    return {
+        "source": "local_and_remote_tracking_refs",
+        "candidates": candidates,
+        "fingerprint": hashlib.sha256(fingerprint_payload.encode("utf-8")).hexdigest(),
+    }
+
+
+def refresh_sdk_inventory(
+    work_dir: Path, *, refresh_remote: bool = False, remote: str = "origin"
+) -> dict[str, Any]:
+    config = load_config(work_dir)
+    sdk_root = Path(config.get("sdk_root") or "").resolve()
+    if refresh_remote:
+        allowed_remote_characters = (
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+        )
+        if not remote or any(character not in allowed_remote_characters for character in remote):
+            raise ConfigurationError("Remote name contains unsupported characters")
+        _run_git(
+            sdk_root,
+            "fetch",
+            "--prune",
+            remote,
+            f"+refs/heads/sdk-*:refs/remotes/{remote}/sdk-*",
+        )
+    inventory = inventory_sdk_branches(sdk_root)
+    previous = config.get("sdk_selection", {})
+    candidate_commits = {item["branch"]: item["commit"] for item in inventory["candidates"]}
+    evaluations = {
+        branch: evaluation
+        for branch, evaluation in previous.get("evaluations", {}).items()
+        if candidate_commits.get(branch) == evaluation.get("commit")
+    }
+    config["sdk_selection"] = {
+        "status": "pending",
+        "inventory_source": inventory["source"],
+        "inventory_fingerprint": inventory["fingerprint"],
+        "candidates": inventory["candidates"],
+        "evaluations": evaluations,
+        "decision": None,
+    }
+    _write_config(work_dir, config)
+    return config["sdk_selection"]
+
+
+def record_sdk_evaluation(
+    work_dir: Path,
+    branch: str,
+    result: str,
+    reason: str,
+    evidence_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    config = load_config(work_dir)
+    selection = config.get("sdk_selection", {})
+    candidates = {item["branch"]: item for item in selection.get("candidates", [])}
+    if branch not in candidates:
+        raise ConfigurationError("SDK branch is not present in the current inventory; refresh it first")
+    allowed_reasons = SDK_EVALUATION_REASONS.get(result)
+    if allowed_reasons is None:
+        raise ConfigurationError("SDK evaluation result must be compatible, partial, or incompatible")
+    if reason not in allowed_reasons:
+        raise ConfigurationError(f"Reason {reason!r} is not valid for SDK evaluation result {result!r}")
+    evidence = sorted(set(evidence_paths or []))
+    available_paths = set(candidates[branch].get("public_contract_paths", []))
+    unknown_evidence = sorted(set(evidence) - available_paths)
+    if unknown_evidence:
+        raise ConfigurationError(
+            "SDK evaluation evidence is not present in the candidate contract: "
+            + ", ".join(unknown_evidence)
+        )
+    if reason != "uninspectable_contract" and not evidence:
+        raise ConfigurationError(
+            "SDK evaluation requires at least one inspected public contract path"
+        )
+    evaluations = selection.setdefault("evaluations", {})
+    evaluations[branch] = {
+        "result": result,
+        "reason": reason,
+        "commit": candidates[branch]["commit"],
+        "evidence_paths": evidence,
+    }
+    selection["status"] = "pending"
+    selection["decision"] = None
+    _write_config(work_dir, config)
+    return evaluations[branch]
+
+
+def record_sdk_selection(
+    work_dir: Path, mode: str, branch: str | None = None
+) -> dict[str, Any]:
+    config = load_config(work_dir)
+    selection = config.get("sdk_selection", {})
+    if not selection.get("inventory_fingerprint"):
+        raise ConfigurationError("SDK inventory is missing; run sdk-inventory first")
+    candidates = {item["branch"]: item for item in selection.get("candidates", [])}
+    evaluations = selection.get("evaluations", {})
+
+    if mode in {"reuse", "extend"}:
+        if not branch or branch not in candidates:
+            raise ConfigurationError("reuse and extend decisions require an inventoried SDK branch")
+        evaluation = evaluations.get(branch, {})
+        allowed_results = {"compatible"} if mode == "reuse" else {"compatible", "partial"}
+        if evaluation.get("result") not in allowed_results:
+            raise ConfigurationError(f"SDK branch must be evaluated before selecting mode {mode}")
+    elif mode == "private-new":
+        if branch:
+            raise ConfigurationError("private-new does not accept a branch")
+        unevaluated = sorted(set(candidates) - set(evaluations))
+        reusable = sorted(
+            name
+            for name, evaluation in evaluations.items()
+            if evaluation.get("result") != "incompatible"
+        )
+        uninspectable = sorted(
+            name
+            for name, evaluation in evaluations.items()
+            if evaluation.get("reason") == "uninspectable_contract"
+        )
+        if unevaluated:
+            raise ConfigurationError(
+                "Every SDK candidate must be evaluated before private-new: " + ", ".join(unevaluated)
+            )
+        if reusable:
+            raise ConfigurationError(
+                "A compatible or extensible SDK exists; reuse or extend it instead: " + ", ".join(reusable)
+            )
+        if uninspectable:
+            raise ConfigurationError(
+                "Uninspectable SDK branches block private-new until access is resolved: "
+                + ", ".join(uninspectable)
+            )
+    else:
+        raise ConfigurationError("SDK selection mode must be reuse, extend, or private-new")
+
+    decision = {
+        "mode": mode,
+        "branch": branch,
+        "inventory_fingerprint": selection["inventory_fingerprint"],
+    }
+    selection["status"] = "selected"
+    selection["decision"] = decision
+    _write_config(work_dir, config)
+    return decision
+
+
+def require_sdk_selection(config: dict[str, Any]) -> dict[str, Any]:
+    selection = config.get("sdk_selection", {})
+    decision = selection.get("decision")
+    if selection.get("status") != "selected" or not isinstance(decision, dict):
+        raise ConfigurationError(
+            "SDK selection is incomplete; inventory, evaluate, and select an existing branch or private-new first"
+        )
+    if decision.get("inventory_fingerprint") != selection.get("inventory_fingerprint"):
+        raise ConfigurationError("SDK inventory changed after selection; refresh and select again")
+    return decision
+
+
+def _write_config(work_dir: Path, config: dict[str, Any]) -> None:
+    (work_dir / "game-l10n.json").write_text(
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
 def initialize_workspace(
     work_dir: Path,
     sdk_root: Path,
@@ -240,6 +504,15 @@ def initialize_workspace(
     config["sdk_root"] = str(sdk_root)
     config["game_roots"] = [str(path.resolve()) for path in (game_roots or [])]
     config["repository"]["initial_choice"] = git_choice
+    inventory = inventory_sdk_branches(sdk_root)
+    config["sdk_selection"] = {
+        "status": "pending",
+        "inventory_source": inventory["source"],
+        "inventory_fingerprint": inventory["fingerprint"],
+        "candidates": inventory["candidates"],
+        "evaluations": {},
+        "decision": None,
+    }
     files = {
         "game-l10n.json": json.dumps(config, ensure_ascii=False, indent=2) + "\n",
         "AGENTS.md": AGENTS_TEXT,
@@ -279,14 +552,17 @@ def update_repository_policy(work_dir: Path, *, initial_choice: str | None = Non
         if publish_approved and policy.get("initial_choice") != "enabled":
             raise ConfigurationError("Publishing cannot be approved unless Git use was enabled initially")
         policy["publish_approved"] = publish_approved
-    (work_dir / "game-l10n.json").write_text(
-        json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    _write_config(work_dir, config)
 
 
 def prepare_sdk_profile(work_dir: Path, engine: str, version: str, *, user_confirmed_success: bool) -> Path:
     if not user_confirmed_success:
         raise ConfigurationError("The user must explicitly confirm a successful translation/patch before promotion")
+    selection = require_sdk_selection(load_config(work_dir))
+    if selection.get("mode") != "private-new":
+        raise ConfigurationError(
+            "An existing SDK branch was selected; reuse or extend that branch instead of creating a duplicate profile"
+        )
     safe_engine = "-".join(part for part in engine.lower().replace("_", "-").split("-") if part.isalnum())
     safe_version = "-".join(part for part in version.lower().replace("_", "-").split("-") if part.replace(".", "").isalnum())
     if not safe_engine or not safe_version:

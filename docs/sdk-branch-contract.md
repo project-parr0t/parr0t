@@ -39,6 +39,12 @@ An engine SDK branch owns:
 - engine payload assembly, packing, and round-trip verification;
 - engine-specific documentation, FAQ entries, ignore rules, and synthetic fixtures.
 
+## Selection before implementation
+
+The agent must complete `docs/sdk-selection.md` before it writes provisional format tooling. A compatible SDK branch is reused directly. A partial match is extended with the smallest missing capability. A new private adapter is allowed only after every inventoried candidate is evaluated as incompatible. Neither the current checkout nor the absence of a local branch is evidence that no reusable SDK exists.
+
+The decision is bound to candidate commits in the external workspace. It must be refreshed when refs change. This state is job control metadata and must never be promoted into an SDK branch.
+
 ## Branch acceptance gate
 
 Before an engine SDK branch is published:

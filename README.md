@@ -16,6 +16,7 @@
 - 최상위 오케스트레이터는 원문이나 번역문을 직접 읽고 판단하지 않고 상태와 무결성 결과만 관리합니다.
 - 모든 번역 경로가 실패한 항목은 원문을 보존하며, 원본 게임 데이터는 수정하지 않습니다.
 - 게임 데이터, 번역 결과, 작업 로그는 외부 에이전트 작업공간에만 남고 이 저장소에는 들어오지 않습니다.
+- 첫 구현 전에 기존 `sdk-*` 브랜치를 강제로 조사하며, 호환 SDK가 있으면 재사용하고 부분 호환이면 새로 만들지 않고 확장합니다.
 - 특정 공급자에 종속되지 않습니다. Codex App의 에이전트와 외부 API를 조합하는 구성을 권장하지만 역할별 공급자를 교체할 수 있습니다.
 - 완성된 페이로드는 Steam 라이브러리 자동 탐색과 수동 폴백을 갖춘 최소 설치 ZIP으로 만들 수 있습니다.
 
@@ -46,6 +47,7 @@ sdk-<engine>-<version>       재사용 가능한 추출·적용·패킹 구현
 ## 에이전트 문서
 
 - [`docs/agent-usage.md`](docs/agent-usage.md): Codex 및 OpenCodex 기준 전체 운용 절차
+- [`docs/sdk-selection.md`](docs/sdk-selection.md): 기존 SDK 브랜치 조사·평가·재사용을 강제하는 시작 게이트
 - [`docs/prompt-examples.md`](docs/prompt-examples.md): 신규 작업, 재개, 검증, SDK 승격 요청 예제
 - [`docs/execution-budget.md`](docs/execution-budget.md): 범위 확장·중복 검사·불필요한 위임을 막는 실행 예산
 - [`docs/runtime-approval.md`](docs/runtime-approval.md): 실제 설치·업데이트·제거·실행을 분리하는 일회성 승인 경계
