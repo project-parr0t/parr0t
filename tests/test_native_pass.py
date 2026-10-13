@@ -83,6 +83,39 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual([row["target_id"] for row in task_rows], [f"fixture-{index}" for index in range(5)])
         self.assertEqual([row["ordinal"] for row in task_rows], list(range(5)))
 
+    def test_native_tasks_bound_fresh_workers_by_records_and_material(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "fixture-source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            segments = [
+                Segment(f"fixture-{index}", "S" * 700)
+                for index in range(3)
+            ]
+            output = root / "fixture-tasks"
+            summary = prepare_native_tasks(
+                root,
+                source,
+                segments,
+                output,
+                max_records=32,
+                max_material_tokens=300,
+            )
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(summary["tasks"], 3)
+        self.assertTrue(summary["fresh_worker_per_task"])
+        self.assertEqual(summary["history_mode"], "none")
+        self.assertEqual(manifest["version"], 2)
+        self.assertEqual(manifest["max_material_tokens"], 300)
+        self.assertEqual(manifest["worker_contract"]["max_followup_tasks"], 0)
+        self.assertEqual(manifest["worker_contract"]["parent_result"], "metadata_only")
+        self.assertTrue(
+            all(task["records"] == 1 for task in manifest["tasks"])
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

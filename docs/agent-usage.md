@@ -145,6 +145,8 @@ Read `docs/execution-budget.md` before a multi-stage job. Freeze the active deli
 
 Keep simple or tightly coupled work in the current agent. Parallel workers are appropriate for independent translation or review shards, not for small scripts, status polling, repeated package inspection, or duplicate QA.
 
+Native translation and review tasks follow the context budget in `docs/execution-budget.md`. Use `prepare-native-pass` v2, start every task in a fresh no-history worker, and end that worker after its metadata-only result. Never reuse an idle worker for another task or inherit the parent chat. The default 32-ID and 12,000 estimated-material-token bounds prevent accumulated target/tool history from being replayed on every model event without reducing per-target context quality.
+
 ## Steam delivery packages
 
 Steam support on `main` packages an already prepared payload; it does not replace an engine SDK. Keep the payload and package spec in the private workspace, then run:

@@ -13,6 +13,9 @@ from .store import stable_hash
 
 ALLOWED_STATUSES = {"success", "refused", "error", "invalid"}
 SAFE_NAME = re.compile(r"[^a-z0-9._-]+")
+TASK_MANIFEST_VERSION = 2
+DEFAULT_MAX_RECORDS = 32
+DEFAULT_MAX_MATERIAL_TOKENS = 12_000
 
 
 def _atomic_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
@@ -41,16 +44,31 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _estimated_material_tokens(segment: Segment) -> int:
+    """Estimate private input material for shard sizing, not provider billing."""
+
+    payload = json.dumps(
+        asdict(segment),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return max(1, (len(payload) + 2) // 3)
+
+
 def prepare_native_tasks(
     work_dir: Path,
     source_path: Path,
     segments: list[Segment],
     output_dir: Path,
     *,
-    max_records: int = 256,
+    max_records: int = DEFAULT_MAX_RECORDS,
+    max_material_tokens: int = DEFAULT_MAX_MATERIAL_TOKENS,
 ) -> dict[str, Any]:
     if not 1 <= max_records <= 2000:
         raise ValueError("max_records must be between 1 and 2000")
+    if not 256 <= max_material_tokens <= 1_000_000:
+        raise ValueError("max_material_tokens must be between 256 and 1000000")
     if not segments:
         raise ValueError("Ordered source contains no segments")
     ids = [segment.id for segment in segments]
@@ -66,7 +84,12 @@ def prepare_native_tasks(
     manifest_path = output_dir / "manifest.json"
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("source_fingerprint") == fingerprint and manifest.get("max_records") == max_records:
+        if (
+            manifest.get("version") == TASK_MANIFEST_VERSION
+            and manifest.get("source_fingerprint") == fingerprint
+            and manifest.get("max_records") == max_records
+            and manifest.get("max_material_tokens") == max_material_tokens
+        ):
             task_rows = manifest.get("tasks", [])
             valid = bool(task_rows) and all(
                 (output_dir / item["file"]).is_file()
@@ -79,6 +102,9 @@ def prepare_native_tasks(
                     "records": len(segments),
                     "tasks": len(task_rows),
                     "max_records": max_records,
+                    "max_material_tokens": max_material_tokens,
+                    "fresh_worker_per_task": True,
+                    "history_mode": "none",
                     "manifest": str(manifest_path),
                     "artifacts": [str(output_dir / item["file"]) for item in task_rows],
                 }
@@ -86,13 +112,30 @@ def prepare_native_tasks(
     output_dir.mkdir(parents=True, exist_ok=True)
     expected: set[str] = set()
     tasks: list[dict[str, Any]] = []
-    for offset in range(0, len(segments), max_records):
+    batches: list[list[tuple[int, Segment, int]]] = []
+    current: list[tuple[int, Segment, int]] = []
+    current_tokens = 0
+    for ordinal, segment in enumerate(segments):
+        estimated_tokens = _estimated_material_tokens(segment)
+        if current and (
+            len(current) >= max_records
+            or current_tokens + estimated_tokens > max_material_tokens
+        ):
+            batches.append(current)
+            current = []
+            current_tokens = 0
+        current.append((ordinal, segment, estimated_tokens))
+        current_tokens += estimated_tokens
+    if current:
+        batches.append(current)
+
+    for batch in batches:
         number = len(tasks) + 1
         name = f"task-{number:04d}.jsonl"
         path = output_dir / name
         rows = [
             {"target_id": segment.id, "ordinal": ordinal}
-            for ordinal, segment in enumerate(segments[offset : offset + max_records], start=offset)
+            for ordinal, segment, _ in batch
         ]
         _atomic_jsonl(path, rows)
         expected.add(name)
@@ -100,6 +143,10 @@ def prepare_native_tasks(
             {
                 "file": name,
                 "records": len(rows),
+                "estimated_material_tokens": sum(item[2] for item in batch),
+                "oversized_target_count": sum(
+                    item[2] > max_material_tokens for item in batch
+                ),
                 "sha256": _file_sha256(path),
             }
         )
@@ -107,11 +154,19 @@ def prepare_native_tasks(
         if stale.name not in expected:
             stale.unlink()
     manifest = {
-        "version": 1,
+        "version": TASK_MANIFEST_VERSION,
         "source_artifact": source_artifact,
         "source_fingerprint": fingerprint,
         "max_records": max_records,
+        "max_material_tokens": max_material_tokens,
         "records": len(segments),
+        "worker_contract": {
+            "history_mode": "none",
+            "fresh_worker_per_task": True,
+            "max_followup_tasks": 0,
+            "task_message_contains_game_text": False,
+            "parent_result": "metadata_only",
+        },
         "tasks": tasks,
     }
     temporary = manifest_path.with_name(f"{manifest_path.name}.tmp")
@@ -122,6 +177,9 @@ def prepare_native_tasks(
         "records": len(segments),
         "tasks": len(tasks),
         "max_records": max_records,
+        "max_material_tokens": max_material_tokens,
+        "fresh_worker_per_task": True,
+        "history_mode": "none",
         "manifest": str(manifest_path),
         "artifacts": [str(output_dir / item["file"]) for item in tasks],
     }

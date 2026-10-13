@@ -97,6 +97,30 @@ class PromptTests(unittest.TestCase):
         self.assertIn("exactly one target", system)
         self.assertIn("idiomatic", system)
 
+    def test_optional_context_identity_nulls_are_normalized_before_prompting(self) -> None:
+        segment = Segment(
+            "fixture-id",
+            "SOURCE_TARGET",
+            speaker=None,  # type: ignore[arg-type]
+            scene=None,  # type: ignore[arg-type]
+            previous=None,  # type: ignore[arg-type]
+            next=None,  # type: ignore[arg-type]
+        )
+        _, user = translation_prompt(
+            ProjectContext("FIXTURE", "src", "dst"),
+            segment,
+            [],
+            None,
+        )
+        context = json.loads(user)["context_only_do_not_translate"]
+
+        self.assertEqual(segment.speaker, "")
+        self.assertEqual(segment.scene, "")
+        self.assertEqual(context["speaker"], "")
+        self.assertEqual(context["scene"], "")
+        self.assertEqual(context["previous"], "")
+        self.assertEqual(context["next"], "")
+
     def test_review_issue_codes_cover_effect_not_only_literal_meaning(self) -> None:
         self.assertIn("literalism", REVIEW_ISSUE_CODES)
         self.assertIn("reference_loss", REVIEW_ISSUE_CODES)
