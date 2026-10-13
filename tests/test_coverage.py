@@ -111,6 +111,38 @@ class CoverageTests(unittest.TestCase):
         self.assertTrue(state["order_mismatch"])
         self.assertIn("INVENTORY_ORDER_MISMATCH", state["issue_codes"])
 
+    def test_independent_inventory_must_confirm_ui_composition(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            primary_rows = [
+                {
+                    "id": "synthetic-state",
+                    "source": "SOURCE_STATE",
+                    "metadata": {
+                        "ui_slot_role": "state_value",
+                        "ui_state_semantics": "enabled",
+                        "ui_composed_with_ids": ["synthetic-label"],
+                    },
+                }
+            ]
+            independent_rows = [
+                {
+                    "id": "synthetic-state",
+                    "source": "SOURCE_STATE",
+                    "metadata": {"ui_slot_role": "standalone"},
+                }
+            ]
+            write_inventory(primary, "synthetic-ast", primary_rows)
+            write_inventory(independent, "synthetic-secondary", independent_rows)
+
+            state = verify_inventory_pair(primary, independent)
+
+        self.assertFalse(state["static_complete"])
+        self.assertEqual(state["ui_composition_mismatch_count"], 1)
+        self.assertIn("INVENTORY_UI_COMPOSITION_MISMATCH", state["issue_codes"])
+
     def test_completion_separates_manifest_review_and_runtime_claims(self) -> None:
         segment = Segment("synthetic-1", "SOURCE_ONE")
         text = "TARGET_ONE"

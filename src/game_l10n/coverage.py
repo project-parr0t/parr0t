@@ -12,6 +12,16 @@ from .store import stable_hash
 
 INVENTORY_SCHEMA = "parr0t.source-inventory.v1"
 RUNTIME_SCHEMA = "parr0t.runtime-coverage.v1"
+UI_COMPOSITION_FIELDS = (
+    "ui_slot_role",
+    "ui_state_semantics",
+    "ui_composed_with_ids",
+    "ui_render_pattern",
+    "ui_fixed_target_prefix",
+    "ui_fixed_target_suffix",
+    "ui_max_chars",
+)
+UI_SLOT_ROLES = {"standalone", "label", "value", "state_value", "template_fragment"}
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -74,6 +84,51 @@ def _segment_map(payload: dict[str, Any]) -> dict[str, str]:
     return result
 
 
+def _ui_contract_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for row in payload["segments"]:
+        target_id = str(row["id"])
+        metadata = row.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ConfigurationError(f"Inventory segment {target_id!r} metadata must be an object")
+        contract = {key: metadata[key] for key in UI_COMPOSITION_FIELDS if key in metadata}
+        if not contract:
+            result[target_id] = {}
+            continue
+        role = contract.get("ui_slot_role")
+        if role not in UI_SLOT_ROLES:
+            raise ConfigurationError(
+                f"Inventory segment {target_id!r} requires a supported ui_slot_role"
+            )
+        for key in (
+            "ui_state_semantics",
+            "ui_render_pattern",
+            "ui_fixed_target_prefix",
+            "ui_fixed_target_suffix",
+        ):
+            if key in contract and not isinstance(contract[key], str):
+                raise ConfigurationError(
+                    f"Inventory segment {target_id!r} field {key} must be a string"
+                )
+        related = contract.get("ui_composed_with_ids")
+        if related is not None and (
+            not isinstance(related, list)
+            or not all(isinstance(item, str) and item for item in related)
+        ):
+            raise ConfigurationError(
+                f"Inventory segment {target_id!r} ui_composed_with_ids must be string IDs"
+            )
+        max_chars = contract.get("ui_max_chars")
+        if max_chars is not None and (
+            not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 0
+        ):
+            raise ConfigurationError(
+                f"Inventory segment {target_id!r} ui_max_chars must be a non-negative integer"
+            )
+        result[target_id] = contract
+    return result
+
+
 def inventory_fingerprint(payload: dict[str, Any]) -> str:
     return stable_hash(
         {
@@ -96,6 +151,8 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
 
     primary_rows = _segment_map(primary)
     independent_rows = _segment_map(independent)
+    primary_ui_contracts = _ui_contract_map(primary)
+    independent_ui_contracts = _ui_contract_map(independent)
     primary_order = list(primary_rows)
     independent_order = list(independent_rows)
     primary_ids = set(primary_rows)
@@ -106,6 +163,11 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
         target_id
         for target_id in primary_ids & independent_ids
         if primary_rows[target_id] != independent_rows[target_id]
+    }
+    ui_contract_mismatches = {
+        target_id
+        for target_id in primary_ids & independent_ids
+        if primary_ui_contracts[target_id] != independent_ui_contracts[target_id]
     }
     order_mismatch = primary_order != independent_order
     visible_exclusions = [
@@ -121,6 +183,7 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
         missing_from_primary
         or missing_from_independent
         or source_mismatches
+        or ui_contract_mismatches
         or order_mismatch
         or visible_exclusions
         or not declared_complete
@@ -132,6 +195,8 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
         issue_codes.append("INDEPENDENT_INVENTORY_MISSED_PRIMARY_TARGETS")
     if source_mismatches:
         issue_codes.append("INVENTORY_SOURCE_MISMATCH")
+    if ui_contract_mismatches:
+        issue_codes.append("INVENTORY_UI_COMPOSITION_MISMATCH")
     if order_mismatch:
         issue_codes.append("INVENTORY_ORDER_MISMATCH")
     if visible_exclusions:
@@ -156,6 +221,7 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
         "missing_from_primary_count": len(missing_from_primary),
         "missing_from_independent_count": len(missing_from_independent),
         "source_mismatch_count": len(source_mismatches),
+        "ui_composition_mismatch_count": len(ui_contract_mismatches),
         "order_mismatch": order_mismatch,
         "user_visible_exclusion_count": len(visible_exclusions),
         "static_complete": complete,

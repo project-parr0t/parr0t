@@ -103,6 +103,42 @@ class PromptTests(unittest.TestCase):
         self.assertIn("tone_rhythm", REVIEW_ISSUE_CODES)
         self.assertIn("function", REVIEW_ISSUE_CODES)
         self.assertIn("knowledge_order", REVIEW_ISSUE_CODES)
+        self.assertIn("slot_composition", REVIEW_ISSUE_CODES)
+
+    def test_ui_slot_contract_is_preserved_for_translation_and_review(self) -> None:
+        segment = Segment(
+            "ui-state",
+            "SOURCE_STATE",
+            metadata={
+                "text_type": "setting_state",
+                "ui_slot_role": "state_value",
+                "ui_state_semantics": "enabled",
+                "ui_composed_with_ids": ["ui-label"],
+                "ui_render_pattern": "{label}: {value}",
+                "ui_fixed_target_prefix": "TARGET_LABEL: ",
+            },
+        )
+        translation_system, translation_user = translation_prompt(
+            ProjectContext("FIXTURE", "src", "dst"), segment, [], None
+        )
+        review_system, review_user = review_judge_prompt(
+            ProjectContext("FIXTURE", "src", "dst"), segment, "TARGET_STATE", [], None
+        )
+
+        self.assertEqual(
+            json.loads(translation_user)["context_only_do_not_translate"]["metadata"][
+                "ui_slot_role"
+            ],
+            "state_value",
+        )
+        self.assertEqual(
+            json.loads(review_user)["context_only_do_not_translate"]["metadata"][
+                "ui_state_semantics"
+            ],
+            "enabled",
+        )
+        self.assertIn("translate only this slot", translation_system)
+        self.assertIn("slot_composition", review_system)
 
     def test_functional_and_knowledge_context_are_focused_by_evidence(self) -> None:
         system, user = translation_prompt(

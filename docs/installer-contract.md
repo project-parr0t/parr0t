@@ -16,11 +16,14 @@ Every standard ZIP has exactly these framework-owned root entries plus the manif
 Install-Translation-Patch.bat
 Install-Translation-Patch.ps1
 parr0t-patch-manifest.json
+parr0t-release-checkpoint.json
 README.txt
 payload/**
 ```
 
-Do not add `AGENTS.md`, prompts, runtime approvals, `.game-l10n`, task state, logs, source game data, translation work files, SDK documentation, or build-host paths. Title-specific values belong only in the generated manifest, README, payload, and explicitly approved custom error registry.
+`parr0t-release-checkpoint.json` is required but is never installed into the game. It is a machine-readable continuation point governed by `docs/release-checkpoint.md`; it may contain the target strings already present in the distribution, but no separate raw-source copy, prompts, provider output, credentials, logs, private paths, or unpublished candidates. A target that intentionally preserves its source remains marked `source_preserved`.
+
+Do not add `AGENTS.md`, prompts, runtime approvals, `.game-l10n`, task state, logs, source game data, translation work files, SDK documentation, or build-host paths. Title-specific values belong only in the generated manifest, README, checkpoint, payload, and explicitly approved custom error registry.
 
 ## Required operations
 
@@ -71,7 +74,7 @@ Executable wrappers additionally follow `docs/wrapper-executable.md`. They use a
 
 ## Core result codes
 
-Core codes and meanings are fixed by `parr0t.windows-installer/v1`:
+Core codes and meanings are fixed by `parr0t.windows-installer/v2`:
 
 | Code | Meaning |
 | --- | --- |

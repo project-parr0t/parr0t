@@ -217,3 +217,43 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Diagnosis:** Inspect the metadata-only failure queue for categorical failure codes and `blocking` state; do not expose source text or provider prose to the control plane.
 - **Resolution:** Keep operational failures queued until the user explicitly asks to resume. If any queued target is marked `metadata.blocking_on_failure=true`, retain all results as a private held checkpoint and emit no new patch.
 - **Prevention:** Mark required targets during extraction, preserve the failure queue across turns, bind it to the inventory fingerprint, and resume only through `game-l10n resume-failures`.
+
+## A prior release is available but the agent translates everything again
+
+- **Symptom:** Supplying a released package with the current game folder does not shorten the next translation or a small wording correction triggers a full translation and review pass.
+- **General cause:** The distribution lacks a validated continuation checkpoint, or reuse was decided from filenames and target IDs without comparing source, location, dependency, context, review-policy, SDK, and game-build bindings.
+- **Diagnosis:** Validate `parr0t-release-checkpoint.json`, compare its manifest digest and IDs, regenerate both current inventories, and count exact reusable, invalidated, new, and unresolved targets without exposing text to the control plane.
+- **Resolution:** Reuse only matching `reviewed` targets. Translate and review new, changed, `source_preserved`, or otherwise invalidated targets; for a user-requested correction, add the selected stable IDs and their transitive reverse dependencies. Run a full semantic review only when the user requested one or a global binding changed.
+- **Prevention:** Include the checkpoint in every distribution, keep stable SDK-defined IDs and dependency fingerprints, and follow `docs/release-checkpoint.md` before making model calls.
+
+## A game update introduces a locale key that the patch does not contain
+
+- **Symptom:** A newly updated game displays no text or crashes while resolving a localized key absent from an older patch.
+- **General cause:** The engine requires a complete locale shape or replaces locale data wholesale, and the patch has no verified lookup fallback for unknown keys.
+- **Diagnosis:** In a synthetic SDK fixture, add an unknown key with the same type and container shape as the engine resource and observe whether lookup reaches the base locale, source text, a placeholder, or an invalid state.
+- **Resolution:** When the SDK supports it safely, preserve missing keys through a verified base-locale, exact-source, or nonempty-placeholder fallback while retaining placeholders and data shape. If no safe mechanism exists, record the checkpoint fallback as `unsupported` with a neutral reason and retain strict build binding instead of claiming protection.
+- **Prevention:** Declare and test the fallback mode in the engine SDK, bind it into each release checkpoint, and never treat fallback as permission to install on an unvalidated game build.
+
+## A translated UI value repeats its label or describes the wrong state
+
+- **Symptom:** The rendered UI shows a label twice, joins two translated fragments incorrectly, or uses a literal open/close-style word where the control means enabled/disabled.
+- **General cause:** Extraction represented a render-time value or state slot as a standalone sentence, so translation and review saw the dictionary meaning but not the surrounding label, composition pattern, or semantic state.
+- **Diagnosis:** Inspect the static resource binding or render call site without launching the game. Identify each independently localized slot, its related stable IDs, render pattern, semantic state, fixed target affixes, and any hard display limit.
+- **Resolution:** Add the evidence-backed fields from `docs/segment-metadata.md`, invalidate only the affected IDs and composition dependents, and translate/review the slot payload again. Reject an explicitly repeated fixed affix deterministically.
+- **Prevention:** Make UI slot metadata part of both independent inventories and compact review. Keep labels and values separate when the runtime does, and do not infer composition from wording alone.
+
+## An installed patch is mistaken for an upstream game update
+
+- **Symptom:** An agent sees files differing from a clean source or prior extraction and unnecessarily repeats unpacking, translation, or packaging even though the known patch is still intact.
+- **General cause:** The game root was compared with an unpatched baseline without first reading `parr0t-patch-status.txt` and its matching receipt, or any mismatch was treated as proof of a game update.
+- **Diagnosis:** Run `game-l10n inspect-installed-state` against the exact configured game root. It hashes only receipt-owned installed files and preserved original backups and performs no mutation.
+- **Resolution:** Reuse the recorded state when it reports `installed_intact`. Investigate `possible_game_update` as an advisory external-change signal before attributing its cause; stop all mutation on `damaged_state` until preserved originals are recovered.
+- **Prevention:** Use receipt-scoped inspection before whole-game comparison or re-extraction, and never classify a game update from a patched-file mismatch alone.
+
+## A one-line correction consumes a full translation run
+
+- **Symptom:** Fixing an exact typo or user-specified wording takes many minutes, invokes a long-running discovery worker, reloads full context, checks the complete game tree, or creates several one-off scripts and reports.
+- **General cause:** The correction was treated as a new localization job instead of a target-ID delta against a verified result and release checkpoint. Broad safety checks were repeated even though their inputs did not change.
+- **Diagnosis:** Compare elapsed tool time with agent reasoning/wait time, count model/context calls, list reread artifacts, and identify whether unchanged targets, source files, installation state, or package layers were revalidated without an invalidating input.
+- **Resolution:** If the user supplied the exact final wording, run `game-l10n apply-user-correction`, then repack only the owning payload and verify the package once. If reverse dependencies are reported, review only those IDs. Use one narrow static lookup only when the stable mapping is ambiguous.
+- **Prevention:** Preserve the full reviewed result and release checkpoint, keep corrections in the current agent, prohibit job-specific correction scripts, and enforce the zero-model exact-correction budget in `docs/minimal-corrections.md`.
