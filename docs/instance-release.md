@@ -13,6 +13,8 @@ Design and validate the release for the environment in which the player will ins
 - Use relative package paths and runtime discovery. The extracted package must work from an arbitrary user-selected directory, including paths containing spaces and non-ASCII characters.
 - Do not require Git, Codex, Parr0t, a source checkout, build tools, or a developer SDK on the player's machine. Bundle redistributable runtime components when their licenses allow it; otherwise identify the exact prerequisite, supported version, source, and installation requirement before release.
 - Provide a Windows-appropriate user entry point and README instructions when Windows is the target. Do not assume the player will run repository build commands or understand the agent workspace layout.
+- A Parr0t Windows package follows `docs/installer-contract.md`. Ship only its fixed public files and payload; never ship `AGENTS.md`, runtime approval JSON, prompts, task state, logs, or private workspace policy. Interactive players must not be asked for an agent approval file.
+- A release containing a launcher wrapper follows `docs/wrapper-executable.md`: exact approved architecture-specific bytes, public source/build recipe, reproducible unsigned hash, verified signed hash and publisher identity, wrapper behavior disclosure, and no per-game ad hoc binary.
 - Do not require administrator rights unless the selected install location actually requires elevation. Keep discovery and verification read-only, and request elevation only at the mutating boundary.
 - Validate the packaged interface as a clean target user would receive it. Success on the current build machine is not evidence of target compatibility; use an isolated or synthetic target-environment check plus the engine/build-specific checks required by the instance.
 
@@ -68,8 +70,10 @@ Before an agent publishes an instance release, it must verify all of the followi
 5. The target operating system, architecture, and prerequisites describe the player's environment rather than the build host; Windows is used when no other platform was specified.
 6. The committed distribution output or deterministic build recipe produces the exact staged assets.
 7. Package validation, required engine/adapter checks, license checks, and one proportional target-environment synthetic lifecycle pass.
-8. The existing README is preserved except for reviewed, release-specific edits.
-9. Release notes identify the release ID, source commit, supported builds, changes, installation/update caveats, and asset checksums.
-10. The uploaded assets are the same bytes that passed verification, and their published digests are checked once after upload.
+8. The public installer exposes Install, Restore, and Verify; its `parr0t-patch-status.txt`, receipt, declared original replacements, custom errors, and player messages satisfy `docs/installer-contract.md`.
+9. Every launcher wrapper matches the approved Parr0t wrapper release and its architecture, source tag, reproducible-build record, Authenticode result, and published hashes; no Steam client configuration is edited and Steam is never terminated.
+10. The existing README is preserved except for reviewed, release-specific edits.
+11. Release notes identify the release ID, source commit, supported builds, changes, installation/update caveats, and asset checksums.
+12. The uploaded assets are the same bytes that passed verification, and their published digests are checked once after upload.
 
 If any gate fails, keep the staged release in the private workspace and report the mismatch. Do not publish a best-effort or partially documented release.

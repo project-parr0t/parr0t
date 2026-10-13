@@ -59,6 +59,14 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("Preserve the user's existing README", generated_agents)
         self.assertIn("default to Windows", generated_agents)
         self.assertIn("player's execution environment", generated_agents)
+        self.assertIn("docs/installer-contract.md", generated_agents)
+        self.assertIn("docs/steam-faq.md", generated_agents)
+        self.assertIn("docs/wrapper-executable.md", generated_agents)
+        self.assertIn("parr0t-patch-status.txt", generated_agents)
+        self.assertIn("interactive player's menu choice", generated_agents)
+        self.assertIn("preserve it once", generated_agents)
+        self.assertIn("Never read or edit `localconfig.vdf`", generated_agents)
+        self.assertIn("ad hoc game-workspace binary", generated_agents)
 
     def test_workspace_must_be_outside_sdk(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -15,7 +15,7 @@ Use the lowest sufficient level:
 1. **Inspect:** batch the necessary reads once and select the existing adapter or private implementation.
 2. **Build:** produce one new artifact without mutating the source root.
 3. **Focused validation:** validate changed data, package structure, manifests, placeholders, and hashes once.
-4. **Synthetic lifecycle:** for an installer change, run one isolated install, update, verify, and remove lifecycle against synthetic files.
+4. **Synthetic lifecycle:** for an installer change, run one isolated install, update, verify, and restore lifecycle against synthetic files. Include one declared original replacement only when that behavior changed.
 5. **Real runtime validation:** launch or install into a real game only after the user explicitly requests that exact external action and the matching one-shot approval is recorded. An offline limitation or concrete runtime failure is a reason to ask, not permission to act.
 6. **Broad regression:** run the repository suite and privacy scan before a repository commit or SDK publication, not after every private artifact edit.
 
@@ -46,7 +46,7 @@ Every patch still requires these boundaries:
 - reject path traversal and unowned collisions;
 - manage only paths listed by the patch manifest or receipt;
 - verify the produced package once;
-- preserve a clear remove path for patch-owned files.
+- preserve a clear Restore path for patch-owned files and any explicitly replaced originals.
 - deny real install, update, remove, and launch by default; follow `docs/runtime-approval.md` when the user explicitly requests one.
 
 These boundaries do not imply a full game backup, hashing every source file, embedding the previous package, supporting unknown legacy states, or designing automatic rollback across arbitrary versions. Add those capabilities only when the user requests them or a concrete target requires them.

@@ -53,7 +53,7 @@ Inspect <public-reference-url> only to learn the public patch format and determi
 ## Build a minimal Steam installer
 
 ```text
-Read Parr0t's AGENTS.md, docs/execution-budget.md, and docs/steam-packaging.md. Use the completed payload at <payload-directory> and keep every title-specific value in a private Steam spec. Build one deterministic Steam-aware ZIP with receipt-owned install, update, verify, and remove operations. Do not embed an older package, design a legacy migration layer, back up or hash the complete game, or use subagents for this packaging task. Run package validation and one synthetic installer lifecycle, then stop and report the artifact for user validation.
+Read Parr0t's AGENTS.md, docs/execution-budget.md, docs/installer-contract.md, and docs/steam-packaging.md. Use the completed payload at <payload-directory> and keep every title-specific value in a private Steam spec. Build one deterministic Steam-aware ZIP with the standard player-facing Install, Restore, and Verify operations, fixed messages/codes, and `parr0t-patch-status.txt`. If and only if a payload path must replace an original file, declare its target and backup path so first install preserves the original, update reuses it, and Restore puts it back. Put SDK/title-specific failures in the custom error namespace. Do not include agent harness files, approval records, prompts, logs, or task state; do not embed an older package, design a legacy migration layer, back up or hash the complete game, or use subagents for this packaging task. Run package validation and one synthetic lifecycle, then stop and report the artifact for user validation.
 ```
 
 ## Explicitly authorize one real installation action

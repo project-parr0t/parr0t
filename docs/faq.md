@@ -87,7 +87,7 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Symptom:** A simple package or launcher takes much longer than translation because the agent adds legacy fingerprints, embedded previous releases, generalized rollback, or compatibility logic that was not requested.
 - **General cause:** Safety and reuse were treated as unlimited goals instead of constraints proportional to the active deliverable.
 - **Diagnosis:** Compare each added component with the current acceptance criteria. If removing it still produces the requested recoverable patch, it is outside the active scope.
-- **Resolution:** Return to the smallest design: immutable source, explicit payload, one receipt, owned-path collision checks, one package validation, and a clear remove operation. Move optional migration work to a separately approved task.
+- **Resolution:** Return to the smallest design: immutable source, explicit payload, one status marker and receipt, owned-path collision checks, one package validation, and a clear Restore operation. Preserve only original files explicitly declared for replacement. Move optional migration work to a separately approved task.
 - **Prevention:** Follow `docs/execution-budget.md`, freeze scope per user request, and stop after the proportional acceptance checks pass.
 
 ## Steam discovery fails on a library that no longer exists
@@ -129,3 +129,19 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Diagnosis:** Inspect the archive, scripts, manifest, prerequisites, and README for build-host paths or tools; test extraction and entry points from a clean target-environment fixture with spaces and non-ASCII characters in its path.
 - **Resolution:** Rebuild the staged package with relative paths, runtime discovery, declared target architecture, and only bundled or explicitly documented redistributable prerequisites. Keep the broken release unchanged until a corrected release receives publication approval.
 - **Prevention:** Default unspecified public distributions to Windows, derive architecture and runtime requirements from the game build rather than the agent host, and validate the exact packaged interface as an end user would receive it.
+
+## An interactive installer asks the player for an agent approval or prints internal exceptions
+
+- **Symptom:** A player-facing batch installer stops for a runtime-approval JSON, mentions workspace policy, or exposes raw internal `E_*` exceptions instead of actionable guidance.
+- **General cause:** The noninteractive agent automation guard was applied to the interactive distribution interface, or installer messages and codes were improvised per task.
+- **Diagnosis:** Run the exact packaged batch file in a synthetic game directory. Its menu choice and final target/action confirmation must authorize the interactive mutation, while noninteractive PowerShell mutation without approval must fail with a public `PARR0T-E###` code. Inspect the ZIP for harness and workspace artifacts.
+- **Resolution:** Rebuild with the shared installer contract. Keep runtime approval only on noninteractive mutation, map failures to the fixed player messages, and expose internal details only in diagnostic mode.
+- **Prevention:** Validate the fixed archive entries, result-code registry, Korean menu, one interactive lifecycle, and one denied noninteractive mutation before release.
+
+## Updating a launcher wrapper loses the real original or Restore puts back the wrapper
+
+- **Symptom:** An update backs up the already installed wrapper as though it were the original, or Restore deletes/reinstalls the wrong executable.
+- **General cause:** An original-file replacement was treated as an ordinary overlay collision and was not bound to a stable backup in the first-install receipt.
+- **Diagnosis:** Compare `parr0t-patch-status.txt`, the receipt's patch ID and original records, the current replacement set, and the sizes/hashes of both installed targets and backups. Do not move files while diagnosing.
+- **Resolution:** Stop before mutation on any mismatch. Use the original matching installer to Restore, then install a release whose declared replacement and backup paths are correct. Never adopt an unknown existing backup.
+- **Prevention:** Declare every original replacement in the package spec, preserve it only on first install, require the same replacement set on update, verify both copies, and exercise install/update/verify/restore with a synthetic replacement file.

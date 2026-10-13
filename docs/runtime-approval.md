@@ -13,7 +13,7 @@ artifact_built
   -> runtime_validated
 ```
 
-Each arrow into a real external effect requires the user's explicit instruction for that action. `install`, `update`, `remove`, and `launch` are four different permissions. Installation does not imply launch; launch does not imply cleanup, log deletion, save changes, another launch, or any patch mutation.
+Each arrow into a real external effect performed by an agent or noninteractive script requires the user's explicit instruction for that action. `install`, `update`, `remove`, and `launch` are four different automation permissions. Installation does not imply launch; launch does not imply cleanup, log deletion, save changes, another launch, or any patch mutation. This record is not a player-facing license prompt: a player running the packaged interactive menu authorizes Install or Restore through its final target/action confirmation.
 
 ## Approval record
 
@@ -38,13 +38,14 @@ A changed build, different path, different action, different executable, expiry,
 
 ## Steam packages
 
-The generated Steam installer permits read-only `Verify` without an approval. `Install` determines whether the operation is a first install or update and requires the matching approval; `Remove` requires its own approval. Pass the record explicitly:
+The generated Steam installer permits read-only `Verify` without an approval. Interactive player operation needs only the installer's final confirmation. For noninteractive automation, `Install` determines whether the operation is a first install or update and requires the matching approval; public `Restore` requires the internal `remove` approval. Pass the record explicitly:
 
 ```text
 powershell -File <extracted-package>/Install-Translation-Patch.ps1 -Mode Install -GameRoot <configured-game-root> -ApprovalFile <approval-json>
+powershell -File <extracted-package>/Install-Translation-Patch.ps1 -Mode Restore -GameRoot <configured-game-root> -ApprovalFile <approval-json>
 ```
 
-The installer recomputes its manifest/payload fingerprint, checks the exact target, action, expiry, and one-shot state, consumes the record, and only then mutates receipt-owned paths.
+The installer recomputes its manifest/payload fingerprint, checks the exact target, action, expiry, and one-shot state, consumes the record, and only then mutates receipt-owned paths. Its agent-harness approval JSON stays in the private workspace and is never included in the player ZIP. See `docs/installer-contract.md`.
 
 ## Engine SDK contract
 

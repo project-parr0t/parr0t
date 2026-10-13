@@ -11,6 +11,20 @@ Place the completed files under a payload directory in the external workspace. C
   "patch_id": "fixture-localization",
   "release_id": "r1",
   "display_name": "Fixture localization patch",
+  "replace_files": [
+    {
+      "path": "fixture-launcher.exe",
+      "backup_path": "fixture-launcher.parr0t-original.exe"
+    }
+  ],
+  "custom_errors": [
+    {
+      "internal_code": "E_CUSTOM_FIXTURE_BINDING",
+      "public_code": "PARR0T-FIXTURE-E001",
+      "message": "This patch does not match the installed build.",
+      "resolution": "Use the release that lists this build as supported."
+    }
+  ],
   "steam": {
     "app_id": "123456",
     "install_dir": "Fixture Game",
@@ -19,7 +33,7 @@ Place the completed files under a payload directory in the external workspace. C
 }
 ```
 
-`patch_id` is the stable receipt identity. `release_id` changes when a new package replaces the previous release. `required_files` is optional and validates a manually selected game root. Real identifiers and payload paths stay in the private workspace and generated ZIP; they must not be committed to Parr0t.
+`patch_id` is the stable status/receipt identity. `release_id` changes when a new package replaces the previous release. `required_files` is optional and validates a manually selected game root. `replace_files` is optional and is reserved for payload paths that must replace and later restore an original game file; omit `backup_path` to use the private `.parr0t/backups/<patch-id>/...` default. `custom_errors` is optional and uses the isolated `PARR0T-<SCOPE>-E###` namespace. Real identifiers and payload paths stay in the private workspace and generated ZIP; they must not be committed to Parr0t.
 
 ## Build and verify
 
@@ -28,7 +42,7 @@ game-l10n steam-package --workspace <external-workspace> --payload <payload-dire
 game-l10n verify-steam-package --workspace <external-workspace> --package <patch.zip>
 ```
 
-The ZIP is deterministic for identical inputs. It contains a payload manifest, a PowerShell installer, a double-click batch launcher, a short README, and the payload. The package validator checks the exact entry set, sizes, artifact fingerprint, and payload digests.
+The ZIP is deterministic for identical inputs. It contains only the fixed files and payload defined by `docs/installer-contract.md`; agent harness files and workspace state are forbidden. The package validator checks the exact entry set, installer contract, result-code registry, sizes, artifact fingerprint, and payload digests.
 
 ## Installer behavior
 
@@ -39,16 +53,21 @@ The installer:
 - requires the matching app manifest for automatic discovery;
 - asks for a game directory when automatic discovery fails;
 - verifies package payload hashes once before mutation;
-- denies install, update, and remove without an exact unexpired one-shot runtime approval;
+- accepts a player's interactive menu selection and final confirmation without an agent approval file;
+- denies noninteractive agent/script install, update, and restore without an exact unexpired one-shot runtime approval;
 - refuses collisions with files not owned by its receipt;
-- removes only paths listed by its prior receipt when updating;
-- writes one receipt with the stable patch ID, release ID, owned paths, and hashes;
-- supports install/update, remove, and installed-file verification.
+- backs up only explicitly declared original replacements and binds their paths, sizes, and hashes to the receipt;
+- reuses the verified original backup on update instead of mistaking the installed wrapper for the original;
+- removes or restores only paths listed by its prior receipt;
+- writes `parr0t-patch-status.txt` as the primary patch-ID marker and a matching detailed receipt;
+- supports the public operations Install, Restore, and Verify installed state.
 
-`Verify` is read-only and needs no runtime approval. Before a real mutation, the user must explicitly request the exact action and the agent records it with `game-l10n approve-runtime`; pass the resulting file with `-ApprovalFile`. A first install requires `install`, an existing receipt makes the same installer mode require `update`, and removal requires `remove`. Package creation and verification do not authorize any of them. See `docs/runtime-approval.md`.
+For an ordinary player, run the batch file, select the operation, review the target/action confirmation, and continue. `Verify` is read-only. When an agent invokes the PowerShell modes noninteractively, the user must explicitly request the exact action and the agent records it with `game-l10n approve-runtime`; pass the resulting file with `-ApprovalFile`. A first `Install` requires `install`, an existing status/receipt makes the same mode require `update`, and public `Restore` consumes the internal `remove` approval. Package creation and verification do not authorize automation. See `docs/runtime-approval.md` and `docs/installer-contract.md`.
 
 It deliberately does not embed the previous package, back up the complete game, fingerprint every Steam-managed file, or implement arbitrary legacy migration. If a title needs a special migration, keep it in the private workspace until it proves reusable and receives separate publication approval.
 
+Steam per-account launch options and `localconfig.vdf` are forbidden targets. Prefer an overlay or declared wrapper replacement and never require or terminate Steam. A wrapper package must use the exact approved binary, signature, hashes, adjacent original naming, and source/build evidence defined by `docs/wrapper-executable.md`.
+
 ## Acceptance checks
 
-For an unchanged payload, one package verification is sufficient. When installer logic changes, run one synthetic install/update/verify/remove lifecycle in a temporary directory. A real game install, update, removal, or launch is a separately approved step and must not be inferred or repeated after unrelated documentation or packaging changes.
+For an unchanged payload, one package verification is sufficient. When installer logic changes, run one synthetic install/update/verify/restore lifecycle in a temporary directory, including one declared original replacement when that layer changed. A real agent-driven game install, update, restore, or launch is a separately approved step and must not be inferred or repeated after unrelated documentation or packaging changes.
