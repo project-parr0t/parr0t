@@ -74,6 +74,14 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Resolution:** Use a compact judge that returns only `ok` or `rewrite` plus categorical issue codes. Invoke a rewriter only for `rewrite`, validate the correction, and confirm it with another compact judgment.
 - **Prevention:** Set per-task output limits, retain focused scene/character evidence, record provider usage metadata, and compare quality and cost on synthetic representative evaluations before changing the configured roles.
 
+## A semantically accurate title or short line still reads like a literal translation
+
+- **Symptom:** A candidate preserves dictionary meaning but loses idiomatic phrasing, a recognizable allusion or wordplay cue, deliberate alteration, atmosphere, or the cadence expected of its text function.
+- **General cause:** The judge treats semantic equivalence as sufficient, or receives no reliable indication that the segment is a title, quest name, slogan, UI label, or reference-bearing line.
+- **Diagnosis:** Check segment metadata and target-scoped context cues, then inspect whether the compact verdict can report `literalism`, `reference_loss`, or `tone_rhythm` without echoing private text.
+- **Resolution:** Route only the flagged target to the configured rewriter with its focused scene, voice, text-function, and evidence-backed reference cues; confirm the correction with another compact judgment.
+- **Prevention:** Analyze the ordered script and metadata before translation, preserve communicative effect instead of source word order, and never manufacture a reference from weak resemblance.
+
 ## A small installer request expands into a migration framework
 
 - **Symptom:** A simple package or launcher takes much longer than translation because the agent adds legacy fingerprints, embedded previous releases, generalized rollback, or compatibility logic that was not requested.

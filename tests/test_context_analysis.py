@@ -35,6 +35,7 @@ def successful_context(**kwargs):
             }
         ],
         "relationship_timeline": ["EVENT"],
+        "reference_cues": [],
     }
 
 
@@ -75,6 +76,42 @@ class ContextAnalysisTests(unittest.TestCase):
         self.assertTrue(second_cached)
         self.assertEqual(first.story_summary, second.story_summary)
         self.assertEqual(provider.call_count, 1)
+
+    def test_preserves_supported_reference_cues_and_segment_metadata(self) -> None:
+        captured = {}
+
+        def context_with_cue(**kwargs):
+            payload = json.loads(kwargs["user"])
+            captured.update(payload["lines"][0])
+            result = successful_context(**kwargs)
+            result["reference_cues"] = [
+                {
+                    "kind": "parody",
+                    "scene": "S",
+                    "evidence_line_ids": ["fixture-title"],
+                    "recognition_cue": "FIXTURE_RECOGNITION_PATTERN",
+                    "translation_goal": "PRESERVE_FIXTURE_EFFECT",
+                    "confidence": "high",
+                }
+            ]
+            return result
+
+        provider = ScriptedProvider("context", context_with_cue)
+        analyzer = ContextAnalyzer(ProviderRegistry({"context": provider}), ["context"])
+        pack = analyzer.analyze(
+            [
+                Segment(
+                    "fixture-title",
+                    "SOURCE_TITLE",
+                    speaker="A",
+                    scene="S",
+                    metadata={"text_type": "quest_title"},
+                )
+            ]
+        )
+
+        self.assertEqual(captured["metadata"], {"text_type": "quest_title"})
+        self.assertEqual(pack.reference_cues[0]["kind"], "parody")
 
     def test_context_gate_rejects_missing_named_character_coverage(self) -> None:
         def incomplete(**_kwargs):

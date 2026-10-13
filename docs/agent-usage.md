@@ -46,7 +46,9 @@ instructions and approvals
   -> new patch and metadata-only completion report
 ```
 
-Context analysis must finish before translation. It produces scene state, relationship changes, character voice rules, forms of address, glossary constraints, and evidence identifiers from the complete ordered script. A worker receives one target segment at a time plus that read-only context. Segment isolation limits failure scope; it does not remove narrative or character context.
+Context analysis must finish before translation. It produces scene state, relationship changes, character voice rules, forms of address, glossary constraints, evidence identifiers, and supported allusion/wordplay/rhetorical cues from the complete ordered script and segment metadata. It must not invent a reference from weak resemblance. A worker receives one target segment at a time plus that read-only context. Segment isolation limits failure scope; it does not remove narrative, character, or text-function context.
+
+The compact judge evaluates effect as well as denotational accuracy. It flags mechanical literalism, lost recognition cues, and unsuitable tone/rhythm for titles, quest names, slogans, dialogue, and UI text, while sending only target-relevant cues to keep input and output token cost bounded.
 
 If every context-analysis route fails, stop before translation. If every permitted translation route fails for a target, preserve the exact source and mark it `source_preserved`. Never cancel unrelated targets because one target or batch was refused.
 

@@ -96,6 +96,7 @@ class ContextPack:
     scene_summaries: dict[str, dict[str, Any]] = field(default_factory=dict)
     character_guides: dict[str, dict[str, Any]] = field(default_factory=dict)
     relationship_timeline: tuple[str, ...] = ()
+    reference_cues: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(slots=True)

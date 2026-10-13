@@ -14,15 +14,17 @@ validated translation candidate
        error    -> bounded retry, then next configured judge
 ```
 
-The judge returns only a verdict and categorical issue codes. It never echoes a correct translation. A rewriter runs only when the judge reports a material meaning, omission, addition, voice, register, terminology, consistency, formatting, or fluency problem. The corrected candidate must pass deterministic validation and another compact judgment before acceptance.
+The judge returns only a verdict and categorical issue codes. It never echoes a correct translation. A rewriter runs only when the judge reports a material `meaning`, `omission`, `addition`, `voice`, `register`, `terminology`, `consistency`, `formatting`, `fluency`, `literalism`, `reference_loss`, or `tone_rhythm` problem. A denotationally accurate candidate still requires rewriting when mechanical source syntax, translationese, lost recognition cues, or unsuitable title/quest/slogan cadence changes the intended effect. The corrected candidate must pass deterministic validation and another compact judgment before acceptance.
 
 `routing.review_max_rounds` bounds judge/rewrite cycles. The recommended value is `2`: one initial judgment and one confirmation after at most one rewrite. Increase it only when representative evaluations show that another correction cycle improves accepted quality enough to justify the extra calls.
 
 ## Focused evidence, not context removal
 
-The judge still receives the story summary, current scene state, current speaker guide, approved same-speaker anchors, adjacent lines, and project style rules. To avoid repeatedly sending irrelevant data, it receives only glossary entries present in the source/candidate and the relationship entries associated with the current scene or speaker. The rewriter receives the same focused evidence plus categorical issue codes.
+The judge still receives the story summary, current scene state, current speaker guide, approved same-speaker anchors, adjacent lines, segment metadata, and project style rules. To avoid repeatedly sending irrelevant data, it receives only glossary entries present in the source/candidate, relationship entries associated with the current scene or speaker, and up to four evidence-backed reference cues attached to the target ID or scene. The rewriter receives the same focused evidence plus categorical issue codes.
 
-Translation remains context-first and may use the broader context pack. Focused review is not isolated sentence review: it removes unrelated evidence while preserving the information needed to assess meaning and character voice.
+Translation remains context-first and may use the broader context pack. Focused review is not isolated sentence review: it removes unrelated evidence while preserving the information needed to assess meaning, character voice, idiomatic expression, recognizability, pragmatic effect, and the function-specific tone or rhythm of dialogue, titles, quest names, slogans, and UI text.
+
+Reference cues are advisory evidence, not a license to invent. Context analysis records only high- or medium-confidence cues grounded in source wording or metadata. If no supported cue exists, the judge and rewriter must not force a familiar phrase, external work, joke, or canonical wording into the target.
 
 ## Configuration
 
@@ -54,7 +56,7 @@ Providers may define per-task output caps without changing their general context
 }
 ```
 
-For providers that reliably obey an exact response contract, `"review_verdict_format":"plain"` reduces the judge response to `OK`, `REFUSED`, `ERROR`, or `REWRITE meaning,voice`. Keep `json` for providers whose plain-output compliance has not passed representative evaluation; malformed plain output is retried and then routed like any other protocol failure.
+For providers that reliably obey an exact response contract, `"review_verdict_format":"plain"` reduces the judge response to `OK`, `REFUSED`, `ERROR`, or a compact result such as `REWRITE literalism,reference_loss`. Keep `json` for providers whose plain-output compliance has not passed representative evaluation; malformed plain output is retried and then routed like any other protocol failure.
 
 Choose limits with representative evaluations. Reasoning models may need a larger judge allowance than non-reasoning models even though the visible verdict is short. Provider-reported input, output, total, and reasoning token counts are normalized into text-free attempt metadata when available.
 
