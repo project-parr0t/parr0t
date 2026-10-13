@@ -84,6 +84,44 @@ class CompatibleProviderTests(unittest.TestCase):
             {"input_tokens": 120, "output_tokens": 7, "total_tokens": 127},
         )
 
+    def test_plain_review_verdict_accepts_effect_quality_codes(self) -> None:
+        def fake_post(_url, _headers, _payload, _timeout):
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": "REWRITE function,condition,knowledge_order,length_risk"
+                        },
+                    }
+                ]
+            }
+
+        provider = CompatibleChatProvider(
+            "fixture-judge",
+            "fixture-model",
+            api_key_env="FIXTURE_API_KEY",
+            base_url="https://fixture.invalid",
+            review_verdict_format="plain",
+        )
+        with patch.dict(os.environ, {"FIXTURE_API_KEY": "fixture-key"}), patch(
+            "game_l10n.providers._post_json", side_effect=fake_post
+        ):
+            result = provider.generate_review_verdict(
+                system="Judge.",
+                user='{"translation_target":{"source":"SOURCE"}}',
+                schema={"type": "object"},
+                schema_name="game_translation_review_judge",
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "verdict": "rewrite",
+                "issues": ["function", "condition", "knowledge_order", "length_risk"],
+            },
+        )
+
     def test_json_object_mode_uses_deepseek_compatible_format(self) -> None:
         captured = {}
 

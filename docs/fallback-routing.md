@@ -25,8 +25,8 @@ Selecting this preset and supplying its key environment variables authorizes its
 
 ## Ordered routing
 
-1. Analyze the complete ordered script with the context chain. The resulting context pack records story flow, scene state, relationship changes, and character voice.
-2. Send one translation target per GPT-6 Luna request. Run up to `routing.max_workers` independent requests concurrently. Every request still receives the relevant full-script analysis, character guide, scene state, adjacent lines, glossary, and control-code rules as context-only evidence.
+1. Analyze the complete ordered source inventory with the context chain. Auto mode selects narrative, functional, knowledge, or hybrid analysis; the resulting pack records only evidence-backed domains and verifies their coverage.
+2. Send one translation target per GPT-6 Luna request. Run up to `routing.max_workers` independent requests concurrently. Every request receives only its relevant typed context entries, adjacent lines, glossary, and control-code rules as context-only evidence.
 3. Record refusal/error metadata without source or translated text. Finish the entire Luna stage before releasing only failed target IDs to DeepSeek.
 4. After all translation routes finish, obtain compact `ok` or `rewrite` judgments in script order. An `ok` result keeps the existing candidate without making the judge echo it. Approved lines from the same speaker become style anchors for later judgments.
 5. Send only `rewrite` candidates to the configured rewriter chain, run deterministic validation, and ask the compact judge to confirm the corrected candidate. Release only refused, errored, invalid, or unconfirmed review IDs to the next judge.
@@ -36,7 +36,7 @@ The top-level Codex/Sol operator observes completion, categorical refusals/error
 
 ## Refusal isolation
 
-Translation is a bounded transformation of existing user-provided text, not generation of a new scene. Provider prompts explicitly prohibit continuation, roleplay, invention, censorship, and intensity changes. Mature content in neighboring or narrative context must not turn an otherwise permitted target into a blanket refusal.
+Translation is a bounded transformation of existing user-provided text, not generation of new content. Provider prompts explicitly prohibit continuation, roleplay, invention, censorship, and intensity changes. Mature content in any context-only domain must not turn an otherwise permitted target into a blanket refusal.
 
 One provider request contains exactly one output target. Context remains available but is labeled as non-target evidence. A refusal therefore queues only that target; the orchestrator continues every unrelated target and never resubmits the refused collection as one larger fallback batch.
 

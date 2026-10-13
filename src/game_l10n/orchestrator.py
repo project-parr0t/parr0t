@@ -698,6 +698,7 @@ class LocalizationOrchestrator:
             if verdict.verdict is ReviewVerdict.ERROR:
                 return ReviewEnvelope(ReviewDecision.ERROR, text=working, raw=verdict.raw)
             # A protocol-v1 reviewer may still return a complete corrected candidate.
+            legacy_candidate_changed = False
             if verdict.text:
                 integrity = validate_integrity(
                     segment,
@@ -708,10 +709,25 @@ class LocalizationOrchestrator:
                 )
                 if integrity:
                     return ReviewEnvelope(ReviewDecision.ERROR, text=working)
-                revised = revised or verdict.text != working
+                legacy_candidate_changed = verdict.text != working
+                revised = revised or legacy_candidate_changed
                 working = verdict.text
                 self._set_candidate(result, working)
             if verdict.verdict is ReviewVerdict.OK:
+                if legacy_candidate_changed:
+                    if round_index + 1 >= self.config.review_max_rounds:
+                        self._record(
+                            result,
+                            AttemptRecord(
+                                "review-gate",
+                                provider.name,
+                                "rejected",
+                                issue_code=FailureCode.MEANING_NOT_PRESERVED.value,
+                                candidate_generation=result.candidate_generation,
+                            ),
+                        )
+                        return ReviewEnvelope(ReviewDecision.ERROR, text=working)
+                    continue
                 return ReviewEnvelope(
                     ReviewDecision.REVISED if revised else ReviewDecision.APPROVED,
                     text=working,
@@ -821,6 +837,125 @@ class LocalizationOrchestrator:
             {"segment_id": result.segment_id, "stage": "complete", "status": result.status}
         )
         return result
+
+    def review_existing_one(self, segment: Segment, candidate: str) -> TranslationResult:
+        """Run a fresh semantic review over a reused candidate.
+
+        This intentionally does not reuse translation-cache approval. Reuse proves only
+        candidate identity; the independent reviewer must approve the current text under
+        the current context pack.
+        """
+
+        if not self.config.require_review:
+            raise ValueError("Existing candidates require an enabled independent review route")
+        anchors = self._anchors(segment.speaker)
+        result = TranslationResult(
+            segment_id=segment.id,
+            source=segment.source,
+            translator="existing-candidate",
+            metadata={**segment.metadata, "candidate_origin": "existing"},
+        )
+        self._set_candidate(result, candidate)
+        integrity = validate_integrity(
+            segment,
+            candidate,
+            self.glossary,
+            extra_patterns=self.config.extra_protected_patterns,
+            max_length_ratio=self.config.max_length_ratio,
+        )
+        if integrity:
+            self._record(
+                result,
+                AttemptRecord(
+                    "integrity",
+                    "deterministic-validator",
+                    "rejected",
+                    issues=[item.code for item in integrity],
+                    issue_code=FailureCode.INTEGRITY_INVALID.value,
+                    candidate_generation=result.candidate_generation,
+                ),
+            )
+            repaired = None
+            for rewriter_name in self.config.rewriter_chain or self.config.reviewer_chain:
+                repaired = self._rewrite_with_refusal_retry(
+                    result,
+                    self.registry.get(rewriter_name),
+                    segment,
+                    candidate,
+                    ["formatting"],
+                    anchors,
+                )
+                if repaired is not None and repaired.status is AgentStatus.SUCCESS:
+                    candidate = repaired.text
+                    self._set_candidate(result, candidate)
+                    break
+            if repaired is None or repaired.status is not AgentStatus.SUCCESS:
+                result.errors.append("Existing candidate failed deterministic integrity repair")
+                return self._preserve_or_fail_existing(segment, result)
+
+        for reviewer_name in self.config.reviewer_chain:
+            reviewer = self.registry.get(reviewer_name)
+            review = self._review_with_refusal_retry(
+                result, reviewer, segment, candidate, anchors
+            )
+            if review is not None and review.text:
+                candidate = review.text
+                self._set_candidate(result, candidate)
+            if review is None or review.decision in {
+                ReviewDecision.REFUSED,
+                ReviewDecision.ERROR,
+            }:
+                continue
+            result.text = candidate
+            result.status = "reviewed"
+            result.reviewer = reviewer_name
+            result.review_outcome = review.decision.value
+            result.acceptance_authority = "reviewer"
+            self._remember(segment, result.text)
+            self.audit.append(
+                {"segment_id": result.segment_id, "stage": "complete", "status": result.status}
+            )
+            return result
+
+        result.errors.append("All review routes were exhausted for existing candidate")
+        if self._accept_after_review_refusal(result, candidate):
+            return result
+        return self._preserve_or_fail_existing(segment, result)
+
+    def _preserve_or_fail_existing(
+        self, segment: Segment, result: TranslationResult
+    ) -> TranslationResult:
+        if self.config.preserve_source_on_failure or self.config.review_refusal_policy == "source_preserve":
+            result.text = segment.source
+            result.status = "source_preserved"
+            result.resolution_code = FailureCode.SOURCE_PRESERVED.value
+        self.audit.append(
+            {"segment_id": result.segment_id, "stage": "complete", "status": result.status}
+        )
+        return result
+
+    def review_existing_many(
+        self,
+        segments: Iterable[Segment],
+        candidates: dict[str, dict[str, str]],
+    ) -> list[TranslationResult]:
+        items = list(segments)
+        expected_ids = {item.id for item in items}
+        candidate_ids = set(candidates)
+        if expected_ids != candidate_ids:
+            raise ValueError(
+                "Full re-review requires exactly one existing candidate for every source target"
+            )
+        for segment in items:
+            if candidates[segment.id]["source"] != segment.source:
+                raise ValueError(
+                    f"Existing candidate source does not match current inventory: {segment.id}"
+                )
+        # Ordered execution lets later targets reuse only freshly approved style anchors.
+        return [
+            self.review_existing_one(segment, candidates[segment.id]["text"])
+            for segment in items
+        ]
 
     def _accept_after_review_refusal(
         self, result: TranslationResult, candidate: str

@@ -23,6 +23,14 @@ _REVIEW_ISSUE_CODES = {
     "consistency",
     "formatting",
     "fluency",
+    "literalism",
+    "reference_loss",
+    "tone_rhythm",
+    "function",
+    "condition",
+    "unit",
+    "knowledge_order",
+    "length_risk",
 }
 
 
@@ -89,6 +97,7 @@ def _refusal_payload(schema_name: str) -> dict[str, Any]:
             "scenes": [],
             "characters": [],
             "relationship_timeline": [],
+            "reference_cues": [],
         }
     return {"status": "refused", "text": "", "reason": "provider_refusal"}
 

@@ -43,7 +43,11 @@ The full path report stays under `reports/` in the private workspace. The comman
 
 ## Prepare translation inventory
 
-An extractor or private bridge must create normal framework segments with stable IDs and Unity location metadata. Each segment uses one of these metadata contracts:
+Two independently implemented extractors or audits must each create a complete ordered `parr0t.source-inventory.v1` document with stable IDs and Unity location metadata. The primary path should walk serialized localization resources; the independent path should separately enumerate the relevant Unity object/type indexes and audit managed string call sites or registered dynamic UI paths. Re-reading one extractor's output through another parser is not independent.
+
+Every user-visible class must appear in both inventories in the same order. If String Tables, TextAssets, static literals, or a dynamic UI category cannot be accounted for, record a user-visible exclusion and stop with incomplete static coverage. Mark an indispensable boot, navigation, or state-transition target with `metadata.blocking_on_failure=true` so an operational model failure holds the complete payload rather than producing an unusable partial patch.
+
+Each segment uses one of these metadata contracts:
 
 ```json
 {
@@ -65,18 +69,29 @@ An extractor or private bridge must create normal framework segments with stable
 
 The location metadata is data-plane input. It remains in the workspace and is never promoted into the SDK branch.
 
+Verify the two documents before context analysis or translation:
+
+```powershell
+game-l10n verify-inventory `
+  --workspace <agent-workspace> `
+  --primary inputs\unity-primary.json `
+  --independent inputs\unity-independent.json
+```
+
+The method names and implementation fingerprints must differ. Both inventories must agree on stable ID, source text, and order without a user-visible exclusion.
+
 Run the normal context-first translation and compact review pipeline, then compile only reviewed or source-preserved results:
 
 ```powershell
 game-l10n unity compile-payload `
   --workspace <agent-workspace> `
-  --segments inputs\fixture-segments.json `
+  --segments inputs\unity-primary.json `
   --reviewed outputs\fixture-reviewed.json `
   --locale qaa-FIXTURE `
   --output build\fixture-runtime.json
 ```
 
-`--allow-unreviewed` exists for an explicitly accepted exceptional workflow. It is intentionally off by default.
+`compile-payload` requires the matching independent-inventory attestation and embeds its fingerprint in the runtime payload. It refuses to emit a payload while the current failure queue contains a blocking target. `--allow-unreviewed` exists for an explicitly accepted exceptional workflow; it is intentionally off by default and does not bypass either gate.
 
 ## Build a private loader bridge
 

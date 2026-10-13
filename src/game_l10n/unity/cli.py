@@ -87,6 +87,7 @@ def cmd_compile_payload(args: argparse.Namespace) -> int:
         _work_path(work_dir, args.segments, must_exist=True),
         _work_path(work_dir, args.reviewed, must_exist=True),
         _work_path(work_dir, args.output),
+        work_dir=work_dir,
         locale=args.locale,
         allow_unreviewed=args.allow_unreviewed,
     )

@@ -6,11 +6,27 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ..coverage import require_inventory_attestation
 from ..formats import read_segments
 
 
 LOCALE_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 REVIEWED_STATUSES = {"reviewed", "source_preserved"}
+
+
+def _require_patch_gate(work_dir: Path, segments_path: Path) -> dict[str, Any]:
+    inventory = require_inventory_attestation(work_dir, segments_path)
+    queue_path = work_dir / ".game-l10n" / "failure-queue.json"
+    if not queue_path.is_file():
+        return inventory
+    queue = json.loads(queue_path.read_text(encoding="utf-8"))
+    if queue.get("schema") != "parr0t.failure-queue.v1":
+        raise ValueError("Failure queue schema is unsupported")
+    if queue.get("inventory_fingerprint") != inventory["primary_fingerprint"]:
+        raise ValueError("Failure queue is stale for the verified Unity inventory")
+    if int(queue.get("blocking_count", 0)) > 0:
+        raise ValueError("Unity payload is held while a blocking translation target remains unresolved")
+    return inventory
 
 
 def _read_results(path: Path) -> list[dict[str, Any]]:
@@ -47,6 +63,7 @@ def compile_runtime_payload(
     reviewed_results_path: Path,
     output_path: Path,
     *,
+    work_dir: Path,
     locale: str,
     allow_unreviewed: bool = False,
 ) -> dict[str, Any]:
@@ -55,6 +72,7 @@ def compile_runtime_payload(
     output_path = output_path.resolve()
     if output_path in {segments_path.resolve(), reviewed_results_path.resolve()}:
         raise ValueError("Runtime payload output must not overwrite its source inventory or reviewed results")
+    inventory = _require_patch_gate(work_dir.resolve(), segments_path.resolve())
     segments = read_segments(segments_path)
     rows = _read_results(reviewed_results_path)
     by_id: dict[str, dict[str, Any]] = {}
@@ -124,6 +142,7 @@ def compile_runtime_payload(
 
     payload = {
         "schema_version": 1,
+        "inventory_fingerprint": inventory["primary_fingerprint"],
         "locale": locale,
         "string_tables": {
             collection: dict(sorted(entries.items()))
