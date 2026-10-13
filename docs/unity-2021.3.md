@@ -1,6 +1,6 @@
-# Unity 2021.3 managed-mod patch adapter
+# Unity 2021.3 Mono and IL2CPP patch adapter
 
-This branch supports reusable patch construction for Unity 2021.3 Mono players that already expose a managed mod-loader boundary. It does not claim that one binary can patch every Unity title.
+This branch supports reusable patch construction for Unity 2021.3 Mono and IL2CPP players that expose a managed mod-loader boundary. It does not claim that one binary can patch every Unity title.
 
 ## Reuse boundary
 
@@ -8,6 +8,9 @@ The adapter generalizes these engine-facing operations:
 
 - discover a `*_Data/Managed` player layout and its exact Unity version;
 - distinguish Mono from IL2CPP before attempting a managed build;
+- validate the IL2CPP metadata header and report its format version;
+- generate IL2CPP interop assemblies offline through a compatible BepInEx toolchain;
+- compile a BepInEx IL2CPP bridge against read-only loader and .NET 6 references;
 - detect Unity Localization, TextMeshPro, Addressables, and Harmony assemblies;
 - compile a workspace-only loader bridge against read-only managed references;
 - map reviewed targets to String Table entries, TextAsset keys, and exact literal keys;
@@ -27,9 +30,10 @@ BepInEx, MelonLoader, and native project loaders use different entry contracts. 
 
 - A private agent workspace created by the framework.
 - The Unity player root configured as a read-only `game_root`.
-- A Unity 2021.3 Mono build. IL2CPP discovery is reported but managed bridge compilation is not enabled by this branch.
+- A Unity 2021.3 Mono or IL2CPP build.
 - A .NET SDK containing Roslyn.
 - A loader-specific C# bridge in the workspace. The SDK never stores that bridge if it contains project-specific type or resource names.
+- For IL2CPP, a BepInEx IL2CPP distribution and matching Unity base libraries extracted inside the private workspace.
 
 ## Discover
 
@@ -39,7 +43,7 @@ game-l10n unity discover `
   --game-root <configured-player-root>
 ```
 
-The full path report stays under `reports/` in the private workspace. The command returns a nonzero status when the build is not a supported Unity 2021.3 Mono player.
+The full path report stays under `reports/` in the private workspace. The command succeeds for a supported Unity 2021.3 Mono layout or a Unity 2021.3 IL2CPP layout with a valid metadata header. An IL2CPP report includes `metadata_version`; version 31 is accepted when the selected Cpp2IL/interop toolchain supports it.
 
 ## Prepare translation inventory
 
@@ -78,7 +82,7 @@ game-l10n unity compile-payload `
 
 `--allow-unreviewed` exists for an explicitly accepted exceptional workflow. It is intentionally off by default.
 
-## Build a private loader bridge
+## Build a private Mono loader bridge
 
 ```powershell
 game-l10n unity build-managed `
@@ -92,6 +96,35 @@ game-l10n unity build-managed `
 ```
 
 The compiler receives argument arrays directly, reads the installed managed assemblies as references, and verifies that every reference is byte-for-byte unchanged afterward. Loader-specific references are supplied with repeated `--reference` arguments.
+
+## Generate IL2CPP interop assemblies
+
+Keep the player files read-only and extract the compatible BepInEx IL2CPP distribution and Unity base libraries into the private workspace. Then run:
+
+```powershell
+game-l10n unity generate-interop `
+  --workspace <agent-workspace> `
+  --game-root <configured-player-root> `
+  --loader-root dependencies\fixture-loader `
+  --unity-base-libs dependencies\fixture-unity-libs `
+  --output build\fixture-interop
+```
+
+The adapter reads the canonical IL2CPP metadata header, compiles a temporary offline runner, and performs Cpp2IL plus interop generation without launching the game. It snapshots the player inputs and toolchain references before execution and fails if any read-only input changes. The output directory must not already exist, so a failed or repeated run cannot silently merge incompatible assemblies.
+
+The BepInEx distribution must contain the public Cpp2IL, LibCpp2IL, AsmResolver, and Il2CppInterop generator assemblies expected by the adapter. If the generator rejects the reported metadata version, replace the private workspace toolchain with a compatible release rather than modifying player metadata.
+
+## Build a private IL2CPP loader bridge
+
+```powershell
+game-l10n unity build-il2cpp `
+  --workspace <agent-workspace> `
+  --loader-root dependencies\fixture-loader `
+  --source bridge\FixtureBridge.cs `
+  --output build\Fixture.Localization.dll
+```
+
+The build uses an explicit, bounded set of .NET 6 references from the pack beside the selected SDK and the BepInEx IL2CPP bridge references. Additional loader references can be supplied with repeated `--reference` arguments, and additional framework references with repeated `--framework-reference` arguments. As with the Mono path, compilation happens only in the private workspace and every reference is verified unchanged.
 
 ## Pack and verify
 
@@ -131,4 +164,5 @@ The archive is never installed automatically. Installation requires a separate u
 - It does not redistribute `Assembly-CSharp`, Unity assemblies, or framework assemblies from the installed player.
 - It does not guess project-specific hooks from class names.
 - It does not treat the presence of Unity Localization as proof that every visible string comes from a String Table.
-- It does not support IL2CPP injection. That requires a distinct engine/loader branch and test matrix.
+- It does not install or redistribute BepInEx, Unity base libraries, or generated interop assemblies as though they were owned by the SDK.
+- It does not choose a BepInEx/Cpp2IL release for an unknown metadata version; compatibility must be pinned and verified in the private workspace.

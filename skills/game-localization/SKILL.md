@@ -25,3 +25,7 @@ Read the repository `AGENTS.md`, `docs/agent-usage.md`, and the target workspace
 16. Treat every translation/review refusal as a routing event, not a judgment that the content should be omitted. Normalize its explanation before returning to the parent, continue the staged fallback chain, and still produce the patch with exact source preservation only after all configured routes are exhausted. Use supported low-creativity generation settings; never claim or attempt to disable provider safeguards.
 
 Never copy source game data, extracted strings, translations, caches, logs, prompts, or keys into the SDK repository.
+
+## Unity 2021.3 branch
+
+On `sdk-unity-2021.3`, read `docs/unity-2021.3.md` and run `game-l10n unity discover` before selecting a build path. Keep the existing Mono workflow for Mono players. For IL2CPP players, generate interop assemblies offline with a compatible private-workspace BepInEx toolchain, then compile the private bridge with `build-il2cpp`. Treat the player binary, metadata, loader references, and Unity base libraries as read-only inputs; keep generated assemblies and patch packages outside the SDK repository.

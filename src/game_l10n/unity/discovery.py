@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import re
+import struct
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 
 UNITY_VERSION_RE = re.compile(rb"20\d{2}\.\d+\.\d+[abfp]\d+")
+IL2CPP_METADATA_MAGIC = 0xFAB11BAF
 
 
 @dataclass(slots=True, frozen=True)
@@ -14,6 +16,8 @@ class UnityInstallation:
     game_root: Path
     data_root: Path
     managed_root: Path
+    metadata_path: Path | None
+    metadata_version: int | None
     unity_version: str
     backend: str
     capabilities: dict[str, bool]
@@ -33,14 +37,37 @@ class UnityInstallation:
             and self.capabilities.get("unity_core", False)
         )
 
+    @property
+    def supports_il2cpp_interop(self) -> bool:
+        return (
+            self.backend == "il2cpp"
+            and self.unity_series == "2021.3"
+            and self.metadata_version is not None
+        )
+
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["game_root"] = str(self.game_root)
         payload["data_root"] = str(self.data_root)
         payload["managed_root"] = str(self.managed_root)
+        payload["metadata_path"] = str(self.metadata_path) if self.metadata_path else None
         payload["unity_series"] = self.unity_series
         payload["supports_managed_mod_build"] = self.supports_managed_mod_build
+        payload["supports_il2cpp_interop"] = self.supports_il2cpp_interop
         return payload
+
+
+def read_il2cpp_metadata_version(metadata_path: Path) -> int:
+    with metadata_path.open("rb") as handle:
+        header = handle.read(8)
+    if len(header) != 8:
+        raise ValueError("IL2CPP metadata header is truncated")
+    magic, version = struct.unpack("<II", header)
+    if magic != IL2CPP_METADATA_MAGIC:
+        raise ValueError("IL2CPP metadata header has an invalid magic value")
+    if version <= 0:
+        raise ValueError("IL2CPP metadata header has an invalid version")
+    return version
 
 
 def _read_unity_version(data_root: Path) -> str:
@@ -88,6 +115,8 @@ def discover_unity_installation(game_root: Path) -> UnityInstallation:
     data_root = _find_data_root(game_root)
     managed_root = data_root / "Managed"
     il2cpp = (game_root / "GameAssembly.dll").is_file() and (data_root / "il2cpp_data").is_dir()
+    metadata_path = data_root / "il2cpp_data" / "Metadata" / "global-metadata.dat"
+    metadata_version = read_il2cpp_metadata_version(metadata_path) if metadata_path.is_file() else None
     capabilities = {
         "assembly_csharp": (managed_root / "Assembly-CSharp.dll").is_file(),
         "unity_core": (managed_root / "UnityEngine.CoreModule.dll").is_file(),
@@ -98,6 +127,7 @@ def discover_unity_installation(game_root: Path) -> UnityInstallation:
             (managed_root / name).is_file()
             for name in ("0Harmony.dll", "HarmonyX.dll")
         ),
+        "il2cpp_metadata": metadata_version is not None,
     }
     loader_candidates: tuple[tuple[str, Path | None], ...] = (
         ("Mods", game_root / "Mods"),
@@ -109,6 +139,8 @@ def discover_unity_installation(game_root: Path) -> UnityInstallation:
         game_root=game_root,
         data_root=data_root,
         managed_root=managed_root,
+        metadata_path=metadata_path if metadata_path.is_file() else None,
+        metadata_version=metadata_version,
         unity_version=_read_unity_version(data_root),
         backend="il2cpp" if il2cpp else "mono",
         capabilities=capabilities,
