@@ -13,10 +13,11 @@ from .errors import GameL10nError
 from .context_analysis import ContextAnalyzer, analyze_with_cache
 from .formats import read_segments, write_results
 from .models import CharacterProfile, ContextPack, GlossaryEntry, ProjectContext
-from .native_pass import import_native_shard, merge_native_pass
+from .native_pass import import_native_shard, merge_native_pass, prepare_native_tasks
 from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from .privacy import is_within, require_external_workdir
 from .providers import ProviderRegistry
+from .steam import build_steam_package, validate_steam_package
 from .tooling import run_cached_tool
 from .workspace import (
     initialize_workspace,
@@ -249,6 +250,25 @@ def cmd_import_native_shard(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    source = _path_in_workspace(work_dir, args.input, must_exist=True)
+    output = _path_in_workspace(work_dir, args.output)
+    max_records = args.max_records or int(
+        config.get("execution", {}).get("native_shard_records", 256)
+    )
+    result = prepare_native_tasks(
+        work_dir,
+        source,
+        read_segments(source),
+        output,
+        max_records=max_records,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def cmd_merge_native_pass(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
@@ -286,6 +306,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "game_roots": [str(path) for path in game_roots],
                 "missing_game_roots": missing_roots,
                 "repository": policy,
+                "execution": config.get("execution", {}),
                 "next_actions": actions or ["ready"],
             },
             ensure_ascii=False,
@@ -319,6 +340,30 @@ def cmd_publish(args: argparse.Namespace) -> int:
         push=args.push,
     )
     print(json.dumps({"branch": branch, "committed": args.commit, "pushed": args.push}))
+    return 0
+
+
+def cmd_steam_package(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
+    require_external_workdir(work_dir, sdk_root)
+    result = build_steam_package(
+        _path_in_workspace(work_dir, args.payload, must_exist=True),
+        _path_in_workspace(work_dir, args.spec, must_exist=True),
+        _path_in_workspace(work_dir, args.output),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_verify_steam_package(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
+    require_external_workdir(work_dir, sdk_root)
+    result = validate_steam_package(_path_in_workspace(work_dir, args.package, must_exist=True))
+    print(json.dumps(result, ensure_ascii=False))
     return 0
 
 
@@ -399,6 +444,16 @@ def build_parser() -> argparse.ArgumentParser:
     tool.add_argument("--force", action="store_true")
     tool.set_defaults(func=cmd_run_tool)
 
+    native_prepare = sub.add_parser(
+        "prepare-native-pass",
+        help="Create cached exclusive target-ID task files for native workers",
+    )
+    native_prepare.add_argument("--workspace", required=True)
+    native_prepare.add_argument("--input", required=True, help="Ordered source segment file")
+    native_prepare.add_argument("--output", required=True, help="Private task directory")
+    native_prepare.add_argument("--max-records", type=int)
+    native_prepare.set_defaults(func=cmd_prepare_native_pass)
+
     native_import = sub.add_parser(
         "import-native-shard",
         help="Import one exclusive native-agent result shard into the private workspace",
@@ -435,6 +490,24 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--commit", action="store_true")
     publish.add_argument("--push", action="store_true")
     publish.set_defaults(func=cmd_publish)
+
+    steam_package = sub.add_parser(
+        "steam-package",
+        help="Build a minimal Steam-aware install package from a private workspace payload",
+    )
+    steam_package.add_argument("--workspace", required=True)
+    steam_package.add_argument("--payload", required=True, help="Patch payload directory inside the workspace")
+    steam_package.add_argument("--spec", required=True, help="Steam package JSON spec inside the workspace")
+    steam_package.add_argument("--output", required=True, help="New ZIP path inside the workspace")
+    steam_package.set_defaults(func=cmd_steam_package)
+
+    verify_steam = sub.add_parser(
+        "verify-steam-package",
+        help="Verify a Parr0t Steam package without installing it",
+    )
+    verify_steam.add_argument("--workspace", required=True)
+    verify_steam.add_argument("--package", required=True)
+    verify_steam.set_defaults(func=cmd_verify_steam_package)
 
     doctor = sub.add_parser("doctor", help="Check workspace configuration without sending game data")
     doctor.add_argument("--workspace", required=True)

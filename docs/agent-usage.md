@@ -111,3 +111,20 @@ python -m unittest discover -s tests -t . -v
 For a localization job, the agent must also validate format structure, placeholders, markup, control codes, glossary constraints, source immutability, patch recoverability, and output paths using the selected SDK branch.
 
 The final report to the parent contains only counts, categorical states, deterministic issue codes, artifact paths, and the next required approval. Private content remains in the external workspace.
+
+## Execution economy
+
+Read `docs/execution-budget.md` before a multi-stage job. Freeze the active deliverable, create the minimum working artifact, and validate only the layers that changed. Do not broaden an installer or packaging request into migration, backup, rollback, or compatibility infrastructure without a demonstrated requirement. A passed check remains valid while its input fingerprint is unchanged.
+
+Keep simple or tightly coupled work in the current agent. Parallel workers are appropriate for independent translation or review shards, not for small scripts, status polling, repeated package inspection, or duplicate QA.
+
+## Steam delivery packages
+
+Steam support on `main` packages an already prepared payload; it does not replace an engine SDK. Keep the payload and package spec in the private workspace, then run:
+
+```text
+game-l10n steam-package --workspace <external-workspace> --payload <payload-directory> --spec <steam-spec.json> --output <patch.zip>
+game-l10n verify-steam-package --workspace <external-workspace> --package <patch.zip>
+```
+
+The generated installer discovers valid Steam libraries, ignores stale library entries, asks for a directory when discovery fails, and manages only files listed in its receipt. Follow `docs/steam-packaging.md` for the private spec and acceptance checks.

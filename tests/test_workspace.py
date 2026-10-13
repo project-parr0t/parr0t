@@ -45,6 +45,11 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(config["routing"]["review_refusal_policy"], "fallback")
         self.assertTrue(config["routing"]["defer_fallbacks_until_primary_complete"])
         self.assertTrue(config["routing"]["preserve_source_on_failure"])
+        self.assertEqual(config["execution"]["scope_mode"], "minimum_requested_artifact")
+        self.assertEqual(config["execution"]["validation_profile"], "proportional")
+        self.assertEqual(config["execution"]["same_failure_limit"], 2)
+        self.assertFalse(config["execution"]["delegate_simple_tasks"])
+        self.assertEqual(config["execution"]["native_shard_records"], 256)
 
     def test_workspace_must_be_outside_sdk(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

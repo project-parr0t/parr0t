@@ -73,3 +73,27 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Diagnosis:** Check whether accepted candidates are echoed by the reviewer and whether a correction model runs for every target.
 - **Resolution:** Use a compact judge that returns only `ok` or `rewrite` plus categorical issue codes. Invoke a rewriter only for `rewrite`, validate the correction, and confirm it with another compact judgment.
 - **Prevention:** Set per-task output limits, retain focused scene/character evidence, record provider usage metadata, and compare quality and cost on synthetic representative evaluations before changing the configured roles.
+
+## A small installer request expands into a migration framework
+
+- **Symptom:** A simple package or launcher takes much longer than translation because the agent adds legacy fingerprints, embedded previous releases, generalized rollback, or compatibility logic that was not requested.
+- **General cause:** Safety and reuse were treated as unlimited goals instead of constraints proportional to the active deliverable.
+- **Diagnosis:** Compare each added component with the current acceptance criteria. If removing it still produces the requested recoverable patch, it is outside the active scope.
+- **Resolution:** Return to the smallest design: immutable source, explicit payload, one receipt, owned-path collision checks, one package validation, and a clear remove operation. Move optional migration work to a separately approved task.
+- **Prevention:** Follow `docs/execution-budget.md`, freeze scope per user request, and stop after the proportional acceptance checks pass.
+
+## Steam discovery fails on a library that no longer exists
+
+- **Symptom:** Automatic game discovery aborts before reaching a valid Steam library or manual-path fallback.
+- **General cause:** A stale `libraryfolders.vdf` entry points to a missing directory or unavailable drive, and child paths are joined before the root is checked.
+- **Diagnosis:** Enumerate only library root metadata and identify roots that fail an existence check; do not scan game content.
+- **Resolution:** Skip every missing root before constructing `steamapps` paths, continue remaining roots, and prompt for an explicit game directory when no valid match remains.
+- **Prevention:** Cover one stale-root case in the synthetic installer lifecycle and keep manual selection available.
+
+## Unchanged artifacts are validated repeatedly
+
+- **Symptom:** The same hashes, archive entries, build, or runtime state are checked many times without any input change.
+- **General cause:** Successful validation is not tied to an input fingerprint, or confidence checks are run without a new failure hypothesis.
+- **Diagnosis:** Compare content, tool, and configuration fingerprints between checks.
+- **Resolution:** Reuse the prior pass while its fingerprint remains unchanged. Re-run only the layer invalidated by a changed input or failed check.
+- **Prevention:** Record validation fingerprints and apply the stop conditions in `docs/execution-budget.md`.

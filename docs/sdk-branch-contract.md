@@ -14,6 +14,8 @@ main framework  ->  engine SDK branch  ->  private per-game workspace
 
 The reverse direction is forbidden. `main` must not contain an engine name, engine file layout, engine command, engine-specific warning, engine fixture, or exception added solely for one SDK branch. A private workspace must never be copied into either branch.
 
+Distribution-layer packaging that does not inspect or interpret engine assets may live on `main`. It must consume an already prepared payload, remain independent of the payload's engine, and keep every title-specific identifier and file in the private workspace. Steam discovery and receipt-based installation are distribution concerns; text extraction, runtime hooks, asset rebuilding, and engine payload construction remain SDK-branch concerns.
+
 Engine SDK branches may use every public interface from `main`. When `main` changes, each engine branch should merge or rebase the new core and run both the core suite and its own adapter suite. A core change must not import the adapter package or special-case its paths.
 
 ## Ownership
@@ -25,6 +27,7 @@ Engine SDK branches may use every public interface from `main`. When `main` chan
 - context, glossary, voice, integrity, and privacy contracts;
 - translation and review fallback policy;
 - source immutability and patch-output requirements;
+- engine-neutral delivery packaging and receipt contracts;
 - sanitized SDK promotion and branch lifecycle.
 
 An engine SDK branch owns:
@@ -32,7 +35,7 @@ An engine SDK branch owns:
 - unpacking and text-target discovery;
 - engine-specific manifests and protected fields;
 - translation application, mirror updates, span handling, and escaping;
-- packing, round-trip verification, and patch assembly;
+- engine payload assembly, packing, and round-trip verification;
 - engine-specific documentation, FAQ entries, ignore rules, and synthetic fixtures.
 
 ## Branch acceptance gate

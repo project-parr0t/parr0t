@@ -17,6 +17,7 @@
 - 모든 번역 경로가 실패한 항목은 원문을 보존하며, 원본 게임 데이터는 수정하지 않습니다.
 - 게임 데이터, 번역 결과, 작업 로그는 외부 에이전트 작업공간에만 남고 이 저장소에는 들어오지 않습니다.
 - 특정 공급자에 종속되지 않습니다. Codex App의 에이전트와 외부 API를 조합하는 구성을 권장하지만 역할별 공급자를 교체할 수 있습니다.
+- 완성된 페이로드는 Steam 라이브러리 자동 탐색과 수동 폴백을 갖춘 최소 설치 ZIP으로 만들 수 있습니다.
 
 ## 에이전트에게 시작시키기
 
@@ -46,6 +47,8 @@ sdk-<engine>-<version>       재사용 가능한 추출·적용·패킹 구현
 
 - [`docs/agent-usage.md`](docs/agent-usage.md): Codex 및 OpenCodex 기준 전체 운용 절차
 - [`docs/prompt-examples.md`](docs/prompt-examples.md): 신규 작업, 재개, 검증, SDK 승격 요청 예제
+- [`docs/execution-budget.md`](docs/execution-budget.md): 범위 확장·중복 검사·불필요한 위임을 막는 실행 예산
+- [`docs/steam-packaging.md`](docs/steam-packaging.md): Steam 설치 ZIP 제작과 영수증 기반 설치·제거
 - [`docs/review-pipeline.md`](docs/review-pipeline.md): 저토큰 독립 검수와 선택적 재작성
 - [`docs/provider-protocol.md`](docs/provider-protocol.md): 공급자·명령형 워커 연결 규약
 - [`docs/codex-app-deepseek.md`](docs/codex-app-deepseek.md): 권장 App + API 구성 예시

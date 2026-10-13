@@ -10,6 +10,7 @@ from .models import (
 )
 from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from .providers import ModelProvider, ProviderRegistry
+from .steam import build_steam_package, validate_steam_package
 
 __all__ = [
     "CharacterProfile",
@@ -22,6 +23,8 @@ __all__ = [
     "ProviderRegistry",
     "Segment",
     "TranslationResult",
+    "build_steam_package",
+    "validate_steam_package",
 ]
 
 __version__ = "0.1.0"

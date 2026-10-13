@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -33,6 +35,96 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(f"Native shard row {line_number} must be an object")
             rows.append(value)
     return rows
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def prepare_native_tasks(
+    work_dir: Path,
+    source_path: Path,
+    segments: list[Segment],
+    output_dir: Path,
+    *,
+    max_records: int = 256,
+) -> dict[str, Any]:
+    if not 1 <= max_records <= 2000:
+        raise ValueError("max_records must be between 1 and 2000")
+    if not segments:
+        raise ValueError("Ordered source contains no segments")
+    ids = [segment.id for segment in segments]
+    if len(ids) != len(set(ids)):
+        raise ValueError("Ordered source contains duplicate target IDs")
+    try:
+        source_artifact = source_path.resolve().relative_to(work_dir.resolve()).as_posix()
+        output_dir.resolve().relative_to(work_dir.resolve())
+    except ValueError as exc:
+        raise ValueError("Native task source and output must stay inside the private workspace") from exc
+
+    fingerprint = stable_hash([asdict(segment) for segment in segments])
+    manifest_path = output_dir / "manifest.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("source_fingerprint") == fingerprint and manifest.get("max_records") == max_records:
+            task_rows = manifest.get("tasks", [])
+            valid = bool(task_rows) and all(
+                (output_dir / item["file"]).is_file()
+                and _file_sha256(output_dir / item["file"]) == item["sha256"]
+                for item in task_rows
+            )
+            if valid:
+                return {
+                    "cached": True,
+                    "records": len(segments),
+                    "tasks": len(task_rows),
+                    "max_records": max_records,
+                    "manifest": str(manifest_path),
+                    "artifacts": [str(output_dir / item["file"]) for item in task_rows],
+                }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    expected: set[str] = set()
+    tasks: list[dict[str, Any]] = []
+    for offset in range(0, len(segments), max_records):
+        number = len(tasks) + 1
+        name = f"task-{number:04d}.jsonl"
+        path = output_dir / name
+        rows = [
+            {"target_id": segment.id, "ordinal": ordinal}
+            for ordinal, segment in enumerate(segments[offset : offset + max_records], start=offset)
+        ]
+        _atomic_jsonl(path, rows)
+        expected.add(name)
+        tasks.append(
+            {
+                "file": name,
+                "records": len(rows),
+                "sha256": _file_sha256(path),
+            }
+        )
+    for stale in output_dir.glob("task-*.jsonl"):
+        if stale.name not in expected:
+            stale.unlink()
+    manifest = {
+        "version": 1,
+        "source_artifact": source_artifact,
+        "source_fingerprint": fingerprint,
+        "max_records": max_records,
+        "records": len(segments),
+        "tasks": tasks,
+    }
+    temporary = manifest_path.with_name(f"{manifest_path.name}.tmp")
+    temporary.write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(manifest_path)
+    return {
+        "cached": False,
+        "records": len(segments),
+        "tasks": len(tasks),
+        "max_records": max_records,
+        "manifest": str(manifest_path),
+        "artifacts": [str(output_dir / item["file"]) for item in tasks],
+    }
 
 
 def _validate_row(row: dict[str, Any]) -> dict[str, Any]:

@@ -43,3 +43,9 @@ The patch in <external-workspace> has been confirmed successful. Prepare a sanit
 ```text
 Inspect <public-reference-url> only to learn the public patch format and determine whether the method is reusable across independent titles. Do not import project identity, content, assets, filenames, or incident history. Keep provisional work private until a real patch is confirmed, then follow Parr0t's sanitized SDK promotion and publication approval flow.
 ```
+
+## Build a minimal Steam installer
+
+```text
+Read Parr0t's AGENTS.md, docs/execution-budget.md, and docs/steam-packaging.md. Use the completed payload at <payload-directory> and keep every title-specific value in a private Steam spec. Build one deterministic Steam-aware ZIP with receipt-owned install, update, verify, and remove operations. Do not embed an older package, design a legacy migration layer, back up or hash the complete game, or use subagents for this packaging task. Run package validation and one synthetic installer lifecycle, then stop and report the artifact for user validation.
+```

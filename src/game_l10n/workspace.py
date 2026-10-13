@@ -90,6 +90,14 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "pack": ["python", "tools/pack.py", "{input}", "{output}"],
     },
     "repository": {"initial_choice": "pending", "publish_approved": False},
+    "execution": {
+        "scope_mode": "minimum_requested_artifact",
+        "validation_profile": "proportional",
+        "same_failure_limit": 2,
+        "reuse_unchanged_checks": True,
+        "delegate_simple_tasks": False,
+        "native_shard_records": 256,
+    },
 }
 
 AGENTS_TEXT = """# AGENTS.md — Game localization workspace
@@ -108,13 +116,16 @@ This directory contains private game data and translation artifacts. It is inten
 8. Engine profiles use branch names `sdk-<engine>-<version>`. Export only reusable files from `tools/`; the privacy scan must pass first.
 9. Keep promoted SDK content provenance-free. Never transfer real game/project names, filenames, asset paths, map/event identifiers, dialogue, translations, project-specific exclusions, job metadata, tool paths, counts, hashes, reports, or execution history. Use only public engine-format identifiers and unmistakably synthetic fixtures.
 10. Record only recurring engine/SDK problems in the repository `docs/faq.md`, after reducing them to neutral symptom, general cause, diagnosis, resolution, and prevention. Keep one-off or project-specific incidents in this private workspace.
-11. Treat translation as a faithful transformation of existing user-provided text, never as new scene generation, continuation, roleplay, or endorsement. Do not censor, soften, intensify, or invent content. A refusal applies only to the individual target segment and must never cancel unrelated segments.
+11. Treat translation as a faithful transformation of existing user-provided text, never as new scene generation, continuation, roleplay, or endorsement. Do not censor, soften, intensify, or invent content. A native worker may receive an exclusive ID shard to reduce startup overhead, but it must load and finalize one target at a time. A refusal applies only to the individual target segment and must never cancel unrelated segments.
 12. Follow the configured role chains, not hard-coded provider identities. Finish the complete primary translation pass before translation fallback. Review with compact judges; invoke configured rewriters only for `rewrite` verdicts; confirm corrected candidates; and send only refused/failed judge targets to the next judge. With the recommended OpenAI/DeepSeek preset these roles map to Luna translation, Sol compact judging, and selective DeepSeek/Sol correction, but API, native App, command, local, and compatible providers may be substituted independently. If every permitted route fails, emit the unchanged source with `source_preserved`; never silently claim it was reviewed.
 13. Selecting a provider preset and supplying its API-key environment variables authorizes its automatic context, translation, review, and fallback calls. Do not pause for another per-segment API or cost approval. Keep configured game roots read-only; create translated data, rebuilt archives, and installable patches only under this workspace. Never overwrite an installed or source game in place.
 14. Distinguish API providers from native Codex App workers. In the recommended App + DeepSeek mode, use native GPT-6 Luna translator subagents and a separate native GPT-6.1 Sol compact judge; use only `DEEPSEEK_API_KEY` for configured translation fallback, selective rewriting, and judge fallback. This is not a core dependency: API, command, compatible, local, and other native providers may fill each role. The top-level agent remains orchestration-only and follows `docs/codex-app-deepseek.md`.
 15. Keep a strict data-plane/control-plane boundary. The top-level agent may receive target IDs, categorical status/error codes, counts, queue transitions, artifact paths, and deterministic issue codes only. It must not open dialogue/input/result files or receive source, candidate, translated text, or provider prose refusal explanations. Workers read and write private workspace files and return metadata-only envelopes.
 16. A translation or review refusal is a routing event, not a content judgment and not grounds to omit a target or cancel patch creation. Normalize explanations before returning metadata to the parent. Use the configured faithful-transformation prompt and supported deterministic low-creativity settings for DeepSeek; never claim or attempt to disable provider safeguards.
 17. The checked-out `main` branch is an engine-neutral control framework. Engine-specific discovery, unpack, apply, pack, verification, FAQ, ignore rules, and fixtures must come from the selected `sdk-<engine>-<version>` branch and must never be copied back into `main`.
+18. Follow the repository `docs/execution-budget.md`. Build the smallest artifact that satisfies the active request. Do not add speculative rollback archives, legacy migrations, compatibility layers, exhaustive backups, or unrelated generalization. After the required focused checks pass, stop unless inputs changed or a concrete failure justifies more testing.
+19. Handle simple fixes, packaging, documentation, and status inspection in the current agent. Use subagents only for independent bulk translation/review shards or genuinely parallel research. Do not delegate deterministic rechecks or small installer work.
+20. For Steam delivery, use `game-l10n steam-package` with a completed payload and private spec. The generated installer owns only receipt-listed files, skips missing Steam libraries, and falls back to a supplied game directory. Do not embed a previous package or copy Steam/game-specific data into the SDK.
 
 ## Data boundary
 
