@@ -19,6 +19,7 @@ from .coverage import (
     save_inventory_attestation,
 )
 from .context_analysis import ContextAnalyzer, analyze_with_cache
+from .corrections import apply_user_corrections
 from .failure_queue import held_checkpoint_path, load_failure_queue, update_failure_queue
 from .formats import (
     read_existing_translations,
@@ -32,7 +33,7 @@ from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from .privacy import is_within, require_external_workdir
 from .providers import ProviderRegistry
 from .runtime_approval import create_runtime_approval
-from .steam import build_steam_package, validate_steam_package
+from .steam import build_steam_package, inspect_installed_state, validate_steam_package
 from .tooling import run_cached_tool
 from .wolf.cli import register_wolf_parser
 from .workspace import (
@@ -424,6 +425,40 @@ def cmd_resume_failures(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def cmd_apply_user_correction(args: argparse.Namespace) -> int:
+    if not args.user_requested:
+        raise ValueError("Exact correction requires explicit user-supplied or user-approved wording")
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_selection(config)
+    sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
+    require_external_workdir(work_dir, sdk_root)
+    source = _path_in_workspace(work_dir, args.input, must_exist=True)
+    base_results = (
+        _path_in_workspace(work_dir, args.existing, must_exist=True)
+        if args.existing
+        else None
+    )
+    checkpoint = _path_in_workspace(work_dir, args.checkpoint, must_exist=True)
+    request = _path_in_workspace(work_dir, args.request, must_exist=True)
+    destination = _path_in_workspace(work_dir, args.output)
+    if destination in {source, checkpoint, request} or (
+        base_results is not None and destination == base_results
+    ):
+        raise ValueError("Correction output must be a new workspace artifact")
+    inventory_state = require_inventory_attestation(work_dir, source)
+    summary = apply_user_corrections(
+        segments=read_segments(source),
+        base_results_path=base_results,
+        checkpoint_path=checkpoint,
+        request_path=request,
+        output_path=destination,
+        expected_inventory_fingerprint=inventory_state["primary_fingerprint"],
+    )
+    print(json.dumps(summary, ensure_ascii=False))
+    return 0
+
+
 def cmd_verify_inventory(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     require_sdk_selection(load_config(work_dir))
@@ -687,6 +722,22 @@ def cmd_verify_steam_package(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_inspect_installed_state(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
+    require_external_workdir(work_dir, sdk_root)
+    target = _source_path(work_dir, args.target, config)
+    configured_roots = {Path(item).resolve() for item in config.get("game_roots", [])}
+    if target not in configured_roots:
+        raise ValueError(f"Target is not a configured game root: {target}")
+    if not target.is_dir():
+        raise ValueError(f"Target is not a directory: {target}")
+    result = inspect_installed_state(target)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_approve_runtime(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
@@ -831,6 +882,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Assert that the user explicitly requested resuming the saved failure queue",
     )
     resume.set_defaults(func=cmd_resume_failures)
+
+    correction = sub.add_parser(
+        "apply-user-correction",
+        help="Apply exact user-specified target wording without model calls or broad re-review",
+    )
+    correction.add_argument("--workspace", required=True)
+    correction.add_argument("--input", required=True, help="Verified current source inventory")
+    correction.add_argument(
+        "--existing",
+        help="Released full result artifact; omit to materialize candidates from the checkpoint",
+    )
+    correction.add_argument("--checkpoint", required=True, help="Matching release checkpoint")
+    correction.add_argument("--request", required=True, help="Private exact-correction request JSON")
+    correction.add_argument("--output", required=True, help="New corrected full result artifact")
+    correction.add_argument(
+        "--user-requested",
+        action="store_true",
+        required=True,
+        help="Assert that the user explicitly supplied or approved the exact replacement wording",
+    )
+    correction.set_defaults(func=cmd_apply_user_correction)
 
     inventory = sub.add_parser(
         "verify-inventory",
@@ -984,6 +1056,14 @@ def build_parser() -> argparse.ArgumentParser:
     verify_steam.add_argument("--workspace", required=True)
     verify_steam.add_argument("--package", required=True)
     verify_steam.set_defaults(func=cmd_verify_steam_package)
+
+    inspect_installed = sub.add_parser(
+        "inspect-installed-state",
+        help="Classify a configured game root from Parr0t receipt hashes without changing it",
+    )
+    inspect_installed.add_argument("--workspace", required=True)
+    inspect_installed.add_argument("--target", required=True, help="Exact configured game root")
+    inspect_installed.set_defaults(func=cmd_inspect_installed_state)
 
     approve_runtime = sub.add_parser(
         "approve-runtime",

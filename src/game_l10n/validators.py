@@ -80,6 +80,44 @@ def validate_integrity(
                 )
             )
 
+    slot_role = str(segment.metadata.get("ui_slot_role", "")).casefold()
+    if slot_role in {"value", "state_value", "template_fragment"}:
+        normalized_candidate = candidate.strip().casefold()
+        fixed_prefix = segment.metadata.get("ui_fixed_target_prefix")
+        fixed_suffix = segment.metadata.get("ui_fixed_target_suffix")
+        if (
+            isinstance(fixed_prefix, str)
+            and fixed_prefix.strip()
+            and normalized_candidate.startswith(fixed_prefix.strip().casefold())
+        ):
+            issues.append(
+                ValidationIssue(
+                    "ui-composition-duplication",
+                    "Candidate repeats the fixed target prefix rendered outside this slot",
+                )
+            )
+        if (
+            isinstance(fixed_suffix, str)
+            and fixed_suffix.strip()
+            and normalized_candidate.endswith(fixed_suffix.strip().casefold())
+        ):
+            issues.append(
+                ValidationIssue(
+                    "ui-composition-duplication",
+                    "Candidate repeats the fixed target suffix rendered outside this slot",
+                )
+            )
+
+    max_chars = segment.metadata.get("ui_max_chars")
+    if isinstance(max_chars, int) and not isinstance(max_chars, bool) and max_chars >= 0:
+        if len(candidate) > max_chars:
+            issues.append(
+                ValidationIssue(
+                    "ui-length-limit",
+                    f"Candidate length {len(candidate)} exceeds the declared UI limit {max_chars}",
+                )
+            )
+
     if segment.source and len(candidate) > max(200, int(len(segment.source) * max_length_ratio)):
         issues.append(
             ValidationIssue(

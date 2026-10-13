@@ -9,9 +9,10 @@ from .models import (
     Segment,
     TranslationResult,
 )
+from .corrections import apply_user_corrections
 from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from .providers import ModelProvider, ProviderRegistry
-from .steam import build_steam_package, validate_steam_package
+from .steam import build_steam_package, inspect_installed_state, validate_steam_package
 
 __all__ = [
     "CharacterProfile",
@@ -25,7 +26,9 @@ __all__ = [
     "ProviderRegistry",
     "Segment",
     "TranslationResult",
+    "apply_user_corrections",
     "build_steam_package",
+    "inspect_installed_state",
     "validate_steam_package",
 ]
 

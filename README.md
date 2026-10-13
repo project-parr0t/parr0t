@@ -90,6 +90,7 @@ Steam 게임이면 업데이트와 무결성 검사를 막지 말고 상태 확�
 - [`AGENTS.md`](AGENTS.md)
 - [`docs/agent-usage.md`](docs/agent-usage.md)
 - [`docs/coverage-gates.md`](docs/coverage-gates.md)
+- [`docs/release-checkpoint.md`](docs/release-checkpoint.md)
 - [`docs/prompt-examples.md`](docs/prompt-examples.md)
 - [`docs/faq.md`](docs/faq.md)
 
