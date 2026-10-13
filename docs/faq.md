@@ -18,6 +18,14 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Resolution:** Exclude generated outputs and volatile metadata from the fingerprint, then regenerate the stage state.
 - **Prevention:** Test every cached stage by running it twice and requiring the second run to report `skipped`.
 
+## An agent rebuilds an adapter even though a usable SDK branch exists
+
+- **Symptom:** The first session starts writing a new unpacker or patcher without inspecting an existing `sdk-*` implementation, producing duplicate code and avoidable validation work.
+- **General cause:** Branch discovery was advisory, only the current checkout was inspected, or a branch name was treated as the complete compatibility test.
+- **Diagnosis:** Inspect the external workspace's SDK inventory, per-candidate commit-bound evaluations, and selected mode. A missing decision or an unevaluated plausible branch means implementation started too early.
+- **Resolution:** Stop the duplicate implementation, refresh visible local and remote-tracking refs, inspect each plausible public contract, and record `reuse` or `extend` when possible. Select `private-new` only after every candidate is categorically incompatible.
+- **Prevention:** Keep the `docs/sdk-selection.md` gate before extraction and let the CLI block data-plane stages and SDK promotion until a current decision exists.
+
 ## A model refuses fictional game localization
 
 - **Symptom:** A context, translation, or review provider refuses a bounded transformation because the fictional text contains mature themes.
@@ -81,3 +89,123 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Diagnosis:** Inspect the categorical finish signal, HTTP class, and parser outcome without copying provider prose into the control plane.
 - **Resolution:** Reserve `explicit_provider_refusal` for an explicit refusal field or content-filter finish reason. Apply bounded grace retries to retryable parser, transport, rate-limit, timeout, and integrity failures.
 - **Prevention:** Keep a stable failure taxonomy and test each category with synthetic provider responses.
+
+## Review cost is high even when most candidates are already correct
+
+- **Symptom:** The reviewer returns a full copy of every translation and consumes nearly as many output tokens as translation itself.
+- **General cause:** Quality classification and correction were combined into one response contract.
+- **Diagnosis:** Check whether accepted candidates are echoed by the reviewer and whether a correction model runs for every target.
+- **Resolution:** Use a compact judge that returns only `ok` or `rewrite` plus categorical issue codes. Invoke a rewriter only for `rewrite`, validate the correction, and confirm it with another compact judgment.
+- **Prevention:** Set per-task output limits, retain focused scene/character evidence, record provider usage metadata, and compare quality and cost on synthetic representative evaluations before changing the configured roles.
+
+## A semantically accurate title or short line still reads like a literal translation
+
+- **Symptom:** A candidate preserves dictionary meaning but loses idiomatic phrasing, a recognizable allusion or wordplay cue, deliberate alteration, atmosphere, or the cadence expected of its text function.
+- **General cause:** The judge treats semantic equivalence as sufficient, or receives no reliable indication that the segment is a title, quest name, slogan, UI label, or reference-bearing line.
+- **Diagnosis:** Check segment metadata and target-scoped context cues, then inspect whether the compact verdict can report `literalism`, `reference_loss`, or `tone_rhythm` without echoing private text.
+- **Resolution:** Route only the flagged target to the configured rewriter with its focused scene, voice, text-function, and evidence-backed reference cues; confirm the correction with another compact judgment.
+- **Prevention:** Analyze the ordered script and metadata before translation, preserve communicative effect instead of source word order, and never manufacture a reference from weak resemblance.
+
+## A small installer request expands into a migration framework
+
+- **Symptom:** A simple package or launcher takes much longer than translation because the agent adds legacy fingerprints, embedded previous releases, generalized rollback, or compatibility logic that was not requested.
+- **General cause:** Safety and reuse were treated as unlimited goals instead of constraints proportional to the active deliverable.
+- **Diagnosis:** Compare each added component with the current acceptance criteria. If removing it still produces the requested recoverable patch, it is outside the active scope.
+- **Resolution:** Return to the smallest design: immutable source, explicit payload, one status marker and receipt, owned-path collision checks, one package validation, and a clear Restore operation. Preserve only original files explicitly declared for replacement. Move optional migration work to a separately approved task.
+- **Prevention:** Follow `docs/execution-budget.md`, freeze scope per user request, and stop after the proportional acceptance checks pass.
+
+## Steam discovery fails on a library that no longer exists
+
+- **Symptom:** Automatic game discovery aborts before reaching a valid Steam library or manual-path fallback.
+- **General cause:** A stale `libraryfolders.vdf` entry points to a missing directory or unavailable drive, and child paths are joined before the root is checked.
+- **Diagnosis:** Enumerate only library root metadata and identify roots that fail an existence check; do not scan game content.
+- **Resolution:** Skip every missing root before constructing `steamapps` paths, continue remaining roots, and prompt for an explicit game directory when no valid match remains.
+- **Prevention:** Cover one stale-root case in the synthetic installer lifecycle and keep manual selection available.
+
+## Unchanged artifacts are validated repeatedly
+
+- **Symptom:** The same hashes, archive entries, build, or runtime state are checked many times without any input change.
+- **General cause:** Successful validation is not tied to an input fingerprint, or confidence checks are run without a new failure hypothesis.
+- **Diagnosis:** Compare content, tool, and configuration fingerprints between checks.
+- **Resolution:** Reuse the prior pass while its fingerprint remains unchanged. Re-run only the layer invalidated by a changed input or failed check.
+- **Prevention:** Record validation fingerprints and apply the stop conditions in `docs/execution-budget.md`.
+
+## An agent installs or launches a patch while trying to validate it
+
+- **Symptom:** A build, fix, test, or log-inspection request causes files to be written into a real game directory, an installed patch to be changed or removed, or the game/generated code to be launched before the user requests that action.
+- **General cause:** Read access, artifact creation, runtime curiosity, or one external action was incorrectly treated as broad authorization for another external effect.
+- **Diagnosis:** Compare the operation with the recorded runtime approval. A valid record must name exactly one of `install`, `update`, `remove`, or `launch` and match the current artifact digest, configured target, executable when launching, expiry, and unused state.
+- **Resolution:** Stop before the external effect, keep the source and runtime data unchanged, and hand off the recoverable artifact for user execution. If the user explicitly requests agent execution, create and consume only the exact one-shot approval described in `docs/runtime-approval.md`.
+- **Prevention:** Deny runtime mutations and process starts by default, keep installation and launch approvals separate, use only synthetic temporary targets for automated lifecycle tests, and never bypass the shared guard with direct shell copies or process commands.
+
+## A published release differs from the repository output or supports an unclear game build
+
+- **Symptom:** A downloaded asset has a different digest from the verified repository artifact, contains an undocumented first-party file, reports a different release version, or installs against a build not listed consistently in the README and manifest.
+- **General cause:** The package was rebuilt or edited after verification, release metadata was updated independently, or compatibility was described as “latest” without exact build bindings.
+- **Diagnosis:** Compare the tag, source commit, release ID, package/manifest/file digests, embedded versions, compatibility records, release notes, and installer binding checks as one immutable release unit.
+- **Resolution:** Stop distribution, keep the mismatched assets unchanged for diagnosis, rebuild one staged release from the intended clean commit, and request publication approval for the corrected release. Do not silently replace history or broaden compatibility claims.
+- **Prevention:** Follow `docs/instance-release.md`, upload the exact verified bytes, perform one read-only post-upload digest check, enumerate every validated original game build, and preserve the user's README through minimal reviewed edits.
+
+## An agent proposes a repository or release during local work
+
+- **Symptom:** A translation, package build, or local validation report unexpectedly asks whether to commit/push, names a public or private destination repository, or presents tags, GitHub Releases, uploads, or publication gates as the next step.
+- **General cause:** Successful local completion or permission to use Git was incorrectly treated as publication intent, or generated workspace metadata contained an automatic publication prompt.
+- **Diagnosis:** Check the active user request, generated profile metadata, status output, and completion message. If the user did not first command publication of the exact target, every publication-related prompt or state transition is out of scope.
+- **Resolution:** Keep all artifacts local, remove the unsolicited publication step from the active plan and user-facing status, and continue or stop at the requested local deliverable. Do not convert the correction into a new request for publication approval.
+- **Prevention:** Keep publication workflows dormant and silent until activated by a user-originated command. Generated profiles and ordinary status output must not advertise publication; a successful patch, local Git choice, or SDK promotion never activates it.
+
+## A GitHub Release title omits the compatible game version
+
+- **Symptom:** The visible release title contains only a patch version or uses a vague label such as `latest`, leaving players unable to tell which original game version it supports.
+- **General cause:** Patch identity and original-game compatibility were maintained as separate metadata and the title was not validated against the supported-build matrix.
+- **Diagnosis:** Compare the visible title with the README, release notes, manifest, asset metadata, and installer binding checks. The exact supported game-version set must agree everywhere.
+- **Resolution:** Before publication, set the title to `<Game Display Name> Patch <Patch Version> (Game Version <Game Version>)`; use the exact enumerated `Game Versions` form only for multiple validated builds. If the game version is unknown, keep the release private and unresolved.
+- **Prevention:** Make the release-title format a required gate and reject bare patch versions, unverified ranges, and ambiguous compatibility labels.
+
+## A release works on the build agent but not on the player's machine
+
+- **Symptom:** The package depends on an absolute workspace path, developer tool, environment variable, host architecture, or command that exists only on the machine that built it.
+- **General cause:** The build environment was treated as the deployment target instead of producing a self-contained package for the player's operating system and supported game build.
+- **Diagnosis:** Inspect the archive, scripts, manifest, prerequisites, and README for build-host paths or tools; test extraction and entry points from a clean target-environment fixture with spaces and non-ASCII characters in its path.
+- **Resolution:** Rebuild the staged package with relative paths, runtime discovery, declared target architecture, and only bundled or explicitly documented redistributable prerequisites. Keep the broken release unchanged until a corrected release receives publication approval.
+- **Prevention:** Default unspecified public distributions to Windows, derive architecture and runtime requirements from the game build rather than the agent host, and validate the exact packaged interface as an end user would receive it.
+
+## An interactive installer asks the player for an agent approval or prints internal exceptions
+
+- **Symptom:** A player-facing batch installer stops for a runtime-approval JSON, mentions workspace policy, or exposes raw internal `E_*` exceptions instead of actionable guidance.
+- **General cause:** The noninteractive agent automation guard was applied to the interactive distribution interface, or installer messages and codes were improvised per task.
+- **Diagnosis:** Run the exact packaged batch file in a synthetic game directory. Its menu choice and final target/action confirmation must authorize the interactive mutation, while noninteractive PowerShell mutation without approval must fail with a public `PARR0T-E###` code. Inspect the ZIP for harness and workspace artifacts.
+- **Resolution:** Rebuild with the shared installer contract. Keep runtime approval only on noninteractive mutation, map failures to the fixed player messages, and expose internal details only in diagnostic mode.
+- **Prevention:** Validate the fixed archive entries, result-code registry, Korean menu, one interactive lifecycle, and one denied noninteractive mutation before release.
+
+## Updating a launcher wrapper loses the real original or Restore puts back the wrapper
+
+- **Symptom:** An update backs up the already installed wrapper as though it were the original, or Restore deletes/reinstalls the wrong executable.
+- **General cause:** An original-file replacement was treated as an ordinary overlay collision and was not bound to a stable backup in the first-install receipt.
+- **Diagnosis:** Compare `parr0t-patch-status.txt`, the receipt's patch ID and original records, the current replacement set, and the sizes/hashes of both installed targets and backups. Do not move files while diagnosing.
+- **Resolution:** Stop before mutation on any mismatch. Use the original matching installer to Restore, then install a release whose declared replacement and backup paths are correct. Never adopt an unknown existing backup.
+- **Prevention:** Declare every original replacement in the package spec, preserve it only on first install, require the same replacement set on update, verify both copies, and exercise install/update/verify/restore with a synthetic replacement file.
+
+## A report says zero missing entries but visible text is still untranslated
+
+- **Symptom:** Result validation reports no missing IDs, yet runtime screens, descriptions, tooltips, or dynamically assembled labels still contain source-language text.
+- **General cause:** Completeness was measured against the extractor's own manifest, making the denominator circular, or a source class was excluded to avoid overcapture.
+- **Diagnosis:** Compare two independently produced inventories and inspect their declared user-visible exclusions. Keep result alignment separate from runtime observations.
+- **Resolution:** Repair the engine SDK extraction method until both inventories agree without user-visible exclusions, regenerate context and results for the changed fingerprint, and record runtime coverage only from a user-executed or separately authorized observation.
+- **Prevention:** Require `game-l10n verify-inventory`, use the terminology in `docs/coverage-gates.md`, and never restate `manifest_missing_count=0` as zero in-game omissions.
+
+## A partial context file is mistaken for completed analysis
+
+- **Symptom:** Translation starts after a context worker was interrupted, unavailable, or at capacity because an output file happens to exist.
+- **General cause:** Artifact existence was accepted instead of a successful per-part route and evidence-coverage attestation.
+- **Diagnosis:** Check the context-state fingerprint, execution status, completed-part count, and domain coverage rather than the context-pack path alone.
+- **Resolution:** Route the incomplete part through the next configured analyzer. If every route fails, stop without writing a successful context state or starting translation.
+- **Prevention:** Use the CLI context gate, write output and state atomically, and reject partial or stale attestations.
+
+## A transient provider failure leaves a patch partly usable
+
+- **Symptom:** Capacity, timeout, quota, rate-limit, authentication, or malformed-output failure preserves source text and the workflow proceeds as if the patch were complete.
+- **General cause:** Operational failure was collapsed into refusal or final source preservation, and indispensable targets were not identified.
+- **Diagnosis:** Inspect the metadata-only failure queue for categorical failure codes and `blocking` state; do not expose source text or provider prose to the control plane.
+- **Resolution:** Keep operational failures queued until the user explicitly asks to resume. If any queued target is marked `metadata.blocking_on_failure=true`, retain all results as a private held checkpoint and emit no new patch.
+- **Prevention:** Mark required targets during extraction, preserve the failure queue across turns, bind it to the inventory fingerprint, and resume only through `game-l10n resume-failures`.

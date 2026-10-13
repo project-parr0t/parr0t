@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-BATCH_FORMAT = "wolf-rpg-agent-batch-v1"
+BATCH_FORMAT = "wolf-rpg-agent-batch-v2"
+LEGACY_BATCH_FORMAT = "wolf-rpg-agent-batch-v1"
 MANUAL_QUEUE_FORMAT = "wolf-rpg-manual-translation-queue-v1"
 SOURCE_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 CONTROL_RE = re.compile(
@@ -36,8 +37,9 @@ def _has_source_text(text: str) -> bool:
     return bool(SOURCE_RE.search(text))
 
 
-def _make_id(kind: str, speaker: str, source: str) -> str:
-    raw = f"{kind}\0{speaker}\0{source}".encode("utf-8")
+def _make_id(kind: str, speaker: str, source: str, ref: dict[str, Any]) -> str:
+    location = json.dumps(ref, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    raw = f"{kind}\0{speaker}\0{source}\0{location}".encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:16]
 
 
@@ -95,20 +97,18 @@ def _add_item(
     context: dict[str, Any],
     ref: dict[str, Any],
 ) -> None:
-    item_id = _make_id(kind, speaker, source)
-    item = items.setdefault(
-        item_id,
-        {
-            "id": item_id,
-            "kind": kind,
-            "speaker": speaker or "unknown",
-            "source": source,
-            "context": context,
-            "target": "",
-            "refs": [],
-        },
-    )
-    item["refs"].append(ref)
+    item_id = _make_id(kind, speaker, source, ref)
+    if item_id in items:
+        raise ValueError(f"Duplicate WOLF source location: {item_id}")
+    items[item_id] = {
+        "id": item_id,
+        "kind": kind,
+        "speaker": speaker or "unknown",
+        "source": source,
+        "context": context,
+        "target": "",
+        "refs": [ref],
+    }
 
 
 def _collect_text_json(path: Path, root: Path, items: dict[str, dict[str, Any]]) -> None:
@@ -193,7 +193,7 @@ def prepare_batches(
     translated_copy: Path | None = None,
     excluded_json_names: Iterable[str] = (),
 ) -> dict[str, Any]:
-    """Collect translatable WOLF JSON leaves into stable, deduplicated agent batches."""
+    """Collect translatable WOLF JSON occurrences into stable source-order agent batches."""
     source_root = source_root.resolve()
     output_dir = output_dir.resolve()
     if max_chars < 500:
@@ -220,15 +220,7 @@ def prepare_batches(
             if "debug" not in relative_parts:
                 _collect_text_json(path, source_root, items)
 
-    ordered = sorted(
-        items.values(),
-        key=lambda item: (
-            0 if item["kind"] == "name" else 1,
-            item["speaker"],
-            str(item["context"].get("file", "")),
-            item["source"],
-        ),
-    )
+    ordered = list(items.values())
     batches: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
     current_chars = 0
@@ -304,7 +296,7 @@ def apply_batches(
     manual_occurrences = 0
     for batch_path in sorted(batch_dir.glob("batch_*.json")):
         data = json.loads(batch_path.read_text(encoding="utf-8-sig"))
-        if data.get("format") not in {None, BATCH_FORMAT}:
+        if data.get("format") not in {None, BATCH_FORMAT, LEGACY_BATCH_FORMAT}:
             errors.append({"batch": batch_path.name, "error": "unsupported batch format"})
             continue
         for item in data.get("items", []):
@@ -364,6 +356,72 @@ def apply_batches(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     return report
+
+
+def import_reviewed_results(reviewed_path: Path, batch_dir: Path) -> dict[str, Any]:
+    payload = json.loads(reviewed_path.read_text(encoding="utf-8-sig"))
+    rows = payload.get("results", []) if isinstance(payload, dict) else []
+    if not isinstance(rows, list):
+        raise ValueError("Reviewed WOLF result artifact must contain a results list")
+    reviewed: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("Reviewed WOLF result rows must be objects")
+        target_id = str(row.get("segment_id") or row.get("id") or "")
+        if not target_id or target_id in reviewed:
+            raise ValueError(f"Missing or duplicate reviewed WOLF target: {target_id!r}")
+        reviewed[target_id] = row
+
+    documents: dict[Path, dict[str, Any]] = {}
+    items: dict[str, dict[str, Any]] = {}
+    for batch_path in sorted(batch_dir.glob("batch_*.json")):
+        document = json.loads(batch_path.read_text(encoding="utf-8-sig"))
+        documents[batch_path] = document
+        for item in document.get("items", []):
+            target_id = str(item.get("id", ""))
+            if not target_id or target_id in items:
+                raise ValueError(f"Missing or duplicate WOLF batch target: {target_id!r}")
+            items[target_id] = item
+    if set(reviewed) != set(items):
+        missing = len(set(items) - set(reviewed))
+        extra = len(set(reviewed) - set(items))
+        raise ValueError(
+            f"Reviewed WOLF result set does not match batches (missing={missing}, extra={extra})"
+        )
+
+    source_preserved = 0
+    for target_id, item in items.items():
+        row = reviewed[target_id]
+        status = str(row.get("status", ""))
+        if status not in {"reviewed", "source_preserved"}:
+            raise ValueError(f"WOLF target is not patchable: {target_id} ({status or 'missing status'})")
+        source = str(item.get("source", ""))
+        if row.get("source") != source:
+            raise ValueError(f"Reviewed WOLF source changed: {target_id}")
+        target = row.get("text")
+        if not isinstance(target, str) or not target:
+            raise ValueError(f"Reviewed WOLF target is empty: {target_id}")
+        if status == "source_preserved":
+            source_preserved += 1
+            if target != source:
+                raise ValueError(f"Source-preserved WOLF target changed source text: {target_id}")
+        errors = _validate_target(source, target)
+        if errors:
+            raise ValueError(f"Reviewed WOLF target failed integrity checks: {target_id}")
+
+    for target_id, item in items.items():
+        item["target"] = reviewed[target_id]["text"]
+        item.pop("manual", None)
+    for path, document in documents.items():
+        path.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    return {
+        "imported": len(items),
+        "source_preserved": source_preserved,
+        "batches": len(documents),
+    }
 
 
 def export_manual_queue(

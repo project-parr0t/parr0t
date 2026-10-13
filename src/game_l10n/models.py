@@ -18,6 +18,21 @@ class ReviewDecision(str, Enum):
     ERROR = "error"
 
 
+class ReviewVerdict(str, Enum):
+    OK = "ok"
+    REWRITE = "rewrite"
+    REFUSED = "refused"
+    ERROR = "error"
+
+
+class ContextMode(str, Enum):
+    AUTO = "auto"
+    NARRATIVE = "narrative"
+    FUNCTIONAL = "functional"
+    KNOWLEDGE = "knowledge"
+    HYBRID = "hybrid"
+
+
 class FailureCode(str, Enum):
     EXPLICIT_PROVIDER_REFUSAL = "explicit_provider_refusal"
     MALFORMED_RESPONSE = "malformed_response"
@@ -69,6 +84,7 @@ class ProjectContext:
     fictional_content_note: str = (
         "This is fictional game localization. Translate faithfully while following the provider's policies."
     )
+    context_mode: str = ContextMode.AUTO.value
 
 
 @dataclass(slots=True, frozen=True)
@@ -89,6 +105,14 @@ class ContextPack:
     scene_summaries: dict[str, dict[str, Any]] = field(default_factory=dict)
     character_guides: dict[str, dict[str, Any]] = field(default_factory=dict)
     relationship_timeline: tuple[str, ...] = ()
+    reference_cues: tuple[dict[str, Any], ...] = ()
+    context_mode: str = ContextMode.NARRATIVE.value
+    functional_summary: str = ""
+    knowledge_summary: str = ""
+    terminology_rules: tuple[str, ...] = ()
+    screen_flows: dict[str, dict[str, Any]] = field(default_factory=dict)
+    feature_guides: dict[str, dict[str, Any]] = field(default_factory=dict)
+    knowledge_nodes: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -106,6 +130,14 @@ class ReviewEnvelope:
     meaning_preserved: bool = False
     issues: list[str] = field(default_factory=list)
     reason: str = ""
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ReviewVerdictEnvelope:
+    verdict: ReviewVerdict
+    issues: list[str] = field(default_factory=list)
+    text: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
 

@@ -1,172 +1,98 @@
-# Agent Game Translation Framework
+> **개발 방식 공개:** Parr0t은 완전히 바이브 코딩으로 제작되었습니다. 개발자는 방향 제시와 사례 분석을 맡았고, 구현과 문서화는 코딩 에이전트를 중심으로 진행했습니다.
 
-`main`은 특정 게임 엔진에 의존하지 않는 중앙 제어 프레임워크입니다. 게임 전체 맥락과 캐릭터 말투를 먼저 분석한 뒤, 번역 AI와 독립 검수 AI를 폴백 체인으로 운용합니다. 최상위 오케스트레이터는 의미를 직접 판단하지 않고 각 에이전트가 정상 완료했는지, 거부·오류·형식 위반이 있었는지, 결정론적 무결성 검사를 통과했는지만 확인합니다.
+# Parr0t
 
-엔진별 SDK는 `sdk-<engine>-<version>` 브랜치가 소유합니다. 해당 브랜치는 `main`의 오케스트레이션·프로바이더·상태 머신을 상속하고, 엔진 고유의 추출·적용·패킹·검증 구현과 그 엔진에만 해당하는 문서·FAQ·합성 테스트를 추가합니다. `main`은 SDK 브랜치의 구현이나 주의사항을 역으로 포함하지 않습니다.
+게임의 전체 문맥을 읽고 한국어 패치를 만드는 Codex용 프레임워크입니다.
 
-정확한 소유 범위와 병합 규칙은 [코어/엔진 SDK 브랜치 계약](docs/sdk-branch-contract.md)을 따릅니다.
+현재 브랜치는 WOLF RPG Pro/WolfDawn 추출물의 배치·인벤토리·런타임 무결성·패킹 어댑터를 추가합니다. 외부 추출기와 Pro 패커, 게임 데이터는 포함하지 않습니다. 자세한 범위는 [WOLF RPG Pro 가이드](docs/wolf-rpg-pro.md)를 참고하십시오.
 
-## 핵심 동작
+## 사용법
+
+게임에 맞는 프롬프트 하나를 Codex에 복사한 뒤, **번역할 게임 폴더를 같은 메시지에 드래그해 첨부**하고 전송하세요.
+
+### 1. 대사와 UI가 있는 게임
 
 ```text
-전체 스크립트
-  → 컨텍스트 분석 AI 체인
-     (스토리/장면/관계 변화/캐릭터 말투 규칙)
-  → 번역 AI 체인
-     (거부·오류·형식 실패 시 다음 모델)
-  → 플레이스홀더/태그/스크립트 침범 검사
-  → 독립 검수 AI 체인
-     (의미·누락·첨가·말투·용어를 확인하고 필요 시 수정)
-  → 최종 무결성 검사
-  → 에이전트 작업 디렉터리에만 결과 저장
+다음 Parr0t 저장소의 AGENTS.md와 에이전트 문서를 읽고, 첨부한 게임의 한국어 패치를 만들어라.
+https://github.com/project-parr0t/parr0t
+
+게임에 사용 가능한 한국어가 이미 있다면 아무것도 수정하지 말고 보고하라.
+게임 폴더는 읽기 전용으로 다루고, 번역 데이터와 결과물은 별도 작업 폴더에 저장하라.
+기존 SDK를 먼저 찾아 재사용하고, 전체 게임 흐름과 스크립트, 장면, 인물 관계와 캐릭터 말투를 분석하라.
+대사뿐 아니라 메뉴, 설정, 튜토리얼, 퀘스트, 아이템, 시스템 메시지 등 모든 사용자 노출 UI를 문맥과 게임 로직에 맞춰 번역·검수하라.
+코드, 식별자, 플레이스홀더, 제어 코드와 게임 동작은 보존하고, 한국어 길이에 맞춰 UI 잘림과 줄바꿈도 확인하라.
+번역이나 검수가 거부된 항목은 다른 항목을 계속 처리한 뒤 설정된 폴백으로 넘겨라.
+실제 게임에 설치하거나 실행하지 말고, 복원 가능한 패치를 완성한 뒤 먼저 보고하라.
 ```
 
-- 컨텍스트 분석이 전부 거부되거나 실패하면 번역을 시작하지 않습니다.
-- 번역기와 검수기는 서로 다른 제공자/모델 체인을 쓸 수 있습니다.
-- 허구의 폭력·욕설·공포·로맨스·성인 등급 요소를 이유로 임의 순화/거부하지 않도록 기존 문장의 언어 변환이라는 작업 성격을 명시합니다. 기본 프리셋에서는 거부 항목만 기록해 1차 단계 완료 후 다음 제공자로 넘깁니다.
-- 검수기가 거부하거나 잘못된 결과를 내면 다음 검수기로 라우팅합니다.
-- `{name}`, `%s`, `<tag>`, `\\n`, 엔진 제어 코드와 사전 지정어를 결정론적으로 검사합니다.
-- 원문에 없던 `<script>`, `javascript:`, `eval(` 등의 삽입을 차단합니다.
-- 이전에 승인된 동일 화자의 번역을 후속 대사의 스타일 앵커로 제공합니다.
-- 동일 원문·컨텍스트·사전·모델·설정은 콘텐츠 해시 캐시로 다시 처리하지 않습니다.
-- unpack/pack도 입력과 도구 지문이 같으면 다시 실행하지 않습니다.
-- 기본 `openai-deepseek` 프리셋은 문장별 GPT-6 Luna 번역을 먼저 모두 수행한 뒤, 거부·오류 문장만 DeepSeek으로 넘깁니다. 이후 GPT-6.1 Sol 검수 전체를 마치고 검수 실패 항목만 DeepSeek으로 넘깁니다.
-- 모든 허용 경로 또는 DeepSeek 쿼타가 소진되면 해당 항목은 `source_preserved` 상태로 정확한 원문을 유지합니다. 다른 문장의 진행은 중단하지 않습니다.
-- DeepSeek 요청은 JSON Object 출력, `thinking=disabled`, `reasoning_effort=none`, `temperature=0.0`, 원문 길이 기반 출력 상한을 사용해 불필요한 추론과 창작성을 낮춥니다. 공급자 안전장치를 비활성화하는 옵션으로 가장하지 않으며, 실제 거부는 문장별 폴백으로 격리합니다.
-- 명시적 거절은 바로 다음 경로로 보내고, 형식 오류·일시적 공급자 오류·속도 제한·타임아웃·무결성 실패만 설정된 grace retry를 수행합니다.
-- 번역 후보가 바뀔 때마다 세대와 해시가 갱신되므로, 이전 후보를 본 검수 결과를 재사용하지 않습니다.
-- 상위 오케스트레이터에는 건별 상태·범주 코드·개수만 노출합니다. 원문, 번역문, 후보문, 공급자가 작성한 거부 설명은 비공개 데이터 평면에만 남고 감사 로그나 표준 출력으로 전달되지 않습니다.
+### 2. 대사가 없고 UI와 게임 로직이 중심인 게임
 
-## 데이터 격리 원칙
+```text
+다음 Parr0t 저장소의 AGENTS.md와 에이전트 문서를 읽고, 첨부한 게임의 한국어 패치를 만들어라.
+https://github.com/project-parr0t/parr0t
 
-SDK 저장소에는 게임 데이터와 번역 데이터가 들어가지 않습니다. 실제 작업은 반드시 저장소 밖에 만듭니다.
-
-```powershell
-python -m pip install -e .
-game-l10n init-workspace C:\agent-work\my-game --sdk-root C:\src\agent-game-translation-sdk
+이 게임에는 분석할 대사가 없으므로 대본이나 캐릭터 설정을 억지로 만들지 마라.
+게임에 사용 가능한 한국어가 이미 있다면 아무것도 수정하지 말고 보고하라.
+게임 폴더는 읽기 전용으로 다루고, 번역 데이터와 결과물은 별도 작업 폴더에 저장하라.
+기존 SDK를 먼저 찾아 재사용하고, 화면 구조, 메뉴 흐름, 상태 전환, 입력과 결과, 조건, 규칙과 수치·단위를 문맥으로 분석하라.
+메뉴, 설정, 버튼, 툴팁, 튜토리얼, 도움말, 오류, 업적, 아이템과 시스템 메시지 등 모든 사용자 노출 텍스트를 찾아 일관되게 번역·검수하라.
+번역할 문자열과 코드 식별자, 리소스 키, 저장 키를 구분하고 게임 로직과 동작은 변경하지 마라. 한국어 길이에 따른 UI 잘림, 줄바꿈, 단축키와 플레이스홀더도 확인하라.
+번역이나 검수가 거부된 항목은 다른 항목을 계속 처리한 뒤 설정된 폴백으로 넘겨라.
+실제 게임에 설치하거나 실행하지 말고, 복원 가능한 패치를 완성한 뒤 먼저 보고하라.
 ```
 
-새 작업공간은 기본적으로 `openai-deepseek` 프리셋을 사용합니다. `OPENAI_API_KEY`와 `DEEPSEEK_API_KEY`를 환경변수에 지정하면 별도의 문장별 폴백 승인 없이 설정된 체인을 실행합니다. 자세한 순서와 사용자 정의 조합은 [API + API 폴백 라우팅 가이드](docs/fallback-routing.md)를 참고하십시오. Codex App의 네이티브 Luna/Sol 서브에이전트와 DeepSeek API를 조합할 때는 [Codex App + DeepSeek API 가이드](docs/codex-app-deepseek.md)를 사용하십시오.
+### 3. 기존 한국어 번역을 원어부터 다시 개선하는 게임
 
-생성되는 작업공간의 `game-data/`, `inputs/`, `translations/`, `.game-l10n/`에는 원문·결과·캐시·감사 로그가 남습니다. SDK 저장소의 `.gitignore`, `AGENTS.md`, 개인정보 검사 스크립트가 이 경계를 보조합니다.
+```text
+다음 Parr0t 저장소의 AGENTS.md와 에이전트 문서를 읽고, 첨부한 게임의 기존 한국어 번역을 원어부터 다시 번역하여 개선 패치를 만들어라.
+https://github.com/project-parr0t/parr0t
 
-Codex Work에서는 SDK 저장소와 게임 폴더, 외부 에이전트 작업공간이 모두 허용된 프로젝트 범위 안에 있어야 합니다. `init-workspace`에 `--game-root`를 지정하면 원본은 읽기 전용 입력으로 취급됩니다. 권장 배치는 [docs/codex-work.md](docs/codex-work.md)를 참고하십시오. 저장소의 `AGENTS.md`와 번들 `game-localization` 스킬 덕분에 Codex/Sol이 저장소를 열고 절차를 바로 판별할 수 있습니다.
-
-## Git 승인 흐름
-
-초기에 에이전트가 사용자에게 Git 사용 여부를 물은 뒤 답을 기록합니다. 이 명령은 Git을 초기화하거나 커밋하지 않습니다.
-
-```powershell
-game-l10n policy --workspace C:\agent-work\my-game --git-choice enabled
-# 또는 거부 시: --git-choice disabled
+기존 한국어는 의도된 교체 대상이므로 한국어가 이미 있다는 이유로 중단하지 마라.
+게임 폴더는 읽기 전용으로 다루고, 번역 데이터와 결과물은 별도 작업 폴더에 저장하라.
+기존 SDK를 먼저 찾아 재사용하고, 원어와 기존 한국어의 항목 ID, 순서, 장면과 UI 기능을 정확히 대응시켜라.
+뜻의 기준은 원어로 삼고 기존 한국어는 용어와 누락·오역을 확인하는 대조 자료로만 사용하라. 기존 문장을 단순히 다듬거나 오역과 직역을 그대로 계승하지 마라.
+전체 게임 흐름, 인물 관계와 말투, 화면 구조와 게임 로직을 분석한 뒤 대사와 모든 사용자 노출 UI를 원어에서 다시 번역·검수하라.
+결과물은 기존 한국어 리소스 위에 적용되는 복원 가능한 교체 패치로 구성하되, 원어 리소스와 코드, 식별자, 플레이스홀더, 제어 코드와 게임 동작은 변경하지 마라.
+원어와 한국어의 항목 누락·중복·잘못된 대응, 용어 일관성, UI 잘림과 줄바꿈도 검증하라.
+번역이나 검수가 거부된 항목은 다른 항목을 계속 처리한 뒤 설정된 폴백으로 넘겨라.
+실제 게임에 설치하거나 실행하지 말고, 완성된 개선 패치를 먼저 보고하라.
 ```
 
-번역·패치 성공을 사용자가 명시적으로 확인한 뒤에만 재사용 가능한 도구를 정제합니다.
+이것으로 시작할 수 있습니다. Codex가 필요한 경우에만 Git 사용 여부나 API 키, 설치·실행 여부를 물어봅니다.
 
-```powershell
-game-l10n promote-sdk --workspace C:\agent-work\my-game `
-  --engine fixture-engine --version 1.0 --user-confirmed-success
+추가 조건이 있다면 아래 예시 중 필요한 한 줄만 프롬프트 마지막에 덧붙이면 됩니다.
+
+```text
+한글 폰트가 필요하면 게임 분위기와 배포 라이선스에 맞는 폰트를 선택하라.
+기본 번역이 끝난 뒤 거부 항목에만 DeepSeek 폴백을 사용하고, 키가 필요할 때 요청하라.
+Steam 게임이면 업데이트와 무결성 검사를 막지 말고 상태 확인·재설치·복원을 지원하라.
 ```
 
-이 단계는 작업공간의 `sdk-export/sdk-fixture-engine-1.0/`에 `tools/`와 해시 manifest만 만듭니다. 원문과 번역문은 복사하지 않습니다. 그 후 에이전트가 커밋/푸시 여부를 다시 묻고 승인받아야 합니다.
+## 하는 일
 
-```powershell
-game-l10n policy --workspace C:\agent-work\my-game --publish-approved yes
-game-l10n publish-sdk --workspace C:\agent-work\my-game `
-  --sdk-root C:\src\agent-game-translation-sdk `
-  --profile C:\agent-work\my-game\sdk-export\sdk-fixture-engine-1.0 `
-  --commit --push
-```
+- 전체 게임 흐름과 화면 구조를 먼저 분석하고, 대사가 있다면 장면·인물 관계·캐릭터별 말투까지 반영합니다.
+- 문장 단위 번역 실패가 전체 작업을 중단하지 않도록 폴백합니다.
+- 대사는 자연스러움·말투·패러디를, UI는 기능·용어·수치·단위의 일관성을 독립 검수합니다.
+- 기존 한국어를 개선할 때는 원어를 뜻의 기준으로 삼고 항목 대응과 누락·오역을 다시 확인합니다.
+- 플레이스홀더, 태그, 제어 코드, UI 배치와 게임 로직이 손상되지 않았는지 확인합니다.
+- 원본을 수정하지 않고 새 패치와 복원 가능한 설치본을 만듭니다.
 
-`publish-sdk`는 깨끗한 `main`에서 해당 `sdk-<engine>-<version>` 브랜치를 만들며, 저장소가 없을 때 임의로 `git init`하지 않습니다.
+## 데이터와 SDK
 
-## 전체 맥락 번역
+게임 파일, 추출문, 번역문, 로그와 API 키는 Parr0t 저장소에 넣지 않습니다. 게임별 데이터는 Codex의 외부 작업 폴더에만 남습니다.
 
-입력은 순서가 보존된 JSON, JSONL 또는 CSV이며 최소 필드는 `id`, `source`입니다. `scene`, `speaker`, `previous`, `next`, `metadata`를 함께 줄 수 있습니다. 실제 데이터 파일은 작업공간에만 두십시오.
+`main`은 엔진 중립 오케스트레이션 코어이며, 실제 게임 형식은 `sdk-<engine>-<version>` 브랜치가 담당합니다. 새 도구를 만들기 전에 기존 SDK를 확인하고, 성공이 검증된 재사용 코드만 게임 데이터를 제거한 뒤 SDK로 승격합니다.
 
-전체 대본 중 일부만 번역하려면 번역 대상과 전체 컨텍스트를 분리합니다.
+## 에이전트 문서
 
-```powershell
-game-l10n translate --workspace C:\agent-work\my-game `
-  --input inputs\chapter-3.json `
-  --context-input inputs\full-script.json `
-  --output translations\chapter-3.ko.json
-```
+이 README는 사람을 위한 시작 안내입니다. Codex는 다음 문서를 실행 규약으로 사용합니다.
 
-컨텍스트 패스는 전체 대본을 순서대로 장면 단위 청크로 분석해 다음 정보를 만듭니다.
+- [`AGENTS.md`](AGENTS.md)
+- [`docs/agent-usage.md`](docs/agent-usage.md)
+- [`docs/coverage-gates.md`](docs/coverage-gates.md)
+- [`docs/prompt-examples.md`](docs/prompt-examples.md)
+- [`docs/faq.md`](docs/faq.md)
 
-- 전체 스토리와 장면별 사건/톤
-- 관계 변화 타임라인
-- 캐릭터 성향, 격식 수준, 호칭, 말끝, 문장 길이와 리듬
-- 각 판단의 근거 대사 ID
-- 전역 스타일 규칙
+Parr0t은 모델이나 API의 안전장치, DRM, 안티치트 또는 플랫폼 보호 기능을 우회하는 도구가 아닙니다.
 
-예를 들어 `Hello, Darwin.`을 단독 예문으로 번역하지 않습니다. 무뚝뚝한 집사라는 전체 흐름상의 프로필, 다윈과의 관계, 현재 장면의 긴장도, 앞선 검수 완료 대사를 함께 제공해 격식 있는 어조를 선택하고 검수기도 같은 기준으로 확인합니다.
-
-## 설정
-
-`init-workspace`가 만드는 `game-l10n.json`에서 제공자와 경로를 설정합니다. API 키는 값이 아니라 환경변수 이름만 기록합니다.
-
-```json
-{
-  "providers": [
-    {"name": "openai-luna", "type": "openai_responses", "model": "gpt-6-luna", "api_key_env": "OPENAI_API_KEY", "reasoning_effort": "none"},
-    {"name": "deepseek", "type": "compatible_chat", "model": "deepseek-flash", "base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY", "response_format": "json_object", "thinking": "disabled", "reasoning_effort": "none", "temperature": 0.0},
-    {"name": "openai-sol", "type": "openai_responses", "model": "gpt-6.1-sol", "api_key_env": "OPENAI_API_KEY", "reasoning_effort": "low"}
-  ],
-  "routing": {
-    "context_analyzers": ["openai-sol", "deepseek"],
-    "translators": ["openai-luna", "deepseek"],
-    "reviewers": ["openai-sol", "deepseek"],
-    "require_review": true,
-    "use_style_memory": true,
-    "style_anchor_limit": 6,
-    "retry_refusals_once": false,
-    "grace_retries": 3,
-    "defer_fallbacks_until_primary_complete": true,
-    "preserve_source_on_failure": true,
-    "review_refusal_policy": "fallback",
-    "context_chunk_chars": 30000,
-    "max_workers": 8
-  }
-}
-```
-
-`command` 제공자는 Codex/OpenCode/사내 에이전트 하네스를 연결하는 중립 어댑터입니다. 셸을 거치지 않고 stdin으로 요청 JSON을 받아 stdout으로 결과 JSON 하나를 반환합니다. 자세한 규약은 [docs/provider-protocol.md](docs/provider-protocol.md)를 참고하십시오.
-
-번역 호출 하나에는 출력 대상 문장 하나만 들어갑니다. 다만 전체 대본 분석, 장면 상태, 관계 변화, 캐릭터 말투, 앞뒤 문장과 용어집은 `context-only` 근거로 계속 전달됩니다. 따라서 거부 범위는 한 문장으로 제한하면서도 흐름과 어체 판단은 유지됩니다.
-
-## Python API
-
-```python
-from pathlib import Path
-from game_l10n import LocalizationOrchestrator
-
-# ProviderRegistry, ProjectContext, ContextPack, OrchestratorConfig를 구성한 뒤 사용합니다.
-results = orchestrator.translate_many(segments)
-```
-
-실제 애플리케이션에서는 CLI가 컨텍스트 분석·캐시·데이터 경계를 함께 보장하므로 우선 권장됩니다.
-
-## 검사
-
-여러 작업에서 반복될 수 있는 문제와 중립적인 해결법은 [FAQ](docs/faq.md)에 유지합니다. 특정 게임·파일·대사·번역·작업 결과를 식별할 수 있는 내용은 FAQ와 SDK 기록에 남기지 않습니다.
-
-```powershell
-python scripts/check_repo_privacy.py
-python -m unittest discover -s tests -t . -v
-```
-
-OpenAI 연동은 Responses API의 strict JSON Schema 출력을 사용합니다. 구조화 출력은 거부를 명시적으로 감지할 수 있어 폴백 라우팅에 적합합니다. 공급자 정책을 우회하지 않으며, 정상적인 게임 번역 요청이 특정 제공자에서 처리되지 않을 때 구성된 다른 제공자로 넘깁니다.
-
-## WOLF RPG / WolfDawn
-
-`sdk-wolf-rpg-pro` 브랜치는 WOLF RPG Editor의 공개 파일 구조를 다루는 재사용 가능한 SDK 어댑터를 제공합니다.
-
-- WolfDawn 추출 JSON에서 화자·앞뒤 문맥·원본 위치를 보존한 번역 배치를 생성합니다.
-- 번역기와 수동 번역가가 같은 배치 포맷을 사용하며, 별도의 동일 포맷 샘플 JSON을 만들 수 있습니다.
-- `S[]`/`CSelf[]` 문자열 분기 키, 이벤트 호출명, 데이터베이스 조회 키, 리소스 경로를 번역 대상에서 복원하거나 주입 후 비교 검사합니다.
-- `@putselect` 같은 화면 표시 명령의 문구는 허용하면서 `@voice` 같은 런타임 명령 변경은 차단합니다.
-- WOLF Pro 게임은 `BasicData.wolf`, `MapData.wolf`, `Text_Script.wolf`를 하나의 원본 `Game.wolf`를 기준으로 모두 다시 묶어 암호화 버전 불일치를 방지합니다.
-
-외부 WolfDawn 및 Pro 패커 실행 파일은 라이선스·게임 키 경계를 지키기 위해 포함하지 않습니다. 실제 명령과 안전한 실행 순서는 [WOLF RPG Pro 가이드](docs/wolf-rpg-pro.md)를 참고하십시오.
+[정식 저장소](https://github.com/project-parr0t/parr0t) · [MIT License](LICENSE)

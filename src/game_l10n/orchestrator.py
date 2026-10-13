@@ -20,10 +20,21 @@ from .models import (
     ProjectContext,
     ReviewDecision,
     ReviewEnvelope,
+    ReviewVerdict,
+    ReviewVerdictEnvelope,
     Segment,
     TranslationResult,
 )
-from .prompts import PROMPT_VERSION, REVIEW_SCHEMA, TRANSLATION_SCHEMA, review_prompt, translation_prompt
+from .prompts import (
+    PROMPT_VERSION,
+    REVIEW_ISSUE_CODES,
+    REVIEW_JUDGE_SCHEMA,
+    REVIEW_REWRITE_SCHEMA,
+    TRANSLATION_SCHEMA,
+    review_judge_prompt,
+    review_rewrite_prompt,
+    translation_prompt,
+)
 from .providers import ModelProvider, ProviderRegistry
 from .store import AuditLog, ResultStore, stable_hash
 from .validators import validate_integrity
@@ -53,6 +64,8 @@ class OrchestratorConfig:
     defer_fallbacks_until_primary_complete: bool = False
     preserve_source_on_failure: bool = False
     review_refusal_policy: str = "fallback"
+    review_max_rounds: int = 2
+    rewriter_chain: list[str] = field(default_factory=list)
 
 
 T = TypeVar("T")
@@ -78,6 +91,8 @@ class LocalizationOrchestrator:
             raise ValueError("reviewer_chain must not be empty when require_review is true")
         if config.grace_retries < 0:
             raise ValueError("grace_retries must be zero or greater")
+        if config.review_max_rounds < 1:
+            raise ValueError("review_max_rounds must be one or greater")
         if config.review_refusal_policy not in {
             "fallback",
             "accept_candidate_unreviewed",
@@ -138,7 +153,13 @@ class LocalizationOrchestrator:
                 "style_anchors": anchors,
                 "orchestrator": asdict(self.config),
                 "providers": self.registry.fingerprints(
-                    self.config.translator_chain + self.config.reviewer_chain
+                    list(
+                        dict.fromkeys(
+                            self.config.translator_chain
+                            + self.config.reviewer_chain
+                            + self.config.rewriter_chain
+                        )
+                    )
                 ),
             }
         )
@@ -177,6 +198,50 @@ class LocalizationOrchestrator:
             reason=str(raw.get("reason", "")),
             raw=raw,
         )
+
+    @staticmethod
+    def _review_verdict_envelope(raw: dict[str, Any]) -> ReviewVerdictEnvelope:
+        # Protocol-v1 reviewers returned a complete candidate on every call. Accept
+        # that shape for compatibility while new reviewers use the compact verdict.
+        if "verdict" not in raw and "decision" in raw:
+            legacy = LocalizationOrchestrator._review_envelope(raw)
+            mapping = {
+                ReviewDecision.APPROVED: ReviewVerdict.OK,
+                ReviewDecision.REVISED: ReviewVerdict.OK,
+                ReviewDecision.REFUSED: ReviewVerdict.REFUSED,
+                ReviewDecision.ERROR: ReviewVerdict.ERROR,
+            }
+            return ReviewVerdictEnvelope(
+                verdict=mapping[legacy.decision],
+                issues=legacy.issues,
+                text=legacy.text if legacy.meaning_preserved else "",
+                raw=raw,
+            )
+        try:
+            verdict = ReviewVerdict(raw.get("verdict"))
+        except (ValueError, TypeError) as exc:
+            raise ProviderError("Reviewer returned an unknown compact verdict") from exc
+        issues = raw.get("issues", [])
+        if not isinstance(issues, list) or not all(isinstance(item, str) for item in issues):
+            raise ProviderError("Reviewer issue codes must be a list of strings")
+        if len(issues) > 4 or any(item not in REVIEW_ISSUE_CODES for item in issues):
+            raise ProviderError("Reviewer returned invalid compact issue codes")
+        if verdict is ReviewVerdict.REWRITE and not issues:
+            raise ProviderError("Rewrite verdict requires at least one issue code")
+        if verdict is not ReviewVerdict.REWRITE and issues:
+            raise ProviderError("Only rewrite verdicts may include issue codes")
+        return ReviewVerdictEnvelope(verdict=verdict, issues=issues, raw=raw)
+
+    @staticmethod
+    def _usage(raw: dict[str, Any]) -> dict[str, int]:
+        usage = raw.get("_usage", {})
+        if not isinstance(usage, dict):
+            return {}
+        return {
+            str(key): int(value)
+            for key, value in usage.items()
+            if isinstance(value, int) and value >= 0
+        }
 
     def _record(self, result: TranslationResult, record: AttemptRecord) -> None:
         # The parent/orchestration plane receives categorical control metadata only.
@@ -287,7 +352,7 @@ class LocalizationOrchestrator:
             )
         )
 
-    def _call_review(
+    def _call_review_judge(
         self,
         provider: ModelProvider,
         segment: Segment,
@@ -295,8 +360,9 @@ class LocalizationOrchestrator:
         anchors: list[dict[str, str]],
         *,
         refusal_retry: bool = False,
-    ) -> ReviewEnvelope:
-        system, user = review_prompt(
+    ) -> ReviewVerdictEnvelope:
+        plain_verdict = provider.fingerprint().get("review_verdict_format") == "plain"
+        system, user = review_judge_prompt(
             self.project,
             segment,
             candidate,
@@ -305,13 +371,44 @@ class LocalizationOrchestrator:
             self.context_pack,
             anchors,
             refusal_retry,
+            plain_verdict,
         )
-        return self._review_envelope(
+        return self._review_verdict_envelope(
+            provider.generate_review_verdict(
+                system=system,
+                user=user,
+                schema=REVIEW_JUDGE_SCHEMA,
+                schema_name="game_translation_review_judge",
+            )
+        )
+
+    def _call_review_rewrite(
+        self,
+        provider: ModelProvider,
+        segment: Segment,
+        candidate: str,
+        issue_codes: list[str],
+        anchors: list[dict[str, str]],
+        *,
+        refusal_retry: bool = False,
+    ) -> AgentEnvelope:
+        system, user = review_rewrite_prompt(
+            self.project,
+            segment,
+            candidate,
+            issue_codes,
+            self.glossary,
+            self._character(segment.speaker),
+            self.context_pack,
+            anchors,
+            refusal_retry,
+        )
+        return self._translation_envelope(
             provider.generate_json(
                 system=system,
                 user=user,
-                schema=REVIEW_SCHEMA,
-                schema_name="game_translation_review",
+                schema=REVIEW_REWRITE_SCHEMA,
+                schema_name="game_translation_review_rewrite",
             )
         )
 
@@ -345,6 +442,7 @@ class LocalizationOrchestrator:
                         ordinal=ordinal,
                         model=self._provider_model(provider),
                         candidate_generation=result.candidate_generation,
+                        usage=self._usage(envelope.raw),
                     ),
                 )
             except Exception as exc:
@@ -402,23 +500,25 @@ class LocalizationOrchestrator:
                 continue
             return None
 
-    def _review_with_refusal_retry(
+    def _judge_with_refusal_retry(
         self,
         result: TranslationResult,
         provider: ModelProvider,
         segment: Segment,
         candidate: str,
         anchors: list[dict[str, str]],
-    ) -> ReviewEnvelope | None:
+        *,
+        confirmation: bool = False,
+    ) -> ReviewVerdictEnvelope | None:
         ordinal = 0
         refusal_retried = False
         retry_stage = "review-grace-retry"
         while True:
             ordinal += 1
             started = time.monotonic()
-            stage = "review" if ordinal == 1 else retry_stage
+            stage = ("review-confirm" if confirmation else "review") if ordinal == 1 else retry_stage
             try:
-                review = self._call_review(
+                review = self._call_review_judge(
                     provider,
                     segment,
                     candidate,
@@ -431,13 +531,19 @@ class LocalizationOrchestrator:
                     AttemptRecord(
                         stage,
                         provider.name,
-                        review.decision.value,
-                        review.reason,
+                        {
+                            ReviewVerdict.OK: ReviewDecision.APPROVED.value,
+                            ReviewVerdict.REWRITE: "rewrite",
+                            ReviewVerdict.REFUSED: ReviewDecision.REFUSED.value,
+                            ReviewVerdict.ERROR: ReviewDecision.ERROR.value,
+                        }[review.verdict],
+                        "",
                         review.issues,
                         duration,
                         ordinal=ordinal,
                         model=self._provider_model(provider),
                         candidate_generation=result.candidate_generation,
+                        usage=self._usage(review.raw),
                     ),
                 )
             except Exception as exc:
@@ -461,37 +567,94 @@ class LocalizationOrchestrator:
                     retry_stage = "review-grace-retry"
                     continue
                 return None
-            if review.decision is ReviewDecision.REFUSED:
+            if review.verdict is ReviewVerdict.REFUSED:
                 if self.config.retry_refusals_once and not refusal_retried:
                     refusal_retried = True
                     retry_stage = "review-refusal-retry"
                     continue
                 return review
-            if review.decision is ReviewDecision.ERROR:
+            if review.verdict is ReviewVerdict.ERROR:
                 return review
-            if not review.meaning_preserved or not review.text.strip():
+            return review
+
+    def _rewrite_with_refusal_retry(
+        self,
+        result: TranslationResult,
+        provider: ModelProvider,
+        segment: Segment,
+        candidate: str,
+        issue_codes: list[str],
+        anchors: list[dict[str, str]],
+    ) -> AgentEnvelope | None:
+        ordinal = 0
+        refusal_retried = False
+        retry_stage = "review-rewrite-grace-retry"
+        while True:
+            ordinal += 1
+            started = time.monotonic()
+            stage = "review-rewrite" if ordinal == 1 else retry_stage
+            try:
+                rewrite = self._call_review_rewrite(
+                    provider,
+                    segment,
+                    candidate,
+                    issue_codes,
+                    anchors,
+                    refusal_retry=ordinal > 1,
+                )
+                duration = int((time.monotonic() - started) * 1000)
                 self._record(
                     result,
                     AttemptRecord(
-                        "review-gate",
+                        stage,
                         provider.name,
-                        "rejected",
+                        rewrite.status.value,
+                        rewrite.reason,
+                        duration_ms=duration,
                         ordinal=ordinal,
                         model=self._provider_model(provider),
-                        issue_code=FailureCode.MEANING_NOT_PRESERVED.value,
+                        candidate_generation=result.candidate_generation,
+                        usage=self._usage(rewrite.raw),
+                    ),
+                )
+            except Exception as exc:
+                duration = int((time.monotonic() - started) * 1000)
+                code, retryable = self._failure(exc)
+                self._record(
+                    result,
+                    AttemptRecord(
+                        stage,
+                        provider.name,
+                        "error",
+                        code,
+                        duration_ms=duration,
+                        ordinal=ordinal,
+                        model=self._provider_model(provider),
+                        issue_code=code,
                         candidate_generation=result.candidate_generation,
                     ),
                 )
+                if retryable and self._can_grace_retry(code, ordinal):
+                    retry_stage = "review-rewrite-grace-retry"
+                    continue
                 return None
+            if rewrite.status is AgentStatus.REFUSED:
+                if self.config.retry_refusals_once and not refusal_retried:
+                    refusal_retried = True
+                    retry_stage = "review-rewrite-refusal-retry"
+                    continue
+                return rewrite
+            if rewrite.status is not AgentStatus.SUCCESS:
+                return rewrite
             integrity = validate_integrity(
                 segment,
-                review.text,
+                rewrite.text,
                 self.glossary,
                 extra_patterns=self.config.extra_protected_patterns,
                 max_length_ratio=self.config.max_length_ratio,
             )
             if not integrity:
-                return review
+                return rewrite
             self._record(
                 result,
                 AttemptRecord(
@@ -505,9 +668,105 @@ class LocalizationOrchestrator:
                 ),
             )
             if self._can_grace_retry(FailureCode.INTEGRITY_INVALID.value, ordinal):
-                retry_stage = "review-grace-retry"
+                retry_stage = "review-rewrite-grace-retry"
                 continue
             return None
+
+    def _review_with_refusal_retry(
+        self,
+        result: TranslationResult,
+        provider: ModelProvider,
+        segment: Segment,
+        candidate: str,
+        anchors: list[dict[str, str]],
+    ) -> ReviewEnvelope | None:
+        working = candidate
+        revised = False
+        for round_index in range(self.config.review_max_rounds):
+            verdict = self._judge_with_refusal_retry(
+                result,
+                provider,
+                segment,
+                working,
+                anchors,
+                confirmation=round_index > 0,
+            )
+            if verdict is None:
+                return ReviewEnvelope(ReviewDecision.ERROR, text=working)
+            if verdict.verdict is ReviewVerdict.REFUSED:
+                return ReviewEnvelope(ReviewDecision.REFUSED, text=working, raw=verdict.raw)
+            if verdict.verdict is ReviewVerdict.ERROR:
+                return ReviewEnvelope(ReviewDecision.ERROR, text=working, raw=verdict.raw)
+            # A protocol-v1 reviewer may still return a complete corrected candidate.
+            legacy_candidate_changed = False
+            if verdict.text:
+                integrity = validate_integrity(
+                    segment,
+                    verdict.text,
+                    self.glossary,
+                    extra_patterns=self.config.extra_protected_patterns,
+                    max_length_ratio=self.config.max_length_ratio,
+                )
+                if integrity:
+                    return ReviewEnvelope(ReviewDecision.ERROR, text=working)
+                legacy_candidate_changed = verdict.text != working
+                revised = revised or legacy_candidate_changed
+                working = verdict.text
+                self._set_candidate(result, working)
+            if verdict.verdict is ReviewVerdict.OK:
+                if legacy_candidate_changed:
+                    if round_index + 1 >= self.config.review_max_rounds:
+                        self._record(
+                            result,
+                            AttemptRecord(
+                                "review-gate",
+                                provider.name,
+                                "rejected",
+                                issue_code=FailureCode.MEANING_NOT_PRESERVED.value,
+                                candidate_generation=result.candidate_generation,
+                            ),
+                        )
+                        return ReviewEnvelope(ReviewDecision.ERROR, text=working)
+                    continue
+                return ReviewEnvelope(
+                    ReviewDecision.REVISED if revised else ReviewDecision.APPROVED,
+                    text=working,
+                    meaning_preserved=True,
+                    issues=verdict.issues,
+                    raw=verdict.raw,
+                )
+            if round_index + 1 >= self.config.review_max_rounds:
+                self._record(
+                    result,
+                    AttemptRecord(
+                        "review-gate",
+                        provider.name,
+                        "rejected",
+                        issue_code=FailureCode.MEANING_NOT_PRESERVED.value,
+                        candidate_generation=result.candidate_generation,
+                    ),
+                )
+                return ReviewEnvelope(ReviewDecision.ERROR, text=working)
+            rewrite = None
+            rewriters = self.config.rewriter_chain or [provider.name]
+            for rewriter_name in rewriters:
+                rewriter = self.registry.get(rewriter_name)
+                rewrite = self._rewrite_with_refusal_retry(
+                    result,
+                    rewriter,
+                    segment,
+                    working,
+                    verdict.issues,
+                    anchors,
+                )
+                if rewrite is not None and rewrite.status is AgentStatus.SUCCESS:
+                    break
+            if rewrite is None or rewrite.status is not AgentStatus.SUCCESS:
+                return ReviewEnvelope(ReviewDecision.ERROR, text=working)
+            revised = revised or rewrite.text != working
+            working = rewrite.text
+            self._set_candidate(result, working)
+        return ReviewEnvelope(ReviewDecision.ERROR, text=working)
 
     def translate_one(self, segment: Segment, *, force: bool = False) -> TranslationResult:
         anchors = self._anchors(segment.speaker)
@@ -545,13 +804,14 @@ class LocalizationOrchestrator:
                 review = self._review_with_refusal_retry(
                     result, reviewer, segment, candidate, anchors
                 )
+                if review is not None and review.text:
+                    candidate = review.text
+                    self._set_candidate(result, candidate)
                 if review is None or review.decision in {
                     ReviewDecision.REFUSED,
                     ReviewDecision.ERROR,
                 }:
                     continue
-                candidate = review.text
-                self._set_candidate(result, candidate)
                 result.text = candidate
                 result.status = "reviewed"
                 result.reviewer = reviewer_name
@@ -578,11 +838,132 @@ class LocalizationOrchestrator:
         )
         return result
 
+    def review_existing_one(self, segment: Segment, candidate: str) -> TranslationResult:
+        """Run a fresh semantic review over a reused candidate.
+
+        This intentionally does not reuse translation-cache approval. Reuse proves only
+        candidate identity; the independent reviewer must approve the current text under
+        the current context pack.
+        """
+
+        if not self.config.require_review:
+            raise ValueError("Existing candidates require an enabled independent review route")
+        anchors = self._anchors(segment.speaker)
+        result = TranslationResult(
+            segment_id=segment.id,
+            source=segment.source,
+            translator="existing-candidate",
+            metadata={**segment.metadata, "candidate_origin": "existing"},
+        )
+        self._set_candidate(result, candidate)
+        integrity = validate_integrity(
+            segment,
+            candidate,
+            self.glossary,
+            extra_patterns=self.config.extra_protected_patterns,
+            max_length_ratio=self.config.max_length_ratio,
+        )
+        if integrity:
+            self._record(
+                result,
+                AttemptRecord(
+                    "integrity",
+                    "deterministic-validator",
+                    "rejected",
+                    issues=[item.code for item in integrity],
+                    issue_code=FailureCode.INTEGRITY_INVALID.value,
+                    candidate_generation=result.candidate_generation,
+                ),
+            )
+            repaired = None
+            for rewriter_name in self.config.rewriter_chain or self.config.reviewer_chain:
+                repaired = self._rewrite_with_refusal_retry(
+                    result,
+                    self.registry.get(rewriter_name),
+                    segment,
+                    candidate,
+                    ["formatting"],
+                    anchors,
+                )
+                if repaired is not None and repaired.status is AgentStatus.SUCCESS:
+                    candidate = repaired.text
+                    self._set_candidate(result, candidate)
+                    break
+            if repaired is None or repaired.status is not AgentStatus.SUCCESS:
+                result.errors.append("Existing candidate failed deterministic integrity repair")
+                return self._preserve_or_fail_existing(segment, result)
+
+        for reviewer_name in self.config.reviewer_chain:
+            reviewer = self.registry.get(reviewer_name)
+            review = self._review_with_refusal_retry(
+                result, reviewer, segment, candidate, anchors
+            )
+            if review is not None and review.text:
+                candidate = review.text
+                self._set_candidate(result, candidate)
+            if review is None or review.decision in {
+                ReviewDecision.REFUSED,
+                ReviewDecision.ERROR,
+            }:
+                continue
+            result.text = candidate
+            result.status = "reviewed"
+            result.reviewer = reviewer_name
+            result.review_outcome = review.decision.value
+            result.acceptance_authority = "reviewer"
+            self._remember(segment, result.text)
+            self.audit.append(
+                {"segment_id": result.segment_id, "stage": "complete", "status": result.status}
+            )
+            return result
+
+        result.errors.append("All review routes were exhausted for existing candidate")
+        if self._accept_after_review_refusal(result, candidate):
+            return result
+        return self._preserve_or_fail_existing(segment, result)
+
+    def _preserve_or_fail_existing(
+        self, segment: Segment, result: TranslationResult
+    ) -> TranslationResult:
+        if self.config.preserve_source_on_failure or self.config.review_refusal_policy == "source_preserve":
+            result.text = segment.source
+            result.status = "source_preserved"
+            result.resolution_code = FailureCode.SOURCE_PRESERVED.value
+        self.audit.append(
+            {"segment_id": result.segment_id, "stage": "complete", "status": result.status}
+        )
+        return result
+
+    def review_existing_many(
+        self,
+        segments: Iterable[Segment],
+        candidates: dict[str, dict[str, str]],
+    ) -> list[TranslationResult]:
+        items = list(segments)
+        expected_ids = {item.id for item in items}
+        candidate_ids = set(candidates)
+        if expected_ids != candidate_ids:
+            raise ValueError(
+                "Full re-review requires exactly one existing candidate for every source target"
+            )
+        for segment in items:
+            if candidates[segment.id]["source"] != segment.source:
+                raise ValueError(
+                    f"Existing candidate source does not match current inventory: {segment.id}"
+                )
+        # Ordered execution lets later targets reuse only freshly approved style anchors.
+        return [
+            self.review_existing_one(segment, candidates[segment.id]["text"])
+            for segment in items
+        ]
+
     def _accept_after_review_refusal(
         self, result: TranslationResult, candidate: str
     ) -> bool:
         refused = any(
-            item.stage.startswith("review") and item.status == ReviewDecision.REFUSED.value
+            item.stage.startswith("review")
+            and not item.stage.startswith("review-rewrite")
+            and item.status == ReviewDecision.REFUSED.value
             for item in result.attempts
         )
         if not refused or self.config.review_refusal_policy != "accept_candidate_unreviewed":
@@ -614,7 +995,13 @@ class LocalizationOrchestrator:
                 "context_pack": asdict(self.context_pack) if self.context_pack else None,
                 "orchestrator": asdict(self.config),
                 "providers": self.registry.fingerprints(
-                    self.config.translator_chain + self.config.reviewer_chain
+                    list(
+                        dict.fromkeys(
+                            self.config.translator_chain
+                            + self.config.reviewer_chain
+                            + self.config.rewriter_chain
+                        )
+                    )
                 ),
             }
         )
@@ -838,6 +1225,9 @@ class LocalizationOrchestrator:
                     review = self._review_with_refusal_retry(
                         result, reviewer, segment, candidates[index], review_anchors
                     )
+                    if review is not None and review.text:
+                        candidates[index] = review.text
+                        self._set_candidate(result, review.text)
                     if review is None or review.decision in {
                         ReviewDecision.REFUSED,
                         ReviewDecision.ERROR,

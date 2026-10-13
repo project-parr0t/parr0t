@@ -7,9 +7,17 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from ..coverage import save_inventory_attestation
 from ..privacy import is_within, require_external_workdir
 from ..workspace import load_config
-from .batches import apply_batches, export_manual_queue, merge_manual_queue, prepare_batches
+from .batches import (
+    apply_batches,
+    export_manual_queue,
+    import_reviewed_results,
+    merge_manual_queue,
+    prepare_batches,
+)
+from .inventory import require_wolf_patch_gate, write_inventory_pair
 from .runtime import audit_runtime_scripts, protect_runtime_identifiers
 from .tools import decompile_runtime_scripts, pack_pro_archives
 
@@ -59,12 +67,40 @@ def _tool_command(value: str) -> list[str]:
 
 def cmd_prepare_batches(args: argparse.Namespace) -> int:
     work_dir, _ = _workspace(args)
+    source = _work_path(work_dir, args.source, must_exist=True)
+    batches = _work_path(work_dir, args.output)
     result = prepare_batches(
-        _work_path(work_dir, args.source, must_exist=True),
-        _work_path(work_dir, args.output),
+        source,
+        batches,
         max_chars=args.max_chars,
         translated_copy=_work_path(work_dir, args.copy_to) if args.copy_to else None,
         excluded_json_names=args.exclude_json,
+    )
+    primary, independent = write_inventory_pair(
+        source,
+        batches,
+        _work_path(work_dir, args.primary_inventory),
+        _work_path(work_dir, args.independent_inventory),
+        excluded_json_names=args.exclude_json,
+    )
+    inventory = save_inventory_attestation(work_dir, primary, independent)
+    result["inventory"] = {
+        "primary": str(primary),
+        "independent": str(independent),
+        "status": inventory["status"],
+        "issue_codes": inventory["issue_codes"],
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if inventory["static_complete"] else 1
+
+
+def cmd_import_reviewed(args: argparse.Namespace) -> int:
+    work_dir, _ = _workspace(args)
+    primary = _work_path(work_dir, args.segments, must_exist=True)
+    require_wolf_patch_gate(work_dir, primary)
+    result = import_reviewed_results(
+        _work_path(work_dir, args.reviewed, must_exist=True),
+        _work_path(work_dir, args.batches, must_exist=True),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -72,6 +108,9 @@ def cmd_prepare_batches(args: argparse.Namespace) -> int:
 
 def cmd_apply_batches(args: argparse.Namespace) -> int:
     work_dir, _ = _workspace(args)
+    require_wolf_patch_gate(
+        work_dir, _work_path(work_dir, args.segments, must_exist=True)
+    )
     result = apply_batches(
         _work_path(work_dir, args.batches, must_exist=True),
         _work_path(work_dir, args.translated_json, must_exist=True),
@@ -141,6 +180,9 @@ def cmd_audit_runtime(args: argparse.Namespace) -> int:
 
 def cmd_pack_pro(args: argparse.Namespace) -> int:
     work_dir, config = _workspace(args)
+    require_wolf_patch_gate(
+        work_dir, _work_path(work_dir, args.segments, must_exist=True)
+    )
     results = pack_pro_archives(
         _tool_command(args.packer),
         _work_path(work_dir, args.built_data, must_exist=True),
@@ -161,6 +203,10 @@ def register_wolf_parser(subparsers: argparse._SubParsersAction) -> None:
     prepare.add_argument("--output", required=True)
     prepare.add_argument("--copy-to", help="Optional untouched copy used as the translated JSON tree")
     prepare.add_argument("--max-chars", type=int, default=9000)
+    prepare.add_argument("--primary-inventory", default="inputs/wolf-primary.json")
+    prepare.add_argument(
+        "--independent-inventory", default="inputs/wolf-independent.json"
+    )
     prepare.add_argument(
         "--exclude-json",
         action="append",
@@ -169,10 +215,21 @@ def register_wolf_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     prepare.set_defaults(func=cmd_prepare_batches)
 
+    import_reviewed = commands.add_parser(
+        "import-reviewed",
+        help="Import the complete reviewed result set into stable WOLF batches",
+    )
+    import_reviewed.add_argument("--workspace", required=True)
+    import_reviewed.add_argument("--reviewed", required=True)
+    import_reviewed.add_argument("--batches", required=True)
+    import_reviewed.add_argument("--segments", default="inputs/wolf-primary.json")
+    import_reviewed.set_defaults(func=cmd_import_reviewed)
+
     apply = commands.add_parser("apply-batches", help="Validate and apply completed batches to WOLF JSON")
     apply.add_argument("--workspace", required=True)
     apply.add_argument("--batches", required=True)
     apply.add_argument("--translated-json", required=True)
+    apply.add_argument("--segments", default="inputs/wolf-primary.json")
     apply.add_argument("--allow-incomplete", action="store_true")
     apply.set_defaults(func=cmd_apply_batches)
 
@@ -212,4 +269,5 @@ def register_wolf_parser(subparsers: argparse._SubParsersAction) -> None:
     pack.add_argument("--built-data", required=True)
     pack.add_argument("--game-archive", required=True, help="Original Data/Game.wolf used by the external packer")
     pack.add_argument("--output", required=True)
+    pack.add_argument("--segments", default="inputs/wolf-primary.json")
     pack.set_defaults(func=cmd_pack_pro)

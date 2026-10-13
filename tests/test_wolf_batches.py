@@ -20,6 +20,43 @@ SYNTHETIC_SOURCE_MANUAL = "\u3048"
 
 
 class WolfBatchTests(unittest.TestCase):
+    def test_repeated_source_occurrences_keep_distinct_stable_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "extracted-fixture"
+            text_dir = source / "text" / "synthetic-fixture"
+            text_dir.mkdir(parents=True)
+            (text_dir / "__strings.json").write_text(
+                json.dumps(
+                    {
+                        "files": [
+                            {
+                                "file": "fixture-script.txt",
+                                "lines": [
+                                    {"source": "@mes fixture-speaker", "text": "@mes fixture-speaker"},
+                                    {"source": SYNTHETIC_SOURCE_SCENE, "text": SYNTHETIC_SOURCE_SCENE},
+                                    {"source": SYNTHETIC_SOURCE_SCENE, "text": SYNTHETIC_SOURCE_SCENE},
+                                ],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            batches = root / "batches"
+
+            manifest = prepare_batches(source, batches)
+            items = [
+                item
+                for path in sorted(batches.glob("batch_*.json"))
+                for item in json.loads(path.read_text(encoding="utf-8"))["items"]
+            ]
+
+        self.assertEqual(manifest["item_count"], 2)
+        self.assertEqual([item["source"] for item in items], [SYNTHETIC_SOURCE_SCENE] * 2)
+        self.assertEqual(len({item["id"] for item in items}), 2)
+
     def test_prepare_and_apply_structured_names_and_text_scripts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

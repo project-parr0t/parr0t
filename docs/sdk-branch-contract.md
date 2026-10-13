@@ -1,6 +1,6 @@
 # Core and engine SDK branch contract
 
-The `main` branch is the engine-neutral control framework. It owns narrative context gates, provider routing, refusal and error taxonomy, candidate generations, review state, deterministic validation hooks, checkpointing, privacy boundaries, and source-preservation behavior.
+The `main` branch is the engine-neutral control framework. It owns typed narrative, functional, knowledge, and hybrid context gates; provider routing; refusal and error taxonomy; candidate generations; review state; deterministic validation hooks; checkpointing; privacy boundaries; and source-preservation behavior.
 
 An `sdk-<engine>-<version>` branch is a concrete data-plane implementation. It inherits `main` and adds only the public engine contract needed to discover text, unpack data, apply a validated translation manifest, repack a patch, and verify the rebuilt output.
 
@@ -14,6 +14,8 @@ main framework  ->  engine SDK branch  ->  private per-game workspace
 
 The reverse direction is forbidden. `main` must not contain an engine name, engine file layout, engine command, engine-specific warning, engine fixture, or exception added solely for one SDK branch. A private workspace must never be copied into either branch.
 
+Distribution-layer packaging that does not inspect or interpret engine assets may live on `main`. It must consume an already prepared payload, remain independent of the payload's engine, and keep every title-specific identifier and file in the private workspace. Steam discovery and receipt-based installation are distribution concerns; text extraction, runtime hooks, asset rebuilding, and engine payload construction remain SDK-branch concerns.
+
 Engine SDK branches may use every public interface from `main`. When `main` changes, each engine branch should merge or rebase the new core and run both the core suite and its own adapter suite. A core change must not import the adapter package or special-case its paths.
 
 ## Ownership
@@ -25,6 +27,8 @@ Engine SDK branches may use every public interface from `main`. When `main` chan
 - context, glossary, voice, integrity, and privacy contracts;
 - translation and review fallback policy;
 - source immutability and patch-output requirements;
+- the deny-by-default runtime approval guard for real install, update, remove, and launch actions;
+- engine-neutral delivery packaging and receipt contracts;
 - sanitized SDK promotion and branch lifecycle.
 
 An engine SDK branch owns:
@@ -32,8 +36,14 @@ An engine SDK branch owns:
 - unpacking and text-target discovery;
 - engine-specific manifests and protected fields;
 - translation application, mirror updates, span handling, and escaping;
-- packing, round-trip verification, and patch assembly;
+- engine payload assembly, packing, and round-trip verification;
 - engine-specific documentation, FAQ entries, ignore rules, and synthetic fixtures.
+
+## Selection before implementation
+
+The agent must complete `docs/sdk-selection.md` before it writes provisional format tooling. A compatible SDK branch is reused directly. A partial match is extended with the smallest missing capability. A new private adapter is allowed only after every inventoried candidate is evaluated as incompatible. Neither the current checkout nor the absence of a local branch is evidence that no reusable SDK exists.
+
+The decision is bound to candidate commits in the external workspace. It must be refreshed when refs change. This state is job control metadata and must never be promoted into an SDK branch.
 
 ## Branch acceptance gate
 
@@ -44,5 +54,6 @@ Before an engine SDK branch is published:
 3. Run the core test suite, the adapter test suite, and the privacy scan.
 4. Confirm no private game data, names, paths, text, hashes, counts, logs, or run history appears in the tree or branch-only commits.
 5. Keep engine-only FAQ entries on the engine branch. Keep only framework-generic FAQ entries on `main`.
+6. Call the core runtime approval guard immediately before any real installation write or process launch. Do not add an unguarded direct execution path in an SDK branch.
 
 The framework may be installed without an engine adapter, but it cannot unpack or patch an engine by itself. Once an engine SDK branch supplies its adapter, the same central context, translation, fallback, review, and source-preservation flow becomes executable without duplicating orchestration logic.

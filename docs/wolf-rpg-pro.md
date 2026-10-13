@@ -38,23 +38,30 @@ game-l10n wolf prepare-batches `
 
 game-l10n translate `
   --workspace <agent-workspace> `
-  --input inputs\wolf-segments.json `
-  --context-input inputs\full-ordered-script.json `
+  --input inputs\wolf-primary.json `
+  --context-input inputs\wolf-primary.json `
   --output translations\reviewed.json
 ```
 
-The context-first translation/review orchestrator remains authoritative. `prepare-batches` is the engine mapping layer: it keeps stable IDs and exact JSON references so reviewed targets can be applied without fuzzy matching.
+`prepare-batches` now produces `inputs/wolf-primary.json` from the semantic batch collector and `inputs/wolf-independent.json` through a separately implemented raw-JSON shape audit, then records the shared inventory attestation. The two paths must agree on stable ID, source, and order. An explicit `--exclude-json` entry is declared as user-visible and leaves static coverage incomplete instead of silently shrinking the denominator.
 
-After filling each batch's `target` fields:
+The context-first translation/review orchestrator remains authoritative. Batch v2 assigns a stable ID to each source occurrence instead of collapsing repeated text, so the same words may receive different translations in different scenes. The primary inventory preserves speaker, neighboring lines, extraction order, engine kind, and exact JSON references while the independent audit checks that the collector did not omit a supported source shape.
+
+Import the complete reviewed output into the batches, then apply it:
 
 ```powershell
+game-l10n wolf import-reviewed `
+  --workspace <agent-workspace> `
+  --reviewed translations\reviewed.json `
+  --batches batches
+
 game-l10n wolf apply-batches `
   --workspace <agent-workspace> `
   --batches batches `
   --translated-json translations\wolf-json
 ```
 
-Control-code or newline mismatches abort before any translated JSON document is written.
+The importer requires every current target to be `reviewed` or exact `source_preserved`, validates the complete ID/source set, and updates batches transactionally. Control-code or newline mismatches abort before any translated JSON document is written. A verified inventory fingerprint is mandatory, and any unresolved `metadata.blocking_on_failure=true` target holds import, application, and packing until a later user-requested resume resolves it.
 
 ## Manual translator queue
 
@@ -111,3 +118,5 @@ game-l10n wolf pack-pro `
 ```
 
 Review the output before installing it. Keep a recoverable copy of the original archives and never copy packer binaries or game-derived data into this SDK repository.
+
+`pack-pro` rechecks the current inventory and blocking-failure gate before invoking the external packer. Runtime coverage remains a separate claim: packing and a clean static audit do not prove that every screen or state was observed in a real execution.

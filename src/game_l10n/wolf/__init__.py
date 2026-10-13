@@ -3,9 +3,11 @@
 from .batches import (
     apply_batches,
     export_manual_queue,
+    import_reviewed_results,
     merge_manual_queue,
     prepare_batches,
 )
+from .inventory import require_wolf_patch_gate, write_inventory_pair
 from .runtime import (
     WolfIntegrityError,
     audit_runtime_scripts,
@@ -21,11 +23,14 @@ __all__ = [
     "audit_runtime_scripts",
     "decompile_runtime_scripts",
     "export_manual_queue",
+    "import_reviewed_results",
     "merge_manual_queue",
     "pack_pro_archives",
     "prepare_batches",
     "protect_runtime_identifiers",
+    "require_wolf_patch_gate",
     "run_checked",
     "validate_decompiled_pair",
     "validate_text_script_commands",
+    "write_inventory_pair",
 ]
