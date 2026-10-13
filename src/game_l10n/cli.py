@@ -17,6 +17,7 @@ from .native_pass import import_native_shard, merge_native_pass
 from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from .privacy import is_within, require_external_workdir
 from .providers import ProviderRegistry
+from .rpg_maker_mv.cli import register_rpg_maker_mv_parser
 from .tooling import run_cached_tool
 from .workspace import (
     initialize_workspace,
@@ -439,6 +440,8 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="Check workspace configuration without sending game data")
     doctor.add_argument("--workspace", required=True)
     doctor.set_defaults(func=cmd_doctor)
+
+    register_rpg_maker_mv_parser(sub)
     return parser
 
 

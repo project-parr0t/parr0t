@@ -73,3 +73,27 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Diagnosis:** Check whether accepted candidates are echoed by the reviewer and whether a correction model runs for every target.
 - **Resolution:** Use a compact judge that returns only `ok` or `rewrite` plus categorical issue codes. Invoke a rewriter only for `rewrite`, validate the correction, and confirm it with another compact judgment.
 - **Prevention:** Set per-task output limits, retain focused scene/character evidence, record provider usage metadata, and compare quality and cost on synthetic representative evaluations before changing the configured roles.
+
+## An MV plugin or script command disappears after translation
+
+- **Symptom:** Visible text changes correctly, but the surrounding plugin command or JavaScript call is missing or malformed.
+- **General cause:** The patcher replaced the entire JSON string even though only one span inside that string was translatable.
+- **Diagnosis:** Compare the manifest mapping with the baseline and confirm that plugin and script targets record a parent path plus an exact span. Script literals must also record their quote style.
+- **Resolution:** Replace only the recorded span. Encode script text as a JavaScript literal with the original quote style, then reparse the rebuilt JSON.
+- **Prevention:** Use synthetic round-trip tests for plugin payloads, single- and double-quoted literals, apostrophes, backslashes, tabs, and newlines.
+
+## Applying a later MV target reports a false baseline mismatch
+
+- **Symptom:** The baseline precondition passes for an early target but fails for another valid target in the same JSON document.
+- **General cause:** Preconditions were checked against the mutable output document after earlier assignments had already changed it.
+- **Diagnosis:** Check whether the patcher keeps separate immutable baseline and mutable output objects for every file.
+- **Resolution:** Validate all source values, mirror values, and spans against the immutable baseline. Accumulate assignments and publish output only after every precondition succeeds.
+- **Prevention:** Test multiple targets in one parent string and conflicting assignments to one JSON path.
+
+## An MV dialogue block no longer aligns with event commands
+
+- **Symptom:** A rebuilt event has missing, merged, or shifted text lines even though the translation itself is readable.
+- **General cause:** A multi-line target was split into a different number of lines than its recorded Show Text or Scrolling Text command paths.
+- **Diagnosis:** Compare the candidate newline count with the manifest path count before writing any JSON.
+- **Resolution:** Reprocess the target with the required line count or preserve its exact source. Never redistribute lines heuristically during patch assembly.
+- **Prevention:** Extract consecutive text commands as one target and test one- through four-line synthetic blocks.

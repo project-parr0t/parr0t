@@ -6,6 +6,8 @@
 
 정확한 소유 범위와 병합 규칙은 [코어/엔진 SDK 브랜치 계약](docs/sdk-branch-contract.md)을 따릅니다.
 
+`sdk-rpg-maker-mv-1.6.1` 브랜치는 RPG Maker MV 1.6.1용 읽기 전용 추출, manifest 기반 적용, 구조 검증, 결정론적 ZIP 패킹을 추가합니다. 사용 절차와 엔진 고유 무결성 규칙은 [RPG Maker MV 1.6.1 어댑터 문서](docs/rpg-maker-mv-1.6.1.md)를 참고하십시오.
+
 ## 핵심 동작
 
 ```text
