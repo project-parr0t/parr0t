@@ -97,6 +97,14 @@ class Segment:
     next: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        for field_name in ("speaker", "scene", "previous", "next"):
+            value = getattr(self, field_name)
+            if value is None:
+                object.__setattr__(self, field_name, "")
+            elif not isinstance(value, str):
+                raise TypeError(f"Segment {field_name} must be a string or null")
+
 
 @dataclass(slots=True, frozen=True)
 class ContextPack:

@@ -546,8 +546,22 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
     require_sdk_selection(config)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     output = _path_in_workspace(work_dir, args.output)
-    max_records = args.max_records or int(
-        config.get("execution", {}).get("native_shard_records", 256)
+    execution = config.get("execution", {})
+    legacy_default = (
+        execution.get("native_shard_records") == 256
+        and "native_shard_material_tokens" not in execution
+    )
+    max_records = (
+        args.max_records
+        if args.max_records is not None
+        else 32
+        if legacy_default
+        else int(execution.get("native_shard_records", 32))
+    )
+    max_material_tokens = (
+        args.max_material_tokens
+        if args.max_material_tokens is not None
+        else int(execution.get("native_shard_material_tokens", 12_000))
     )
     result = prepare_native_tasks(
         work_dir,
@@ -555,6 +569,7 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
         read_segments(source),
         output,
         max_records=max_records,
+        max_material_tokens=max_material_tokens,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -947,6 +962,11 @@ def build_parser() -> argparse.ArgumentParser:
     native_prepare.add_argument("--input", required=True, help="Ordered source segment file")
     native_prepare.add_argument("--output", required=True, help="Private task directory")
     native_prepare.add_argument("--max-records", type=int)
+    native_prepare.add_argument(
+        "--max-material-tokens",
+        type=int,
+        help="Estimated private input-material cap per fresh native worker task",
+    )
     native_prepare.set_defaults(func=cmd_prepare_native_pass)
 
     native_import = sub.add_parser(
