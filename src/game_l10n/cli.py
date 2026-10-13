@@ -12,7 +12,7 @@ from typing import Any
 from .errors import GameL10nError
 from .context_analysis import ContextAnalyzer, analyze_with_cache
 from .formats import read_segments, write_results
-from .models import CharacterProfile, ContextPack, GlossaryEntry, ProjectContext
+from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext
 from .native_pass import import_native_shard, merge_native_pass, prepare_native_tasks
 from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from .privacy import is_within, require_external_workdir
@@ -127,7 +127,7 @@ def _orchestrator(work_dir: Path, context_pack: ContextPack) -> LocalizationOrch
 
 
 def _analyze_context(
-    work_dir: Path, segments: list, *, force: bool = False
+    work_dir: Path, segments: list, *, force: bool = False, context_mode: str | None = None
 ) -> tuple[ContextPack, bool]:
     config = load_config(work_dir)
     routing = config["routing"]
@@ -137,6 +137,7 @@ def _analyze_context(
         registry,
         chain,
         max_chunk_chars=int(routing.get("context_chunk_chars", 30000)),
+        context_mode=context_mode or str(config.get("project", {}).get("context_mode", "auto")),
     )
     context_relative = config.get("files", {}).get("context_pack", "context/context-pack.json")
     return analyze_with_cache(
@@ -185,7 +186,10 @@ def cmd_translate(args: argparse.Namespace) -> int:
         work_dir, args.context_input or args.input, must_exist=True
     )
     context_pack, context_cached = _analyze_context(
-        work_dir, read_segments(context_source), force=args.force_context
+        work_dir,
+        read_segments(context_source),
+        force=args.force_context,
+        context_mode=args.context_mode,
     )
     orchestrator = _orchestrator(work_dir, context_pack)
     results = orchestrator.translate_many(segments, force=args.force)
@@ -201,6 +205,7 @@ def cmd_translate(args: argparse.Namespace) -> int:
                 "source_preserved": source_preserved,
                 "cached": cached,
                 "context_cached": context_cached,
+                "context_mode": context_pack.context_mode,
                 "output": str(destination),
             }
         )
@@ -212,7 +217,12 @@ def cmd_analyze_context(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     require_sdk_selection(load_config(work_dir))
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
-    context_pack, cached = _analyze_context(work_dir, read_segments(source), force=args.force)
+    context_pack, cached = _analyze_context(
+        work_dir,
+        read_segments(source),
+        force=args.force,
+        context_mode=args.context_mode,
+    )
     config = load_config(work_dir)
     output = _path_in_workspace(
         work_dir, config.get("files", {}).get("context_pack", "context/context-pack.json")
@@ -222,8 +232,12 @@ def cmd_analyze_context(args: argparse.Namespace) -> int:
             {
                 "cached": cached,
                 "output": str(output),
+                "context_mode": context_pack.context_mode,
                 "scenes": len(context_pack.scene_summaries),
                 "characters": len(context_pack.character_guides),
+                "screens": len(context_pack.screen_flows),
+                "features": len(context_pack.feature_guides),
+                "knowledge_nodes": len(context_pack.knowledge_nodes),
             }
         )
     )
@@ -506,16 +520,26 @@ def build_parser() -> argparse.ArgumentParser:
     translate.add_argument("--input", required=True)
     translate.add_argument(
         "--context-input",
-        help="Full ordered script used for mandatory narrative analysis; defaults to --input",
+        help="Complete ordered source inventory used for context analysis; defaults to --input",
+    )
+    translate.add_argument(
+        "--context-mode",
+        choices=[mode.value for mode in ContextMode],
+        help="Override project.context_mode for this run",
     )
     translate.add_argument("--output", required=True)
     translate.add_argument("--force", action="store_true")
     translate.add_argument("--force-context", action="store_true")
     translate.set_defaults(func=cmd_translate)
 
-    context = sub.add_parser("analyze-context", help="Analyze the complete script before translation")
+    context = sub.add_parser("analyze-context", help="Analyze complete source context before translation")
     context.add_argument("--workspace", required=True)
     context.add_argument("--input", required=True)
+    context.add_argument(
+        "--context-mode",
+        choices=[mode.value for mode in ContextMode],
+        help="Override project.context_mode for this run",
+    )
     context.add_argument("--force", action="store_true")
     context.set_defaults(func=cmd_analyze_context)
 

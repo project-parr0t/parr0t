@@ -26,6 +26,11 @@ _REVIEW_ISSUE_CODES = {
     "literalism",
     "reference_loss",
     "tone_rhythm",
+    "function",
+    "condition",
+    "unit",
+    "knowledge_order",
+    "length_risk",
 }
 
 

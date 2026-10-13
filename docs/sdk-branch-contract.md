@@ -1,6 +1,6 @@
 # Core and engine SDK branch contract
 
-The `main` branch is the engine-neutral control framework. It owns narrative context gates, provider routing, refusal and error taxonomy, candidate generations, review state, deterministic validation hooks, checkpointing, privacy boundaries, and source-preservation behavior.
+The `main` branch is the engine-neutral control framework. It owns typed narrative, functional, knowledge, and hybrid context gates; provider routing; refusal and error taxonomy; candidate generations; review state; deterministic validation hooks; checkpointing; privacy boundaries; and source-preservation behavior.
 
 An `sdk-<engine>-<version>` branch is a concrete data-plane implementation. It inherits `main` and adds only the public engine contract needed to discover text, unpack data, apply a validated translation manifest, repack a patch, and verify the rebuilt output.
 

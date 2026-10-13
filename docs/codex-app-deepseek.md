@@ -20,7 +20,7 @@ The SDK repository, Git history, neutral FAQ, and reusable engine branch must no
 ## Native agent topology
 
 - **Top-level Codex/Sol:** owns orchestration state only. It receives target IDs, categorical statuses, counts, queue transitions, artifact paths, and deterministic issue codes. It must not open dialogue/input/result artifacts, receive candidates, read prose refusal explanations, or semantically approve translations.
-- **GPT-6 Luna workers:** use no more native subagent slots than the active Codex host and configured concurrency allow. Prepare stable, exclusive target-ID shard files and give each worker one shard path, the ordered source artifact path, and the private workspace path, never dialogue in the task message. Inside the shard, the worker handles one target at a time with the relevant full-script context pack, character guide, scene state, adjacent lines, glossary, and immutable formatting rules. It writes one result row per target and returns only a metadata envelope. This amortizes worker startup without turning the shard into one batch translation decision.
+- **GPT-6 Luna workers:** use no more native subagent slots than the active Codex host and configured concurrency allow. Prepare stable, exclusive target-ID shard files and give each worker one shard path, the ordered source artifact path, and the private workspace path, never game text in the task message. Inside the shard, the worker handles one target at a time with only its relevant narrative, functional, or knowledge entries plus adjacent lines, glossary, and immutable formatting rules. It writes one result row per target and returns only a metadata envelope. This amortizes worker startup without turning the shard into one batch translation decision.
 - **GPT-6.1 Sol judge:** must be a separate subagent/session from the top-level orchestrator. It reads the source/candidate by private artifact path and returns only a compact `ok`, `rewrite`, refusal, or error envelope. It never echoes a correct candidate to the parent.
 - **DeepSeek API:** receives individual translation requests only for target IDs that the complete Luna stage refused or failed. In review, it may selectively rewrite `rewrite` targets and act as the next compact judge for Sol refusals/errors. Each request includes one target and focused relevant context. Never combine failed targets into a new batch prompt.
 
@@ -38,7 +38,7 @@ Subagent data-plane files use the JSON envelopes in [provider-protocol.md](provi
 
 ## Refusal containment
 
-Every worker is instructed that localization is a bounded transformation of already-existing user-provided text, not new content generation, scene continuation, roleplay, or endorsement. Full narrative context remains available but is explicitly labeled as context-only evidence.
+Every worker is instructed that localization is a bounded transformation of already-existing user-provided text, not new content generation, scene continuation, roleplay, or endorsement. Relevant typed context remains available but is explicitly labeled as context-only evidence.
 
 A worker may refuse only its one target. The parent must not:
 

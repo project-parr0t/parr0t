@@ -91,7 +91,7 @@ class CompatibleProviderTests(unittest.TestCase):
                     {
                         "finish_reason": "stop",
                         "message": {
-                            "content": "REWRITE literalism,reference_loss,tone_rhythm"
+                            "content": "REWRITE function,condition,knowledge_order,length_risk"
                         },
                     }
                 ]
@@ -118,7 +118,7 @@ class CompatibleProviderTests(unittest.TestCase):
             result,
             {
                 "verdict": "rewrite",
-                "issues": ["literalism", "reference_loss", "tone_rhythm"],
+                "issues": ["function", "condition", "knowledge_order", "length_risk"],
             },
         )
 

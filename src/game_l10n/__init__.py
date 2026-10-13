@@ -2,6 +2,7 @@
 
 from .models import (
     CharacterProfile,
+    ContextMode,
     ContextPack,
     GlossaryEntry,
     ProjectContext,
@@ -14,6 +15,7 @@ from .steam import build_steam_package, validate_steam_package
 
 __all__ = [
     "CharacterProfile",
+    "ContextMode",
     "ContextPack",
     "GlossaryEntry",
     "LocalizationOrchestrator",

@@ -37,6 +37,7 @@ class WorkspaceTests(unittest.TestCase):
 
         providers = {item["name"]: item for item in config["providers"]}
         self.assertEqual(config["provider_preset"], "openai-deepseek")
+        self.assertEqual(config["project"]["context_mode"], "auto")
         self.assertEqual(providers["openai-luna"]["model"], "gpt-6-luna")
         self.assertEqual(providers["deepseek"]["model"], "deepseek-flash")
         self.assertNotIn("temperature", providers["deepseek"])

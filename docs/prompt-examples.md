@@ -5,7 +5,7 @@ These prompts are written for Codex or Codex routed through an OpenCodex-compati
 ## Start a new localization and patch job
 
 ```text
-Read Parr0t's AGENTS.md, docs/agent-usage.md, and docs/sdk-selection.md first. Treat <source-root> as read-only and create a separate workspace at <external-workspace>. Ask me once whether Git is allowed. Before writing any unpacker or patcher, inventory every visible sdk-* branch, inspect plausible public contracts, record compatibility, and select reuse, extension, or private-new; never duplicate a compatible or extensible adapter. Then analyze the complete ordered script and character voices, translate every target with configured fallbacks, run independent review and deterministic validation, and build a new recoverable patch. Keep all content and provider explanations in the private workspace and report only metadata to the top-level orchestrator.
+Read Parr0t's AGENTS.md, docs/agent-usage.md, and docs/sdk-selection.md first. Treat <source-root> as read-only and create a separate workspace at <external-workspace>. Ask me once whether Git is allowed. Before writing any unpacker or patcher, inventory every visible sdk-* branch, inspect plausible public contracts, record compatibility, and select reuse, extension, or private-new; never duplicate a compatible or extensible adapter. Then analyze the complete ordered source inventory with the appropriate narrative, functional, knowledge, or hybrid context, translate every target with configured fallbacks, run independent review and deterministic validation, and build a new recoverable patch. Keep all content and provider explanations in the private workspace and report only metadata to the top-level orchestrator.
 ```
 
 ## Use an existing SDK branch

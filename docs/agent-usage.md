@@ -36,7 +36,7 @@ The external workspace stores extracted content, context packs, translations, ca
 instructions and approvals
   -> format discovery and SDK selection
   -> read-only extraction into the external workspace
-  -> complete ordered-script context analysis
+  -> complete ordered-source typed context analysis
   -> primary translation for every target
   -> fallback translation for refused or failed targets only
   -> compact independent judgment
@@ -46,9 +46,11 @@ instructions and approvals
   -> new patch and metadata-only completion report
 ```
 
-Context analysis must finish before translation. It produces scene state, relationship changes, character voice rules, forms of address, glossary constraints, evidence identifiers, and supported allusion/wordplay/rhetorical cues from the complete ordered script and segment metadata. It must not invent a reference from weak resemblance. A worker receives one target segment at a time plus that read-only context. Segment isolation limits failure scope; it does not remove narrative, character, or text-function context.
+Context analysis must finish before translation. `project.context_mode` defaults to `auto` and may be set to `narrative`, `functional`, `knowledge`, or `hybrid`. Auto mode uses stable segment metadata plus speaker/scene evidence to select the smallest suitable schema. Narrative context covers story, scene, relationship, voice, and supported references. Functional context covers screens, actions, states, conditions, units, controls, and layout constraints. Knowledge context covers ordered nodes, prerequisites, terminology, and cross-entry consistency. Hybrid context combines only the domains present in the source.
 
-The compact judge evaluates effect as well as denotational accuracy. It flags mechanical literalism, lost recognition cues, and unsuitable tone/rhythm for titles, quest names, slogans, dialogue, and UI text, while sending only target-relevant cues to keep input and output token cost bounded.
+The extraction layer should set `metadata.context_mode` or `metadata.context_domains` when it knows the correct domain; otherwise `text_type`, `text_function`, `category`, speaker, and scene are used as hints. Every functional or knowledge segment must be cited by an analyzed evidence entry, while narrative data must cover every named scene and speaker. A worker receives one target plus only its relevant typed entries. Segment isolation limits failure scope without reducing context to an isolated sentence.
+
+The compact judge evaluates effect as well as denotational accuracy. It flags mechanical literalism, lost recognition cues, unsuitable tone/rhythm, changed UI function or conditions, unit errors, broken knowledge order, and material layout risk, while receiving only target-relevant evidence to keep token cost bounded.
 
 If every context-analysis route fails, stop before translation. If every permitted translation route fails for a target, preserve the exact source and mark it `source_preserved`. Never cancel unrelated targets because one target or batch was refused.
 

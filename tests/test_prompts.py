@@ -101,6 +101,52 @@ class PromptTests(unittest.TestCase):
         self.assertIn("literalism", REVIEW_ISSUE_CODES)
         self.assertIn("reference_loss", REVIEW_ISSUE_CODES)
         self.assertIn("tone_rhythm", REVIEW_ISSUE_CODES)
+        self.assertIn("function", REVIEW_ISSUE_CODES)
+        self.assertIn("knowledge_order", REVIEW_ISSUE_CODES)
+
+    def test_functional_and_knowledge_context_are_focused_by_evidence(self) -> None:
+        system, user = translation_prompt(
+            ProjectContext("FIXTURE", "src", "dst"),
+            Segment("ui-1", "Apply", metadata={"text_type": "button"}),
+            [],
+            None,
+            ContextPack(
+                context_mode="hybrid",
+                functional_summary="UI FLOW",
+                knowledge_summary="GUIDE FLOW",
+                global_style_rules=("CONCISE",),
+                terminology_rules=("APPLY IS AN ACTION",),
+                screen_flows={
+                    "OPTIONS": {"evidence_line_ids": ["ui-1"], "purpose": "SETTINGS"},
+                    "OTHER": {"evidence_line_ids": ["ui-2"], "purpose": "OTHER"},
+                },
+                knowledge_nodes={
+                    "APPLY HELP": {"evidence_line_ids": ["ui-1"], "summary": "HOW TO APPLY"},
+                    "OTHER HELP": {"evidence_line_ids": ["ui-2"], "summary": "OTHER"},
+                },
+                reference_cues=(
+                    {
+                        "kind": "wordplay",
+                        "scene": "",
+                        "evidence_line_ids": ["ui-1"],
+                        "recognition_cue": "FIXTURE CUE",
+                        "translation_goal": "KEEP EFFECT",
+                        "confidence": "high",
+                    },
+                ),
+            ),
+        )
+        payload = json.loads(user)
+
+        self.assertEqual(payload["localization_context"]["mode"], "hybrid")
+        self.assertEqual(
+            payload["localization_context"]["relevant_reference_cues"][0]["kind"],
+            "wordplay",
+        )
+        self.assertEqual(len(payload["functional_context"]["relevant_screens"]), 1)
+        self.assertEqual(len(payload["knowledge_context"]["relevant_nodes"]), 1)
+        self.assertIsNone(payload["narrative_context"])
+        self.assertIn("functional text", system)
 
 
 if __name__ == "__main__":
