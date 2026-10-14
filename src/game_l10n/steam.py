@@ -100,6 +100,10 @@ def _manifest_fingerprint(manifest: dict[str, Any]) -> str:
     )
     lines.extend(f"steam.required:{item}" for item in manifest["steam"]["required_files"])
     lines.extend(
+        "steam.source_binding:{path}\t{bytes}\t{sha256}\t{error_code}".format(**item)
+        for item in manifest["steam"].get("source_bindings", [])
+    )
+    lines.extend(
         f"file:{item['path']}\t{item['bytes']}\t{item['sha256']}" for item in manifest["files"]
     )
     return _sha256(("\n".join(lines) + "\n").encode("utf-8"))
@@ -200,6 +204,51 @@ def _replace_files(payload: dict[str, Any], patch_id: str) -> list[dict[str, str
     return sorted(result, key=lambda item: item["path"].casefold())
 
 
+def _source_bindings(
+    steam: dict[str, Any], custom_errors: list[dict[str, str]]
+) -> list[dict[str, Any]]:
+    configured = steam.get("source_bindings", [])
+    if not isinstance(configured, list):
+        raise SteamPackageError("spec field 'steam.source_bindings' must be a list")
+    registered_errors = {item["internal_code"] for item in custom_errors}
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(configured):
+        if not isinstance(item, dict):
+            raise SteamPackageError(f"steam.source_bindings[{index}] must be an object")
+        path = _safe_relative(
+            str(item.get("path", "")), field=f"steam.source_bindings[{index}].path"
+        )
+        folded = path.casefold()
+        if folded in seen:
+            raise SteamPackageError("steam.source_bindings paths must be case-insensitively unique")
+        byte_count = item.get("bytes")
+        if not isinstance(byte_count, int) or isinstance(byte_count, bool) or byte_count < 0:
+            raise SteamPackageError(
+                f"steam.source_bindings[{index}].bytes must be a non-negative integer"
+            )
+        sha256 = item.get("sha256")
+        if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            raise SteamPackageError(
+                f"steam.source_bindings[{index}].sha256 must be a lowercase SHA-256 digest"
+            )
+        error_code = item.get("error_code")
+        if not isinstance(error_code, str) or error_code not in registered_errors:
+            raise SteamPackageError(
+                f"steam.source_bindings[{index}].error_code must reference a registered custom error"
+            )
+        seen.add(folded)
+        result.append(
+            {
+                "path": path,
+                "bytes": byte_count,
+                "sha256": sha256,
+                "error_code": error_code,
+            }
+        )
+    return sorted(result, key=lambda item: item["path"].casefold())
+
+
 def _load_spec(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -229,6 +278,9 @@ def _load_spec(path: Path) -> dict[str, Any]:
     required_files = steam.get("required_files", [])
     if not isinstance(required_files, list) or not all(isinstance(item, str) for item in required_files):
         raise SteamPackageError("steam.required_files must be a list of relative paths")
+    custom_errors = _custom_errors(payload)
+    replace_files = _replace_files(payload, patch_id)
+    source_bindings = _source_bindings(steam, custom_errors)
     return {
         "schema": SCHEMA,
         "patch_id": patch_id,
@@ -244,13 +296,14 @@ def _load_spec(path: Path) -> dict[str, Any]:
             "operations": ["install", "restore", "verify"],
             "interactive_authorization": "menu_confirmation",
             "automation_authorization": "runtime_approval_v1",
-            "custom_errors": _custom_errors(payload),
-            "replace_files": _replace_files(payload, patch_id),
+            "custom_errors": custom_errors,
+            "replace_files": replace_files,
         },
         "steam": {
             "app_id": app_id,
             "install_dir": install_dir,
             "required_files": [_safe_relative(item, field="steam.required_files") for item in required_files],
+            "source_bindings": source_bindings,
         },
     }
 
@@ -348,11 +401,19 @@ def build_steam_package(payload_root: Path, spec_path: Path, output_path: Path) 
     }
     payload = _payload_files(payload_root)
     payload_paths = {relative.casefold() for relative, _ in payload}
+    replacement_paths = {
+        replacement["path"].casefold() for replacement in manifest["installer"]["replace_files"]
+    }
     for replacement in manifest["installer"]["replace_files"]:
         if replacement["path"].casefold() not in payload_paths:
             raise SteamPackageError("every replacement path must have a corresponding payload file")
         if replacement["backup_path"].casefold() in payload_paths:
             raise SteamPackageError("a replacement backup path cannot be part of the payload")
+    for binding in manifest["steam"]["source_bindings"]:
+        if binding["path"].casefold() in payload_paths - replacement_paths:
+            raise SteamPackageError(
+                "a source-bound payload path must be declared as an original-file replacement"
+            )
     manifest["files"] = [
         {"path": relative, "bytes": len(data), "sha256": _sha256(data)}
         for relative, data in payload
@@ -449,6 +510,15 @@ def validate_steam_package(package_path: Path) -> dict[str, Any]:
         validated_custom = _custom_errors({"custom_errors": custom_errors})
         if custom_errors != validated_custom:
             raise SteamPackageError("Package custom error registry is not canonical")
+        steam_contract = manifest.get("steam")
+        if not isinstance(steam_contract, dict):
+            raise SteamPackageError("Package Steam contract is not supported")
+        source_bindings = steam_contract.get("source_bindings", [])
+        validated_bindings = _source_bindings(
+            {"source_bindings": source_bindings}, validated_custom
+        )
+        if "source_bindings" in steam_contract and source_bindings != validated_bindings:
+            raise SteamPackageError("Package source binding registry is not canonical")
         validated_replacements = _replace_files(
             {"replace_files": installer_contract.get("replace_files")}, str(manifest.get("patch_id", ""))
         )
@@ -475,6 +545,12 @@ def validate_steam_package(package_path: Path) -> dict[str, Any]:
                 raise SteamPackageError("Replacement path is absent from the payload")
             if replacement["backup_path"].casefold() in payload_paths:
                 raise SteamPackageError("Replacement backup path overlaps the payload")
+        replacement_paths = {item["path"].casefold() for item in validated_replacements}
+        for binding in validated_bindings:
+            if binding["path"].casefold() in payload_paths - replacement_paths:
+                raise SteamPackageError(
+                    "A source-bound payload path is not an original-file replacement"
+                )
         fingerprint = manifest.get("artifact_fingerprint")
         if not isinstance(fingerprint, str) or fingerprint != _manifest_fingerprint(manifest):
             raise SteamPackageError("Package artifact fingerprint is invalid")
