@@ -1,8 +1,8 @@
 # OpenAI API + DeepSeek API fallback preset
 
-The `openai-deepseek` preset is the default for new private workspaces. Codex or ChatGPT Work may act as the top-level operator, but provider calls use API credentials from environment variables. A ChatGPT subscription is not treated as an API credential.
+The `openai-deepseek` preset is the explicit API + API option for private workspaces. Codex or ChatGPT Work may act as the top-level operator, but provider calls use API credentials from environment variables. A ChatGPT subscription is not treated as an API credential. New Codex App workspaces default to the separate locked `codex-app-deepseek` preset.
 
-For native Luna/Sol workers supplied by the signed-in desktop app plus DeepSeek API fallback, use the separate [Codex App + DeepSeek API workflow](codex-app-deepseek.md).
+For native Luna/Sol workers supplied by the signed-in desktop app plus DeepSeek API fallback, initialize the separate locked `codex-app-deepseek` preset and follow the [Codex App + DeepSeek API workflow](codex-app-deepseek.md). Do not convert between the two presets because an API key happens to be available.
 
 ## Ready-to-run setup
 
