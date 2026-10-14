@@ -140,30 +140,30 @@ This directory contains private game data and translation artifacts. It is inten
 ## Mandatory workflow
 
 1. Before any `git init`, remote creation, branch creation, commit, or push, ask the user whether Git use is allowed for this game/tooling task. Record the answer in `game-l10n.json` under `repository.initial_choice`. If refused, do not initialize Git. Run `game-l10n status --workspace <this-directory>` first; it reports the next safe action without sending data.
-1a. Before writing or adapting format tooling, inspect the candidates recorded by `game-l10n sdk-inventory`, evaluate each plausible public contract with `game-l10n sdk-evaluate`, and record exactly one `reuse`, `extend`, or `private-new` decision with `game-l10n sdk-select`. Reuse is the default; extend a partial match instead of reimplementing it. `private-new` is allowed only after every inventoried candidate is incompatible. The CLI blocks extraction, context, translation, and new-profile promotion until this gate is complete.
+1a. Before writing or adapting format tooling, derive the target engine/version identity from the inspected runtime, inspect the candidates recorded by `game-l10n sdk-inventory`, and bind every `sdk-evaluate` and `sdk-select` call to that target. Keep implementation reuse separate from compatibility ownership: reuse or extend only the exact target branch; mark useful code from a different identity as `reference` and select `derive-new`. Use `private-new` only when every candidate is incompatible and none is a reusable reference. The CLI blocks extraction, context, translation, and new-profile promotion until this gate is complete.
 2. Never copy source game data, extracted strings, translations, prompts, caches, logs, or credentials into the SDK repository.
 3. Run unpack and pack through `game-l10n run-tool`; identical tool/input/environment fingerprints are skipped automatically.
 4. Run translation through the orchestrator. The orchestrator only monitors execution/protocol status and fallback routing. It must not replace the independent review agent.
 5. Treat model refusals, malformed output, timeouts, and failed integrity checks as route failures. Continue through the configured fallback chain and keep the audit record free of game text.
 6. Preserve placeholders, tags, control codes, glossary terms, names, character voice and scene state, UI actions/states/conditions/units, and knowledge order/prerequisites. Preserve communicative function, idiomatic target-language phrasing, supported allusions/wordplay, deliberate alterations, and function-appropriate tone/rhythm. Do not approve a mechanically literal result merely because its denotational meaning is correct, and do not invent a reference from weak resemblance.
-7. A toolchain may be promoted only after the user explicitly states that the translation/patch succeeded. Keep the sanitized SDK profile local and stop. Do not propose, ask about, preview, stage, or mention commit, push, repository publication, tags, or releases unless the user first gives an explicit publication command.
-8. Engine profiles use branch names `sdk-<engine>-<version>`. Export only reusable files from `tools/`; the privacy scan must pass first.
+7. A toolchain may be promoted only after the user explicitly states that the translation/patch succeeded, and the promotion engine/version must equal the target identity recorded before implementation. A reference SDK is a code source, not the promotion destination. Keep the sanitized SDK profile local and stop. Do not propose, ask about, preview, stage, or mention commit, push, repository publication, tags, or releases unless the user first gives an explicit publication command.
+8. Engine profiles use branch names `sdk-<engine>-<version>` and originate from `main`. For `derive-new`, port only the verified neutral capability and never merge the reference SDK branch wholesale. Export only reusable files from `tools/`; the privacy scan must pass first.
 9. Keep promoted SDK content provenance-free. Never transfer real game/project names, filenames, asset paths, map/event identifiers, dialogue, translations, project-specific exclusions, job metadata, tool paths, counts, hashes, reports, or execution history. Use only public engine-format identifiers and unmistakably synthetic fixtures.
-10. Record only recurring engine/SDK problems in the repository `docs/faq.md`, after reducing them to neutral symptom, general cause, diagnosis, resolution, and prevention. Keep one-off or project-specific incidents in this private workspace.
+10. Follow the repository `docs/engine-faq-contract.md`. Classify each material engine problem as `automated_fix`, `engine_runbook`, `private_only`, or `unresolved`. Fix deterministic conditions in SDK code and regression tests. Add an engine runbook entry only when safe continuation requires external tooling, user material, runtime evidence, authorization, or a decision the SDK cannot infer; keep title-specific incidents private and unresolved causes in the failure queue. Entry count is not a goal.
 11. Treat translation as a faithful transformation of existing user-provided text, never as new scene generation, continuation, roleplay, or endorsement. Analyze the complete ordered inventory first, using `auto`, `narrative`, `functional`, `knowledge`, or `hybrid` context; give each target only the relevant typed evidence. Do not censor, soften, intensify, or invent content. A native worker may receive an exclusive ID shard to reduce startup overhead, but it must load and finalize one target at a time. A refusal applies only to the individual target segment and must never cancel unrelated segments.
 12. Follow the configured role chains, not hard-coded provider identities. Finish the complete primary translation pass before translation fallback. Review with compact judges; invoke configured rewriters only for `rewrite` verdicts; confirm corrected candidates; and send only refused/failed judge targets to the next judge. With the recommended OpenAI/DeepSeek preset these roles map to Luna translation, Sol compact judging, and selective DeepSeek/Sol correction, but API, native App, command, local, and compatible providers may be substituted independently. If every permitted route fails, emit the unchanged source with `source_preserved`; never silently claim it was reviewed.
 13. Selecting a provider preset and supplying its API-key environment variables authorizes its automatic context, translation, review, and fallback calls. Do not pause for another per-segment API or cost approval. Keep configured game roots read-only; create translated data, rebuilt archives, and installable patches only under this workspace. Never overwrite an installed or source game in place.
 14. Distinguish API providers from native Codex App workers. In the recommended App + DeepSeek mode, use native GPT-6 Luna translator subagents and a separate native GPT-6.1 Sol compact judge; use only `DEEPSEEK_API_KEY` for configured translation fallback, selective rewriting, and judge fallback. This is not a core dependency: API, command, compatible, local, and other native providers may fill each role. The top-level agent remains orchestration-only and follows `docs/codex-app-deepseek.md`.
 15. Keep a strict data-plane/control-plane boundary. The top-level agent may receive target IDs, categorical status/error codes, counts, queue transitions, artifact paths, and deterministic issue codes only. It must not open dialogue/input/result files or receive source, candidate, translated text, or provider prose refusal explanations. Workers read and write private workspace files and return metadata-only envelopes.
 16. A translation or review refusal is a routing event, not a content judgment and not grounds to omit a target or cancel patch creation. Normalize explanations before returning metadata to the parent. Use the configured faithful-transformation prompt and supported deterministic low-creativity settings for DeepSeek; never claim or attempt to disable provider safeguards.
-17. The checked-out `main` branch is an engine-neutral control framework. Engine-specific discovery, unpack, apply, pack, verification, FAQ, ignore rules, and fixtures must come from the selected `sdk-<engine>-<version>` branch and must never be copied back into `main`.
+17. The checked-out `main` branch is an engine-neutral control framework. Engine-specific discovery, unpack, apply, pack, verification, `docs/engine-faq.md`, ignore rules, and fixtures must come from the selected `sdk-<engine>-<version>` branch and must never be copied back into `main`. Inspect only matching runbook triggers when the SDK protocol reaches a condition it cannot resolve.
 18. Follow the repository `docs/execution-budget.md`. Build the smallest artifact that satisfies the active request. Do not add speculative rollback archives, legacy migrations, compatibility layers, exhaustive backups, or unrelated generalization. After the required focused checks pass, stop unless inputs changed or a concrete failure justifies more testing.
 19. Handle simple fixes, packaging, documentation, and status inspection in the current agent. Use subagents only for independent bulk translation/review shards or genuinely parallel research. Do not delegate deterministic rechecks or small installer work.
 20. For Steam delivery, use `game-l10n steam-package` with a completed payload and private spec. The generated installer owns only receipt-listed files, skips missing Steam libraries, and falls back to a supplied game directory. Do not embed a previous package or copy Steam/game-specific data into the SDK.
 21. Building, fixing, packing, or validating a patch does not authorize installing, updating, removing, or launching it. Access to a game folder is read-only discovery permission only. Do not infer runtime permission from a request to inspect logs, test a build, or confirm execution data.
 22. Default to handing the recoverable artifact to the user for execution. If the user explicitly asks the agent to act on a real installation, record a separate short-lived one-shot approval for exactly one of `install`, `update`, `remove`, or `launch`. Bind it to the current artifact digest, exact configured game root, and—only for launch—the exact executable. A changed artifact, target, executable, action, expiry, or consumed approval must stop the operation.
 23. Installation approval never authorizes launch, and launch approval never authorizes installation, update, removal, cleanup, log deletion, save modification, or another launch. Consume the matching approval immediately before the external effect. Automated lifecycle tests use temporary synthetic targets; only isolated repository tests may create synthetic approval fixtures for those targets.
-24. The public per-game instance workflow is dormant until the user first explicitly commands publication. Before that command, do not mention, propose, ask about, preview, or prepare a publication repository, commit/push, tag, GitHub Release, release gate, or upload. Once activated, follow the repository `docs/instance-release.md`, target the player's execution environment, default to Windows unless another platform is named, and derive architecture and prerequisites from the supported game build. Build once from a clean tagged commit and upload the exact verified bytes; bind the source commit, tag, release ID, package/manifest/file hashes, and embedded versions as one release unit. Record every supported original game version/build and make the README, release notes, manifest, asset name, and installer checks agree. Preserve the user's existing README with minimal reviewed edits. Use the visible title `<Game Display Name> Patch <Patch Version> (Game Version <Game Version>)`, or the exact enumerated `Game Versions` form.
+24. The public per-game instance workflow is dormant until the user first explicitly commands publication. Before that command, do not mention, propose, ask about, preview, or prepare a publication repository, commit/push, tag, GitHub Release, release gate, or upload. Once activated, follow the repository `docs/instance-release.md`, target the player's execution environment, default to Windows unless another platform is named, and derive architecture and prerequisites from the supported game build. Keep deployable archives, installers, generated payloads, game data, copied SDKs, and duplicate translation exports out of the instance branch; publish verified distributable bytes only as GitHub Release assets. The branch normally contains only the preserved README/legal notices, canonical checkpoint plus small release metadata, and strictly necessary minimal title/engine build glue. When a translation source repository, current read-only game folder, and instance/checkpoint repository are supplied together, validate and use each for its separate role before any model call. Build once from clean referenced commits and upload the exact verified bytes; bind the instance, translation-source, and SDK commits, tag, release ID, package/manifest/file hashes, and embedded versions as one release unit. Record every supported original game version/build and make the README, release notes, manifest, asset name, and installer checks agree. Preserve the user's existing README with minimal reviewed edits. Use the visible title `<Game Display Name> Patch <Patch Version> (Game Version <Game Version>)`, or the exact enumerated `Game Versions` form.
 25. Player-facing Windows installers follow the repository `docs/installer-contract.md`, not this agent harness. Keep the fixed ZIP layout and the public Install, Restore, and Verify installed-state operations. Use `<game-root>/parr0t-patch-status.txt` as the first patch-ID authority and the matching receipt for owned files. Explicitly declare any original file that must be replaced; preserve it once, verify and reuse that backup on update, and put it back on Restore. Core result codes are fixed; SDK/title-specific failures use a separate `PARR0T-<SCOPE>-E###` registry. Never copy `AGENTS.md`, approval JSON, prompts, task state, logs, or workspace policy into a distribution. An interactive player's menu choice plus final confirmation needs no agent approval; noninteractive mutation still does.
 26. For Steam discovery or integration, follow the repository `docs/steam-faq.md` and `docs/wrapper-executable.md`. Use exact App ID metadata and binding checks and ask when the validated game root is ambiguous. Never read or edit `localconfig.vdf`, Steam launch options, or per-account client configuration, and never require, close, kill, or restart Steam. Integrate the Steam Play button only with exact approved, reproducible, signature/hash-verified Parr0t wrapper bytes for the target architecture at explicitly declared main-executable paths; preserve each real original through `replace_files` and do not use `.lnk` or an ad hoc game-workspace binary. Require the target game to be closed for locked replacements; close only the validated game process after separate player confirmation.
 27. The control plane must proactively use the repository `skills/request-scope-guard/SKILL.md` whenever the user limits or narrows scope, asks for read-only inspection/diagnosis, or a contemplated action is optional, unrequested, destructive, or externally consequential. Prefer a discovered `$request-scope-guard`; otherwise read and apply the bundled file directly. Re-evaluate after every user message and give workers only the exact authorized targets and side effects. No worker may infer permission to expand scope, clean up data, commit/push, publish, deploy, install, launch, or contact an external system.
@@ -233,6 +233,7 @@ if __name__ == "__main__":
 SDK_EVALUATION_REASONS = {
     "compatible": {"public_contract_match"},
     "partial": {"reusable_with_extension"},
+    "reference": {"reusable_for_new_identity"},
     "incompatible": {
         "engine_mismatch",
         "format_mismatch",
@@ -241,6 +242,24 @@ SDK_EVALUATION_REASONS = {
         "uninspectable_contract",
     },
 }
+
+
+def _sdk_target(engine: str, version: str) -> dict[str, str]:
+    safe_engine = "-".join(
+        part for part in engine.lower().replace("_", "-").split("-") if part.isalnum()
+    )
+    safe_version = "-".join(
+        part
+        for part in version.lower().replace("_", "-").split("-")
+        if part.replace(".", "").isalnum()
+    )
+    if not safe_engine or not safe_version:
+        raise ConfigurationError("target engine and version must form a safe SDK branch name")
+    return {
+        "engine": safe_engine,
+        "version": safe_version,
+        "branch": f"sdk-{safe_engine}-{safe_version}",
+    }
 
 
 def _run_git(sdk_root: Path, *args: str) -> str:
@@ -373,17 +392,31 @@ def record_sdk_evaluation(
     result: str,
     reason: str,
     evidence_paths: list[str] | None = None,
+    *,
+    target_engine: str,
+    target_version: str,
 ) -> dict[str, Any]:
     config = load_config(work_dir)
     selection = config.get("sdk_selection", {})
     candidates = {item["branch"]: item for item in selection.get("candidates", [])}
     if branch not in candidates:
         raise ConfigurationError("SDK branch is not present in the current inventory; refresh it first")
+    target = _sdk_target(target_engine, target_version)
     allowed_reasons = SDK_EVALUATION_REASONS.get(result)
     if allowed_reasons is None:
-        raise ConfigurationError("SDK evaluation result must be compatible, partial, or incompatible")
+        raise ConfigurationError(
+            "SDK evaluation result must be compatible, partial, reference, or incompatible"
+        )
     if reason not in allowed_reasons:
         raise ConfigurationError(f"Reason {reason!r} is not valid for SDK evaluation result {result!r}")
+    if branch == target["branch"] and result == "reference":
+        raise ConfigurationError(
+            "A target-identity SDK cannot be reference-only; evaluate it as compatible, partial, or incompatible"
+        )
+    if branch != target["branch"] and result in {"compatible", "partial"}:
+        raise ConfigurationError(
+            "A different SDK identity cannot be reused or extended for this target; record reference or incompatible"
+        )
     evidence = sorted(set(evidence_paths or []))
     available_paths = set(candidates[branch].get("public_contract_paths", []))
     unknown_evidence = sorted(set(evidence) - available_paths)
@@ -402,6 +435,7 @@ def record_sdk_evaluation(
         "reason": reason,
         "commit": candidates[branch]["commit"],
         "evidence_paths": evidence,
+        "target": target,
     }
     selection["status"] = "pending"
     selection["decision"] = None
@@ -410,7 +444,12 @@ def record_sdk_evaluation(
 
 
 def record_sdk_selection(
-    work_dir: Path, mode: str, branch: str | None = None
+    work_dir: Path,
+    mode: str,
+    branch: str | None = None,
+    *,
+    target_engine: str,
+    target_version: str,
 ) -> dict[str, Any]:
     config = load_config(work_dir)
     selection = config.get("sdk_selection", {})
@@ -418,26 +457,57 @@ def record_sdk_selection(
         raise ConfigurationError("SDK inventory is missing; run sdk-inventory first")
     candidates = {item["branch"]: item for item in selection.get("candidates", [])}
     evaluations = selection.get("evaluations", {})
+    target = _sdk_target(target_engine, target_version)
+
+    def evaluation_for_target(name: str) -> dict[str, Any]:
+        evaluation = evaluations.get(name, {})
+        return evaluation if evaluation.get("target") == target else {}
 
     if mode in {"reuse", "extend"}:
         if not branch or branch not in candidates:
             raise ConfigurationError("reuse and extend decisions require an inventoried SDK branch")
-        evaluation = evaluations.get(branch, {})
+        if branch != target["branch"]:
+            raise ConfigurationError(
+                "reuse and extend require the SDK branch whose engine/version identity matches the target"
+            )
+        evaluation = evaluation_for_target(branch)
         allowed_results = {"compatible"} if mode == "reuse" else {"compatible", "partial"}
         if evaluation.get("result") not in allowed_results:
             raise ConfigurationError(f"SDK branch must be evaluated before selecting mode {mode}")
+    elif mode == "derive-new":
+        if not branch or branch not in candidates:
+            raise ConfigurationError("derive-new requires an inventoried reference SDK branch")
+        if target["branch"] in candidates:
+            raise ConfigurationError(
+                "The target SDK branch already exists; evaluate and reuse or extend that branch"
+            )
+        if branch == target["branch"]:
+            raise ConfigurationError("derive-new requires a different reference SDK identity")
+        evaluation = evaluation_for_target(branch)
+        if evaluation.get("result") != "reference":
+            raise ConfigurationError(
+                "derive-new requires a reference evaluation for the selected source branch"
+            )
     elif mode == "private-new":
         if branch:
             raise ConfigurationError("private-new does not accept a branch")
-        unevaluated = sorted(set(candidates) - set(evaluations))
+        if target["branch"] in candidates:
+            raise ConfigurationError(
+                "The target SDK branch already exists; evaluate and reuse or extend that branch"
+            )
+        unevaluated = sorted(
+            name for name in candidates if not evaluation_for_target(name)
+        )
         reusable = sorted(
             name
-            for name, evaluation in evaluations.items()
+            for name in candidates
+            if (evaluation := evaluation_for_target(name))
             if evaluation.get("result") != "incompatible"
         )
         uninspectable = sorted(
             name
-            for name, evaluation in evaluations.items()
+            for name in candidates
+            if (evaluation := evaluation_for_target(name))
             if evaluation.get("reason") == "uninspectable_contract"
         )
         if unevaluated:
@@ -446,7 +516,8 @@ def record_sdk_selection(
             )
         if reusable:
             raise ConfigurationError(
-                "A compatible or extensible SDK exists; reuse or extend it instead: " + ", ".join(reusable)
+                "A reusable SDK reference exists; select reuse, extend, or derive-new instead: "
+                + ", ".join(reusable)
             )
         if uninspectable:
             raise ConfigurationError(
@@ -454,11 +525,14 @@ def record_sdk_selection(
                 + ", ".join(uninspectable)
             )
     else:
-        raise ConfigurationError("SDK selection mode must be reuse, extend, or private-new")
+        raise ConfigurationError(
+            "SDK selection mode must be reuse, extend, derive-new, or private-new"
+        )
 
     decision = {
         "mode": mode,
         "branch": branch,
+        "target": target,
         "inventory_fingerprint": selection["inventory_fingerprint"],
     }
     selection["status"] = "selected"
@@ -472,10 +546,17 @@ def require_sdk_selection(config: dict[str, Any]) -> dict[str, Any]:
     decision = selection.get("decision")
     if selection.get("status") != "selected" or not isinstance(decision, dict):
         raise ConfigurationError(
-            "SDK selection is incomplete; inventory, evaluate, and select an existing branch or private-new first"
+            "SDK selection is incomplete; inventory, evaluate, and select reuse, extend, derive-new, or private-new first"
         )
     if decision.get("inventory_fingerprint") != selection.get("inventory_fingerprint"):
         raise ConfigurationError("SDK inventory changed after selection; refresh and select again")
+    target = decision.get("target")
+    if not isinstance(target, dict) or target.get("branch") != _sdk_target(
+        str(target.get("engine", "")), str(target.get("version", ""))
+    )["branch"]:
+        raise ConfigurationError(
+            "SDK selection has no valid target identity; evaluate and select again"
+        )
     return decision
 
 
@@ -588,15 +669,16 @@ def prepare_sdk_profile(work_dir: Path, engine: str, version: str, *, user_confi
     if not user_confirmed_success:
         raise ConfigurationError("The user must explicitly confirm a successful translation/patch before promotion")
     selection = require_sdk_selection(load_config(work_dir))
-    if selection.get("mode") != "private-new":
+    if selection.get("mode") not in {"derive-new", "private-new"}:
         raise ConfigurationError(
             "An existing SDK branch was selected; reuse or extend that branch instead of creating a duplicate profile"
         )
-    safe_engine = "-".join(part for part in engine.lower().replace("_", "-").split("-") if part.isalnum())
-    safe_version = "-".join(part for part in version.lower().replace("_", "-").split("-") if part.replace(".", "").isalnum())
-    if not safe_engine or not safe_version:
-        raise ConfigurationError("engine and version must form a safe profile name")
-    profile_name = f"sdk-{safe_engine}-{safe_version}"
+    target = _sdk_target(engine, version)
+    if target != selection.get("target"):
+        raise ConfigurationError(
+            "Promotion engine/version must match the target identity recorded by sdk-select"
+        )
+    profile_name = target["branch"]
     tool_root = work_dir / "tools"
     manifest = scan_tools(tool_root)
     export_root = work_dir / "sdk-export" / profile_name
@@ -605,8 +687,10 @@ def prepare_sdk_profile(work_dir: Path, engine: str, version: str, *, user_confi
     shutil.copytree(tool_root, export_root / "tools")
     profile = {
         "profile": profile_name,
-        "engine": engine,
-        "version": version,
+        "engine": target["engine"],
+        "version": target["version"],
+        "selection_mode": selection["mode"],
+        "reference_branch": selection.get("branch") if selection["mode"] == "derive-new" else None,
         "contains_game_data": False,
         "files": manifest,
     }
@@ -640,7 +724,26 @@ def publish_sdk_profile(
     if not (sdk_root / ".git").exists():
         raise ConfigurationError("SDK repository is not initialized; this command never runs git init")
     profile_data = json.loads((profile_root / "profile.json").read_text(encoding="utf-8"))
-    branch = profile_data["profile"]
+    selection = require_sdk_selection(config)
+    target = selection["target"]
+    expected_reference = (
+        selection.get("branch") if selection.get("mode") == "derive-new" else None
+    )
+    if selection.get("mode") not in {"derive-new", "private-new"}:
+        raise ConfigurationError(
+            "The recorded selection does not authorize creating a new SDK identity"
+        )
+    if (
+        profile_data.get("profile") != target["branch"]
+        or profile_data.get("engine") != target["engine"]
+        or profile_data.get("version") != target["version"]
+        or profile_data.get("selection_mode") != selection.get("mode")
+        or profile_data.get("reference_branch") != expected_reference
+    ):
+        raise ConfigurationError(
+            "SDK profile does not match the recorded target identity and selection provenance"
+        )
+    branch = target["branch"]
     scan_tools(profile_root / "tools")
 
     def git(*args: str) -> str:

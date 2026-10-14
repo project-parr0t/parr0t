@@ -1,6 +1,6 @@
 # Release checkpoint contract
 
-Every Parr0t distribution contains `parr0t-release-checkpoint.json`. The file makes the released translation a machine-readable continuation point: when an agent later receives that release together with a readable game folder, it can recover verified unchanged targets without translating or reviewing them again.
+Every Parr0t distribution contains `parr0t-release-checkpoint.json`. The file makes the released translation a machine-readable continuation point: when an agent later receives that release together with a readable game folder, it can recover verified unchanged targets without translating or reviewing them again. When a title-specific translation source repository is also supplied, it remains a separate build/apply input; use it instead of reconstructing equivalent title-specific work or copying it into the checkpoint repository.
 
 The checkpoint is distribution data, not SDK data. It may contain only the target strings already shipped in the release; source text is represented by a digest and must not be duplicated in a separate field. A `source_preserved` target may necessarily equal its source, but remains explicitly marked unresolved. The file must not contain prompts, model output, provider explanations, credentials, logs, private workspace paths, or unpublished translation candidates.
 
@@ -20,10 +20,10 @@ The package manifest records the checkpoint path, schema, byte count, and digest
 
 ## Resume algorithm
 
-When a prior release and game folder are supplied, the agent must do this before any model call:
+When a prior release and game folder are supplied, the agent must do this before any model call. If a title-specific translation source repository is also supplied, bind its current commit and use its applicable implementation/state as a third input rather than ignoring it:
 
 1. Validate the package and checkpoint and confirm that their patch and release IDs agree.
-2. Select the compatible SDK under `docs/sdk-selection.md` and produce the two current source inventories required by `docs/coverage-gates.md`.
+2. Select the compatible SDK under `docs/sdk-selection.md`, inspect any supplied translation source repository without importing its title-specific data into Parr0t or the instance branch, and produce the two current source inventories required by `docs/coverage-gates.md` from the read-only game folder.
 3. Recompute the game-build, SDK-adapter, inventory, context, and review-policy bindings. Treat a different game build as a new release target, not as proof that every string changed.
 4. Match current entries by stable ID. Reuse a `reviewed` target without a model call only when its source hash, location fingerprint, dependency fingerprint, target digest, and target-scoped review fingerprint still match, the global review policy is unchanged, and the selected SDK declares the adapter compatible. The target-scoped review fingerprint must cover only the context, glossary, voice/function evidence, and constraints that can affect that target.
 5. Never promote `source_preserved` to translated or reviewed. It remains unresolved input for the configured routes.
