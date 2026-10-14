@@ -13,7 +13,9 @@ The Codex App login is not an OpenAI API key. Do not copy account tokens, App cr
 
 ## Selecting the mode
 
-When a user selects **Codex App + DeepSeek API**, the top-level Codex agent records that choice only in the private workspace and verifies `DEEPSEEK_API_KEY` without printing it. The selection plus the supplied key authorizes automatic DeepSeek fallback calls for the current localization run. Do not ask again for every refused line.
+Initialize this mode explicitly with `game-l10n init-workspace <workspace> --provider-preset codex-app-deepseek`. The CLI records `execution_mode=codex_app_native` and a text-free `.game-l10n/provider-mode.json` lock in the private workspace. The lock is immutable for that job: neither the agent nor the presence of an API key may change the preset, turn it into `custom`, or replace a native role with an API or command provider.
+
+When a user selects **Codex App + DeepSeek API**, the top-level Codex agent verifies `DEEPSEEK_API_KEY` without printing it. The key unlocks only the preset's `translation_fallback`, `selective_rewrite`, and `judge_fallback` roles after their corresponding native primary barriers. It does not authorize context analysis, primary translation, primary review, OpenAI API calls, a child Codex process, or any other external provider. Once a declared fallback role becomes eligible, do not ask again for every refused line.
 
 The SDK repository, Git history, neutral FAQ, and reusable engine branch must not record which mode or provider handled a particular game.
 
@@ -23,6 +25,8 @@ The SDK repository, Git history, neutral FAQ, and reusable engine branch must no
 - **GPT-6 Luna workers:** use no more native subagent slots than the active Codex host and configured concurrency allow. Start every task as a fresh subagent with `fork_turns="none"` or the host's no-history equivalent. Give it one task path, the ordered source/context artifact paths, and the private workspace path—never game text or parent history in the task message. Inside the task, the worker handles one target at a time with only its relevant narrative, functional, or knowledge entries plus adjacent lines, glossary, and immutable formatting rules. It writes one result row per target, returns only a metadata envelope, and ends; never reuse it for the next task.
 - **GPT-6.1 Sol judge:** uses the same fresh-worker/no-history/one-task rule and must be separate from the top-level orchestrator and translators. It reads the source/candidate by private artifact path and returns only a compact `ok`, `rewrite`, refusal, or error envelope. It never echoes a correct candidate to the parent.
 - **DeepSeek API:** receives individual translation requests only for target IDs that the complete Luna stage refused or failed. In review, it may selectively rewrite `rewrite` targets and act as the next compact judge for Sol refusals/errors. Each request includes one target and focused relevant context. Never combine failed targets into a new batch prompt.
+
+Native means an actual Codex App collaboration worker. Do not run `codex.exe`, `codex exec`, a second Codex session, or any model-bearing command provider to simulate one. Do not ask the user for external-transfer approval as a workaround. If the CLI reports `E_PROVIDER_MODE_DRIFT` or `E_NATIVE_WORKFLOW_REQUIRED`, stop before opening text-bearing artifacts or constructing a prompt and restore the selected topology.
 
 Subagent data-plane files use the JSON envelopes in [provider-protocol.md](provider-protocol.md). The message returned to the parent is a separate control envelope containing only `target_id`, categorical `status`, optional issue codes, and a private artifact path. Game text, candidates, results, and provider prose reasons remain in the private workspace.
 
@@ -60,6 +64,6 @@ Keep queue and attempt state only under `.game-l10n/` in the private workspace. 
 
 Create tasks with `game-l10n prepare-native-pass --workspace <workspace> --input <ordered-script> --output <private-task-directory>`. Version 2 defaults to 32 IDs and 12,000 estimated private material tokens per fresh worker task; tune them with `--max-records` and `--max-material-tokens`. Identical ordered input and bounds reuse the task manifest instead of rebuilding it. Each manifest declares no inherited history, no worker reuse, and metadata-only parent results. Native workers write exclusive result JSONL shards in the private workspace. Import each result with `game-l10n import-native-shard`; after the Luna barrier, run `game-l10n merge-native-pass` against the ordered source segment file. The merge rejects overlapping IDs, sorts by source order rather than file append order, adds candidate generation/digest metadata, and reports only aggregate completeness to the parent.
 
-This is the recommended deployment, not a core dependency. Native agents, API providers, command adapters, and local models can independently fill the translator, judge, rewriter, and fallback roles described in [provider-neutral review](review-pipeline.md).
+This is the recommended deployment, not a core dependency. Other API, command, compatible, local, and native combinations remain available through an explicitly selected `openai-deepseek` or `custom` workspace. They may not be introduced by mutating a `codex-app-deepseek` workspace.
 
 See also [OpenAI + DeepSeek API preset](fallback-routing.md) and [Codex Work operation](codex-work.md).
