@@ -162,7 +162,15 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **General cause:** The package was rebuilt or edited after verification, the instance branch was treated as an artifact store, release metadata was updated independently, or compatibility was described as “latest” without exact build bindings.
 - **Diagnosis:** Compare the tag, instance/translation-source/SDK commits, checkpoint, release ID, package/manifest/file digests, tracked-file allowlist, compatibility records, release notes, and installer binding checks as one immutable release unit.
 - **Resolution:** Stop distribution, keep the mismatched assets unchanged for diagnosis, rebuild one staged release from the intended clean commit, and request publication approval for the corrected release. Do not silently replace history or broaden compatibility claims.
-- **Prevention:** Follow `docs/instance-release.md`, keep distributable bytes only in GitHub Releases, restrict the branch to its lean allowlist, upload the exact verified bytes, perform one read-only post-upload digest check, enumerate every validated original game build, and preserve the user's README through minimal reviewed edits.
+- **Prevention:** Follow `docs/instance-release.md`, keep distributable bytes only in GitHub Releases, restrict the branch to its lean allowlist, require `game-l10n instance-release-gate` to return `ready` for the exact local commit and asset before any external publication, upload those exact bytes, perform one read-only post-upload digest check, enumerate every validated original game build, and preserve the user's README through minimal reviewed edits.
+
+## Packaging succeeds and the agent skips the instance release contract
+
+- **Symptom:** A valid installer or ZIP is treated as ready to publish; the agent uses a generic GitHub Release workflow, commits the archive to the branch, replaces the existing README, or discovers the checkpoint and lean-branch rules only after a user correction.
+- **General cause:** Package correctness and publication correctness were collapsed into one state, while the instance contract existed only as prose and was read too late.
+- **Diagnosis:** Check whether `parr0t-instance-release.json` exists in the committed lean tree and whether `.game-l10n/instance-release-gate.json` reports `ready` for the current instance commit and exact asset digest. A package-validator pass is not equivalent evidence.
+- **Resolution:** Stop before push/tag/release/upload. Restore the user's README, remove deployable artifacts and unexplained files from the branch, add the canonical checkpoint and release metadata, commit locally, and run the instance release gate. Publish nothing until it passes.
+- **Prevention:** On an explicit instance-publication request, read `docs/instance-release.md` before editing the target repository. Use the dedicated gate rather than a remembered checklist or generic `gh release create` sequence.
 
 ## An agent proposes a repository or release during local work
 
