@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .errors import ConfigurationError, ProviderError, ProviderFailure
+from .provider_policy import validate_provider_policy
 
 _REVIEW_ISSUE_CODES = {
     "meaning",
@@ -543,6 +544,7 @@ class ProviderRegistry:
 
     @classmethod
     def from_config(cls, config: dict[str, Any], project_root: Path) -> "ProviderRegistry":
+        validate_provider_policy(config)
         registry = cls()
         for item in config.get("providers", []):
             kind = item.get("type")

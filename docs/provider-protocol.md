@@ -1,6 +1,8 @@
 # Command provider protocol v1
 
-`type: command` is the integration point for Codex, OpenCode, local models, and internal agent runners. The SDK starts the configured argument array directly with `shell=False`.
+`type: command` is an integration point for explicitly selected `custom` provider workflows, including OpenCode-compatible, local-model, and internal runners. The SDK starts the configured argument array directly with `shell=False`.
+
+It is not a substitute for a native Codex App collaboration worker. A workspace locked to `codex-app-deepseek` rejects every command provider before input or prompt construction. Never wrap `codex.exe`, `codex exec`, a signed-in App session, or a second Codex session to evade that topology. Select `custom` at workspace creation only when the user actually requested a command-provider workflow.
 
 The process receives one UTF-8 JSON object on stdin:
 

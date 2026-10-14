@@ -32,6 +32,7 @@ from .native_pass import import_native_shard, merge_native_pass, prepare_native_
 from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from .privacy import is_within, require_external_workdir
 from .providers import ProviderRegistry
+from .provider_policy import require_direct_provider_pipeline
 from .runtime_approval import create_runtime_approval
 from .steam import build_steam_package, inspect_installed_state, validate_steam_package
 from .tooling import run_cached_tool
@@ -87,6 +88,7 @@ def _load_dataclass_list(path: Path, cls: type) -> list[Any]:
 
 def _orchestrator(work_dir: Path, context_pack: ContextPack) -> LocalizationOrchestrator:
     config = load_config(work_dir)
+    require_direct_provider_pipeline(config, "direct translation/review orchestration")
     sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
     require_external_workdir(work_dir, sdk_root)
     project = ProjectContext(**config["project"])
@@ -145,6 +147,7 @@ def _analyze_context(
     work_dir: Path, segments: list, *, force: bool = False, context_mode: str | None = None
 ) -> tuple[ContextPack, bool]:
     config = load_config(work_dir)
+    require_direct_provider_pipeline(config, "direct context-provider execution")
     routing = config["routing"]
     chain = list(routing.get("context_analyzers") or routing["translators"])
     registry = ProviderRegistry.from_config(config, work_dir)
@@ -279,6 +282,7 @@ def cmd_policy(args: argparse.Namespace) -> int:
 def cmd_translate(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
+    require_direct_provider_pipeline(config, "game-l10n translate")
     require_sdk_selection(config)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     destination = _path_in_workspace(work_dir, args.output)
@@ -323,6 +327,7 @@ def cmd_translate(args: argparse.Namespace) -> int:
 def cmd_review_existing(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
+    require_direct_provider_pipeline(config, "game-l10n review-existing")
     require_sdk_selection(config)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     existing_path = _path_in_workspace(work_dir, args.existing, must_exist=True)
@@ -368,6 +373,7 @@ def cmd_review_existing(args: argparse.Namespace) -> int:
 def cmd_resume_failures(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
+    require_direct_provider_pipeline(config, "game-l10n resume-failures")
     require_sdk_selection(config)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     destination = _path_in_workspace(work_dir, args.output)
@@ -483,7 +489,9 @@ def cmd_record_runtime_coverage(args: argparse.Namespace) -> int:
 
 def cmd_analyze_context(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
-    require_sdk_selection(load_config(work_dir))
+    config = load_config(work_dir)
+    require_direct_provider_pipeline(config, "game-l10n analyze-context")
+    require_sdk_selection(config)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     require_inventory_attestation(work_dir, source)
     context_pack, cached = _analyze_context(
@@ -647,6 +655,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "game_roots": [str(path) for path in game_roots],
                 "missing_game_roots": missing_roots,
                 "repository": visible_policy,
+                "provider_preset": config.get("provider_preset"),
+                "execution_mode": config.get("execution_mode"),
+                "native_workflow": config.get("native_workflow"),
                 "sdk_selection": sdk_selection,
                 "execution": config.get("execution", {}),
                 "runtime": config.get("runtime", {"default_policy": "deny"}),
@@ -832,9 +843,12 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--git-choice", choices=["pending", "enabled", "disabled"], default="pending")
     init.add_argument(
         "--provider-preset",
-        choices=["openai-deepseek", "custom"],
-        default="openai-deepseek",
-        help="Ready-to-run OpenAI/DeepSeek routing or a manually configured provider chain",
+        choices=["openai-deepseek", "codex-app-deepseek", "custom"],
+        default="codex-app-deepseek",
+        help=(
+            "OpenAI/DeepSeek APIs, locked Codex App native workers with DeepSeek fallback, "
+            "or a manually configured provider chain"
+        ),
     )
     init.set_defaults(func=cmd_init)
 
