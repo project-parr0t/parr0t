@@ -16,6 +16,7 @@ from game_l10n.workspace import (
     initialize_workspace,
     load_config,
     prepare_sdk_profile,
+    publish_sdk_profile,
     record_sdk_evaluation,
     record_sdk_selection,
     refresh_sdk_inventory,
@@ -118,6 +119,9 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("Re-evaluate after every user message", generated_agents)
         self.assertIn("give workers only the exact authorized targets and side effects", generated_agents)
         self.assertIn("game-l10n sdk-inventory", generated_agents)
+        self.assertIn("implementation reuse separate from compatibility ownership", generated_agents)
+        self.assertIn("derive-new", generated_agents)
+        self.assertIn("promotion engine/version must equal the target identity", generated_agents)
         self.assertIn("private-new", generated_agents)
         self.assertEqual(config["sdk_selection"]["status"], "pending")
 
@@ -138,7 +142,12 @@ class WorkspaceTests(unittest.TestCase):
             source = work / "game-data" / "asset.bin"
             source.write_bytes(b"private")
             output = work / "inputs" / "unpacked.bin"
-            record_sdk_selection(work, "private-new")
+            record_sdk_selection(
+                work,
+                "private-new",
+                target_engine="fixture-engine",
+                target_version="1.0",
+            )
             command = ["python", "tools/unpack.py", "{input}", "{output}"]
             first = run_cached_tool(
                 stage="unpack", command=command, input_path=source, output_path=output, work_dir=work
@@ -156,7 +165,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertNotIn("publish", json.dumps(manifest).lower())
         self.assertEqual(exported, {"profile.json", "tools/pack.py", "tools/unpack.py"})
 
-    def test_existing_sdk_must_be_evaluated_before_private_new(self) -> None:
+    def test_sdk_selection_separates_reference_reuse_from_branch_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sdk = root / "sdk"
@@ -189,28 +198,97 @@ class WorkspaceTests(unittest.TestCase):
             self.assertIn("docs/fixture-sdk.md", selection["candidates"][0]["public_contract_paths"])
 
             with self.assertRaises(Exception):
-                record_sdk_selection(work, "private-new")
+                record_sdk_selection(
+                    work,
+                    "private-new",
+                    target_engine="fixture",
+                    target_version="2.0",
+                )
             with self.assertRaises(Exception):
                 record_sdk_evaluation(
-                    work, "sdk-fixture-1.0", "partial", "reusable_with_extension"
+                    work,
+                    "sdk-fixture-1.0",
+                    "reference",
+                    "reusable_for_new_identity",
+                    target_engine="fixture",
+                    target_version="2.0",
                 )
+            with self.assertRaises(Exception):
+                record_sdk_evaluation(
+                    work,
+                    "sdk-fixture-1.0",
+                    "partial",
+                    "reusable_with_extension",
+                    ["docs/fixture-sdk.md"],
+                    target_engine="fixture",
+                    target_version="2.0",
+                )
+            record_sdk_evaluation(
+                work,
+                "sdk-fixture-1.0",
+                "reference",
+                "reusable_for_new_identity",
+                ["docs/fixture-sdk.md"],
+                target_engine="fixture",
+                target_version="2.0",
+            )
+            with self.assertRaises(Exception):
+                record_sdk_selection(
+                    work,
+                    "extend",
+                    "sdk-fixture-1.0",
+                    target_engine="fixture",
+                    target_version="2.0",
+                )
+            with self.assertRaises(Exception):
+                record_sdk_selection(
+                    work,
+                    "private-new",
+                    target_engine="fixture",
+                    target_version="2.0",
+                )
+            decision = record_sdk_selection(
+                work,
+                "derive-new",
+                "sdk-fixture-1.0",
+                target_engine="fixture",
+                target_version="2.0",
+            )
+            self.assertEqual(decision["mode"], "derive-new")
+            self.assertEqual(decision["target"]["branch"], "sdk-fixture-2.0")
+            self.assertEqual(require_sdk_selection(load_config(work)), decision)
+            derived_profile = prepare_sdk_profile(
+                work, "fixture", "2.0", user_confirmed_success=True
+            )
+            derived_manifest = json.loads(
+                (derived_profile / "profile.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(derived_manifest["selection_mode"], "derive-new")
+            self.assertEqual(derived_manifest["reference_branch"], "sdk-fixture-1.0")
+
+            refreshed = refresh_sdk_inventory(work)
+            self.assertEqual(refreshed["status"], "pending")
+            self.assertIn("sdk-fixture-1.0", refreshed["evaluations"])
+            self.assertIsNone(refreshed["decision"])
+
             record_sdk_evaluation(
                 work,
                 "sdk-fixture-1.0",
                 "partial",
                 "reusable_with_extension",
                 ["docs/fixture-sdk.md"],
+                target_engine="fixture",
+                target_version="1.0",
             )
-            with self.assertRaises(Exception):
-                record_sdk_selection(work, "private-new")
-            decision = record_sdk_selection(work, "extend", "sdk-fixture-1.0")
-            self.assertEqual(decision["mode"], "extend")
-            self.assertEqual(require_sdk_selection(load_config(work)), decision)
-
-            refreshed = refresh_sdk_inventory(work)
-            self.assertEqual(refreshed["status"], "pending")
-            self.assertIn("sdk-fixture-1.0", refreshed["evaluations"])
-            self.assertIsNone(refreshed["decision"])
+            same_identity = record_sdk_selection(
+                work,
+                "extend",
+                "sdk-fixture-1.0",
+                target_engine="fixture",
+                target_version="1.0",
+            )
+            self.assertEqual(same_identity["mode"], "extend")
+            self.assertEqual(same_identity["target"]["branch"], "sdk-fixture-1.0")
 
     def test_new_sdk_promotion_requires_private_new_selection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -221,11 +299,57 @@ class WorkspaceTests(unittest.TestCase):
             initialize_workspace(work, sdk, git_choice="disabled")
             with self.assertRaises(Exception):
                 prepare_sdk_profile(work, "fixture-engine", "1.0", user_confirmed_success=True)
-            record_sdk_selection(work, "private-new")
+            record_sdk_selection(
+                work,
+                "private-new",
+                target_engine="fixture-engine",
+                target_version="1.0",
+            )
+            with self.assertRaises(Exception):
+                prepare_sdk_profile(
+                    work, "fixture-engine", "2.0", user_confirmed_success=True
+                )
             profile = prepare_sdk_profile(
                 work, "fixture-engine", "1.0", user_confirmed_success=True
             )
-            self.assertTrue((profile / "profile.json").is_file())
+            manifest = json.loads((profile / "profile.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["selection_mode"], "private-new")
+            self.assertIsNone(manifest["reference_branch"])
+
+    def test_publication_rejects_profile_with_changed_target_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            completed = subprocess.run(
+                ["git", "init", "-b", "main"],
+                cwd=sdk,
+                text=True,
+                capture_output=True,
+                shell=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            initialize_workspace(work, sdk, git_choice="enabled")
+            record_sdk_selection(
+                work,
+                "private-new",
+                target_engine="fixture-engine",
+                target_version="1.0",
+            )
+            profile = prepare_sdk_profile(
+                work, "fixture-engine", "1.0", user_confirmed_success=True
+            )
+            profile_path = profile / "profile.json"
+            manifest = json.loads(profile_path.read_text(encoding="utf-8"))
+            manifest["profile"] = "sdk-fixture-engine-2.0"
+            profile_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            update_repository_policy(work, publish_approved=True)
+            with self.assertRaises(Exception):
+                publish_sdk_profile(work, sdk, profile)
 
     def test_tool_output_cannot_overwrite_its_input(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

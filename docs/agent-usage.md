@@ -24,7 +24,7 @@ The external workspace stores extracted content, context packs, translations, ca
 ## Startup contract
 
 1. Read the repository `AGENTS.md`, this guide, and any `AGENTS.md` in the external workspace.
-2. Follow `docs/sdk-selection.md`. Inventory visible local and remote-tracking SDK branches, inspect plausible public contracts, record categorical evaluations, and select reuse, extension, or a private new adapter before writing format tooling. Reuse is the default and a partial match must be extended rather than duplicated.
+2. Follow `docs/sdk-selection.md`. First derive the target engine/version compatibility identity from the inspected runtime. Inventory visible local and remote-tracking SDK branches, inspect plausible public contracts, and bind every evaluation and selection to that target. Reuse or extend only the exact target branch. When a different identity contains reusable implementation, record it as a reference and select `derive-new`; use `private-new` only when no candidate is reusable even as a reference.
 3. Confirm that the source root is readable and the external workspace is writable.
 4. Ask once at the beginning whether Git may be used for this job. Record the answer; do not infer consent.
 5. Initialize or resume the external workspace and inspect `game-l10n status` before performing work.
@@ -106,8 +106,8 @@ python -m pip install -e .
 game-l10n init-workspace <external-workspace> --sdk-root <repository> --game-root <source-root>
 game-l10n status --workspace <external-workspace>
 game-l10n sdk-inventory --workspace <external-workspace> --refresh-remote
-game-l10n sdk-evaluate --workspace <external-workspace> --branch <sdk-branch> --result <compatible|partial|incompatible> --reason <reason-code> --evidence-path <public-contract-path>
-game-l10n sdk-select --workspace <external-workspace> --mode <reuse|extend|private-new> [--branch <sdk-branch>]
+game-l10n sdk-evaluate --workspace <external-workspace> --target-engine <engine> --target-version <version-line> --branch <sdk-branch> --result <compatible|partial|reference|incompatible> --reason <reason-code> --evidence-path <public-contract-path>
+game-l10n sdk-select --workspace <external-workspace> --target-engine <engine> --target-version <version-line> --mode <reuse|extend|derive-new|private-new> [--branch <sdk-branch>]
 ```
 
 These commands are execution boundaries for the agent, not an end-user workflow.

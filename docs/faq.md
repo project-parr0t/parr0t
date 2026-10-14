@@ -23,8 +23,16 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Symptom:** The first session starts writing a new unpacker or patcher without inspecting an existing `sdk-*` implementation, producing duplicate code and avoidable validation work.
 - **General cause:** Branch discovery was advisory, only the current checkout was inspected, or a branch name was treated as the complete compatibility test.
 - **Diagnosis:** Inspect the external workspace's SDK inventory, per-candidate commit-bound evaluations, and selected mode. A missing decision or an unevaluated plausible branch means implementation started too early.
-- **Resolution:** Stop the duplicate implementation, refresh visible local and remote-tracking refs, inspect each plausible public contract, and record `reuse` or `extend` when possible. Select `private-new` only after every candidate is categorically incompatible.
+- **Resolution:** Stop the duplicate implementation, refresh visible local and remote-tracking refs, inspect each plausible public contract, and record same-identity `reuse` or `extend` when possible. Record useful different-identity code as `reference` and select `derive-new`. Select `private-new` only after every candidate is categorically incompatible and none is a reusable reference.
 - **Prevention:** Keep the `docs/sdk-selection.md` gate before extraction and let the CLI block data-plane stages and SDK promotion until a current decision exists.
+
+## Reusable SDK code is assigned to the wrong engine-version branch
+
+- **Symptom:** A capability verified on one engine/version line is prepared for an older, newer, or otherwise different `sdk-*` branch merely because that branch supplied reusable code.
+- **General cause:** Implementation reuse and compatibility ownership were treated as one decision. A reference implementation was mistaken for evidence that its branch should own the target runtime.
+- **Diagnosis:** Compare the inspected runtime's target engine/version, the target recorded by `sdk-evaluate` and `sdk-select`, the selected mode, and the proposed promotion branch. A differing identity may be a `reference`, but it cannot be `compatible` or `partial` for the target.
+- **Resolution:** Use `reuse` or `extend` only for the exact target identity. For useful code from another identity, record `reference`, select `derive-new`, create the target branch from `main`, and port only the neutral capability verified on the target line. Never merge the reference SDK branch wholesale.
+- **Prevention:** Require explicit target engine/version arguments at evaluation and selection time, reject identity-mismatched extension, and verify that promotion matches the recorded target before exporting or publishing.
 
 ## A model refuses fictional game localization
 

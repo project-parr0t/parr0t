@@ -72,6 +72,25 @@ Do not declare an ordinary new mod file as a replacement, synthesize an original
 
 Executable wrappers additionally follow `docs/wrapper-executable.md`. They use approved architecture-specific wrapper bytes and the adjacent `<name>.parr0t-original.exe` convention; per-game ad hoc binaries and `.lnk` substitutions are not accepted.
 
+## Supported source-build bindings
+
+A package may bind installation compatibility to a small set of original game files without fingerprinting the whole game. Each optional `steam.source_bindings` entry contains a safe relative `path`, original byte count, lowercase SHA-256 digest, and an `error_code` that references the package's registered `E_CUSTOM_*` compatibility error:
+
+```json
+{
+  "path": "fixture-launcher.exe",
+  "bytes": 18,
+  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "error_code": "E_CUSTOM_FIXTURE_BINDING"
+}
+```
+
+Before first installation, the installer checks the current game file. During update and Verify, a binding whose path is in `replace_files` checks the first-install original backup recorded in the receipt; every other binding checks the current game file. `Assert-OwnedState` runs first, so a missing or changed original backup remains the core `PARR0T-E012` failure rather than being disguised as an unsupported build. All binding checks finish before confirmation and before mutation begins.
+
+Source bindings and installed-payload hashes have separate meanings. A source binding establishes that the unpatched source build is supported. Manifest `files` and the receipt establish that packaged and installed patch bytes are intact. A source-bound path may overlap the payload only when it is also an explicitly declared original replacement.
+
+`Test-GameRoot` uses binding paths only as presence markers; it never hashes them during Steam discovery. Digest validation happens immediately before Install/Update and during Verify. `source_bindings` remains optional in `parr0t.steam.patch/v4`; a missing field is semantically an empty list so existing v4 packages remain valid.
+
 ## Core result codes
 
 Core codes and meanings are fixed by `parr0t.windows-installer/v2`:

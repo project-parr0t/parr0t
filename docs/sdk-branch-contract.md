@@ -4,6 +4,8 @@ The `main` branch is the engine-neutral control framework. It owns typed narrati
 
 An `sdk-<engine>-<version>` branch is a concrete data-plane implementation. It inherits `main` and adds only the public engine contract needed to discover text, unpack data, apply a validated translation manifest, repack a patch, and verify the rebuilt output.
 
+The branch name is a compatibility claim, not a statement of code ancestry. `<version>` identifies the public engine/runtime compatibility line actually exercised and validated. Code taken from or inspired by another SDK branch does not authorize publishing the capability under that reference branch's version.
+
 ## Dependency direction
 
 The allowed dependency direction is:
@@ -41,19 +43,31 @@ An engine SDK branch owns:
 
 ## Selection before implementation
 
-The agent must complete `docs/sdk-selection.md` before it writes provisional format tooling. A compatible SDK branch is reused directly. A partial match is extended with the smallest missing capability. A new private adapter is allowed only after every inventoried candidate is evaluated as incompatible. Neither the current checkout nor the absence of a local branch is evidence that no reusable SDK exists.
+The agent must complete `docs/sdk-selection.md` before it writes provisional format tooling. A compatible SDK branch with the same engine/version identity is reused directly. A partial same-identity match is extended with the smallest missing capability. A different identity with reusable implementation is recorded as a reference and selected through `derive-new`; it is not extended. A new private adapter without a reference is allowed only after every inventoried candidate is evaluated as incompatible. Neither the current checkout nor the absence of a local branch is evidence that no reusable SDK exists.
 
-The decision is bound to candidate commits in the external workspace. It must be refreshed when refs change. This state is job control metadata and must never be promoted into an SDK branch.
+The decision is bound to candidate commits and an explicit target engine/version identity in the external workspace. It must be refreshed when refs or that identity change. This state is job control metadata and must never be promoted into an SDK branch.
+
+## Promotion ownership
+
+Promotion exports only behavior actually used and verified after the user confirms success. Its destination is determined by the recorded target identity, never by the checkout that supplied reference code:
+
+- `reuse` publishes nothing new.
+- `extend` may add the verified delta only to the same-identity selected branch.
+- `derive-new` creates `sdk-<target-engine>-<target-version>` from `main` and ports only the verified, provenance-free implementation needed for that target. The reference branch remains unchanged and must not be merged wholesale.
+- `private-new` creates the recorded target branch from `main` without pretending that an incompatible branch owns the new support.
+
+An exact engine build observed in a private workspace may be reduced to its declared public compatibility line for the branch name, but the line must be derived from that observed build before evaluation begins. After it is recorded, the exact `sdk-<engine>-<version>` identity controls ownership; an older, newer, or merely similar branch cannot absorb the result.
 
 ## Branch acceptance gate
 
 Before an engine SDK branch is published:
 
 1. Merge or rebase the intended `main` revision.
-2. Confirm the diff from `main` contains only that engine adapter and its neutral support files.
-3. Run the core test suite, the adapter test suite, and the privacy scan.
-4. Confirm no private game data, names, paths, text, hashes, counts, logs, or run history appears in the tree or branch-only commits.
-5. Keep engine-only FAQ entries on the engine branch. Keep only framework-generic FAQ entries on `main`.
-6. Call the core runtime approval guard immediately before any real installation write or process launch. Do not add an unguarded direct execution path in an SDK branch.
+2. Confirm the branch name equals the recorded promotion target and that every promoted capability was exercised on that target compatibility line.
+3. Confirm the diff from `main` contains only that engine adapter and its neutral support files. For `derive-new`, inspect the diff rather than merging the reference branch.
+4. Run the core test suite, the adapter test suite, and the privacy scan.
+5. Confirm no private game data, names, paths, text, hashes, counts, logs, or run history appears in the tree or branch-only commits.
+6. Keep engine-only FAQ entries on the engine branch. Keep only framework-generic FAQ entries on `main`.
+7. Call the core runtime approval guard immediately before any real installation write or process launch. Do not add an unguarded direct execution path in an SDK branch.
 
 The framework may be installed without an engine adapter, but it cannot unpack or patch an engine by itself. Once an engine SDK branch supplies its adapter, the same central context, translation, fallback, review, and source-preservation flow becomes executable without duplicating orchestration logic.

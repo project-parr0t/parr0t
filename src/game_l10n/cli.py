@@ -259,7 +259,10 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"Initialized private agent workspace: {Path(args.workspace).resolve()}")
     if args.git_choice == "pending":
         print("ACTION_REQUIRED: ask the user whether Git use is allowed, then run `game-l10n policy`.")
-    print("ACTION_REQUIRED: evaluate the inventoried SDK branches and record sdk-select before extraction.")
+    print(
+        "ACTION_REQUIRED: record the target engine/version identity, evaluate the inventoried SDK "
+        "branches against it, and run sdk-select before extraction."
+    )
     return 0
 
 
@@ -605,7 +608,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         if not sdk_selection.get("inventory_fingerprint"):
             actions.append("inventory_sdk_branches")
         else:
-            actions.append("evaluate_and_select_sdk_branch")
+            actions.append("record_target_identity_evaluate_and_select_sdk")
     else:
         if not any((work_dir / "inputs").glob("*")):
             actions.append("unpack_and_extract_ordered_script")
@@ -673,6 +676,8 @@ def cmd_sdk_evaluate(args: argparse.Namespace) -> int:
         args.result,
         args.reason,
         args.evidence_path,
+        target_engine=args.target_engine,
+        target_version=args.target_version,
     )
     print(json.dumps({"branch": args.branch, **evaluation}, ensure_ascii=False))
     return 0
@@ -680,7 +685,11 @@ def cmd_sdk_evaluate(args: argparse.Namespace) -> int:
 
 def cmd_sdk_select(args: argparse.Namespace) -> int:
     decision = record_sdk_selection(
-        Path(args.workspace).resolve(), args.mode, branch=args.branch
+        Path(args.workspace).resolve(),
+        args.mode,
+        branch=args.branch,
+        target_engine=args.target_engine,
+        target_version=args.target_version,
     )
     print(json.dumps(decision, ensure_ascii=False))
     return 0
@@ -1006,14 +1015,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sdk_evaluate.add_argument("--workspace", required=True)
     sdk_evaluate.add_argument("--branch", required=True)
+    sdk_evaluate.add_argument("--target-engine", required=True)
     sdk_evaluate.add_argument(
-        "--result", choices=["compatible", "partial", "incompatible"], required=True
+        "--target-version",
+        required=True,
+        help="Target SDK compatibility line used in sdk-<engine>-<version>",
+    )
+    sdk_evaluate.add_argument(
+        "--result",
+        choices=["compatible", "partial", "reference", "incompatible"],
+        required=True,
     )
     sdk_evaluate.add_argument(
         "--reason",
         choices=[
             "public_contract_match",
             "reusable_with_extension",
+            "reusable_for_new_identity",
             "engine_mismatch",
             "format_mismatch",
             "version_incompatible",
@@ -1032,11 +1050,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     sdk_select = sub.add_parser(
         "sdk-select",
-        help="Select reuse, extension, or a private new adapter after SDK evaluation",
+        help="Select reuse, extension, derived new identity, or a private new adapter after evaluation",
     )
     sdk_select.add_argument("--workspace", required=True)
-    sdk_select.add_argument("--mode", choices=["reuse", "extend", "private-new"], required=True)
+    sdk_select.add_argument(
+        "--mode", choices=["reuse", "extend", "derive-new", "private-new"], required=True
+    )
     sdk_select.add_argument("--branch")
+    sdk_select.add_argument("--target-engine", required=True)
+    sdk_select.add_argument(
+        "--target-version",
+        required=True,
+        help="Target SDK compatibility line used in sdk-<engine>-<version>",
+    )
     sdk_select.set_defaults(func=cmd_sdk_select)
 
     status = sub.add_parser("status", help="Report the next safe action for a Codex orchestrator")
