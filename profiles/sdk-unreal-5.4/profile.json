@@ -1,0 +1,70 @@
+{
+  "profile": "sdk-unreal-5.4",
+  "engine": "unreal",
+  "version": "5.4",
+  "selection_mode": "private-new",
+  "reference_branch": null,
+  "contains_game_data": false,
+  "files": [
+    {
+      "path": "pack.py",
+      "bytes": 5806,
+      "sha256": "151324415e966ab9b7ff58d8f4003d5fd3af44892329f6e90e14d85c836d2889"
+    },
+    {
+      "path": "README.md",
+      "bytes": 1667,
+      "sha256": "e61a151c8d7962e71d2319c65e993e40571dc78b9c9ab6402262715b15988a15"
+    },
+    {
+      "path": "selftest.py",
+      "bytes": 1751,
+      "sha256": "42a80f56cb3e41088b996f6d9966c6259ad7beb73937da4afa3c3d24c9df7bb4"
+    },
+    {
+      "path": "unpack.py",
+      "bytes": 4256,
+      "sha256": "b9a34ea06349f88e59eac2b539c50791d4a0f5824fff40f07c76416f92399d85"
+    },
+    {
+      "path": "unreal_profile.py",
+      "bytes": 11605,
+      "sha256": "eb3cdd46b32a9b13da113114174692e36f101843fe64786a19f523061c7c4d1e"
+    },
+    {
+      "path": "vendor/pylocres/__init__.py",
+      "bytes": 125,
+      "sha256": "bc983814e6d2cb85161d828fb53aced926df85b1ff1c5111cd37a493028ee945"
+    },
+    {
+      "path": "vendor/pylocres/city_hash.py",
+      "bytes": 9831,
+      "sha256": "708c6b5ebc34a5b04bbc7730c8a51a6e395746b2823a832f55dc2b077b6aaab4"
+    },
+    {
+      "path": "vendor/pylocres/crc_hash.py",
+      "bytes": 3645,
+      "sha256": "ec0a2ec07bb11aaca9292cd6428513723f5d63ae2c965f7f09f4c9b08f49aa2a"
+    },
+    {
+      "path": "vendor/pylocres/file_io.py",
+      "bytes": 13816,
+      "sha256": "805eb9171a2ab982802b68f91b0442bb59932d9ac005ab3dd56df163b1da0183"
+    },
+    {
+      "path": "vendor/pylocres/LICENSE.md",
+      "bytes": 1066,
+      "sha256": "7ea755630d21dbd7e450bf5a630d213ce31bac5d809ba8a1187ffd9ea48cccad"
+    },
+    {
+      "path": "vendor/pylocres/locmeta.py",
+      "bytes": 2177,
+      "sha256": "2f25e8fd7616ba129c171192420185d112c9df7b773008581e3244266c785d85"
+    },
+    {
+      "path": "vendor/pylocres/locres.py",
+      "bytes": 8955,
+      "sha256": "547732c619e5e1fe3807d767df3dffc6145a729276342c700945641f33b67932"
+    }
+  ]
+}
