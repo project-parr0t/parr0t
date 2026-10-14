@@ -79,7 +79,7 @@ Configure providers by role rather than by company name:
 - selective rewriter;
 - fallback judge.
 
-The recommended hybrid uses native Codex workers for primary translation and compact judgment, with an independent API for refused translations, selective rewriting, and review fallback. It is only a preset. Native-only, API-only, command, compatible, and local providers may fill the same roles.
+The recommended `codex-app-deepseek` hybrid uses native Codex collaboration workers for primary translation and compact judgment, with DeepSeek limited to refused translations, selective rewriting, and review fallback after the corresponding primary barriers. Supplying a key never changes the selected mode or role map. Native-only, API-only, command, compatible, and local combinations remain available through another preset selected at workspace creation; they cannot be injected into the locked App preset.
 
 Provider refusal is a routing event, not a semantic verdict. Return a categorical status to the parent and keep provider prose inside the private data plane. The top-level orchestrator must not receive source text, candidate text, translated text, or prose refusal explanations.
 
