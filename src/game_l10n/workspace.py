@@ -9,10 +9,23 @@ from typing import Any
 
 from .errors import ConfigurationError
 from .privacy import require_external_workdir, scan_tools
+from .provider_policy import (
+    CODEX_APP_EXTERNAL_ROLES,
+    CODEX_APP_EXECUTION_MODE,
+    CODEX_APP_PRESET,
+    MODE_LOCK_PATH,
+    provider_mode_lock,
+    validate_provider_policy,
+)
 
 
 CONFIG_TEMPLATE: dict[str, Any] = {
     "provider_preset": "openai-deepseek",
+    "execution_mode": "api",
+    "provider_policy": {
+        "selected_preset": "openai-deepseek",
+        "key_presence_selects_mode": False,
+    },
     "project": {
         "game_title": "CHANGE_ME",
         "source_language": "ja",
@@ -125,6 +138,13 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "selective_user_corrections": True,
         "locale_fallback": "best_effort_declared",
     },
+    "instance_release": {
+        "dormant_until_user_publication_command": True,
+        "package_validation_is_not_release_readiness": True,
+        "gate_required_before_external_publication": True,
+        "metadata_file": "parr0t-instance-release.json",
+        "asset_location": "github_release_only",
+    },
     "runtime": {
         "default_policy": "deny",
         "approval_ttl_minutes": 30,
@@ -151,9 +171,9 @@ This directory contains private game data and translation artifacts. It is inten
 9. Keep promoted SDK content provenance-free. Never transfer real game/project names, filenames, asset paths, map/event identifiers, dialogue, translations, project-specific exclusions, job metadata, tool paths, counts, hashes, reports, or execution history. Use only public engine-format identifiers and unmistakably synthetic fixtures.
 10. Follow the repository `docs/engine-faq-contract.md`. Classify each material engine problem as `automated_fix`, `engine_runbook`, `private_only`, or `unresolved`. Fix deterministic conditions in SDK code and regression tests. Add an engine runbook entry only when safe continuation requires external tooling, user material, runtime evidence, authorization, or a decision the SDK cannot infer; keep title-specific incidents private and unresolved causes in the failure queue. Entry count is not a goal.
 11. Treat translation as a faithful transformation of existing user-provided text, never as new scene generation, continuation, roleplay, or endorsement. Analyze the complete ordered inventory first, using `auto`, `narrative`, `functional`, `knowledge`, or `hybrid` context; give each target only the relevant typed evidence. Do not censor, soften, intensify, or invent content. A native worker may receive an exclusive ID shard to reduce startup overhead, but it must load and finalize one target at a time. A refusal applies only to the individual target segment and must never cancel unrelated segments.
-12. Follow the configured role chains, not hard-coded provider identities. Finish the complete primary translation pass before translation fallback. Review with compact judges; invoke configured rewriters only for `rewrite` verdicts; confirm corrected candidates; and send only refused/failed judge targets to the next judge. With the recommended OpenAI/DeepSeek preset these roles map to Luna translation, Sol compact judging, and selective DeepSeek/Sol correction, but API, native App, command, local, and compatible providers may be substituted independently. If every permitted route fails, emit the unchanged source with `source_preserved`; never silently claim it was reviewed.
-13. Selecting a provider preset and supplying its API-key environment variables authorizes its automatic context, translation, review, and fallback calls. Do not pause for another per-segment API or cost approval. Keep configured game roots read-only; create translated data, rebuilt archives, and installable patches only under this workspace. Never overwrite an installed or source game in place.
-14. Distinguish API providers from native Codex App workers. In the recommended App + DeepSeek mode, use native GPT-6 Luna translator subagents and a separate native GPT-6.1 Sol compact judge; use only `DEEPSEEK_API_KEY` for configured translation fallback, selective rewriting, and judge fallback. This is not a core dependency: API, command, compatible, local, and other native providers may fill each role. The top-level agent remains orchestration-only and follows `docs/codex-app-deepseek.md`.
+12. Follow the configured role chains, not hard-coded provider identities. Finish the complete primary translation pass before translation fallback. Review with compact judges; invoke configured rewriters only for `rewrite` verdicts; confirm corrected candidates; and send only refused/failed judge targets to the next judge. Provider-neutral substitution is allowed only when the user explicitly selected `custom`; never turn a locked preset into `custom` as a workaround. If every permitted route fails, emit the unchanged source with `source_preserved`; never silently claim it was reviewed.
+13. A selected provider preset authorizes only the providers and stage roles declared by that preset. API-key presence never selects a mode, expands a role, promotes fallback to primary, or authorizes a different external service. Once an authorized fallback stage becomes eligible, do not pause for another per-segment approval. Keep configured game roots read-only; create translated data, rebuilt archives, and installable patches only under this workspace. Never overwrite an installed or source game in place.
+14. Distinguish API providers from native Codex App workers. In `codex-app-deepseek`, use native GPT-6 Luna translator subagents and a separate native GPT-6.1 Sol compact judge; `DEEPSEEK_API_KEY` unlocks only post-barrier translation fallback, selective rewriting, and judge fallback. Never run `codex.exe`, `codex exec`, a second Codex session, or a command provider to imitate a native worker, and never request external-transfer approval as a workaround. Other provider combinations remain available only through a user-selected preset such as `openai-deepseek` or `custom`. The top-level agent remains orchestration-only and follows `docs/codex-app-deepseek.md`.
 15. Keep a strict data-plane/control-plane boundary. The top-level agent may receive target IDs, categorical status/error codes, counts, queue transitions, artifact paths, and deterministic issue codes only. It must not open dialogue/input/result files or receive source, candidate, translated text, or provider prose refusal explanations. Workers read and write private workspace files and return metadata-only envelopes.
 16. A translation or review refusal is a routing event, not a content judgment and not grounds to omit a target or cancel patch creation. Normalize explanations before returning metadata to the parent. Use the configured faithful-transformation prompt and supported deterministic low-creativity settings for DeepSeek; never claim or attempt to disable provider safeguards.
 17. The checked-out `main` branch is an engine-neutral control framework. Engine-specific discovery, unpack, apply, pack, verification, `docs/engine-faq.md`, ignore rules, and fixtures must come from the selected `sdk-<engine>-<version>` branch and must never be copied back into `main`. Inspect only matching runbook triggers when the SDK protocol reaches a condition it cannot resolve.
@@ -163,7 +183,7 @@ This directory contains private game data and translation artifacts. It is inten
 21. Building, fixing, packing, or validating a patch does not authorize installing, updating, removing, or launching it. Access to a game folder is read-only discovery permission only. Do not infer runtime permission from a request to inspect logs, test a build, or confirm execution data.
 22. Default to handing the recoverable artifact to the user for execution. If the user explicitly asks the agent to act on a real installation, record a separate short-lived one-shot approval for exactly one of `install`, `update`, `remove`, or `launch`. Bind it to the current artifact digest, exact configured game root, and—only for launch—the exact executable. A changed artifact, target, executable, action, expiry, or consumed approval must stop the operation.
 23. Installation approval never authorizes launch, and launch approval never authorizes installation, update, removal, cleanup, log deletion, save modification, or another launch. Consume the matching approval immediately before the external effect. Automated lifecycle tests use temporary synthetic targets; only isolated repository tests may create synthetic approval fixtures for those targets.
-24. The public per-game instance workflow is dormant until the user first explicitly commands publication. Before that command, do not mention, propose, ask about, preview, or prepare a publication repository, commit/push, tag, GitHub Release, release gate, or upload. Once activated, follow the repository `docs/instance-release.md`, target the player's execution environment, default to Windows unless another platform is named, and derive architecture and prerequisites from the supported game build. Keep deployable archives, installers, generated payloads, game data, copied SDKs, and duplicate translation exports out of the instance branch; publish verified distributable bytes only as GitHub Release assets. The branch normally contains only the preserved README/legal notices, canonical checkpoint plus small release metadata, and strictly necessary minimal title/engine build glue. When a translation source repository, current read-only game folder, and instance/checkpoint repository are supplied together, validate and use each for its separate role before any model call. Build once from clean referenced commits and upload the exact verified bytes; bind the instance, translation-source, and SDK commits, tag, release ID, package/manifest/file hashes, and embedded versions as one release unit. Record every supported original game version/build and make the README, release notes, manifest, asset name, and installer checks agree. Preserve the user's existing README with minimal reviewed edits. Use the visible title `<Game Display Name> Patch <Patch Version> (Game Version <Game Version>)`, or the exact enumerated `Game Versions` form.
+24. The public per-game instance workflow is dormant until the user first explicitly commands publication. Before that command, do not mention, propose, ask about, preview, or prepare a publication repository, commit/push, tag, GitHub Release, release gate, or upload. Once activated, follow the repository `docs/instance-release.md`, target the player's execution environment, default to Windows unless another platform is named, and derive architecture and prerequisites from the supported game build. Keep deployable archives, installers, generated payloads, game data, copied SDKs, and duplicate translation exports out of the instance branch; publish verified distributable bytes only as GitHub Release assets. The branch normally contains only the preserved README/legal notices, canonical checkpoint plus `parr0t-instance-release.json`, and strictly necessary minimal title/engine build glue. When a translation source repository, current read-only game folder, and instance/checkpoint repository are supplied together, validate and use each for its separate role before any model call. Build once from clean referenced commits and upload the exact verified bytes; bind the instance, translation-source, and SDK commits, tag, release ID, package/manifest/file hashes, and embedded versions as one release unit. Record every supported original game version/build and make the README, release notes, manifest, asset name, and installer checks agree. Preserve the user's existing README with minimal reviewed edits. Use the visible title `<Game Display Name> Patch <Patch Version> (Game Version <Game Version>)`, or the exact enumerated `Game Versions` form. A validated package is not publication readiness: after committing the lean tree locally and before any push, tag, `gh release create`, or upload, run `game-l10n instance-release-gate` and require `ready` for the exact commit and exact external asset. Never replace it with a generic GitHub Release workflow or repair the contract only after publication.
 25. Player-facing Windows installers follow the repository `docs/installer-contract.md`, not this agent harness. Keep the fixed ZIP layout and the public Install, Restore, and Verify installed-state operations. Use `<game-root>/parr0t-patch-status.txt` as the first patch-ID authority and the matching receipt for owned files. Explicitly declare any original file that must be replaced; preserve it once, verify and reuse that backup on update, and put it back on Restore. Core result codes are fixed; SDK/title-specific failures use a separate `PARR0T-<SCOPE>-E###` registry. Never copy `AGENTS.md`, approval JSON, prompts, task state, logs, or workspace policy into a distribution. An interactive player's menu choice plus final confirmation needs no agent approval; noninteractive mutation still does.
 26. For Steam discovery or integration, follow the repository `docs/steam-faq.md` and `docs/wrapper-executable.md`. Use exact App ID metadata and binding checks and ask when the validated game root is ambiguous. Never read or edit `localconfig.vdf`, Steam launch options, or per-account client configuration, and never require, close, kill, or restart Steam. Integrate the Steam Play button only with exact approved, reproducible, signature/hash-verified Parr0t wrapper bytes for the target architecture at explicitly declared main-executable paths; preserve each real original through `replace_files` and do not use `.lnk` or an ad hoc game-workspace binary. Require the target game to be closed for locked replacements; close only the validated game process after separate player confirmation.
 27. The control plane must proactively use the repository `skills/request-scope-guard/SKILL.md` whenever the user limits or narrows scope, asks for read-only inspection/diagnosis, or a contemplated action is optional, unrequested, destructive, or externally consequential. Prefer a discovered `$request-scope-guard`; otherwise read and apply the bundled file directly. Re-evaluate after every user message and give workers only the exact authorized targets and side effects. No worker may infer permission to expand scope, clean up data, commit/push, publish, deploy, install, launch, or contact an external system.
@@ -175,6 +195,7 @@ This directory contains private game data and translation artifacts. It is inten
 33. Follow the repository `docs/segment-metadata.md` for UI composition. When the selected SDK can prove the call-site structure, emit `ui_slot_role`, semantic state, related IDs, render pattern, fixed target affixes, and hard limits. Translate and review only the slot payload; never duplicate surrounding labels or confuse a semantic enabled/disabled state with a literal source token. Before assuming an installed patch is a new game build or repeating broad extraction, run the read-only `game-l10n inspect-installed-state --workspace <this-directory> --target <configured-game-root>`. Treat `possible_game_update` as an advisory receipt-owned-file mismatch, not proof of cause, and stop before mutation if preserved original backups are damaged.
 34. When the user supplies or approves exact replacement wording for a typo or small fix, follow `docs/minimal-corrections.md` and run `game-l10n apply-user-correction` against the matching verified inventory and release checkpoint; reuse the full result artifact when available, or materialize released candidates from the checkpoint. Keep the correction in the current agent with zero model/context calls, preserve every unnamed result, repack only the owning payload once, and verify the package once. Do not delegate, reopen discovery, inspect or hash the whole game, re-review unchanged targets, or create one-off correction scripts. A reverse dependency or ambiguous mapping expands only to the specifically affected IDs.
 35. Native bulk translation and review use `prepare-native-pass` v2. Run every task in a fresh native worker with no parent conversation history (`fork_turns="none"` or the host equivalent), one task per worker, no follow-up task reuse, and a metadata-only final envelope. Pass only workspace/contract/source/context/task artifact paths in the startup message; never paste source, candidate, inventory, code, or tool output into the conversation. Keep the default 32-ID and 12,000 estimated-material-token task bounds unless a smaller bound is needed. Normalize null speaker, scene, previous, and next values to empty strings before prompting.
+36. Treat `.game-l10n/provider-mode.json` as the immutable execution-mode contract. Do not edit, replace, delete, or recreate it to make a different provider path pass. If `game-l10n` reports `E_PROVIDER_MODE_DRIFT` or `E_NATIVE_WORKFLOW_REQUIRED`, stop before reading source text or constructing a prompt and restore the selected mode; do not build a job-local bridge around the guard.
 
 ## Data boundary
 
@@ -571,17 +592,59 @@ def initialize_workspace(
     *,
     git_choice: str = "pending",
     game_roots: list[Path] | None = None,
-    provider_preset: str = "openai-deepseek",
+    provider_preset: str = CODEX_APP_PRESET,
 ) -> None:
     work_dir = work_dir.resolve()
     sdk_root = sdk_root.resolve()
     require_external_workdir(work_dir, sdk_root)
     work_dir.mkdir(parents=True, exist_ok=True)
     config = json.loads(json.dumps(CONFIG_TEMPLATE))
-    if provider_preset not in {"openai-deepseek", "custom"}:
-        raise ConfigurationError("provider_preset must be openai-deepseek or custom")
+    if provider_preset not in {"openai-deepseek", CODEX_APP_PRESET, "custom"}:
+        raise ConfigurationError(
+            "provider_preset must be openai-deepseek, codex-app-deepseek, or custom"
+        )
     config["provider_preset"] = provider_preset
-    if provider_preset == "custom":
+    config["provider_policy"] = {
+        "selected_preset": provider_preset,
+        "key_presence_selects_mode": False,
+    }
+    if provider_preset == CODEX_APP_PRESET:
+        config["execution_mode"] = CODEX_APP_EXECUTION_MODE
+        deepseek = next(
+            item for item in config["providers"] if item["name"] == "deepseek"
+        )
+        deepseek["allowed_roles"] = sorted(CODEX_APP_EXTERNAL_ROLES)
+        config["providers"] = [deepseek]
+        config["native_workflow"] = {
+            "required": True,
+            "launcher": "collaboration",
+            "child_model_cli_allowed": False,
+            "external_provider_primary_allowed": False,
+            "external_provider_roles": sorted(CODEX_APP_EXTERNAL_ROLES),
+        }
+        config["routing"] = {
+            "context_analyzers": ["native-sol"],
+            "translators": ["native-luna", "deepseek"],
+            "reviewers": ["native-sol", "deepseek"],
+            "rewriters": ["deepseek"],
+            "require_review": True,
+            "review_max_rounds": 2,
+            "max_workers": 8,
+            "retry_refusals_once": False,
+            "grace_retries": 3,
+            "grace_retry_codes": [
+                "malformed_response",
+                "provider_error",
+                "rate_limited",
+                "timeout",
+                "integrity_invalid",
+            ],
+            "defer_fallbacks_until_primary_complete": True,
+            "preserve_source_on_failure": True,
+            "review_refusal_policy": "fallback",
+        }
+    elif provider_preset == "custom":
+        config["execution_mode"] = "custom_provider"
         config["providers"] = [
             {
                 "name": "translator-primary",
@@ -610,6 +673,8 @@ def initialize_workspace(
             "preserve_source_on_failure": False,
             "review_refusal_policy": "fallback",
         }
+    else:
+        config["execution_mode"] = "api"
     config["sdk_root"] = str(sdk_root)
     config["game_roots"] = [str(path.resolve()) for path in (game_roots or [])]
     config["repository"]["initial_choice"] = git_choice
@@ -622,8 +687,12 @@ def initialize_workspace(
         "evaluations": {},
         "decision": None,
     }
+    validate_provider_policy(config)
     files = {
         "game-l10n.json": json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        MODE_LOCK_PATH: json.dumps(
+            provider_mode_lock(config), ensure_ascii=False, indent=2
+        ) + "\n",
         "AGENTS.md": AGENTS_TEXT,
         ".gitignore": GITIGNORE_TEXT,
         "context/glossary.json": "[]\n",
@@ -645,7 +714,19 @@ def load_config(work_dir: Path) -> dict[str, Any]:
     path = work_dir / "game-l10n.json"
     if not path.is_file():
         raise ConfigurationError(f"Workspace config not found: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
+    config = json.loads(path.read_text(encoding="utf-8"))
+    lock_path = work_dir / MODE_LOCK_PATH
+    mode_lock = (
+        json.loads(lock_path.read_text(encoding="utf-8"))
+        if lock_path.is_file()
+        else None
+    )
+    validate_provider_policy(
+        config,
+        mode_lock=mode_lock,
+        require_mode_lock=config.get("provider_preset") == CODEX_APP_PRESET,
+    )
+    return config
 
 
 def update_repository_policy(work_dir: Path, *, initial_choice: str | None = None, publish_approved: bool | None = None) -> None:
