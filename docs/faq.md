@@ -1,6 +1,8 @@
 # FAQ
 
-This FAQ contains only provenance-free issues that can recur across independent SDK or engine integrations. It must not identify any localization job, game, source file, asset, dialogue, translation, workspace, model, or execution result.
+This file contains provenance-free troubleshooting for the engine-neutral Parr0t framework. It must not identify any localization job, game, source file, asset, dialogue, translation, workspace, model, or execution result.
+
+Engine branches do not append implementation bugs or ordinary engine questions here. Under `docs/engine-faq-contract.md`, they keep only SDK-external manual exception procedures in their branch-local `docs/engine-faq.md`. A condition the SDK can resolve deterministically belongs in code and regression tests instead.
 
 ## A private repository returns 404 even though it exists
 

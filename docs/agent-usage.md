@@ -24,7 +24,7 @@ The external workspace stores extracted content, context packs, translations, ca
 ## Startup contract
 
 1. Read the repository `AGENTS.md`, this guide, and any `AGENTS.md` in the external workspace.
-2. Follow `docs/sdk-selection.md`. First derive the target engine/version compatibility identity from the inspected runtime. Inventory visible local and remote-tracking SDK branches, inspect plausible public contracts, and bind every evaluation and selection to that target. Reuse or extend only the exact target branch. When a different identity contains reusable implementation, record it as a reference and select `derive-new`; use `private-new` only when no candidate is reusable even as a reference.
+2. Follow `docs/sdk-selection.md`. First derive the target engine/version compatibility identity from the inspected runtime. Inventory visible local and remote-tracking SDK branches, inspect plausible public contracts, and bind every evaluation and selection to that target. Reuse or extend only the exact target branch. When a different identity contains reusable implementation, record it as a reference and select `derive-new`; use `private-new` only when no candidate is reusable even as a reference. After selecting an exact SDK, inspect its `docs/engine-faq.md` headings and triggers; load a complete entry only if that condition occurs.
 3. Confirm that the source root is readable and the external workspace is writable.
 4. Ask once at the beginning whether Git may be used for this job. Record the answer; do not infer consent.
 5. Initialize or resume the external workspace and inspect `game-l10n status` before performing work.
@@ -90,6 +90,8 @@ Always create a new patch under the external workspace. Do not overwrite or inst
 Follow `docs/runtime-approval.md` for every real external effect. Record `install`, `update`, `remove`, and `launch` separately, bind the record to the exact artifact and target, and consume it once immediately before the effect. Default to user-executed runtime validation. Never launch a game or generated plugin merely to collect execution data, and never delete runtime data or logs without a separate request.
 
 Reusable extraction, application, packing, or validation code may be promoted only after the user confirms that the patch succeeded. Promotion must copy only generic implementation, public-format knowledge, synthetic fixtures, and neutral documentation. It must not copy job data, filenames, paths, dialogue, translations, logs, counts, hashes, or incident history.
+
+Before promotion, classify each material engine problem under `docs/engine-faq-contract.md`. A deterministic condition is an adapter fix plus a regression test. Only a condition the SDK cannot safely resolve without external tooling, user material, runtime evidence, authorization, or an uninferable decision belongs in the engine branch's `docs/engine-faq.md`. Title-specific issues stay private and unresolved causes stay queued. Run `python scripts/check_engine_faq.py docs/engine-faq.md` on the SDK branch; a reviewed file with zero entries is valid.
 
 After sanitization, keep the SDK profile local and stop. A successful translation does not imply publication intent. Unless the user first issues an explicit publication command, do not ask whether to commit or push, do not suggest a repository or release, and do not surface publication metadata, gates, or next steps in progress or completion reports.
 

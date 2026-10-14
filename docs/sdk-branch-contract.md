@@ -39,7 +39,7 @@ An engine SDK branch owns:
 - engine-specific manifests and protected fields;
 - translation application, mirror updates, span handling, and escaping;
 - engine payload assembly, packing, and round-trip verification;
-- engine-specific documentation, FAQ entries, ignore rules, and synthetic fixtures.
+- engine-specific documentation, manual exception runbooks, ignore rules, and synthetic fixtures.
 
 ## Selection before implementation
 
@@ -67,7 +67,8 @@ Before an engine SDK branch is published:
 3. Confirm the diff from `main` contains only that engine adapter and its neutral support files. For `derive-new`, inspect the diff rather than merging the reference branch.
 4. Run the core test suite, the adapter test suite, and the privacy scan.
 5. Confirm no private game data, names, paths, text, hashes, counts, logs, or run history appears in the tree or branch-only commits.
-6. Keep engine-only FAQ entries on the engine branch. Keep only framework-generic FAQ entries on `main`.
-7. Call the core runtime approval guard immediately before any real installation write or process launch. Do not add an unguarded direct execution path in an SDK branch.
+6. Classify every material problem observed during adapter work under `docs/engine-faq-contract.md`. Put deterministic fixes in code and regression tests, keep title-specific or unresolved material private, and place only SDK-external manual exceptions in the branch's `docs/engine-faq.md`. Run `python scripts/check_engine_faq.py docs/engine-faq.md`; zero entries is valid.
+7. Keep framework-level troubleshooting in `main`'s `docs/faq.md`. Never merge an engine runbook into `main`.
+8. Call the core runtime approval guard immediately before any real installation write or process launch. Do not add an unguarded direct execution path in an SDK branch.
 
 The framework may be installed without an engine adapter, but it cannot unpack or patch an engine by itself. Once an engine SDK branch supplies its adapter, the same central context, translation, fallback, review, and source-preservation flow becomes executable without duplicating orchestration logic.
