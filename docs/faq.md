@@ -1,6 +1,8 @@
 # FAQ
 
-This FAQ contains only provenance-free issues that can recur across independent SDK or engine integrations. It must not identify any localization job, game, source file, asset, dialogue, translation, workspace, model, or execution result.
+This file contains provenance-free troubleshooting for the engine-neutral Parr0t framework. It must not identify any localization job, game, source file, asset, dialogue, translation, workspace, model, or execution result.
+
+Engine branches do not append implementation bugs or ordinary engine questions here. Under `docs/engine-faq-contract.md`, they keep only SDK-external manual exception procedures in their branch-local `docs/engine-faq.md`. A condition the SDK can resolve deterministically belongs in code and regression tests instead.
 
 ## A private repository returns 404 even though it exists
 
@@ -23,8 +25,16 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Symptom:** The first session starts writing a new unpacker or patcher without inspecting an existing `sdk-*` implementation, producing duplicate code and avoidable validation work.
 - **General cause:** Branch discovery was advisory, only the current checkout was inspected, or a branch name was treated as the complete compatibility test.
 - **Diagnosis:** Inspect the external workspace's SDK inventory, per-candidate commit-bound evaluations, and selected mode. A missing decision or an unevaluated plausible branch means implementation started too early.
-- **Resolution:** Stop the duplicate implementation, refresh visible local and remote-tracking refs, inspect each plausible public contract, and record `reuse` or `extend` when possible. Select `private-new` only after every candidate is categorically incompatible.
+- **Resolution:** Stop the duplicate implementation, refresh visible local and remote-tracking refs, inspect each plausible public contract, and record same-identity `reuse` or `extend` when possible. Record useful different-identity code as `reference` and select `derive-new`. Select `private-new` only after every candidate is categorically incompatible and none is a reusable reference.
 - **Prevention:** Keep the `docs/sdk-selection.md` gate before extraction and let the CLI block data-plane stages and SDK promotion until a current decision exists.
+
+## Reusable SDK code is assigned to the wrong engine-version branch
+
+- **Symptom:** A capability verified on one engine/version line is prepared for an older, newer, or otherwise different `sdk-*` branch merely because that branch supplied reusable code.
+- **General cause:** Implementation reuse and compatibility ownership were treated as one decision. A reference implementation was mistaken for evidence that its branch should own the target runtime.
+- **Diagnosis:** Compare the inspected runtime's target engine/version, the target recorded by `sdk-evaluate` and `sdk-select`, the selected mode, and the proposed promotion branch. A differing identity may be a `reference`, but it cannot be `compatible` or `partial` for the target.
+- **Resolution:** Use `reuse` or `extend` only for the exact target identity. For useful code from another identity, record `reference`, select `derive-new`, create the target branch from `main`, and port only the neutral capability verified on the target line. Never merge the reference SDK branch wholesale.
+- **Prevention:** Require explicit target engine/version arguments at evaluation and selection time, reject identity-mismatched extension, and verify that promotion matches the recorded target before exporting or publishing.
 
 ## A model refuses fictional game localization
 
@@ -122,13 +132,13 @@ This FAQ contains only provenance-free issues that can recur across independent 
 - **Resolution:** Stop before the external effect, keep the source and runtime data unchanged, and hand off the recoverable artifact for user execution. If the user explicitly requests agent execution, create and consume only the exact one-shot approval described in `docs/runtime-approval.md`.
 - **Prevention:** Deny runtime mutations and process starts by default, keep installation and launch approvals separate, use only synthetic temporary targets for automated lifecycle tests, and never bypass the shared guard with direct shell copies or process commands.
 
-## A published release differs from the repository output or supports an unclear game build
+## A published asset differs from the staged release or the branch contains artifacts
 
-- **Symptom:** A downloaded asset has a different digest from the verified repository artifact, contains an undocumented first-party file, reports a different release version, or installs against a build not listed consistently in the README and manifest.
-- **General cause:** The package was rebuilt or edited after verification, release metadata was updated independently, or compatibility was described as “latest” without exact build bindings.
-- **Diagnosis:** Compare the tag, source commit, release ID, package/manifest/file digests, embedded versions, compatibility records, release notes, and installer binding checks as one immutable release unit.
+- **Symptom:** A downloaded asset differs from the verified staged bytes, a deployable archive or generated payload is committed to the instance branch, an asset contains an undocumented first-party file, or compatibility is not listed consistently in the README and manifest.
+- **General cause:** The package was rebuilt or edited after verification, the instance branch was treated as an artifact store, release metadata was updated independently, or compatibility was described as “latest” without exact build bindings.
+- **Diagnosis:** Compare the tag, instance/translation-source/SDK commits, checkpoint, release ID, package/manifest/file digests, tracked-file allowlist, compatibility records, release notes, and installer binding checks as one immutable release unit.
 - **Resolution:** Stop distribution, keep the mismatched assets unchanged for diagnosis, rebuild one staged release from the intended clean commit, and request publication approval for the corrected release. Do not silently replace history or broaden compatibility claims.
-- **Prevention:** Follow `docs/instance-release.md`, upload the exact verified bytes, perform one read-only post-upload digest check, enumerate every validated original game build, and preserve the user's README through minimal reviewed edits.
+- **Prevention:** Follow `docs/instance-release.md`, keep distributable bytes only in GitHub Releases, restrict the branch to its lean allowlist, upload the exact verified bytes, perform one read-only post-upload digest check, enumerate every validated original game build, and preserve the user's README through minimal reviewed edits.
 
 ## An agent proposes a repository or release during local work
 

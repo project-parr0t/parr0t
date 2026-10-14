@@ -190,6 +190,10 @@ function Test-GameRoot([string]$Candidate, $Manifest) {
         $required = Get-SafeTarget $Candidate $relative
         if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { return $false }
     }
+    foreach ($binding in @($Manifest.steam.source_bindings)) {
+        $bound = Get-SafeTarget $Candidate ([string]$binding.path)
+        if (-not (Test-Path -LiteralPath $bound -PathType Leaf)) { return $false }
+    }
     return $true
 }
 
@@ -317,6 +321,9 @@ function Get-ManifestFingerprint($Manifest) {
     foreach ($required in @($Manifest.steam.required_files)) {
         $lines.Add("steam.required:$required")
     }
+    foreach ($binding in @($Manifest.steam.source_bindings)) {
+        $lines.Add(("steam.source_binding:{0}`t{1}`t{2}`t{3}" -f $binding.path, $binding.bytes, $binding.sha256, $binding.error_code))
+    }
     foreach ($file in @($Manifest.files)) {
         $lines.Add(("file:{0}`t{1}`t{2}" -f $file.path, $file.bytes, $file.sha256))
     }
@@ -416,6 +423,32 @@ function Assert-OwnedState([string]$Root, $Receipt) {
     }
 }
 
+function Assert-SourceBindings([string]$Root, $Manifest, $Receipt) {
+    $replacementMap = Get-ReplacementMap $Manifest
+    $originalMap = @{}
+    if ($Receipt) {
+        foreach ($original in @($Receipt.originals)) {
+            $originalMap[[string]$original.path] = $original
+        }
+    }
+    foreach ($binding in @($Manifest.steam.source_bindings)) {
+        $relative = [string]$binding.path
+        if ($Receipt -and $replacementMap.ContainsKey($relative)) {
+            if (-not $originalMap.ContainsKey($relative)) { throw "E_ORIGINAL_BACKUP_MISSING" }
+            $candidate = Get-SafeTarget $Root ([string]$originalMap[$relative].backup_path)
+        } else {
+            $candidate = Get-SafeTarget $Root $relative
+        }
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            throw ([string]$binding.error_code)
+        }
+        if ((Get-Item -LiteralPath $candidate).Length -ne [int64]$binding.bytes -or
+            (Get-Sha256 $candidate) -cne [string]$binding.sha256) {
+            throw ([string]$binding.error_code)
+        }
+    }
+}
+
 function Install-Patch([string]$Root, $Manifest) {
     Write-PatchStatus "확인" "설치 패키지의 무결성을 확인하고 있습니다."
     Test-Package $Manifest
@@ -432,6 +465,7 @@ function Install-Patch([string]$Root, $Manifest) {
             throw "E_REPLACEMENT_SET_MISMATCH"
         }
     }
+    Assert-SourceBindings $Root $Manifest $oldReceipt
     foreach ($file in @($Manifest.files)) {
         $target = Get-SafeTarget $Root $file.path
         $isReplacement = $replacementMap.ContainsKey([string]$file.path)
@@ -564,6 +598,7 @@ function Verify-Patch([string]$Root, $Manifest) {
     $receipt = Read-Receipt $Root $Manifest
     if (-not $receipt) { throw "E_NOT_INSTALLED" }
     Assert-OwnedState $Root $receipt
+    Assert-SourceBindings $Root $Manifest $receipt
     Write-PatchStatus "완료" ("설치된 패치 파일이 정상입니다. ({0}) [PARR0T-S004]" -f $receipt.release_id) Green
 }
 
