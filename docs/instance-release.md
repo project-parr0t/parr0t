@@ -2,7 +2,7 @@
 
 This contract is dormant until the user first explicitly commands publication of a completed localization as a separate, game-specific repository. Before that command, the agent must not invoke or mention this workflow, propose a public or private destination, ask whether to publish, preview release metadata, stage a tag/release, or expose publication as a next step. Ordinary translation, packaging, testing, and successful local validation end with the local artifact.
 
-Once activated, an instance repository is distinct from the Parr0t framework and engine SDK branches: it may contain the approved patch payload and title-specific compatibility data, but none of that data may flow back into Parr0t.
+Once activated, an instance repository is distinct from the Parr0t framework, an optional title-specific translation source repository, and engine SDK branches. Its Git branch is a small continuation and release index, not an artifact store: distributable archives, installers, generated payloads, game files, copied SDKs, and duplicate translation exports belong outside the branch. None of the instance data may flow back into Parr0t.
 
 Publication is an external side effect. A successful patch, permission to use Git, SDK publication approval, and permission to publish a per-game release are separate decisions. Silence, completion approval, or permission for local Git use is not publication intent. Do not create a repository, commit/push for publication, tag, release, or upload until the user explicitly requests that exact instance publication.
 
@@ -22,15 +22,39 @@ Design and validate the release for the environment in which the player will ins
 
 Record the target operating system, architecture, prerequisites, and supported game builds consistently in the README, release notes, manifest, asset name, and installer checks.
 
+## Three-input continuation
+
+When the user supplies a title-specific translation source repository, a readable game folder, and an instance/checkpoint repository or released package, use all three as separate inputs before any model call:
+
+1. Treat the game folder as the immutable current upstream source and produce the two current inventories required by `docs/coverage-gates.md`.
+2. Treat the translation source repository as editable title-specific implementation. Reuse its applicable build/apply logic and reviewed source state without copying it into Parr0t or the instance repository.
+3. Treat the instance repository and its released `parr0t-release-checkpoint.json` as the identity and reviewed-target continuation record. Validate its tag, release ID, supported-build bindings, manifest, and asset digest before reuse.
+4. Follow `docs/release-checkpoint.md` to reuse only targets whose current bindings still match. New, changed, unresolved, or invalidated targets alone return to context, translation, and review.
+5. Write new work only to the external private workspace and the explicitly authorized translation source repository. Do not mutate the game folder or rewrite an old release.
+
+The translation source repository is optional. A valid released package/checkpoint plus the current game folder remains sufficient for checkpoint-based recovery when the selected SDK can rebuild the patch. If the user supplies all three inputs, do not ignore one and reconstruct its data with model calls.
+
+## Lean instance branch
+
+Keep distributable bytes in GitHub Releases, not in the instance repository branch. The tracked branch should normally contain only:
+
+- the existing human-facing `README.md` and legally required license, attribution, or notice files;
+- the canonical `parr0t-release-checkpoint.json` and small machine-readable release/checksum metadata needed to bind it to the published asset;
+- minimal title/engine-specific source, configuration, or build glue that is strictly required to assemble or validate this instance and cannot be supplied by the selected Parr0t SDK at packaging time.
+
+Do not track release ZIPs, installers, generated payload directories, unpacked or original game data, extracted inventories, raw source strings, duplicate translation tables, private workspaces, caches, logs, prompts, model/provider records, credentials, copied Parr0t framework code, or copied SDK trees. The approved checkpoint is the sole branch exception for shipped target text; do not add a second export of the same translations. A required title/engine bridge must be the smallest reviewable source form, must have neutral build instructions, and must not contain proprietary game bytes. Generic reusable behavior belongs in the appropriate SDK branch after its separate promotion flow, not in an instance branch.
+
+Before committing or tagging, inspect the complete tracked-file list against this allowlist. Remove a generated artifact from the proposed commit rather than relying on `.gitignore`. If a required file does not fit the allowlist, stop and obtain an explicit contract decision instead of silently widening the repository.
+
 ## One immutable release unit
 
-Treat the source commit, tag, release metadata, committed distribution output, and uploaded assets as one immutable release unit.
+Treat the instance commit, tag, release metadata, tracked checkpoint/manifest, referenced translation-source and SDK commits, and uploaded assets as one immutable release unit.
 
 - Build once from a clean commit, then upload those exact bytes. Do not rebuild between verification and upload.
-- Record the source commit, tag, release ID, package digest, manifest digest, and every released file digest in the instance repository.
+- Record the instance commit, referenced translation-source commit when one exists, selected SDK commit, tag, release ID, package digest, manifest digest, and every released file digest in the instance repository.
 - Include the validated `parr0t-release-checkpoint.json` defined by `docs/release-checkpoint.md`; bind its digest and schema into the package manifest so the release itself can resume future work without retranslating unchanged reviewed targets.
-- If a deployable archive or file is committed, the corresponding release asset must be byte-identical. If only build source is committed, the tagged source must contain the complete deterministic build recipe and the recorded output digest must match the uploaded asset.
-- A release must not contain untracked first-party code, translation data, installers, manifests, or support files absent from the tagged source or its recorded build inputs.
+- Never commit a deployable archive, installer, generated payload, or other release artifact to the instance branch. Upload the verified staged bytes only as GitHub Release assets and bind their digests in tracked release metadata.
+- Every first-party file in a release asset must be attributable to the tagged instance metadata, the referenced translation-source commit, the selected Parr0t/SDK commit, or a declared deterministic build input. Release-only generation is allowed only when the tagged metadata records the recipe and resulting digest; it does not make the generated bytes eligible for branch tracking.
 - A third-party runtime may be release-only when redistribution or repository-size constraints justify it, but its exact name, version, source, license, and digest must be declared in the tagged source and release manifest. Never describe a first-party component as a third-party exception.
 - Keep the release ID aligned across the tag, release title, package manifest, installer receipt, embedded component versions, and release notes.
 
@@ -84,7 +108,7 @@ Before an agent publishes an instance release, it must verify all of the followi
 4. The complete supported-build matrix is recorded and matches installer binding checks.
 5. The visible GitHub Release title matches `<Game Display Name> Patch <Patch Version> (Game Version <Game Version>)`, or the exact enumerated `Game Versions` form, and agrees with the supported-build matrix.
 6. The target operating system, architecture, and prerequisites describe the player's environment rather than the build host; Windows is used when no other platform was specified.
-7. The committed distribution output or deterministic build recipe produces the exact staged assets.
+7. The instance branch contains only the lean allowlist, contains no committed distribution artifact, and its referenced deterministic inputs produce the exact staged Release assets.
 8. Package validation, required engine/adapter checks, license checks, and one proportional target-environment synthetic lifecycle pass.
 9. The public installer exposes Install, Restore, and Verify; its `parr0t-patch-status.txt`, receipt, declared original replacements, custom errors, and player messages satisfy `docs/installer-contract.md`.
 10. Every launcher wrapper matches the approved Parr0t wrapper release and its architecture, source tag, reproducible-build record, Authenticode result, and published hashes; no Steam client configuration is edited and Steam is never terminated.
@@ -92,5 +116,6 @@ Before an agent publishes an instance release, it must verify all of the followi
 12. Release notes identify the release ID, source commit, supported builds, changes, installation/update caveats, and asset checksums.
 13. `parr0t-release-checkpoint.json` validates against the package IDs, SDK/build/inventory bindings, target digests, and declared locale-fallback result; it contains no separate raw-source copy or private work records, and any released source-preserved target remains explicitly unresolved.
 14. The uploaded assets are the same bytes that passed verification, and their published digests are checked once after upload.
+15. When translation source, game folder, and prior instance/checkpoint inputs are all supplied, each was validated and used for its declared role before any model work; no unchanged reviewed target was regenerated merely because one input was ignored.
 
 If any gate fails, keep the staged release in the private workspace and report the mismatch. Do not publish a best-effort or partially documented release.

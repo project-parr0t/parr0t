@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 
 from game_l10n.runtime_approval import create_runtime_approval
@@ -32,6 +33,22 @@ from game_l10n.workspace import initialize_workspace
 
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def rewrite_package_manifest(
+    source: Path, destination: Path, mutate: Callable[[dict[str, object]], None]
+) -> dict[str, object]:
+    with zipfile.ZipFile(source, "r") as archive:
+        entries = {name: archive.read(name) for name in archive.namelist()}
+    manifest = json.loads(entries[MANIFEST_NAME].decode("utf-8"))
+    mutate(manifest)
+    entries[MANIFEST_NAME] = (
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, data in entries.items():
+            archive.writestr(name, data)
+    return manifest
 
 
 def write_release_checkpoint(
@@ -207,6 +224,7 @@ class SteamPackageTests(unittest.TestCase):
         self.assertEqual(manifest["installer"]["status_file"], STATUS_FILE_NAME)
         self.assertEqual(manifest["installer"]["operations"], ["install", "restore", "verify"])
         self.assertEqual(manifest["installer"]["custom_errors"][0]["public_code"], "PARR0T-FIXTURE-E001")
+        self.assertEqual(manifest["steam"]["source_bindings"], [])
         self.assertEqual(len(manifest["artifact_fingerprint"]), 64)
         self.assertEqual(len(result["installer_sha256"]), 64)
         self.assertEqual(manifest["files"][0]["path"], "fixture-plugin/synthetic.bin")
@@ -242,6 +260,113 @@ class SteamPackageTests(unittest.TestCase):
         )
         self.assertNotIn("previous-package", installer.casefold())
         self.assertNotIn("legacy fingerprint", installer.casefold())
+
+    def test_missing_source_bindings_remains_valid_for_v4_packages(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = root / "fixture-payload"
+            payload.mkdir()
+            (payload / "synthetic.bin").write_bytes(b"synthetic-payload")
+            checkpoint = write_release_checkpoint(root, "r1")
+            spec = root / "fixture-spec.json"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "patch_id": "fixture-localization",
+                        "release_id": "r1",
+                        "display_name": "Fixture localization patch",
+                        "checkpoint_file": checkpoint.name,
+                        "steam": {"app_id": "123456", "install_dir": "Fixture Game"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            package = root / "fixture.zip"
+            legacy = root / "fixture-legacy-v4.zip"
+            build_steam_package(payload, spec, package)
+            manifest = rewrite_package_manifest(
+                package,
+                legacy,
+                lambda item: item["steam"].pop("source_bindings"),
+            )
+
+            self.assertNotIn("source_bindings", manifest["steam"])
+            self.assertEqual(validate_steam_package(legacy)["status"], "valid")
+
+    def test_source_bindings_are_canonical_and_fingerprinted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = root / "fixture-payload"
+            payload.mkdir()
+            (payload / "synthetic.bin").write_bytes(b"synthetic-payload")
+            checkpoint = write_release_checkpoint(root, "r1")
+            spec = root / "fixture-spec.json"
+            valid_binding = {
+                "path": "fixture-game.exe",
+                "bytes": len(b"fixture-executable"),
+                "sha256": hashlib.sha256(b"fixture-executable").hexdigest(),
+                "error_code": "E_CUSTOM_FIXTURE_BINDING",
+            }
+            base = {
+                "patch_id": "fixture-localization",
+                "release_id": "r1",
+                "display_name": "Fixture localization patch",
+                "checkpoint_file": checkpoint.name,
+                "custom_errors": [
+                    {
+                        "internal_code": "E_CUSTOM_FIXTURE_BINDING",
+                        "public_code": "PARR0T-FIXTURE-E001",
+                        "message": "Synthetic binding mismatch.",
+                        "resolution": "Use the matching synthetic fixture.",
+                    }
+                ],
+                "steam": {
+                    "app_id": "123456",
+                    "install_dir": "Fixture Game",
+                    "source_bindings": [valid_binding],
+                },
+            }
+            spec.write_text(json.dumps(base), encoding="utf-8")
+            package = root / "fixture.zip"
+            build_steam_package(payload, spec, package)
+            with zipfile.ZipFile(package) as archive:
+                manifest = json.loads(archive.read(MANIFEST_NAME))
+                installer = archive.read("Install-Translation-Patch.ps1").decode("utf-8-sig")
+            self.assertEqual(manifest["steam"]["source_bindings"], [valid_binding])
+            self.assertIn("Assert-SourceBindings", installer)
+            self.assertIn("steam.source_binding:", installer)
+
+            invalid_values = {
+                "non_list": {"path": "fixture-game.exe"},
+                "non_object": ["fixture-game.exe"],
+                "unsafe_path": [{**valid_binding, "path": "../fixture-game.exe"}],
+                "duplicate_path": [valid_binding, {**valid_binding, "path": "FIXTURE-GAME.EXE"}],
+                "invalid_bytes": [{**valid_binding, "bytes": True}],
+                "invalid_hash": [{**valid_binding, "sha256": "A" * 64}],
+                "unknown_error": [{**valid_binding, "error_code": "E_CUSTOM_UNKNOWN"}],
+            }
+            for name, source_bindings in invalid_values.items():
+                with self.subTest(name=name):
+                    candidate = json.loads(json.dumps(base))
+                    candidate["steam"]["source_bindings"] = source_bindings
+                    spec.write_text(json.dumps(candidate), encoding="utf-8")
+                    with self.assertRaises(SteamPackageError):
+                        build_steam_package(payload, spec, root / f"fixture-{name}.zip")
+
+            candidate = json.loads(json.dumps(base))
+            candidate["steam"]["source_bindings"][0]["path"] = "synthetic.bin"
+            spec.write_text(json.dumps(candidate), encoding="utf-8")
+            with self.assertRaises(SteamPackageError):
+                build_steam_package(payload, spec, root / "fixture-overlap.zip")
+
+            tampered = root / "fixture-tampered.zip"
+            rewrite_package_manifest(
+                package,
+                tampered,
+                lambda item: item["steam"]["source_bindings"][0].update({"sha256": "b" * 64}),
+            )
+            with self.assertRaises(SteamPackageError):
+                validate_steam_package(tampered)
 
     def test_validator_rejects_tampered_payload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -380,7 +505,8 @@ class SteamPackageTests(unittest.TestCase):
             (game / "fixture-game.exe").write_bytes(b"fixture-executable")
             replacement_relative = Path("fixture-launcher.exe")
             replacement_backup = Path("fixture-launcher.parr0t-original.exe")
-            (game / replacement_relative).write_bytes(b"original-launcher")
+            original_launcher = b"original-launcher"
+            (game / replacement_relative).write_bytes(original_launcher)
             initialize_workspace(work, sdk, git_choice="disabled", game_roots=[game])
             spec = work / "fixture-spec.json"
             payload = work / "fixture-payload"
@@ -399,6 +525,14 @@ class SteamPackageTests(unittest.TestCase):
                             "release_id": release_id,
                             "display_name": "Fixture localization patch",
                             "checkpoint_file": checkpoint.name,
+                            "custom_errors": [
+                                {
+                                    "internal_code": "E_CUSTOM_FIXTURE_BINDING",
+                                    "public_code": "PARR0T-FIXTURE-E001",
+                                    "message": "Synthetic binding mismatch.",
+                                    "resolution": "Use the matching synthetic fixture.",
+                                }
+                            ],
                             "replace_files": [
                                 {
                                     "path": replacement_relative.as_posix(),
@@ -409,6 +543,14 @@ class SteamPackageTests(unittest.TestCase):
                                 "app_id": "123456",
                                 "install_dir": "Fixture Game",
                                 "required_files": ["fixture-game.exe"],
+                                "source_bindings": [
+                                    {
+                                        "path": replacement_relative.as_posix(),
+                                        "bytes": len(original_launcher),
+                                        "sha256": hashlib.sha256(original_launcher).hexdigest(),
+                                        "error_code": "E_CUSTOM_FIXTURE_BINDING",
+                                    }
+                                ],
                             },
                         }
                     ),
@@ -466,6 +608,16 @@ class SteamPackageTests(unittest.TestCase):
                 )
 
             first, first_package = make_release("r1", b"release-one")
+            (game / replacement_relative).write_bytes(b"unsupported-original")
+            unsupported = run_menu(first, "1\ny\n")
+            self.assertNotEqual(unsupported.returncode, 0)
+            self.assertIn("PARR0T-FIXTURE-E001", unsupported.stdout + unsupported.stderr)
+            self.assertFalse((game / target_relative).exists())
+            self.assertFalse((game / replacement_backup).exists())
+            self.assertFalse((game / STATUS_FILE_NAME).exists())
+            self.assertEqual((game / replacement_relative).read_bytes(), b"unsupported-original")
+            (game / replacement_relative).write_bytes(original_launcher)
+
             denied = run(first, "Install")
             self.assertNotEqual(denied.returncode, 0)
             self.assertIn("PARR0T-E005", denied.stdout + denied.stderr)
@@ -476,10 +628,16 @@ class SteamPackageTests(unittest.TestCase):
             self.assertEqual(interactive_install.returncode, 0, interactive_install.stdout + interactive_install.stderr)
             self.assertEqual((game / target_relative).read_bytes(), b"release-one")
             self.assertEqual((game / replacement_relative).read_bytes(), b"wrapper-release-one")
-            self.assertEqual((game / replacement_backup).read_bytes(), b"original-launcher")
+            self.assertEqual((game / replacement_backup).read_bytes(), original_launcher)
             status = (game / STATUS_FILE_NAME).read_text(encoding="utf-8-sig")
             self.assertIn("patch_id=fixture-localization", status)
             self.assertFalse((game / CHECKPOINT_NAME).exists())
+            (game / replacement_backup).write_bytes(b"damaged-backup")
+            damaged_backup = run(first, "Verify")
+            self.assertNotEqual(damaged_backup.returncode, 0)
+            self.assertIn("PARR0T-E012", damaged_backup.stdout + damaged_backup.stderr)
+            self.assertNotIn("PARR0T-FIXTURE-E001", damaged_backup.stdout + damaged_backup.stderr)
+            (game / replacement_backup).write_bytes(original_launcher)
             (game / STATUS_FILE_NAME).write_text(
                 status.replace("patch_id=fixture-localization", "patch_id=fixture-other"),
                 encoding="utf-8",
@@ -493,7 +651,7 @@ class SteamPackageTests(unittest.TestCase):
             interactive_restore = run_menu(first, "2\ny\n")
             self.assertEqual(interactive_restore.returncode, 0, interactive_restore.stdout + interactive_restore.stderr)
             self.assertFalse((game / target_relative).exists())
-            self.assertEqual((game / replacement_relative).read_bytes(), b"original-launcher")
+            self.assertEqual((game / replacement_relative).read_bytes(), original_launcher)
             self.assertFalse((game / replacement_backup).exists())
             self.assertFalse((game / STATUS_FILE_NAME).exists())
 
@@ -533,7 +691,7 @@ class SteamPackageTests(unittest.TestCase):
             self.assertEqual(updated.returncode, 0, updated.stdout + updated.stderr)
             self.assertEqual((game / target_relative).read_bytes(), b"release-two")
             self.assertEqual((game / replacement_relative).read_bytes(), b"wrapper-release-two")
-            self.assertEqual((game / replacement_backup).read_bytes(), b"original-launcher")
+            self.assertEqual((game / replacement_backup).read_bytes(), original_launcher)
             verified = run(second, "Verify")
             self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
             remove_approval, _ = create_runtime_approval(
@@ -546,7 +704,7 @@ class SteamPackageTests(unittest.TestCase):
             removed = run(second, "Restore", remove_approval)
             self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
             self.assertFalse((game / target_relative).exists())
-            self.assertEqual((game / replacement_relative).read_bytes(), b"original-launcher")
+            self.assertEqual((game / replacement_relative).read_bytes(), original_launcher)
             self.assertFalse((game / replacement_backup).exists())
             self.assertFalse((game / STATUS_FILE_NAME).exists())
             self.assertTrue((game / "fixture-game.exe").exists())

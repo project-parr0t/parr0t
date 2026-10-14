@@ -29,12 +29,20 @@ Place the completed files under a payload directory in the external workspace. C
   "steam": {
     "app_id": "123456",
     "install_dir": "Fixture Game",
-    "required_files": ["fixture-game.exe"]
+    "required_files": ["fixture-game.exe"],
+    "source_bindings": [
+      {
+        "path": "fixture-launcher.exe",
+        "bytes": 18,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "error_code": "E_CUSTOM_FIXTURE_BINDING"
+      }
+    ]
   }
 }
 ```
 
-`patch_id` is the stable status/receipt identity. `release_id` changes when a new package replaces the previous release. `checkpoint_file` is required, is resolved beside or below the private spec, and must satisfy `docs/release-checkpoint.md` with matching patch/release IDs. The builder canonicalizes it and places it at ZIP root as `parr0t-release-checkpoint.json`; it is release metadata and is not copied into the game. `required_files` is optional and validates a manually selected game root. `replace_files` is optional and is reserved for payload paths that must replace and later restore an original game file; omit `backup_path` to use the private `.parr0t/backups/<patch-id>/...` default. `custom_errors` is optional and uses the isolated `PARR0T-<SCOPE>-E###` namespace. Real identifiers and payload paths stay in the private workspace and generated ZIP; they must not be committed to Parr0t.
+`patch_id` is the stable status/receipt identity. `release_id` changes when a new package replaces the previous release. `checkpoint_file` is required, is resolved beside or below the private spec, and must satisfy `docs/release-checkpoint.md` with matching patch/release IDs. The builder canonicalizes it and places it at ZIP root as `parr0t-release-checkpoint.json`; it is release metadata and is not copied into the game. `required_files` is optional and validates a manually selected game root. `source_bindings` is optional and binds supported original byte counts and hashes to registered custom errors; omission is equivalent to `[]` for v4 compatibility. `replace_files` is optional and is reserved for payload paths that must replace and later restore an original game file; omit `backup_path` to use the private `.parr0t/backups/<patch-id>/...` default. `custom_errors` is optional and uses the isolated `PARR0T-<SCOPE>-E###` namespace. Real identifiers and payload paths stay in the private workspace and generated ZIP; they must not be committed to Parr0t.
 
 ## Build and verify
 
@@ -60,7 +68,9 @@ The installer:
 - accepts a player's interactive menu selection and final confirmation without an agent approval file;
 - denies noninteractive agent/script install, update, and restore without an exact unexpired one-shot runtime approval;
 - refuses collisions with files not owned by its receipt;
+- rejects an unsupported original build through the source binding's registered custom error before mutation;
 - backs up only explicitly declared original replacements and binds their paths, sizes, and hashes to the receipt;
+- checks a replaced file's source binding against its first-install backup during update and Verify, while installed patch hashes remain receipt-owned checks;
 - reuses the verified original backup on update instead of mistaking the installed wrapper for the original;
 - removes or restores only paths listed by its prior receipt;
 - writes `parr0t-patch-status.txt` as the primary patch-ID marker and a matching detailed receipt;
