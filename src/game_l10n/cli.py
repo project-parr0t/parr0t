@@ -28,6 +28,7 @@ from .formats import (
     write_results,
 )
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext
+from .instance_release import validate_instance_release
 from .native_pass import import_native_shard, merge_native_pass, prepare_native_tasks
 from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from .privacy import is_within, require_external_workdir
@@ -756,6 +757,27 @@ def cmd_verify_steam_package(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_instance_release_gate(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
+    require_external_workdir(work_dir, sdk_root)
+    result = validate_instance_release(
+        _path_in_workspace(work_dir, args.instance_root, must_exist=True),
+        _path_in_workspace(work_dir, args.package, must_exist=True),
+        user_confirmed_success=args.user_confirmed_success,
+        user_approved_publication=args.user_approved_publication,
+    )
+    gate_path = work_dir / ".game-l10n" / "instance-release-gate.json"
+    gate_path.parent.mkdir(parents=True, exist_ok=True)
+    gate_path.write_text(
+        json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(json.dumps({**result, "gate_path": str(gate_path)}, ensure_ascii=False))
+    return 0
+
+
 def cmd_inspect_installed_state(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
@@ -1115,6 +1137,21 @@ def build_parser() -> argparse.ArgumentParser:
     verify_steam.add_argument("--workspace", required=True)
     verify_steam.add_argument("--package", required=True)
     verify_steam.set_defaults(func=cmd_verify_steam_package)
+
+    instance_release = sub.add_parser(
+        "instance-release-gate",
+        help="Validate a committed per-game instance before any push, tag, release, or upload",
+    )
+    instance_release.add_argument("--workspace", required=True)
+    instance_release.add_argument(
+        "--instance-root", required=True, help="Committed instance repository inside the workspace"
+    )
+    instance_release.add_argument(
+        "--package", required=True, help="Exact verified Release asset outside the instance repository"
+    )
+    instance_release.add_argument("--user-confirmed-success", action="store_true", required=True)
+    instance_release.add_argument("--user-approved-publication", action="store_true", required=True)
+    instance_release.set_defaults(func=cmd_instance_release_gate)
 
     inspect_installed = sub.add_parser(
         "inspect-installed-state",

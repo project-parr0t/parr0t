@@ -92,6 +92,10 @@ class WorkspaceTests(unittest.TestCase):
             config["release_checkpoint"]["locale_fallback"],
             "best_effort_declared",
         )
+        self.assertTrue(config["instance_release"]["dormant_until_user_publication_command"])
+        self.assertTrue(config["instance_release"]["gate_required_before_external_publication"])
+        self.assertTrue(config["instance_release"]["package_validation_is_not_release_readiness"])
+        self.assertEqual(config["instance_release"]["metadata_file"], "parr0t-instance-release.json")
         self.assertEqual(config["runtime"]["default_policy"], "deny")
         self.assertTrue(config["runtime"]["separate_install_and_launch"])
         self.assertTrue(config["runtime"]["user_executes_by_default"])
@@ -104,6 +108,8 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("workflow is dormant", generated_agents)
         self.assertIn("do not mention, propose, ask about, preview, or prepare", generated_agents.lower())
         self.assertIn("only as GitHub Release assets", generated_agents)
+        self.assertIn("game-l10n instance-release-gate", generated_agents)
+        self.assertIn("before any push, tag, `gh release create`, or upload", generated_agents)
         self.assertIn("duplicate translation exports out of the instance branch", generated_agents)
         self.assertIn("translation source repository", generated_agents)
         self.assertIn("use each for its separate role before any model call", generated_agents)
