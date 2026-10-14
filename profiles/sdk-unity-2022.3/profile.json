@@ -1,0 +1,33 @@
+{
+  "profile": "sdk-unity-2022.3",
+  "engine": "unity",
+  "version": "2022.3",
+  "contains_game_data": false,
+  "files": [
+    {
+      "path": "pack.py",
+      "bytes": 670,
+      "sha256": "034bef73cb13cdb9f53a3a67000ef7eb1c99b2977a6bd20904e7d8579a19f0b7"
+    },
+    {
+      "path": "README.md",
+      "bytes": 1595,
+      "sha256": "09e0aa0bdd605d09aa6dea654f93157fa2df5b44817898cc905cffc697d256f8"
+    },
+    {
+      "path": "selftest.py",
+      "bytes": 1682,
+      "sha256": "c40d38cded7a4808c96d383b603b8922a2230957f19b07563efe5f19812c3bde"
+    },
+    {
+      "path": "unity_textasset.py",
+      "bytes": 23390,
+      "sha256": "5b8a8da59df8947cf82ca98145c223c85b04a5975c96324e7d516d4afa8d74b5"
+    },
+    {
+      "path": "unpack.py",
+      "bytes": 681,
+      "sha256": "95f4cec7fe0fc74235e6b4f7a9d42f8fbd3066674b8396ecf57b97b83dd527d7"
+    }
+  ]
+}

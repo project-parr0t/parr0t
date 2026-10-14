@@ -39,3 +39,7 @@ Control-plane scope guard: proactively activate the bundled `request-scope-guard
 28. For native App translation or review, use `prepare-native-pass` v2 and start one fresh worker per task with `fork_turns="none"` or the host's no-history equivalent. Never reuse a completed worker through follow-up tasks. Pass only private artifact paths and the immutable worker contract, keep source/candidate/tool output out of messages, and require a metadata-only final envelope. The defaults are at most 32 IDs and 12,000 estimated private material tokens per task; reduce them for large focused context or output. This worker rotation is required even when cached input is cheap because accumulated conversation history causes superlinear token replay and latency.
 
 Never copy source game data, extracted strings, translations, caches, logs, prompts, or keys into the SDK repository.
+
+## Unity 2022.3 prototype branch
+
+On `sdk-unity-2022.3`, read `docs/unity-2022.3.md` before selecting the profile. Use it only for a Unity 2022.3 Mono player whose language data consists of ordered INI locale tables stored in one UnityFS `TextAsset` bundle. The profile creates a replacement bundle in the external workspace and verifies that non-target objects and locale assets remain unchanged. It is one primary inventory path, not evidence of complete static coverage; obtain an independent second inventory and account for its declared exclusions before context analysis or translation.
