@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .control_plane import CONTROL_STATE_PATH, initial_control_plane_state
 from .errors import ConfigurationError
 from .privacy import require_external_workdir, scan_tools
 from .provider_policy import (
@@ -123,6 +124,12 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "native_worker_history": "none",
         "native_worker_reuse": False,
     },
+    "control_plane": {
+        "envelope_schema": "parr0t.control-envelope.v1",
+        "metadata_only_for_all_data_plane_stages": True,
+        "reject_free_form_worker_returns": True,
+        "rotate_after_leak": True,
+    },
     "coverage": {
         "require_independent_inventory": True,
         "separate_static_and_runtime_completion": True,
@@ -175,6 +182,9 @@ This directory contains private game data and translation artifacts. It is inten
 13. A selected provider preset authorizes only the providers and stage roles declared by that preset. API-key presence never selects a mode, expands a role, promotes fallback to primary, or authorizes a different external service. Once an authorized fallback stage becomes eligible, do not pause for another per-segment approval. Keep configured game roots read-only; create translated data, rebuilt archives, and installable patches only under this workspace. Never overwrite an installed or source game in place.
 14. Distinguish API providers from native Codex App workers. In `codex-app-deepseek`, use native GPT-6 Luna translator subagents and a separate native GPT-6.1 Sol compact judge; `DEEPSEEK_API_KEY` unlocks only post-barrier translation fallback, selective rewriting, and judge fallback. Never run `codex.exe`, `codex exec`, a second Codex session, or a command provider to imitate a native worker, and never request external-transfer approval as a workaround. Other provider combinations remain available only through a user-selected preset such as `openai-deepseek` or `custom`. The top-level agent remains orchestration-only and follows `docs/codex-app-deepseek.md`.
 15. Keep a strict data-plane/control-plane boundary. The top-level agent may receive target IDs, categorical status/error codes, counts, queue transitions, artifact paths, and deterministic issue codes only. It must not open dialogue/input/result files or receive source, candidate, translated text, or provider prose refusal explanations. Workers read and write private workspace files and return metadata-only envelopes.
+15a. Apply that boundary to primary and independent inventory, context analysis, translation, review, rewriting, application, and validation—not only native translation. Extraction and context workers may inspect private artifacts but may return only a `parr0t.control-envelope.v1` file. Their final chat response is the workspace-relative envelope path only. Validate it with `game-l10n validate-control-envelope` before using any result. Do not accept worker prose, pasted command output, summaries of content, semantic safety labels, anticipated provider-policy judgments, or detailed review categories such as meaning, omission, voice, tone, or terminology.
+15b. Inventory workers classify structure, player visibility, bindings, and order only; context workers produce evidence without deciding translation eligibility. Neither role may exclude user-visible text because of subject matter or suppress a route before an actual configured model/provider invocation. Only the model/provider that processed its assigned context chunk, translation target, or review target may return categorical `provider_refusal`. The parent must not inspect private content to confirm or reinterpret it.
+15c. If the parent receives source/candidate text, prose refusal reasons, content classification, or performs a semantic judgment itself, record the fixed incident code with `game-l10n record-control-plane-leak`, stop using that top-level agent, and preserve only metadata checkpoints. Continue in a fresh control plane and acknowledge the matching incident with `game-l10n resume-control-plane`; never ask the contaminated agent to summarize or sanitize what it saw.
 16. A translation or review refusal is a routing event, not a content judgment and not grounds to omit a target or cancel patch creation. Normalize explanations before returning metadata to the parent. Use the configured faithful-transformation prompt and supported deterministic low-creativity settings for DeepSeek; never claim or attempt to disable provider safeguards.
 17. The checked-out `main` branch is an engine-neutral control framework. Engine-specific discovery, unpack, apply, pack, verification, `docs/engine-faq.md`, ignore rules, and fixtures must come from the selected `sdk-<engine>-<version>` branch and must never be copied back into `main`. Inspect only matching runbook triggers when the SDK protocol reaches a condition it cannot resolve.
 18. Follow the repository `docs/execution-budget.md`. Build the smallest artifact that satisfies the active request. Do not add speculative rollback archives, legacy migrations, compatibility layers, exhaustive backups, or unrelated generalization. After the required focused checks pass, stop unless inputs changed or a concrete failure justifies more testing.
@@ -692,6 +702,9 @@ def initialize_workspace(
         "game-l10n.json": json.dumps(config, ensure_ascii=False, indent=2) + "\n",
         MODE_LOCK_PATH: json.dumps(
             provider_mode_lock(config), ensure_ascii=False, indent=2
+        ) + "\n",
+        CONTROL_STATE_PATH: json.dumps(
+            initial_control_plane_state(), ensure_ascii=False, indent=2
         ) + "\n",
         "AGENTS.md": AGENTS_TEXT,
         ".gitignore": GITIGNORE_TEXT,
