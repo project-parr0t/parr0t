@@ -54,6 +54,8 @@ Do not rename, add fields to, or replace these files with CSV, Markdown, a new J
 
 The source and relevant context travel together. Sentence-level failure isolation therefore does not remove character voice, scene flow, UI role, glossary-related metadata, or adjacent evidence.
 
+The exchange row is not itself a provider prompt. An authorized data-plane adapter resolves the workspace's typed context, projects only evidence relevant to this target, and calls the configured provider adapter. It must not copy the complete context pack or exchange bundle into `context.metadata`, build a job-local API request loop, or resend completed successes. The configured input preflight and usage telemetry apply to fallback exchange processing as they do to the direct pipeline.
+
 ## Success rows
 
 Write a successful candidate to `success.jsonl` with exactly:

@@ -5,6 +5,7 @@ import os
 import unittest
 from unittest.mock import patch
 
+from game_l10n.errors import ProviderFailure
 from game_l10n.providers import CompatibleChatProvider, OpenAIResponsesProvider
 
 
@@ -83,6 +84,67 @@ class CompatibleProviderTests(unittest.TestCase):
             result["_usage"],
             {"input_tokens": 120, "output_tokens": 7, "total_tokens": 127},
         )
+
+    def test_deepseek_cache_usage_is_preserved(self) -> None:
+        def fake_post(_url, _headers, _payload, _timeout):
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": '{"status":"success","text":"T","reason":""}'},
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 120,
+                    "completion_tokens": 7,
+                    "total_tokens": 127,
+                    "prompt_cache_hit_tokens": 80,
+                    "prompt_cache_miss_tokens": 40,
+                },
+            }
+
+        provider = CompatibleChatProvider(
+            "deepseek",
+            "fixture-model",
+            api_key_env="FIXTURE_API_KEY",
+            base_url="https://fixture.invalid",
+            response_format="json_object",
+        )
+        with patch.dict(os.environ, {"FIXTURE_API_KEY": "fixture-key"}), patch(
+            "game_l10n.providers._post_json", side_effect=fake_post
+        ):
+            result = provider.generate_json(
+                system="Translate.",
+                user='{"translation_target":{"source":"S"}}',
+                schema={"type": "object"},
+                schema_name="game_translation",
+            )
+
+        self.assertEqual(result["_usage"]["cached_input_tokens"], 80)
+        self.assertEqual(result["_usage"]["cache_miss_input_tokens"], 40)
+
+    def test_task_input_budget_blocks_oversized_request_before_network(self) -> None:
+        provider = CompatibleChatProvider(
+            "deepseek",
+            "fixture-model",
+            api_key_env="FIXTURE_API_KEY",
+            base_url="https://fixture.invalid",
+            response_format="json_object",
+            task_max_input_chars={"game_translation": 100},
+        )
+        with patch.dict(os.environ, {"FIXTURE_API_KEY": "fixture-key"}), patch(
+            "game_l10n.providers._post_json"
+        ) as post:
+            with self.assertRaisesRegex(ProviderFailure, "budget_exhausted") as raised:
+                provider.generate_json(
+                    system="Translate.",
+                    user=json.dumps({"translation_target": {"source": "X" * 200}}),
+                    schema={"type": "object"},
+                    schema_name="game_translation",
+                )
+
+        self.assertFalse(raised.exception.retryable)
+        post.assert_not_called()
 
     def test_plain_review_verdict_accepts_effect_quality_codes(self) -> None:
         def fake_post(_url, _headers, _payload, _timeout):
