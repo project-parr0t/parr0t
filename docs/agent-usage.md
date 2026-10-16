@@ -21,7 +21,7 @@ For a new job:
 1. Confirm repository/source readability and workspace writability.
 2. Ask once whether Git may be used for this game task and record the choice. Disabled means no `git init`, commit, branch, remote, or push for that job.
 3. Initialize the workspace, then run `game-l10n status`.
-4. Follow the single next action reported by status. Read its linked contract only when that stage becomes active.
+4. Follow the single `next_actions` entry. Resolve only its `required_contracts` against `contract_base`; load another contract only when a new user request activates a route outside workspace state.
 
 For an existing job, start with status and reuse valid checkpoints. Do not repeat extraction, context work, translation, or validation whose input fingerprint is unchanged.
 

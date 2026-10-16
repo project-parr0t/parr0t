@@ -5,7 +5,7 @@ description: Run Parr0t's context-first, refusal-aware game translation and patc
 
 # Parr0t game localization
 
-Use `game-l10n` as the execution boundary. Read the repository `AGENTS.md`, `docs/agent-usage.md`, and the workspace `AGENTS.md`; afterward load only the document for the active stage reported by `game-l10n status`.
+Use `game-l10n` as the execution boundary. Read the repository `AGENTS.md`, `docs/agent-usage.md`, and the workspace `AGENTS.md`; afterward resolve only the status response's `required_contracts` against its `contract_base`.
 
 ## Run
 

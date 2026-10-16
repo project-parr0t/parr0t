@@ -170,7 +170,7 @@ This private workspace contains game data and localization artifacts. Resolve th
 
 1. Read the repository `AGENTS.md` and `docs/agent-usage.md`.
 2. Run `game-l10n status --workspace <this-directory>`.
-3. Perform only the reported next action and load only its linked contract. Reuse unchanged checkpoints.
+3. Perform only its single `next_actions` entry. Resolve only `required_contracts` against `contract_base`; reuse unchanged checkpoints.
 
 ## Core contract
 

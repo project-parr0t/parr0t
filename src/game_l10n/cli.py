@@ -62,6 +62,40 @@ from .workspace import (
 )
 
 
+STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
+    "resume_in_fresh_control_plane": ("docs/control-plane-contract.md",),
+    "ask_user_for_initial_git_choice": ("skills/request-scope-guard/SKILL.md",),
+    "configure_game_root": (),
+    "fix_missing_game_root": (),
+    "inventory_sdk_branches": (
+        "docs/sdk-selection.md",
+        "docs/sdk-branch-contract.md",
+    ),
+    "record_target_identity_evaluate_and_select_sdk": (
+        "docs/sdk-selection.md",
+        "docs/sdk-branch-contract.md",
+    ),
+    "unpack_and_extract_ordered_script": ("docs/coverage-gates.md",),
+    "verify_independent_source_inventory": ("docs/coverage-gates.md",),
+    "resolve_source_inventory_gaps": ("docs/coverage-gates.md",),
+    "analyze_complete_script_context": (
+        "docs/coverage-gates.md",
+        "docs/provider-protocol.md",
+        "docs/control-plane-contract.md",
+    ),
+    "await_explicit_user_request_to_resume_failure_queue": (
+        "docs/coverage-gates.md",
+        "docs/fallback-routing.md",
+        "docs/control-plane-contract.md",
+    ),
+    "ready": (),
+}
+
+
+def _status_contracts(action: str) -> list[str]:
+    return list(STATUS_ACTION_CONTRACTS[action])
+
+
 def _sdk_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -669,74 +703,92 @@ def cmd_seal_translation_exchange(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
+    contract_base = config.get("sdk_root")
     control_state = control_plane_state(work_dir)
     if control_state["status"] == "rotation_required":
+        action = "resume_in_fresh_control_plane"
         print(
             json.dumps(
                 {
                     "workspace": str(work_dir),
                     "control_plane": control_state,
-                    "next_actions": ["resume_in_fresh_control_plane"],
+                    "contract_base": contract_base,
+                    "next_actions": [action],
+                    "required_contracts": _status_contracts(action),
                 },
                 ensure_ascii=False,
                 indent=2,
             )
         )
         return 1
-    actions: list[str] = []
     policy = config.get("repository", {})
     visible_policy = {"initial_choice": policy.get("initial_choice", "pending")}
     if policy.get("publish_approved") is True:
         visible_policy["publish_approved"] = True
+    action: str | None = None
     if policy.get("initial_choice") == "pending":
-        actions.append("ask_user_for_initial_git_choice")
+        action = "ask_user_for_initial_git_choice"
     game_roots = [Path(item) for item in config.get("game_roots", [])]
     missing_roots = [str(path) for path in game_roots if not path.exists()]
-    if not game_roots:
-        actions.append("configure_game_root")
-    elif missing_roots:
-        actions.append("fix_missing_game_root")
+    if action is None and not game_roots:
+        action = "configure_game_root"
+    elif action is None and missing_roots:
+        action = "fix_missing_game_root"
     sdk_selection = config.get("sdk_selection", {})
-    if sdk_selection.get("status") != "selected":
+    if action is None and sdk_selection.get("status") != "selected":
         if not sdk_selection.get("inventory_fingerprint"):
-            actions.append("inventory_sdk_branches")
+            action = "inventory_sdk_branches"
         else:
-            actions.append("record_target_identity_evaluate_and_select_sdk")
-    else:
+            action = "record_target_identity_evaluate_and_select_sdk"
+    elif action is None:
         if not any((work_dir / "inputs").glob("*")):
-            actions.append("unpack_and_extract_ordered_script")
-        inventory_state_path = work_dir / ".game-l10n" / "inventory-attestation.json"
-        inventory_verified = False
-        if not inventory_state_path.exists():
-            actions.append("verify_independent_source_inventory")
+            action = "unpack_and_extract_ordered_script"
         else:
-            inventory_state = json.loads(inventory_state_path.read_text(encoding="utf-8"))
-            inventory_verified = inventory_state.get("status") == "static_verified"
-            if not inventory_verified:
-                actions.append("resolve_source_inventory_gaps")
-        context_path = _path_in_workspace(
-            work_dir, config.get("files", {}).get("context_pack", "context/context-pack.json")
-        )
-        context_state_path = work_dir / ".game-l10n" / "context-state.json"
-        context_ready = context_path.exists() and context_state_path.exists()
-        if context_ready:
-            context_state = json.loads(context_state_path.read_text(encoding="utf-8"))
-            context_ready = (
-                context_state.get("status") == "success"
-                and context_state.get("execution", {}).get("status") == "success"
-            )
-        if inventory_verified and not context_ready:
-            actions.append("analyze_complete_script_context")
-        failure_queue_path = work_dir / ".game-l10n" / "failure-queue.json"
-        if failure_queue_path.exists():
-            queue = json.loads(failure_queue_path.read_text(encoding="utf-8"))
-            if queue.get("pending_count", 0):
-                actions.append("await_explicit_user_request_to_resume_failure_queue")
+            inventory_state_path = work_dir / ".game-l10n" / "inventory-attestation.json"
+            inventory_verified = False
+            if not inventory_state_path.exists():
+                action = "verify_independent_source_inventory"
+            else:
+                inventory_state = json.loads(
+                    inventory_state_path.read_text(encoding="utf-8")
+                )
+                inventory_verified = inventory_state.get("status") == "static_verified"
+                if not inventory_verified:
+                    action = "resolve_source_inventory_gaps"
+            if inventory_verified:
+                failure_queue_path = work_dir / ".game-l10n" / "failure-queue.json"
+                queue_pending = False
+                if failure_queue_path.exists():
+                    queue = json.loads(failure_queue_path.read_text(encoding="utf-8"))
+                    queue_pending = bool(queue.get("pending_count", 0))
+                if queue_pending:
+                    action = "await_explicit_user_request_to_resume_failure_queue"
+                else:
+                    context_path = _path_in_workspace(
+                        work_dir,
+                        config.get("files", {}).get(
+                            "context_pack", "context/context-pack.json"
+                        ),
+                    )
+                    context_state_path = work_dir / ".game-l10n" / "context-state.json"
+                    context_ready = context_path.exists() and context_state_path.exists()
+                    if context_ready:
+                        context_state = json.loads(
+                            context_state_path.read_text(encoding="utf-8")
+                        )
+                        context_ready = (
+                            context_state.get("status") == "success"
+                            and context_state.get("execution", {}).get("status")
+                            == "success"
+                        )
+                    if not context_ready:
+                        action = "analyze_complete_script_context"
+    action = action or "ready"
     print(
         json.dumps(
             {
                 "workspace": str(work_dir),
-                "sdk_root": config.get("sdk_root"),
+                "sdk_root": contract_base,
                 "game_roots": [str(path) for path in game_roots],
                 "missing_game_roots": missing_roots,
                 "repository": visible_policy,
@@ -747,13 +799,15 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "execution": config.get("execution", {}),
                 "runtime": config.get("runtime", {"default_policy": "deny"}),
                 "control_plane": control_state,
-                "next_actions": actions or ["ready"],
+                "contract_base": contract_base,
+                "next_actions": [action],
+                "required_contracts": _status_contracts(action),
             },
             ensure_ascii=False,
             indent=2,
         )
     )
-    return 1 if missing_roots else 0
+    return 1 if action == "fix_missing_game_root" else 0
 
 
 def cmd_sdk_inventory(args: argparse.Namespace) -> int:

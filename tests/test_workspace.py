@@ -571,6 +571,68 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(status["repository"], {"initial_choice": "enabled"})
             self.assertEqual(status["control_plane"]["status"], "ready")
 
+    def test_status_returns_one_immediate_action_and_its_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            game = root / "game"
+            work = root / "work"
+            sdk.mkdir()
+            game.mkdir()
+            initialize_workspace(work, sdk, game_roots=[game])
+
+            first_output = StringIO()
+            with redirect_stdout(first_output):
+                cmd_status(SimpleNamespace(workspace=str(work)))
+            first = json.loads(first_output.getvalue())
+
+            update_repository_policy(work, initial_choice="disabled")
+            second_output = StringIO()
+            with redirect_stdout(second_output):
+                cmd_status(SimpleNamespace(workspace=str(work)))
+            second = json.loads(second_output.getvalue())
+
+        self.assertEqual(first["next_actions"], ["ask_user_for_initial_git_choice"])
+        self.assertEqual(first["contract_base"], str(sdk.resolve()))
+        self.assertEqual(
+            first["required_contracts"],
+            ["skills/request-scope-guard/SKILL.md"],
+        )
+        self.assertEqual(
+            second["next_actions"],
+            ["record_target_identity_evaluate_and_select_sdk"],
+        )
+        self.assertEqual(
+            second["required_contracts"],
+            ["docs/sdk-selection.md", "docs/sdk-branch-contract.md"],
+        )
+
+    def test_status_exit_code_matches_the_immediate_action(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            missing_game = root / "missing-game"
+            work = root / "work"
+            sdk.mkdir()
+            initialize_workspace(work, sdk, game_roots=[missing_game])
+
+            first_output = StringIO()
+            with redirect_stdout(first_output):
+                first_exit = cmd_status(SimpleNamespace(workspace=str(work)))
+            first = json.loads(first_output.getvalue())
+
+            update_repository_policy(work, initial_choice="disabled")
+            second_output = StringIO()
+            with redirect_stdout(second_output):
+                second_exit = cmd_status(SimpleNamespace(workspace=str(work)))
+            second = json.loads(second_output.getvalue())
+
+        self.assertEqual(first_exit, 0)
+        self.assertEqual(first["next_actions"], ["ask_user_for_initial_git_choice"])
+        self.assertEqual(second_exit, 1)
+        self.assertEqual(second["next_actions"], ["fix_missing_game_root"])
+        self.assertEqual(second["required_contracts"], [])
+
     def test_status_reports_only_rotation_action_after_control_plane_leak(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -587,6 +649,9 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertEqual(status["control_plane"]["status"], "rotation_required")
         self.assertEqual(status["next_actions"], ["resume_in_fresh_control_plane"])
+        self.assertEqual(
+            status["required_contracts"], ["docs/control-plane-contract.md"]
+        )
 
 
 if __name__ == "__main__":

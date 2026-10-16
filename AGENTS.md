@@ -7,7 +7,7 @@ Parr0t is an engine-neutral control framework and reusable SDK repository. Keep 
 1. Read this file.
 2. For a localization job, read `docs/agent-usage.md` and the external workspace `AGENTS.md`.
 3. Run `game-l10n status --workspace <workspace>`.
-4. Read only the contract named by the current status or active user request. Do not preload every document.
+4. Resolve each `required_contracts` entry against `contract_base` and read only those contracts. For a user-requested route not represented by workspace state, use the table below. Do not preload every document.
 
 ## Non-negotiable rules
 
