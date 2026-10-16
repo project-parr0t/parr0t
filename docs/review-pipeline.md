@@ -1,5 +1,7 @@
 # Provider-neutral review pipeline
 
+A successful review retry counts toward semantic completion only when its approved verdict binds the current candidate generation. The current candidate digest must also match its text. Retry stage names and attempt ordinals remain in the audit history; a stale approval or an errored retry cannot approve a changed candidate.
+
 The framework reviews by **role**, not by vendor or model name. Translation, compact judging, selective rewriting, and fallback judging may each use a different API, native App agent, command adapter, local model, or compatible endpoint.
 
 ## Cost-aware quality flow
