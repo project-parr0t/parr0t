@@ -32,15 +32,15 @@ Selecting this preset and supplying its key environment variables authorizes its
 5. Send only `rewrite` candidates to the configured rewriter chain, run deterministic validation, and ask the compact judge to confirm the corrected candidate. Release only refused, errored, invalid, or unconfirmed review IDs to the next judge.
 6. If every permitted route fails, including provider quota or rate-limit exhaustion, emit the exact source text with status `source_preserved`. This is an explicit unresolved state, never a claim that the line was translated or reviewed.
 
-The top-level Codex/Sol operator observes completion, categorical refusals/errors, deterministic validation codes, counts, and queue transitions. It does not replace the independent semantic reviewer and must not open the input, candidate, or patch files. Provider prose explanations are normalized to codes such as `provider_refusal`, `quota_exhausted`, and `rate_limited` before control-plane logging.
+The top-level Codex/Sol operator observes completion, `fallback_required`, categorical operational errors, deterministic validation codes, counts, and queue transitions. It does not replace the independent semantic reviewer and must not open the input, candidate, or patch files. Provider refusal status and prose remain private; only `fallback_required` crosses the control-plane boundary. Operational codes such as `quota_exhausted` and `rate_limited` remain categorical metadata.
 
 ## Refusal isolation
 
 Translation is a bounded transformation of existing user-provided text, not generation of new content. Provider prompts explicitly prohibit continuation, roleplay, invention, censorship, and intensity changes. Mature content in any context-only domain must not turn an otherwise permitted target into a blanket refusal.
 
-One provider request contains exactly one output target. Context remains available but is labeled as non-target evidence. A refusal therefore queues only that target; the orchestrator continues every unrelated target and never resubmits the refused collection as one larger fallback batch.
+One provider request contains exactly one output target. Context remains available but is labeled as non-target evidence. A refusal therefore becomes `fallback_required` for only that target; the orchestrator continues every unrelated target and never resubmits the collection as one larger fallback batch. It also never pre-screens whether an authorized fallback may receive that target. `source_preserved` requires complete v2 route evidence for every configured route.
 
-Provider policy still applies. The SDK does not obfuscate content or bypass safeguards; it minimizes unnecessary refusals and limits the effect of a genuine refusal to one target.
+Each provider applies its own policy when it receives the exact request. Parr0t does not obfuscate or alter content. It reports only `fallback_required` to the control plane and advances that one target through the already authorized route chain.
 
 The DeepSeek-compatible translation and rewrite requests use JSON Object output, while the compact judge uses the evaluated plain `OK`/`REWRITE` contract. Requests use `thinking: {"type":"disabled"}`, `reasoning_effort: "none"`, and task-specific output limits. Compact judgments have a small fixed cap; translations and rewrites use source-length-bounded limits. DeepSeek documents `temperature` as ineffective in non-thinking mode, so the preset does not present it as a determinism control. These are supported non-thinking settings, not a vendor safety-disable switch. The system prompt identifies the request as faithful transformation/review of pre-existing text and forbids continuation, roleplay, invention, censorship, and intensity changes.
 

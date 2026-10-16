@@ -9,7 +9,9 @@ from .errors import ConfigurationError
 from .privacy import is_within
 
 
-CONTROL_ENVELOPE_SCHEMA = "parr0t.control-envelope.v1"
+CONTROL_ENVELOPE_SCHEMA = "parr0t.control-envelope.v2"
+LEGACY_CONTROL_ENVELOPE_SCHEMA = "parr0t.control-envelope.v1"
+ROUTE_EVIDENCE_SCHEMA = "parr0t.route-evidence.v1"
 CONTROL_STATE_SCHEMA = "parr0t.control-plane-state.v1"
 CONTROL_STATE_PATH = ".game-l10n/control-plane-state.json"
 
@@ -35,7 +37,14 @@ ROLE_STAGES = {
     "validator": {"validation"},
 }
 
-CONTROL_STATUSES = {"success", "partial", "refused", "error", "invalid"}
+CONTROL_STATUSES = {
+    "success",
+    "partial",
+    "fallback_required",
+    "error",
+    "invalid",
+}
+LEGACY_CONTROL_STATUSES = CONTROL_STATUSES | {"refused"}
 
 COUNT_KEYS = {
     "total",
@@ -43,6 +52,7 @@ COUNT_KEYS = {
     "success",
     "partial",
     "refused",
+    "fallback_required",
     "error",
     "invalid",
     "pending",
@@ -82,7 +92,8 @@ COMMON_ISSUE_CODES = {
     "target_mismatch",
 }
 
-PROVIDER_ISSUE_CODES = {"provider_refusal"}
+ROUTING_ISSUE_CODES = {"fallback_required"}
+LEGACY_PROVIDER_ISSUE_CODES = {"provider_refusal"}
 
 INVENTORY_ISSUE_CODES = {
     "independent_inventory_found_unextracted_targets",
@@ -124,15 +135,43 @@ VALIDATION_ISSUE_CODES = {
 
 ISSUE_CODES_BY_STAGE = {
     "inventory": COMMON_ISSUE_CODES | INVENTORY_ISSUE_CODES,
-    "context": COMMON_ISSUE_CODES | PROVIDER_ISSUE_CODES | CONTEXT_ISSUE_CODES,
-    "translation": COMMON_ISSUE_CODES | PROVIDER_ISSUE_CODES | TRANSLATION_ISSUE_CODES,
+    "context": COMMON_ISSUE_CODES | ROUTING_ISSUE_CODES | CONTEXT_ISSUE_CODES,
+    "translation": COMMON_ISSUE_CODES | ROUTING_ISSUE_CODES | TRANSLATION_ISSUE_CODES,
     # Detailed review findings (meaning, voice, omission, tone, and similar
     # judgments) stay in the private data-plane artifact. The parent needs only
     # the target IDs and queue transition that route a rewrite.
-    "review": COMMON_ISSUE_CODES | PROVIDER_ISSUE_CODES,
-    "rewrite": COMMON_ISSUE_CODES | PROVIDER_ISSUE_CODES | TRANSLATION_ISSUE_CODES,
+    "review": COMMON_ISSUE_CODES | ROUTING_ISSUE_CODES,
+    "rewrite": COMMON_ISSUE_CODES | ROUTING_ISSUE_CODES | TRANSLATION_ISSUE_CODES,
     "application": COMMON_ISSUE_CODES | APPLICATION_ISSUE_CODES,
     "validation": COMMON_ISSUE_CODES | VALIDATION_ISSUE_CODES,
+}
+
+ROUTES_BY_STAGE = {
+    "context": "context_analyzers",
+    "translation": "translators",
+    "review": "reviewers",
+    "rewrite": "rewriters",
+}
+
+TERMINAL_ROUTE_STATUSES = {
+    "provider_refusal",
+    "malformed_response",
+    "provider_error",
+    "rate_limited",
+    "quota_exhausted",
+    "authentication_error",
+    "timeout",
+    "integrity_invalid",
+    "budget_exhausted",
+    "budget_accounting_uncertain",
+}
+
+FALLBACK_QUEUES = {
+    "context_pending",
+    "translation_fallback_pending",
+    "review_fallback_pending",
+    "rewrite_pending",
+    "operational_failure",
 }
 
 LEAK_INCIDENT_CODES = {
@@ -282,6 +321,129 @@ def _validate_transitions(value: Any) -> list[dict[str, Any]]:
     return validated
 
 
+def _validate_route_evidence(
+    work_dir: Path,
+    relative_path: str,
+    *,
+    stage: str,
+    envelope_target_ids: list[str],
+    source_preserved_count: int,
+    artifact_paths: list[str],
+) -> str:
+    if not isinstance(relative_path, str) or not relative_path:
+        raise ConfigurationError(
+            "E_CONTROL_ROUTE_EVIDENCE_REQUIRED: source preservation requires "
+            "metadata-only route evidence"
+        )
+    relative = Path(relative_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ConfigurationError(
+            "E_CONTROL_ROUTE_EVIDENCE_INVALID: route evidence path must be workspace-relative"
+        )
+    normalized = relative.as_posix()
+    if normalized not in artifact_paths:
+        raise ConfigurationError(
+            "E_CONTROL_ROUTE_EVIDENCE_INVALID: route evidence must be an envelope artifact"
+        )
+    resolved = (work_dir / relative).resolve()
+    if not is_within(resolved, work_dir) or not resolved.is_file():
+        raise ConfigurationError(
+            "E_CONTROL_ROUTE_EVIDENCE_INVALID: route evidence is unavailable"
+        )
+    payload = json.loads(resolved.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema",
+        "stage",
+        "target_ids",
+        "attempts",
+    }:
+        raise ConfigurationError(
+            "E_CONTROL_ROUTE_EVIDENCE_INVALID: route evidence shape is invalid"
+        )
+    if payload["schema"] != ROUTE_EVIDENCE_SCHEMA or payload["stage"] != stage:
+        raise ConfigurationError(
+            "E_CONTROL_ROUTE_EVIDENCE_INVALID: route evidence schema or stage is invalid"
+        )
+    target_ids = _validate_target_ids(payload["target_ids"])
+    if len(target_ids) != source_preserved_count:
+        raise ConfigurationError(
+            "E_CONTROL_ROUTE_EVIDENCE_INVALID: terminal target count does not match source preservation"
+        )
+    if not set(target_ids).issubset(envelope_target_ids):
+        raise ConfigurationError(
+            "E_CONTROL_ROUTE_EVIDENCE_INVALID: terminal targets are outside the envelope"
+        )
+
+    config_path = work_dir / "game-l10n.json"
+    if not config_path.is_file():
+        raise ConfigurationError(
+            "E_CONTROL_ROUTE_EVIDENCE_INVALID: workspace routing configuration is missing"
+        )
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    route_key = ROUTES_BY_STAGE.get(stage)
+    expected_routes = config.get("routing", {}).get(route_key, []) if route_key else []
+    if (
+        not isinstance(expected_routes, list)
+        or not expected_routes
+        or not all(isinstance(route, str) and route for route in expected_routes)
+        or len(expected_routes) != len(set(expected_routes))
+    ):
+        raise ConfigurationError(
+            "E_CONTROL_ROUTE_EVIDENCE_INVALID: configured route chain is unavailable"
+        )
+
+    attempts = payload["attempts"]
+    if not isinstance(attempts, list) or len(attempts) > 16000:
+        raise ConfigurationError(
+            "E_CONTROL_ROUTE_EVIDENCE_INVALID: attempts must be a bounded list"
+        )
+    by_target: dict[str, dict[str, dict[str, Any]]] = {
+        target_id: {} for target_id in target_ids
+    }
+    for attempt in attempts:
+        if not isinstance(attempt, dict) or set(attempt) != {
+            "target_id",
+            "route",
+            "status",
+            "attempts",
+        }:
+            raise ConfigurationError(
+                "E_CONTROL_ROUTE_EVIDENCE_INVALID: attempt shape is invalid"
+            )
+        target_id = attempt["target_id"]
+        route = attempt["route"]
+        status = attempt["status"]
+        attempt_count = attempt["attempts"]
+        if target_id not in by_target or route not in expected_routes:
+            raise ConfigurationError(
+                "E_CONTROL_ROUTE_EVIDENCE_INVALID: attempt target or route is unexpected"
+            )
+        if route in by_target[target_id]:
+            raise ConfigurationError(
+                "E_CONTROL_ROUTE_EVIDENCE_INVALID: route outcome is duplicated"
+            )
+        if status not in TERMINAL_ROUTE_STATUSES:
+            raise ConfigurationError(
+                "E_CONTROL_ROUTE_EVIDENCE_INVALID: route did not end in a terminal failure"
+            )
+        if (
+            not isinstance(attempt_count, int)
+            or isinstance(attempt_count, bool)
+            or attempt_count < 1
+        ):
+            raise ConfigurationError(
+                "E_CONTROL_ROUTE_EVIDENCE_INVALID: every route requires an actual attempt"
+            )
+        by_target[target_id][route] = attempt
+
+    required = set(expected_routes)
+    if any(set(route_outcomes) != required for route_outcomes in by_target.values()):
+        raise ConfigurationError(
+            "E_CONTROL_ROUTE_EVIDENCE_INCOMPLETE: every configured route must be exhausted"
+        )
+    return normalized
+
+
 def validate_control_envelope(
     work_dir: Path,
     source: Path,
@@ -307,12 +469,19 @@ def validate_control_envelope(
         "artifact_paths",
         "queue_transitions",
     }
-    if not isinstance(payload, dict) or set(payload) != required:
+    if not isinstance(payload, dict):
         raise ConfigurationError(
             "E_CONTROL_ENVELOPE_INVALID: envelope contains missing or parent-unsafe fields"
         )
-    if payload["schema"] != CONTROL_ENVELOPE_SCHEMA:
+    schema = payload.get("schema")
+    if schema == CONTROL_ENVELOPE_SCHEMA:
+        required.add("route_evidence_path")
+    elif schema != LEGACY_CONTROL_ENVELOPE_SCHEMA:
         raise ConfigurationError("E_CONTROL_ENVELOPE_INVALID: unsupported envelope schema")
+    if set(payload) != required:
+        raise ConfigurationError(
+            "E_CONTROL_ENVELOPE_INVALID: envelope contains missing or parent-unsafe fields"
+        )
     role = payload["worker_role"]
     stage = payload["stage"]
     status = payload["status"]
@@ -322,19 +491,41 @@ def validate_control_envelope(
         raise ConfigurationError("E_CONTROL_ENVELOPE_INVALID: unexpected worker role")
     if expected_stage is not None and stage != expected_stage:
         raise ConfigurationError("E_CONTROL_ENVELOPE_INVALID: unexpected worker stage")
-    if status not in CONTROL_STATUSES:
+    if schema == CONTROL_ENVELOPE_SCHEMA and status == "refused":
+        raise ConfigurationError(
+            "E_CONTROL_ENVELOPE_INVALID: parent-facing refusals must be normalized to fallback_required"
+        )
+    allowed_statuses = (
+        CONTROL_STATUSES if schema == CONTROL_ENVELOPE_SCHEMA else LEGACY_CONTROL_STATUSES
+    )
+    if status not in allowed_statuses:
         raise ConfigurationError("E_CONTROL_ENVELOPE_INVALID: unsupported categorical status")
     target_ids = _validate_target_ids(payload["target_ids"])
     counts = _validate_counts(payload["counts"])
+    if schema == CONTROL_ENVELOPE_SCHEMA and "refused" in counts:
+        raise ConfigurationError(
+            "E_CONTROL_ENVELOPE_INVALID: parent-facing refusal counts must use fallback_required"
+        )
     issue_codes = payload["issue_codes"]
     if (
         not isinstance(issue_codes, list)
         or len(issue_codes) > 16
         or not all(isinstance(code, str) for code in issue_codes)
-        or not set(issue_codes).issubset(ISSUE_CODES_BY_STAGE[stage])
+        or not set(issue_codes).issubset(
+            ISSUE_CODES_BY_STAGE[stage]
+            | (LEGACY_PROVIDER_ISSUE_CODES if schema == LEGACY_CONTROL_ENVELOPE_SCHEMA else set())
+        )
     ):
         raise ConfigurationError(
             "E_CONTROL_ENVELOPE_INVALID: issue_codes contain prose or an unauthorized semantic category"
+        )
+    if schema == CONTROL_ENVELOPE_SCHEMA and "provider_refusal" in issue_codes:
+        raise ConfigurationError(
+            "E_CONTROL_ENVELOPE_INVALID: parent-facing refusals must be normalized to fallback_required"
+        )
+    if status == "fallback_required" and "fallback_required" not in issue_codes:
+        raise ConfigurationError(
+            "E_CONTROL_ENVELOPE_INVALID: fallback_required status requires fallback_required"
         )
     if status == "refused" and "provider_refusal" not in issue_codes:
         raise ConfigurationError(
@@ -342,14 +533,66 @@ def validate_control_envelope(
         )
     artifact_paths = _validate_artifact_paths(work_dir, payload["artifact_paths"])
     transitions = _validate_transitions(payload["queue_transitions"])
+    if status == "fallback_required":
+        if not transitions or not any(
+            transition["to"] in FALLBACK_QUEUES for transition in transitions
+        ):
+            raise ConfigurationError(
+                "E_CONTROL_ENVELOPE_INVALID: fallback_required must advance to a fallback queue"
+            )
+        if any(transition["to"] == "source_preserved" for transition in transitions):
+            raise ConfigurationError(
+                "E_CONTROL_ENVELOPE_INVALID: fallback_required cannot preserve source"
+            )
+
+    source_preserved_count = sum(
+        transition["count"]
+        for transition in transitions
+        if transition["to"] == "source_preserved"
+    )
+    declared_source_preserved = counts.get("source_preserved", 0)
+    if (source_preserved_count or stage in ROUTES_BY_STAGE) and (
+        source_preserved_count != declared_source_preserved
+    ):
+        raise ConfigurationError(
+            "E_CONTROL_ENVELOPE_INVALID: source-preserved counts and transitions disagree"
+        )
+    route_evidence_path = ""
+    if source_preserved_count:
+        if schema != CONTROL_ENVELOPE_SCHEMA:
+            raise ConfigurationError(
+                "E_CONTROL_ROUTE_EVIDENCE_REQUIRED: legacy envelopes cannot terminate routes"
+            )
+        route_evidence_path = _validate_route_evidence(
+            work_dir,
+            payload["route_evidence_path"],
+            stage=stage,
+            envelope_target_ids=target_ids,
+            source_preserved_count=source_preserved_count,
+            artifact_paths=artifact_paths,
+        )
+    elif schema == CONTROL_ENVELOPE_SCHEMA and payload["route_evidence_path"]:
+        raise ConfigurationError(
+            "E_CONTROL_ROUTE_EVIDENCE_INVALID: nonterminal envelope must not claim route evidence"
+        )
+
+    normalized_status = "fallback_required" if status == "refused" else status
+    normalized_issue_codes = [
+        "fallback_required" if code == "provider_refusal" else code
+        for code in issue_codes
+    ]
+    normalized_counts = dict(counts)
+    if schema == LEGACY_CONTROL_ENVELOPE_SCHEMA and "refused" in normalized_counts:
+        normalized_counts["fallback_required"] = normalized_counts.pop("refused")
     return {
         "schema": CONTROL_ENVELOPE_SCHEMA,
         "worker_role": role,
         "stage": stage,
-        "status": status,
+        "status": normalized_status,
         "target_ids": target_ids,
-        "counts": counts,
-        "issue_codes": list(issue_codes),
+        "counts": normalized_counts,
+        "issue_codes": normalized_issue_codes,
         "artifact_paths": artifact_paths,
         "queue_transitions": transitions,
+        "route_evidence_path": route_evidence_path,
     }
