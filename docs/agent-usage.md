@@ -21,7 +21,7 @@ For a new job:
 1. Confirm repository/source readability and workspace writability.
 2. Ask once whether Git may be used for this game task and record the choice. Disabled means no `git init`, commit, branch, remote, or push for that job.
 3. Initialize the workspace, then run `game-l10n status`.
-4. Follow the single `next_actions` entry. Resolve only its `required_contracts` against `contract_base`; load another contract only when a new user request activates a route outside workspace state.
+4. Follow the single `next_actions` entry. Resolve only its `required_contracts` against `contract_base`; load another contract only when a new user request activates a route outside workspace state. `local_patch_ready` is the only terminal local-work action and requires a current completion attestation bound to an unchanged packed artifact.
 
 For an existing job, start with status and reuse valid checkpoints. Do not repeat extraction, context work, translation, or validation whose input fingerprint is unchanged.
 
@@ -39,7 +39,8 @@ workspace and authorization
   -> selective rewrite and confirmation
   -> review fallback for failures only
   -> deterministic validation
-  -> recoverable patch or held checkpoint
+  -> recoverable packed patch or held checkpoint
+  -> local_patch_ready
 ```
 
 Do not skip or reorder barriers. One refusal, timeout, malformed result, capacity error, or worker failure affects only its target and route. It cannot cancel a batch, exclude content, or justify a reduced manifest. Blocking unresolved targets hold the patch; other exhausted targets preserve exact source and remain visibly unresolved.
@@ -69,6 +70,8 @@ Use the routing table in repository `AGENTS.md`. Common short paths are:
 - Windows delivery: `installer-contract.md` plus the selected Steam or filesystem packaging contract;
 - publication: `instance-release.md` only after the user commands publication;
 - reusable SDK promotion: SDK branch and engine FAQ contracts only after confirmed patch success.
+
+After verified context, status routes to the complete primary translation/review pipeline. A missing, malformed, or stale completion attestation is never `ready`; incomplete results route to targeted gap resolution, and static completion routes to validation and packing. Status validates cached pack metadata against both the artifact digest and the current completion attestation before returning `local_patch_ready`. Malformed state returns one metadata-only repair action instead of a traceback, while a failure queue bound to another inventory returns a stale-queue reconciliation action rather than blocking the current inventory.
 
 For non-Steam/launcher-neutral delivery, `filesystem-package` is authoritative. `-GameRoot` accepts an absolute path or a path relative to the startup current directory. If omitted, the installer tries that validated startup current directory before prompting. It never discovers or controls a store client.
 

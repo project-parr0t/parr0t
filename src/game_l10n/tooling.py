@@ -11,6 +11,9 @@ from .errors import ToolExecutionError
 from .store import stable_hash
 
 
+TOOL_STATE_SCHEMA = "parr0t.tool-state.v1"
+
+
 def _hash_path(path: Path) -> str:
     if path.is_file():
         return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -21,6 +24,55 @@ def _hash_path(path: Path) -> str:
                 rows.append((item.relative_to(path).as_posix(), hashlib.sha256(item.read_bytes()).hexdigest()))
         return stable_hash(rows)
     return "missing"
+
+
+def _completion_attestation_hash(work_dir: Path) -> str:
+    return _hash_path(work_dir / ".game-l10n" / "completion-attestation.json")
+
+
+def _completion_binding(work_dir: Path, stage: str) -> str | None:
+    return _completion_attestation_hash(work_dir) if stage == "pack" else None
+
+
+def _write_tool_state(path: Path, state: dict[str, Any]) -> None:
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
+def cached_tool_state(work_dir: Path, stage: str) -> dict[str, Any]:
+    """Return metadata-only validity for a cached unpack/pack artifact."""
+    if stage not in {"unpack", "pack"}:
+        raise ToolExecutionError("stage must be 'unpack' or 'pack'")
+    state_path = work_dir / ".game-l10n" / "tool-state.json"
+    if not state_path.is_file():
+        return {"status": "missing"}
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"status": "invalid", "issue_code": "TOOL_STATE_UNREADABLE"}
+    if not isinstance(state, dict) or state.get("schema") != TOOL_STATE_SCHEMA:
+        return {"status": "invalid", "issue_code": "TOOL_STATE_SCHEMA_INVALID"}
+    entry = state.get(stage)
+    if not isinstance(entry, dict):
+        return {"status": "missing"}
+    output_value = entry.get("output_path")
+    if not isinstance(output_value, str) or not output_value:
+        return {"status": "invalid", "issue_code": "TOOL_OUTPUT_PATH_MISSING"}
+    output_path = Path(output_value).resolve()
+    try:
+        output_path.relative_to(work_dir.resolve())
+    except ValueError:
+        return {"status": "invalid", "issue_code": "TOOL_OUTPUT_OUTSIDE_WORKSPACE"}
+    if not output_path.exists():
+        return {"status": "stale", "issue_code": "TOOL_OUTPUT_MISSING"}
+    if entry.get("output_hash") != _hash_path(output_path):
+        return {"status": "stale", "issue_code": "TOOL_OUTPUT_CHANGED"}
+    if entry.get("completion_attestation_hash") != _completion_binding(work_dir, stage):
+        return {"status": "stale", "issue_code": "COMPLETION_ATTESTATION_CHANGED"}
+    return {"status": "valid", "artifact_path": str(output_path)}
 
 
 def _expand(command: list[str], *, input_path: Path, output_path: Path, work_dir: Path) -> list[str]:
@@ -70,9 +122,21 @@ def run_cached_tool(
     )
     state_path = work_dir / ".game-l10n" / "tool-state.json"
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    if not isinstance(state, dict) or state.get("schema") != TOOL_STATE_SCHEMA:
+        state = {"schema": TOOL_STATE_SCHEMA}
     previous = state.get(stage, {})
-    if not force and previous.get("fingerprint") == fingerprint and output_path.exists():
+    completion_hash = _completion_binding(work_dir, stage)
+    if (
+        not force
+        and previous.get("fingerprint") == fingerprint
+        and previous.get("output_path") == str(resolved_output)
+        and previous.get("output_hash") == _hash_path(output_path)
+        and previous.get("completion_attestation_hash") == completion_hash
+    ):
         return {"stage": stage, "status": "skipped", "reason": "identical environment and input", "fingerprint": fingerprint}
 
     env = os.environ.copy()
@@ -96,8 +160,11 @@ def run_cached_tool(
         raise ToolExecutionError(f"{stage} tool succeeded but did not create: {output_path}")
     state[stage] = {
         "fingerprint": fingerprint,
+        "input_path": str(resolved_input),
+        "output_path": str(resolved_output),
         "output_hash": _hash_path(output_path),
+        "completion_attestation_hash": completion_hash,
         "command": expanded,
     }
-    state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _write_tool_state(state_path, state)
     return {"stage": stage, "status": "completed", "fingerprint": fingerprint}

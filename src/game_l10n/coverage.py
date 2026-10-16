@@ -416,6 +416,7 @@ def completion_attestation(
             "status": inventory["status"],
             "static_complete": inventory["static_complete"],
             "segment_count": inventory["primary_segments"],
+            "fingerprint": inventory["primary_fingerprint"],
         },
         "result_alignment": {
             "complete": alignment_complete,

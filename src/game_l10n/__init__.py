@@ -1,4 +1,4 @@
-"""Parr0t refusal-aware game localization orchestration framework."""
+"""Parr0t fallback-routed game localization orchestration framework."""
 
 from .models import (
     CharacterProfile,

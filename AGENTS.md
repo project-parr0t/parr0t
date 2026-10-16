@@ -9,6 +9,8 @@ Parr0t is an engine-neutral control framework and reusable SDK repository. Keep 
 3. Run `game-l10n status --workspace <workspace>`.
 4. Resolve each `required_contracts` entry against `contract_base` and read only those contracts. For a user-requested route not represented by workspace state, use the table below. Do not preload every document.
 
+`local_patch_ready` is the only terminal local-work status. It requires current static completion and an unchanged packed artifact bound to that completion attestation.
+
 ## Non-negotiable rules
 
 1. **Stay within the request.** Apply `skills/request-scope-guard/SKILL.md` whenever scope is limited, the task is inspection-only, or an action is optional, destructive, or externally consequential. Re-evaluate after every user message. Access and API-key availability are not authorization.

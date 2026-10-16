@@ -4,7 +4,7 @@ Codex must be granted access to three distinct locations:
 
 ```text
 translation-project-root/
-├── agent-game-translation-sdk/   # Git repository; reusable code only
+├── parr0t/                       # Git repository; reusable code only
 ├── my-game-agent-work/           # private extracted/translated data
 └── game-source-link-or-folder/   # read-only installed/unpacked source, when appropriate
 ```

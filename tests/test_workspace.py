@@ -325,11 +325,16 @@ class WorkspaceTests(unittest.TestCase):
             second = run_cached_tool(
                 stage="unpack", command=command, input_path=source, output_path=output, work_dir=work
             )
+            output.write_bytes(b"changed")
+            third = run_cached_tool(
+                stage="unpack", command=command, input_path=source, output_path=output, work_dir=work
+            )
             profile = prepare_sdk_profile(work, "fixture-engine", "1.0", user_confirmed_success=True)
             manifest = json.loads((profile / "profile.json").read_text(encoding="utf-8"))
             exported = {path.relative_to(profile).as_posix() for path in profile.rglob("*") if path.is_file()}
         self.assertEqual(first["status"], "completed")
         self.assertEqual(second["status"], "skipped")
+        self.assertEqual(third["status"], "completed")
         self.assertEqual(manifest["profile"], "sdk-fixture-engine-1.0")
         self.assertNotIn("next_step", manifest)
         self.assertNotIn("publish", json.dumps(manifest).lower())
@@ -652,6 +657,213 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(
             status["required_contracts"], ["docs/control-plane-contract.md"]
         )
+
+    def test_status_routes_every_post_context_stage_to_local_patch_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            game = root / "game"
+            work = root / "work"
+            sdk.mkdir()
+            game.mkdir()
+            initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+            record_sdk_selection(
+                work,
+                "private-new",
+                target_engine="fixture-engine",
+                target_version="1.0",
+            )
+            (work / "inputs" / "primary.json").write_text("{}\n", encoding="utf-8")
+            state_root = work / ".game-l10n"
+            inventory_fingerprint = "fixture-inventory-fingerprint"
+            (state_root / "inventory-attestation.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "parr0t.inventory-attestation.v1",
+                        "status": "static_verified",
+                        "static_complete": True,
+                        "primary_fingerprint": inventory_fingerprint,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (work / "context" / "context-pack.json").write_text("{}\n", encoding="utf-8")
+            (state_root / "context-state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "success",
+                        "execution": {
+                            "status": "success",
+                            "total_parts": 1,
+                            "completed_parts": 1,
+                            "parts": [{"status": "success"}],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            translation_output = StringIO()
+            with redirect_stdout(translation_output):
+                translation_exit = cmd_status(SimpleNamespace(workspace=str(work)))
+            translation_status = json.loads(translation_output.getvalue())
+
+            (state_root / "completion-attestation.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "parr0t.completion-attestation.v1",
+                        "source_inventory": {
+                            "fingerprint": inventory_fingerprint,
+                            "status": "static_verified",
+                            "static_complete": True,
+                        },
+                        "result_alignment": {"complete": True},
+                        "target_scope": {"full_inventory": True},
+                        "semantic_review": {"complete": False},
+                        "target_completion": False,
+                        "static_completion": False,
+                        "issue_codes": ["SEMANTIC_REVIEW_INCOMPLETE"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            gap_output = StringIO()
+            with redirect_stdout(gap_output):
+                gap_exit = cmd_status(SimpleNamespace(workspace=str(work)))
+            gap_status = json.loads(gap_output.getvalue())
+
+            (state_root / "completion-attestation.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "parr0t.completion-attestation.v1",
+                        "source_inventory": {
+                            "fingerprint": inventory_fingerprint,
+                            "status": "static_verified",
+                            "static_complete": True,
+                        },
+                        "result_alignment": {"complete": True},
+                        "target_scope": {"full_inventory": True},
+                        "semantic_review": {"complete": True},
+                        "target_completion": True,
+                        "static_completion": True,
+                        "issue_codes": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            pack_output = StringIO()
+            with redirect_stdout(pack_output):
+                pack_exit = cmd_status(SimpleNamespace(workspace=str(work)))
+            pack_status = json.loads(pack_output.getvalue())
+
+            translated = work / "translations" / "full.json"
+            translated.parent.mkdir(parents=True, exist_ok=True)
+            translated.write_text("{}\n", encoding="utf-8")
+            patch_path = work / "build" / "patch.json"
+            run_cached_tool(
+                stage="pack",
+                command=["python", "tools/pack.py", "{input}", "{output}"],
+                input_path=translated,
+                output_path=patch_path,
+                work_dir=work,
+            )
+            ready_output = StringIO()
+            with redirect_stdout(ready_output):
+                ready_exit = cmd_status(SimpleNamespace(workspace=str(work)))
+            ready_status = json.loads(ready_output.getvalue())
+
+            patch_path.write_text("changed\n", encoding="utf-8")
+            changed_output = StringIO()
+            with redirect_stdout(changed_output):
+                changed_exit = cmd_status(SimpleNamespace(workspace=str(work)))
+            changed_status = json.loads(changed_output.getvalue())
+
+        self.assertEqual(translation_exit, 0)
+        self.assertEqual(
+            translation_status["next_actions"],
+            ["run_primary_translation_review_pipeline"],
+        )
+        self.assertIn("docs/review-pipeline.md", translation_status["required_contracts"])
+        self.assertEqual(gap_exit, 0)
+        self.assertEqual(gap_status["next_actions"], ["resolve_translation_review_gaps"])
+        self.assertEqual(pack_exit, 0)
+        self.assertEqual(
+            pack_status["next_actions"], ["validate_and_pack_recoverable_patch"]
+        )
+        self.assertEqual(ready_exit, 0)
+        self.assertEqual(ready_status["next_actions"], ["local_patch_ready"])
+        self.assertEqual(ready_status["local_artifact"]["status"], "valid")
+        self.assertEqual(
+            ready_status["local_artifact"]["artifact_path"], str(patch_path.resolve())
+        )
+        self.assertEqual(changed_exit, 0)
+        self.assertEqual(
+            changed_status["next_actions"], ["validate_and_pack_recoverable_patch"]
+        )
+        self.assertEqual(changed_status["state_issue_codes"], ["TOOL_OUTPUT_CHANGED"])
+
+    def test_status_routes_invalid_and_stale_metadata_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            game = root / "game"
+            work = root / "work"
+            sdk.mkdir()
+            game.mkdir()
+            initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+            record_sdk_selection(
+                work,
+                "private-new",
+                target_engine="fixture-engine",
+                target_version="1.0",
+            )
+            (work / "inputs" / "primary.json").write_text("{}\n", encoding="utf-8")
+            state_root = work / ".game-l10n"
+            inventory_path = state_root / "inventory-attestation.json"
+            inventory_path.write_text("{", encoding="utf-8")
+
+            invalid_output = StringIO()
+            with redirect_stdout(invalid_output):
+                invalid_exit = cmd_status(SimpleNamespace(workspace=str(work)))
+            invalid_status = json.loads(invalid_output.getvalue())
+
+            inventory_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "parr0t.inventory-attestation.v1",
+                        "status": "static_verified",
+                        "static_complete": True,
+                        "primary_fingerprint": "current-inventory",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (state_root / "failure-queue.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "parr0t.failure-queue.v1",
+                        "inventory_fingerprint": "old-inventory",
+                        "pending_count": 1,
+                        "entries": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stale_output = StringIO()
+            with redirect_stdout(stale_output):
+                stale_exit = cmd_status(SimpleNamespace(workspace=str(work)))
+            stale_status = json.loads(stale_output.getvalue())
+
+        self.assertEqual(invalid_exit, 1)
+        self.assertEqual(invalid_status["next_actions"], ["repair_invalid_workspace_state"])
+        self.assertEqual(
+            invalid_status["state_issue_codes"], ["INVENTORY_ATTESTATION_UNREADABLE"]
+        )
+        self.assertEqual(stale_exit, 1)
+        self.assertEqual(
+            stale_status["next_actions"], ["reconcile_stale_failure_queue"]
+        )
+        self.assertEqual(stale_status["state_issue_codes"], ["FAILURE_QUEUE_STALE"])
 
 
 if __name__ == "__main__":

@@ -48,7 +48,7 @@ from .provider_policy import require_direct_provider_pipeline
 from .runtime_approval import create_runtime_approval
 from .steam import build_steam_package, inspect_installed_state, validate_steam_package
 from .translation_exchange import prepare_translation_exchange, seal_translation_exchange
-from .tooling import run_cached_tool
+from .tooling import cached_tool_state, run_cached_tool
 from .workspace import (
     initialize_workspace,
     refresh_sdk_inventory,
@@ -88,12 +88,101 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
         "docs/fallback-routing.md",
         "docs/control-plane-contract.md",
     ),
-    "ready": (),
+    "repair_invalid_workspace_state": (
+        "docs/coverage-gates.md",
+        "docs/control-plane-contract.md",
+    ),
+    "reconcile_stale_failure_queue": (
+        "docs/coverage-gates.md",
+        "docs/fallback-routing.md",
+        "docs/control-plane-contract.md",
+    ),
+    "run_primary_translation_review_pipeline": (
+        "docs/coverage-gates.md",
+        "docs/review-pipeline.md",
+        "docs/fallback-routing.md",
+        "docs/provider-protocol.md",
+        "docs/control-plane-contract.md",
+        "docs/execution-budget.md",
+    ),
+    "resolve_translation_review_gaps": (
+        "docs/coverage-gates.md",
+        "docs/review-pipeline.md",
+        "docs/fallback-routing.md",
+        "docs/provider-protocol.md",
+        "docs/control-plane-contract.md",
+        "docs/execution-budget.md",
+    ),
+    "rebuild_current_inventory_translation_attestation": (
+        "docs/coverage-gates.md",
+        "docs/review-pipeline.md",
+        "docs/control-plane-contract.md",
+    ),
+    "validate_and_pack_recoverable_patch": (
+        "docs/coverage-gates.md",
+        "docs/execution-budget.md",
+    ),
+    "local_patch_ready": (),
 }
 
 
 def _status_contracts(action: str) -> list[str]:
     return list(STATUS_ACTION_CONTRACTS[action])
+
+
+def _read_status_object(
+    path: Path, *, label: str, expected_schema: str | None = None
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not path.is_file():
+        return None, None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, f"{label}_UNREADABLE"
+    if not isinstance(payload, dict):
+        return None, f"{label}_NOT_OBJECT"
+    if expected_schema is not None and payload.get("schema") != expected_schema:
+        return None, f"{label}_SCHEMA_INVALID"
+    return payload, None
+
+
+def _context_state_valid(payload: dict[str, Any]) -> bool:
+    execution = payload.get("execution")
+    if payload.get("status") != "success" or not isinstance(execution, dict):
+        return False
+    total = execution.get("total_parts")
+    completed = execution.get("completed_parts")
+    parts = execution.get("parts")
+    return bool(
+        execution.get("status") == "success"
+        and isinstance(total, int)
+        and total > 0
+        and completed == total
+        and isinstance(parts, list)
+        and len(parts) == total
+        and all(isinstance(item, dict) and item.get("status") == "success" for item in parts)
+    )
+
+
+def _completion_state_valid(payload: dict[str, Any]) -> bool:
+    source_inventory = payload.get("source_inventory")
+    result_alignment = payload.get("result_alignment")
+    target_scope = payload.get("target_scope")
+    semantic_review = payload.get("semantic_review")
+    return bool(
+        isinstance(source_inventory, dict)
+        and isinstance(source_inventory.get("fingerprint"), str)
+        and source_inventory.get("fingerprint")
+        and isinstance(result_alignment, dict)
+        and isinstance(result_alignment.get("complete"), bool)
+        and isinstance(target_scope, dict)
+        and isinstance(target_scope.get("full_inventory"), bool)
+        and isinstance(semantic_review, dict)
+        and isinstance(semantic_review.get("complete"), bool)
+        and isinstance(payload.get("target_completion"), bool)
+        and isinstance(payload.get("static_completion"), bool)
+        and isinstance(payload.get("issue_codes"), list)
+    )
 
 
 def _sdk_root() -> Path:
@@ -726,6 +815,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     if policy.get("publish_approved") is True:
         visible_policy["publish_approved"] = True
     action: str | None = None
+    state_issue_codes: list[str] = []
+    local_artifact: dict[str, Any] = {"status": "not_checked"}
     if policy.get("initial_choice") == "pending":
         action = "ask_user_for_initial_git_choice"
     game_roots = [Path(item) for item in config.get("game_roots", [])]
@@ -746,24 +837,58 @@ def cmd_status(args: argparse.Namespace) -> int:
         else:
             inventory_state_path = work_dir / ".game-l10n" / "inventory-attestation.json"
             inventory_verified = False
-            if not inventory_state_path.exists():
+            inventory_state, inventory_issue = _read_status_object(
+                inventory_state_path,
+                label="INVENTORY_ATTESTATION",
+                expected_schema="parr0t.inventory-attestation.v1",
+            )
+            if inventory_issue:
+                state_issue_codes.append(inventory_issue)
+                action = "repair_invalid_workspace_state"
+            elif inventory_state is None:
                 action = "verify_independent_source_inventory"
             else:
-                inventory_state = json.loads(
-                    inventory_state_path.read_text(encoding="utf-8")
+                inventory_verified = bool(
+                    inventory_state.get("status") == "static_verified"
+                    and inventory_state.get("static_complete") is True
+                    and isinstance(inventory_state.get("primary_fingerprint"), str)
+                    and inventory_state.get("primary_fingerprint")
                 )
-                inventory_verified = inventory_state.get("status") == "static_verified"
                 if not inventory_verified:
                     action = "resolve_source_inventory_gaps"
-            if inventory_verified:
+            if inventory_verified and action is None:
                 failure_queue_path = work_dir / ".game-l10n" / "failure-queue.json"
                 queue_pending = False
-                if failure_queue_path.exists():
-                    queue = json.loads(failure_queue_path.read_text(encoding="utf-8"))
-                    queue_pending = bool(queue.get("pending_count", 0))
-                if queue_pending:
+                queue, queue_issue = _read_status_object(
+                    failure_queue_path,
+                    label="FAILURE_QUEUE",
+                    expected_schema="parr0t.failure-queue.v1",
+                )
+                if queue_issue:
+                    state_issue_codes.append(queue_issue)
+                    action = "repair_invalid_workspace_state"
+                elif queue is not None:
+                    pending_count = queue.get("pending_count")
+                    if not isinstance(pending_count, int) or pending_count < 0:
+                        state_issue_codes.append("FAILURE_QUEUE_COUNT_INVALID")
+                        action = "repair_invalid_workspace_state"
+                    elif (
+                        pending_count > 0
+                        and queue.get("inventory_fingerprint")
+                        != inventory_state.get("primary_fingerprint")
+                    ):
+                        state_issue_codes.append("FAILURE_QUEUE_STALE")
+                        action = "reconcile_stale_failure_queue"
+                    elif not isinstance(queue.get("entries"), list) or len(
+                        queue["entries"]
+                    ) != pending_count:
+                        state_issue_codes.append("FAILURE_QUEUE_ENTRIES_INVALID")
+                        action = "repair_invalid_workspace_state"
+                    else:
+                        queue_pending = pending_count > 0
+                if action is None and queue_pending:
                     action = "await_explicit_user_request_to_resume_failure_queue"
-                else:
+                elif action is None:
                     context_path = _path_in_workspace(
                         work_dir,
                         config.get("files", {}).get(
@@ -771,19 +896,55 @@ def cmd_status(args: argparse.Namespace) -> int:
                         ),
                     )
                     context_state_path = work_dir / ".game-l10n" / "context-state.json"
-                    context_ready = context_path.exists() and context_state_path.exists()
-                    if context_ready:
-                        context_state = json.loads(
-                            context_state_path.read_text(encoding="utf-8")
-                        )
-                        context_ready = (
-                            context_state.get("status") == "success"
-                            and context_state.get("execution", {}).get("status")
-                            == "success"
-                        )
-                    if not context_ready:
+                    context_state, context_issue = _read_status_object(
+                        context_state_path, label="CONTEXT_ATTESTATION"
+                    )
+                    if context_issue:
+                        state_issue_codes.append(context_issue)
+                        action = "repair_invalid_workspace_state"
+                    elif (
+                        context_state is None
+                        or not context_path.is_file()
+                        or not _context_state_valid(context_state)
+                    ):
                         action = "analyze_complete_script_context"
-    action = action or "ready"
+                    else:
+                        completion_path = (
+                            work_dir / ".game-l10n" / "completion-attestation.json"
+                        )
+                        completion, completion_issue = _read_status_object(
+                            completion_path,
+                            label="COMPLETION_ATTESTATION",
+                            expected_schema="parr0t.completion-attestation.v1",
+                        )
+                        if completion_issue:
+                            state_issue_codes.append(completion_issue)
+                            action = "repair_invalid_workspace_state"
+                        elif completion is None:
+                            action = "run_primary_translation_review_pipeline"
+                        elif not _completion_state_valid(completion):
+                            state_issue_codes.append(
+                                "COMPLETION_ATTESTATION_STRUCTURE_INVALID"
+                            )
+                            action = "repair_invalid_workspace_state"
+                        elif completion["source_inventory"].get("fingerprint") != (
+                            inventory_state.get("primary_fingerprint")
+                        ):
+                            state_issue_codes.append("COMPLETION_ATTESTATION_STALE")
+                            action = "rebuild_current_inventory_translation_attestation"
+                        elif completion.get("static_completion") is not True:
+                            action = "resolve_translation_review_gaps"
+                        else:
+                            local_artifact = cached_tool_state(work_dir, "pack")
+                            action = (
+                                "local_patch_ready"
+                                if local_artifact.get("status") == "valid"
+                                else "validate_and_pack_recoverable_patch"
+                            )
+                            issue_code = local_artifact.get("issue_code")
+                            if isinstance(issue_code, str):
+                                state_issue_codes.append(issue_code)
+    action = action or "run_primary_translation_review_pipeline"
     print(
         json.dumps(
             {
@@ -799,6 +960,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "execution": config.get("execution", {}),
                 "runtime": config.get("runtime", {"default_policy": "deny"}),
                 "control_plane": control_state,
+                "local_artifact": local_artifact,
+                "state_issue_codes": state_issue_codes,
                 "contract_base": contract_base,
                 "next_actions": [action],
                 "required_contracts": _status_contracts(action),
@@ -807,7 +970,16 @@ def cmd_status(args: argparse.Namespace) -> int:
             indent=2,
         )
     )
-    return 1 if action == "fix_missing_game_root" else 0
+    return (
+        1
+        if action
+        in {
+            "fix_missing_game_root",
+            "repair_invalid_workspace_state",
+            "reconcile_stale_failure_queue",
+        }
+        else 0
+    )
 
 
 def cmd_sdk_inventory(args: argparse.Namespace) -> int:

@@ -168,6 +168,7 @@ class CoverageTests(unittest.TestCase):
             "status": "static_verified",
             "static_complete": True,
             "primary_segments": 1,
+            "primary_fingerprint": "synthetic-inventory-fingerprint",
         }
         runtime = {"status": "not_run", "runtime_complete": False, "issue_codes": ["REAL_RUNTIME_NOT_EXECUTED"]}
 
@@ -183,6 +184,10 @@ class CoverageTests(unittest.TestCase):
         self.assertTrue(state["result_alignment"]["complete"])
         self.assertTrue(state["semantic_review"]["complete"])
         self.assertTrue(state["static_completion"])
+        self.assertEqual(
+            state["source_inventory"]["fingerprint"],
+            "synthetic-inventory-fingerprint",
+        )
         self.assertFalse(state["runtime_completion"])
         self.assertIn("REAL_RUNTIME_NOT_EXECUTED", state["issue_codes"])
 

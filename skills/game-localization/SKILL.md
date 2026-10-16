@@ -1,6 +1,6 @@
 ---
 name: game-localization
-description: Run Parr0t's context-first, refusal-aware game translation and patch workflow. Use for game unpacking, text translation, review, repacking, continuation, or reusable SDK promotion; do not use for ordinary software localization.
+description: Run Parr0t's context-first, fallback-routed game translation and patch workflow. Use for game unpacking, text translation, review, repacking, continuation, or reusable SDK promotion; do not use for ordinary software localization.
 ---
 
 # Parr0t game localization
