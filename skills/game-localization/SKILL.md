@@ -27,7 +27,7 @@ Use `game-l10n` as the execution boundary. Read the repository `AGENTS.md`, `doc
 - Operational failures remain in the resumable metadata queue. Retry after a later explicit user request; if `metadata.blocking_on_failure=true`, hold the complete patch.
 - A configured preset fixes provider roles. API-key presence cannot select or alter it. For `codex-app-deepseek`, follow `docs/codex-app-deepseek.md`.
 - The source root is read-only. Real install, update, remove/restore, and launch are separate actions requiring explicit one-shot approval.
-- Publication stays unmentioned and dormant until the user requests it. SDK promotion also requires confirmed patch success and exact target identity.
+- Publication stays unmentioned and dormant until the user requests it. SDK promotion also requires confirmed patch success and exact target identity. Its separate non-merge engine commit must pass `game-l10n verify-sdk-promotion`; common changes belong in an independently authorized `main` commit.
 
 ## Fast routes
 

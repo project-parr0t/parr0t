@@ -58,6 +58,8 @@ Promotion exports only behavior actually used and verified after the user confir
 - `derive-new` creates `sdk-<target-engine>-<target-version>` from `main` and ports only the verified, provenance-free implementation needed for that target. The reference branch remains unchanged and must not be merged wholesale.
 - `private-new` creates the recorded target branch from `main` without pretending that an incompatible branch owns the new support.
 
+A promotion commit owns engine-specific implementation only. It must be a separate non-merge commit after the intended `main` revision is merged, and it must not modify any path that exists on `main`. Do not use promotion to bundle a generally useful helper, control-plane rule, provider change, common test, root documentation edit, or cleanup. If engine work exposes a genuine core need, stop promotion, make that a separately authorized `main` change, verify it there, merge the resulting core commit into the SDK branch, and then create a clean engine-only promotion commit. Never stage or commit both scopes together.
+
 An exact engine build observed in a private workspace may be reduced to its declared public compatibility line for the branch name, but the line must be derived from that observed build before evaluation begins. After it is recorded, the exact `sdk-<engine>-<version>` identity controls ownership; an older, newer, or merely similar branch cannot absorb the result.
 
 ## Branch acceptance gate
@@ -66,7 +68,7 @@ Before an engine SDK branch is published:
 
 1. Merge or rebase the intended `main` revision.
 2. Confirm the branch name equals the recorded promotion target and that every promoted capability was exercised on that target compatibility line.
-3. Confirm the diff from `main` contains only that engine adapter and its neutral support files. For `derive-new`, inspect the diff rather than merging the reference branch.
+3. Confirm the diff from `main` contains only that engine adapter and its engine-owned support files. For `derive-new`, inspect the diff rather than merging the reference branch. Run `game-l10n verify-sdk-promotion --sdk-root <repository> --branch <sdk-branch> --commit <promotion-commit>`; any `main`-owned path is a hard failure and must be split into a separate core change.
 4. Run the core test suite, the adapter test suite, and the privacy scan.
 5. Confirm no private game data, names, paths, text, hashes, counts, logs, or run history appears in the tree or branch-only commits.
 6. Classify every material problem observed during adapter work under `docs/engine-faq-contract.md`. Put deterministic fixes in code and regression tests, keep title-specific or unresolved material private, and place only SDK-external manual exceptions in the branch's `docs/engine-faq.md`. Run `python scripts/check_engine_faq.py docs/engine-faq.md`; zero entries is valid.
