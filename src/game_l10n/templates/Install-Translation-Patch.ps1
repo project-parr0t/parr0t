@@ -9,6 +9,7 @@ param(
 $ErrorActionPreference = "Stop"
 $InstallerPath = $MyInvocation.MyCommand.Path
 $PackageRoot = Split-Path -Parent $InstallerPath
+$InvocationRoot = (Get-Location).Path
 $ManifestPath = Join-Path $PackageRoot "parr0t-patch-manifest.json"
 $CheckpointPath = Join-Path $PackageRoot "parr0t-release-checkpoint.json"
 $PayloadRoot = Join-Path $PackageRoot "payload"
@@ -33,7 +34,7 @@ function Get-PublicFailure([string]$InternalCode) {
             return @("PARR0T-E001", "설치 패키지가 손상되었거나 구성이 올바르지 않습니다.", "ZIP을 다시 다운로드한 뒤 모든 파일을 한 폴더에 압축 해제해 주세요.")
         }
         '^E_GAME_ROOT_INVALID$' {
-            return @("PARR0T-E002", "올바른 게임 설치 폴더를 찾지 못했습니다.", "Steam에서 게임의 설치 폴더를 확인한 뒤 그 폴더를 다시 입력해 주세요.")
+            return @("PARR0T-E002", "올바른 게임 설치 폴더를 찾지 못했습니다.", "게임의 설치 폴더를 확인한 뒤 그 폴더를 다시 입력하거나 창으로 끌어 놓아 주세요.")
         }
         '^E_RUNTIME_APPROVAL_REQUIRED$' {
             return @("PARR0T-E005", "자동 설치에 필요한 승인이 없습니다.", "직접 설치하려면 배치 파일을 더블클릭하세요. 에이전트 자동 실행이라면 해당 작업의 일회성 승인을 전달해야 합니다.")
@@ -48,7 +49,7 @@ function Get-PublicFailure([string]$InternalCode) {
             return @("PARR0T-E008", "설치된 패치를 찾지 못했습니다.", "먼저 패치를 설치하거나 올바른 게임 폴더를 선택해 주세요.")
         }
         '^E_(STATUS_MISSING|STATUS_INVALID|RECEIPT_MISSING|RECEIPT_ID_MISMATCH|INSTALLED_FILE_MISSING|INSTALLED_FILE_HASH)$' {
-            return @("PARR0T-E009", "설치 상태 정보 또는 패치 파일이 변경되었거나 일부가 없습니다.", "설치를 다시 실행하세요. 문제가 계속되면 다른 모드와 Steam 무결성 검사 결과를 확인해 주세요.")
+            return @("PARR0T-E009", "설치 상태 정보 또는 패치 파일이 변경되었거나 일부가 없습니다.", "설치를 다시 실행하세요. 문제가 계속되면 다른 모드와 게임 파일 복구 결과를 확인해 주세요.")
         }
         '^E_PATCH_ID_MISMATCH$' {
             return @("PARR0T-E010", "이 게임 폴더에는 다른 Parr0t 패치 ID가 기록되어 있습니다.", "parr0t-patch-status.txt의 패치 ID를 확인하고, 기록된 패치의 설치기로 먼저 복원해 주세요.")
@@ -183,14 +184,21 @@ function Get-SteamRoots {
     return @($roots)
 }
 
+function Get-TargetContract($Manifest) {
+    if ($null -ne $Manifest.steam) { return $Manifest.steam }
+    if ($null -ne $Manifest.target) { return $Manifest.target }
+    throw "E_MANIFEST_MISSING"
+}
+
 function Test-GameRoot([string]$Candidate, $Manifest) {
     if ([string]::IsNullOrWhiteSpace($Candidate)) { return $false }
     if (-not (Test-Path -LiteralPath $Candidate -PathType Container)) { return $false }
-    foreach ($relative in @($Manifest.steam.required_files)) {
+    $targetContract = Get-TargetContract $Manifest
+    foreach ($relative in @($targetContract.required_files)) {
         $required = Get-SafeTarget $Candidate $relative
         if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { return $false }
     }
-    foreach ($binding in @($Manifest.steam.source_bindings)) {
+    foreach ($binding in @($targetContract.source_bindings)) {
         $bound = Get-SafeTarget $Candidate ([string]$binding.path)
         if (-not (Test-Path -LiteralPath $bound -PathType Leaf)) { return $false }
     }
@@ -198,6 +206,7 @@ function Test-GameRoot([string]$Candidate, $Manifest) {
 }
 
 function Find-GameRoot($Manifest) {
+    if ($null -eq $Manifest.steam) { return $null }
     $gameCandidates = [Collections.Generic.List[string]]::new()
     foreach ($root in Get-SteamRoots) {
         if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
@@ -219,14 +228,29 @@ function Find-GameRoot($Manifest) {
     return $null
 }
 
+function Resolve-GameRootInput([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    if ([IO.Path]::IsPathRooted($Value)) { return $Value }
+    return [IO.Path]::GetFullPath([IO.Path]::Combine($InvocationRoot, $Value))
+}
+
 function Resolve-GameRoot($Manifest) {
-    if (Test-GameRoot $GameRoot $Manifest) { return (Resolve-Path -LiteralPath $GameRoot).Path }
+    $requested = Resolve-GameRootInput $GameRoot
+    if (Test-GameRoot $requested $Manifest) { return (Resolve-Path -LiteralPath $requested).Path }
+    if ([string]::IsNullOrWhiteSpace($GameRoot) -and $null -ne $Manifest.target) {
+        if (Test-GameRoot $InvocationRoot $Manifest) { return (Resolve-Path -LiteralPath $InvocationRoot).Path }
+    }
     $found = Find-GameRoot $Manifest
     if ($found) { return (Resolve-Path -LiteralPath $found).Path }
-    Write-PatchStatus "안내" "Steam에서 게임 설치 폴더를 자동으로 찾지 못했습니다." Yellow
-    $manual = Read-Host "게임 설치 폴더를 입력하거나 탐색기에서 이 창으로 끌어 놓으세요"
-    if (-not (Test-GameRoot $manual $Manifest)) { throw "E_GAME_ROOT_INVALID" }
-    return (Resolve-Path -LiteralPath $manual).Path
+    if ($null -ne $Manifest.steam) {
+        Write-PatchStatus "안내" "Steam에서 게임 설치 폴더를 자동으로 찾지 못했습니다." Yellow
+    } else {
+        Write-PatchStatus "안내" "이 패키지는 사용자가 게임 설치 폴더를 직접 선택해야 합니다." Yellow
+    }
+    $manual = Read-Host "게임 설치 폴더를 절대/상대 경로로 입력하거나 탐색기에서 이 창으로 끌어 놓으세요"
+    $manualPath = Resolve-GameRootInput $manual
+    if (-not (Test-GameRoot $manualPath $Manifest)) { throw "E_GAME_ROOT_INVALID" }
+    return (Resolve-Path -LiteralPath $manualPath).Path
 }
 
 function Get-ReceiptPath([string]$Root, $Manifest) {
@@ -306,8 +330,12 @@ function Get-ManifestFingerprint($Manifest) {
     $lines.Add("installer.ui_locale:$($Manifest.installer.ui_locale)")
     $lines.Add("installer.status_file:$($Manifest.installer.status_file)")
     $lines.Add("installer.operations:$(@($Manifest.installer.operations) -join ',')")
-    $lines.Add("steam.app_id:$($Manifest.steam.app_id)")
-    $lines.Add("steam.install_dir:$($Manifest.steam.install_dir)")
+    if ($null -ne $Manifest.steam) {
+        $lines.Add("steam.app_id:$($Manifest.steam.app_id)")
+        $lines.Add("steam.install_dir:$($Manifest.steam.install_dir)")
+    } else {
+        $lines.Add("target.selection:$($Manifest.target.selection)")
+    }
     $lines.Add("checkpoint.path:$($Manifest.checkpoint.path)")
     $lines.Add("checkpoint.schema:$($Manifest.checkpoint.schema)")
     $lines.Add("checkpoint.bytes:$($Manifest.checkpoint.bytes)")
@@ -318,11 +346,21 @@ function Get-ManifestFingerprint($Manifest) {
     foreach ($replacement in @($Manifest.installer.replace_files)) {
         $lines.Add(("installer.replace:{0}`t{1}" -f $replacement.path, $replacement.backup_path))
     }
-    foreach ($required in @($Manifest.steam.required_files)) {
-        $lines.Add("steam.required:$required")
-    }
-    foreach ($binding in @($Manifest.steam.source_bindings)) {
-        $lines.Add(("steam.source_binding:{0}`t{1}`t{2}`t{3}" -f $binding.path, $binding.bytes, $binding.sha256, $binding.error_code))
+    $targetContract = Get-TargetContract $Manifest
+    if ($null -ne $Manifest.steam) {
+        foreach ($required in @($targetContract.required_files)) {
+            $lines.Add("steam.required:$required")
+        }
+        foreach ($binding in @($targetContract.source_bindings)) {
+            $lines.Add(("steam.source_binding:{0}`t{1}`t{2}`t{3}" -f $binding.path, $binding.bytes, $binding.sha256, $binding.error_code))
+        }
+    } else {
+        foreach ($required in @($targetContract.required_files)) {
+            $lines.Add("target.required:$required")
+        }
+        foreach ($binding in @($targetContract.source_bindings)) {
+            $lines.Add(("target.source_binding:{0}`t{1}`t{2}`t{3}" -f $binding.path, $binding.bytes, $binding.sha256, $binding.error_code))
+        }
     }
     foreach ($file in @($Manifest.files)) {
         $lines.Add(("file:{0}`t{1}`t{2}" -f $file.path, $file.bytes, $file.sha256))
@@ -431,7 +469,8 @@ function Assert-SourceBindings([string]$Root, $Manifest, $Receipt) {
             $originalMap[[string]$original.path] = $original
         }
     }
-    foreach ($binding in @($Manifest.steam.source_bindings)) {
+    $targetContract = Get-TargetContract $Manifest
+    foreach ($binding in @($targetContract.source_bindings)) {
         $relative = [string]$binding.path
         if ($Receipt -and $replacementMap.ContainsKey($relative)) {
             if (-not $originalMap.ContainsKey($relative)) { throw "E_ORIGINAL_BACKUP_MISSING" }

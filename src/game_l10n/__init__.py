@@ -20,6 +20,8 @@ from .rpg_maker_mv import (
     verify_patch as verify_rpg_maker_mv_patch,
 )
 from .steam import build_steam_package, inspect_installed_state, validate_steam_package
+from .filesystem_package import build_filesystem_package, validate_filesystem_package
+from .translation_exchange import prepare_translation_exchange, seal_translation_exchange
 
 __all__ = [
     "CharacterProfile",
@@ -37,10 +39,14 @@ __all__ = [
     "apply_user_corrections",
     "apply_rpg_maker_mv_translations",
     "build_steam_package",
+    "build_filesystem_package",
     "extract_rpg_maker_mv_game",
     "inspect_installed_state",
     "pack_rpg_maker_mv_patch",
     "validate_steam_package",
+    "validate_filesystem_package",
+    "prepare_translation_exchange",
+    "seal_translation_exchange",
     "verify_rpg_maker_mv_patch",
 ]
 

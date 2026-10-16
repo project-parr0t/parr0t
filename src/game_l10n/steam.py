@@ -205,37 +205,37 @@ def _replace_files(payload: dict[str, Any], patch_id: str) -> list[dict[str, str
 
 
 def _source_bindings(
-    steam: dict[str, Any], custom_errors: list[dict[str, str]]
+    steam: dict[str, Any], custom_errors: list[dict[str, str]], *, field: str = "steam"
 ) -> list[dict[str, Any]]:
     configured = steam.get("source_bindings", [])
     if not isinstance(configured, list):
-        raise SteamPackageError("spec field 'steam.source_bindings' must be a list")
+        raise SteamPackageError(f"spec field '{field}.source_bindings' must be a list")
     registered_errors = {item["internal_code"] for item in custom_errors}
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
     for index, item in enumerate(configured):
         if not isinstance(item, dict):
-            raise SteamPackageError(f"steam.source_bindings[{index}] must be an object")
+            raise SteamPackageError(f"{field}.source_bindings[{index}] must be an object")
         path = _safe_relative(
-            str(item.get("path", "")), field=f"steam.source_bindings[{index}].path"
+            str(item.get("path", "")), field=f"{field}.source_bindings[{index}].path"
         )
         folded = path.casefold()
         if folded in seen:
-            raise SteamPackageError("steam.source_bindings paths must be case-insensitively unique")
+            raise SteamPackageError(f"{field}.source_bindings paths must be case-insensitively unique")
         byte_count = item.get("bytes")
         if not isinstance(byte_count, int) or isinstance(byte_count, bool) or byte_count < 0:
             raise SteamPackageError(
-                f"steam.source_bindings[{index}].bytes must be a non-negative integer"
+                f"{field}.source_bindings[{index}].bytes must be a non-negative integer"
             )
         sha256 = item.get("sha256")
         if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
             raise SteamPackageError(
-                f"steam.source_bindings[{index}].sha256 must be a lowercase SHA-256 digest"
+                f"{field}.source_bindings[{index}].sha256 must be a lowercase SHA-256 digest"
             )
         error_code = item.get("error_code")
         if not isinstance(error_code, str) or error_code not in registered_errors:
             raise SteamPackageError(
-                f"steam.source_bindings[{index}].error_code must reference a registered custom error"
+                f"{field}.source_bindings[{index}].error_code must reference a registered custom error"
             )
         seen.add(folded)
         result.append(
