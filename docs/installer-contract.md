@@ -2,6 +2,8 @@
 
 This contract defines the public, player-facing installer produced by Parr0t. It is a distribution interface, not an agent harness. An SDK adapter may implement title- or engine-specific patch construction, but must not invent a different package layout, operation name, core error code, or player message for each job.
 
+The target-discovery manifest uses one of two fixed core schemas: `parr0t.steam.patch/v4` discovers an exact Steam app and can fall back to folder selection; `parr0t.filesystem.patch/v1` requires explicit folder selection and never interacts with a launcher or store client. Both use `parr0t.windows-installer/v2`. See [launcher-neutral filesystem packaging](filesystem-packaging.md).
+
 ## Audience boundary
 
 - A player who double-clicks `Install-Translation-Patch.bat` authorizes the selected operation by choosing it in the menu and accepting the final target/action confirmation. No Parr0t workspace, `AGENTS.md`, approval JSON, API key, development tool, or agent terminology may be required or shipped.
@@ -74,7 +76,7 @@ Executable wrappers additionally follow `docs/wrapper-executable.md`. They use a
 
 ## Supported source-build bindings
 
-A package may bind installation compatibility to a small set of original game files without fingerprinting the whole game. Each optional `steam.source_bindings` entry contains a safe relative `path`, original byte count, lowercase SHA-256 digest, and an `error_code` that references the package's registered `E_CUSTOM_*` compatibility error:
+A package may bind installation compatibility to a small set of original game files without fingerprinting the whole game. Each optional `steam.source_bindings` or launcher-neutral `target.source_bindings` entry contains a safe relative `path`, original byte count, lowercase SHA-256 digest, and an `error_code` that references the package's registered `E_CUSTOM_*` compatibility error:
 
 ```json
 {
@@ -89,7 +91,7 @@ Before first installation, the installer checks the current game file. During up
 
 Source bindings and installed-payload hashes have separate meanings. A source binding establishes that the unpatched source build is supported. Manifest `files` and the receipt establish that packaged and installed patch bytes are intact. A source-bound path may overlap the payload only when it is also an explicitly declared original replacement.
 
-`Test-GameRoot` uses binding paths only as presence markers; it never hashes them during Steam discovery. Digest validation happens immediately before Install/Update and during Verify. `source_bindings` remains optional in `parr0t.steam.patch/v4`; a missing field is semantically an empty list so existing v4 packages remain valid.
+`Test-GameRoot` uses binding paths only as presence markers; it never hashes them during discovery or folder selection. Digest validation happens immediately before Install/Update and during Verify. `source_bindings` remains optional in both schemas; a missing Steam v4 field is semantically an empty list so existing v4 packages remain valid.
 
 ## Core result codes
 
