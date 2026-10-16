@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from pathlib import Path
@@ -14,6 +15,16 @@ LEGACY_CONTROL_ENVELOPE_SCHEMA = "parr0t.control-envelope.v1"
 ROUTE_EVIDENCE_SCHEMA = "parr0t.route-evidence.v1"
 CONTROL_STATE_SCHEMA = "parr0t.control-plane-state.v1"
 CONTROL_STATE_PATH = ".game-l10n/control-plane-state.json"
+
+_CONTROL_STATE_FIELDS = {
+    "schema",
+    "status",
+    "generation",
+    "incident_id",
+    "issue_code",
+    "incident_code",
+}
+_CONTROL_STATE_RESUMED_FIELDS = _CONTROL_STATE_FIELDS | {"resumed_from_incident"}
 
 WORKER_ROLES = {
     "primary_inventory",
@@ -209,13 +220,54 @@ def control_plane_state(work_dir: Path) -> dict[str, Any]:
     if not path.is_file():
         return initial_control_plane_state()
     payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ConfigurationError("E_CONTROL_PLANE_STATE: state must be an object")
+    status = payload.get("status")
+    allowed_shapes = [_CONTROL_STATE_FIELDS]
+    if status == "ready":
+        allowed_shapes.append(_CONTROL_STATE_RESUMED_FIELDS)
+    if not any(set(payload) == shape for shape in allowed_shapes):
+        raise ConfigurationError("E_CONTROL_PLANE_STATE: state contains unsupported fields")
     if payload.get("schema") != CONTROL_STATE_SCHEMA:
         raise ConfigurationError("E_CONTROL_PLANE_STATE: unsupported state schema")
-    if payload.get("status") not in {"ready", "rotation_required"}:
+    if status not in {"ready", "rotation_required"}:
         raise ConfigurationError("E_CONTROL_PLANE_STATE: invalid state status")
     if not isinstance(payload.get("generation"), int) or payload["generation"] < 1:
         raise ConfigurationError("E_CONTROL_PLANE_STATE: invalid generation")
-    return payload
+    for field in ("incident_id", "issue_code", "incident_code"):
+        if not isinstance(payload.get(field), str):
+            raise ConfigurationError("E_CONTROL_PLANE_STATE: invalid categorical state field")
+    if status == "rotation_required":
+        if (
+            len(payload["incident_id"]) != 32
+            or any(character not in "0123456789abcdef" for character in payload["incident_id"])
+            or payload["issue_code"] != "control_plane_leak"
+            or payload["incident_code"] not in LEAK_INCIDENT_CODES
+        ):
+            raise ConfigurationError("E_CONTROL_PLANE_STATE: invalid rotation marker")
+    elif payload["incident_id"] or payload["issue_code"] or payload["incident_code"]:
+        raise ConfigurationError("E_CONTROL_PLANE_STATE: ready state contains an incident")
+    if "resumed_from_incident" in payload:
+        resumed = payload["resumed_from_incident"]
+        if (
+            not isinstance(resumed, str)
+            or len(resumed) != 32
+            or any(character not in "0123456789abcdef" for character in resumed)
+        ):
+            raise ConfigurationError("E_CONTROL_PLANE_STATE: invalid resumed incident marker")
+    return dict(payload)
+
+
+def public_control_plane_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Return the fixed parent-safe projection of an already validated state."""
+
+    return {
+        "schema": state["schema"],
+        "status": state["status"],
+        "generation": state["generation"],
+        "issue_code": state["issue_code"],
+        "incident_code": state["incident_code"],
+    }
 
 
 def require_control_plane_ready(work_dir: Path) -> dict[str, Any]:
@@ -279,6 +331,12 @@ def _validate_target_ids(value: Any) -> list[str]:
     if len(value) != len(set(value)):
         raise ConfigurationError("E_CONTROL_ENVELOPE_INVALID: target_ids contain duplicates")
     return value
+
+
+def control_target_id(target_id: str) -> str:
+    """Create a deterministic parent-safe alias without exposing the data-plane ID."""
+
+    return "ctl_" + hashlib.sha256(target_id.encode("utf-8")).hexdigest()
 
 
 def _validate_artifact_paths(work_dir: Path, value: Any) -> list[str]:
@@ -589,7 +647,7 @@ def validate_control_envelope(
         "worker_role": role,
         "stage": stage,
         "status": normalized_status,
-        "target_ids": target_ids,
+        "target_ids": [control_target_id(target_id) for target_id in target_ids],
         "counts": normalized_counts,
         "issue_codes": normalized_issue_codes,
         "artifact_paths": artifact_paths,

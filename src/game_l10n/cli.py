@@ -16,11 +16,12 @@ from .control_plane import (
     WORKER_ROLES,
     acknowledge_control_plane_rotation,
     control_plane_state,
+    public_control_plane_state,
     record_control_plane_leak,
     require_control_plane_ready,
     validate_control_envelope,
 )
-from .errors import GameL10nError
+from .errors import ConfigurationError, GameL10nError, ToolExecutionError
 from .coverage import (
     COMPLETION_SCHEMA,
     completion_attestation,
@@ -73,7 +74,7 @@ from .workspace import (
 
 
 STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
-    "resume_in_fresh_control_plane": ("docs/control-plane-contract.md",),
+    "stop_current_control_plane": ("docs/control-plane-contract.md",),
     "ask_user_for_initial_git_choice": ("skills/request-scope-guard/SKILL.md",),
     "configure_game_root": (),
     "fix_missing_game_root": (),
@@ -815,21 +816,31 @@ def cmd_validate_control_envelope(args: argparse.Namespace) -> int:
 
 def cmd_control_plane_status(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
-    print(json.dumps(control_plane_state(work_dir), ensure_ascii=False))
+    print(
+        json.dumps(
+            public_control_plane_state(control_plane_state(work_dir)), ensure_ascii=False
+        )
+    )
     return 0
 
 
 def cmd_record_control_plane_leak(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     result = record_control_plane_leak(work_dir, args.incident_code)
-    print(json.dumps(result, ensure_ascii=False))
+    print(json.dumps(public_control_plane_state(result), ensure_ascii=False))
     return 0
 
 
 def cmd_resume_control_plane(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
-    result = acknowledge_control_plane_rotation(work_dir, args.incident_id)
-    print(json.dumps(result, ensure_ascii=False))
+    if not args.fresh_session_confirmed:
+        raise ConfigurationError(
+            "E_CONTROL_PLANE_FRESH_SESSION_REQUIRED: only a newly started metadata-only "
+            "control plane may acknowledge rotation"
+        )
+    state = control_plane_state(work_dir)
+    result = acknowledge_control_plane_rotation(work_dir, state["incident_id"])
+    print(json.dumps(public_control_plane_state(result), ensure_ascii=False))
     return 0
 
 
@@ -911,12 +922,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     contract_base = config.get("sdk_root")
     control_state = control_plane_state(work_dir)
     if control_state["status"] == "rotation_required":
-        action = "resume_in_fresh_control_plane"
+        action = "stop_current_control_plane"
         print(
             json.dumps(
                 {
                     "workspace": str(work_dir),
-                    "control_plane": control_state,
+                    "control_plane": public_control_plane_state(control_state),
                     "contract_base": contract_base,
                     "next_actions": [action],
                     "required_contracts": _status_contracts(action),
@@ -1129,7 +1140,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "sdk_activation": sdk_activation,
                 "execution": config.get("execution", {}),
                 "runtime": config.get("runtime", {"default_policy": "deny"}),
-                "control_plane": control_state,
+                "control_plane": public_control_plane_state(control_state),
                 "local_artifact": local_artifact,
                 "state_issue_codes": state_issue_codes,
                 "contract_base": contract_base,
@@ -1628,7 +1639,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Acknowledge a recorded incident from a fresh metadata-only control plane",
     )
     control_resume.add_argument("--workspace", required=True)
-    control_resume.add_argument("--incident-id", required=True)
+    control_resume.add_argument(
+        "--fresh-session-confirmed",
+        action="store_true",
+        help="Assert this is a newly started metadata-only control plane",
+    )
     control_resume.set_defaults(func=cmd_resume_control_plane)
 
     sdk_inventory = sub.add_parser(
@@ -1836,6 +1851,9 @@ def main(argv: list[str] | None = None) -> int:
             if workspace is not None:
                 require_control_plane_ready(Path(workspace).resolve())
         return int(args.func(args))
+    except ToolExecutionError:
+        print("error: E_TOOL_EXECUTION_FAILED", file=sys.stderr)
+        return 2
     except (GameL10nError, ValueError, OSError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
