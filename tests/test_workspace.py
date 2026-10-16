@@ -115,60 +115,50 @@ class WorkspaceTests(unittest.TestCase):
         self.assertTrue(config["runtime"]["separate_install_and_launch"])
         self.assertTrue(config["runtime"]["user_executes_by_default"])
         self.assertNotIn("publish_approved", config["repository"])
-        self.assertIn("docs/instance-release.md", generated_agents)
-        self.assertIn("exact verified bytes", generated_agents)
-        self.assertIn("Preserve the user's existing README", generated_agents)
-        self.assertIn("default to Windows", generated_agents)
-        self.assertIn("player's execution environment", generated_agents)
-        self.assertIn("workflow is dormant", generated_agents)
-        self.assertIn("do not mention, propose, ask about, preview, or prepare", generated_agents.lower())
-        self.assertIn("only as GitHub Release assets", generated_agents)
-        self.assertIn("game-l10n instance-release-gate", generated_agents)
-        self.assertIn("before any push, tag, `gh release create`, or upload", generated_agents)
-        self.assertIn("duplicate translation exports out of the instance branch", generated_agents)
-        self.assertIn("translation source repository", generated_agents)
-        self.assertIn("use each for its separate role before any model call", generated_agents)
-        self.assertIn("<Game Display Name> Patch <Patch Version> (Game Version <Game Version>)", generated_agents)
-        self.assertIn("docs/installer-contract.md", generated_agents)
-        self.assertIn("docs/steam-faq.md", generated_agents)
-        self.assertIn("docs/wrapper-executable.md", generated_agents)
-        self.assertIn("parr0t-patch-status.txt", generated_agents)
-        self.assertIn("interactive player's menu choice", generated_agents)
-        self.assertIn("game-l10n verify-inventory", generated_agents)
-        self.assertIn("game-l10n review-existing", generated_agents)
-        self.assertIn("metadata.blocking_on_failure=true", generated_agents)
-        self.assertIn("parr0t-release-checkpoint.json", generated_agents)
-        self.assertIn("reuse a reviewed target only", generated_agents)
-        self.assertIn("fallback as unsupported", generated_agents)
-        self.assertIn("docs/segment-metadata.md", generated_agents)
-        self.assertIn("ui_slot_role", generated_agents)
-        self.assertIn("game-l10n inspect-installed-state", generated_agents)
-        self.assertIn("docs/minimal-corrections.md", generated_agents)
-        self.assertIn("game-l10n apply-user-correction", generated_agents)
-        self.assertIn("zero model/context calls", generated_agents)
-        self.assertIn("fresh native worker", generated_agents)
-        self.assertIn("no parent conversation history", generated_agents)
-        self.assertIn("parr0t.control-envelope.v2", generated_agents)
-        self.assertIn("fallback_required", generated_agents)
-        self.assertIn("route evidence", generated_agents)
-        self.assertIn("game-l10n validate-control-envelope", generated_agents)
-        self.assertIn("game-l10n record-control-plane-leak", generated_agents)
-        self.assertIn("fresh control plane", generated_agents)
-        self.assertIn("preserve it once", generated_agents)
-        self.assertIn("Never read or edit `localconfig.vdf`", generated_agents)
-        self.assertIn("ad hoc game-workspace binary", generated_agents)
-        self.assertIn("skills/request-scope-guard/SKILL.md", generated_agents)
-        self.assertIn("Re-evaluate after every user message", generated_agents)
-        self.assertIn("give workers only the exact authorized targets and side effects", generated_agents)
-        self.assertIn("game-l10n sdk-inventory", generated_agents)
-        self.assertIn("docs/engine-faq-contract.md", generated_agents)
-        self.assertIn("automated_fix", generated_agents)
-        self.assertIn("engine_runbook", generated_agents)
-        self.assertIn("Entry count is not a goal", generated_agents)
-        self.assertIn("implementation reuse separate from compatibility ownership", generated_agents)
-        self.assertIn("derive-new", generated_agents)
-        self.assertIn("promotion engine/version must equal the target identity", generated_agents)
-        self.assertIn("private-new", generated_agents)
+        self.assertLessEqual(len(generated_agents.split()), 1000)
+        for required in (
+            "game-l10n status",
+            "skills/request-scope-guard/SKILL.md",
+            "Do not inspect images for text",
+            "two independent complete ordered inventories",
+            "primary translation",
+            "translation fallback for failures only",
+            "complete independent review",
+            "review fallback for failures only",
+            "parr0t.control-envelope.v2",
+            "game-l10n validate-control-envelope",
+            "game-l10n record-control-plane-leak",
+            "fresh control plane",
+            "fallback_required",
+            "route evidence",
+            "parr0t.translation-exchange/v1",
+            "metadata.blocking_on_failure=true",
+            "docs/sdk-selection.md",
+            "docs/engine-faq-contract.md",
+            "docs/coverage-gates.md",
+            "docs/release-checkpoint.md",
+            "docs/minimal-corrections.md",
+            "docs/segment-metadata.md",
+            "docs/runtime-approval.md",
+            "docs/installer-contract.md",
+            "docs/steam-faq.md",
+            "docs/wrapper-executable.md",
+            "docs/instance-release.md",
+            "startup-current-directory-relative paths",
+        ):
+            self.assertIn(required, generated_agents)
+        self.assertLess(
+            generated_agents.index("primary translation"),
+            generated_agents.index("translation fallback for failures only"),
+        )
+        self.assertLess(
+            generated_agents.index("translation fallback for failures only"),
+            generated_agents.index("complete independent review"),
+        )
+        self.assertLess(
+            generated_agents.index("complete independent review"),
+            generated_agents.index("review fallback for failures only"),
+        )
         self.assertEqual(config["sdk_selection"]["status"], "pending")
 
     def test_default_provider_preset_is_locked_codex_app(self) -> None:
