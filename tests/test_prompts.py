@@ -208,6 +208,43 @@ class PromptTests(unittest.TestCase):
         self.assertIsNone(payload["narrative_context"])
         self.assertIn("functional text", system)
 
+    def test_translation_drops_duplicated_context_metadata_and_focuses_evidence(self) -> None:
+        _, user = translation_prompt(
+            ProjectContext("FIXTURE", "src", "dst"),
+            Segment(
+                "fixture-id",
+                "SOURCE_TERM",
+                speaker="A",
+                scene="SCENE_A",
+                metadata={
+                    "text_type": "dialogue",
+                    "focused_context_pack": {"bulk": "X" * 100_000},
+                    "target_context_attachment": {"bulk": "Y" * 100_000},
+                },
+            ),
+            [
+                GlossaryEntry("SOURCE_TERM", "TARGET_TERM"),
+                GlossaryEntry("UNRELATED", "UNRELATED_TARGET"),
+            ],
+            CharacterProfile("A", voice="VOICE_A"),
+            ContextPack(
+                story_summary="STORY",
+                relationship_timeline=("A RELATIONSHIP", "B UNRELATED"),
+            ),
+        )
+        payload = json.loads(user)
+        metadata = payload["context_only_do_not_translate"]["metadata"]
+
+        self.assertEqual(metadata, {"text_type": "dialogue"})
+        self.assertEqual(payload["glossary"][0]["source"], "SOURCE_TERM")
+        self.assertEqual(len(payload["glossary"]), 1)
+        self.assertEqual(
+            payload["narrative_context"]["relationship_timeline"],
+            ["A RELATIONSHIP"],
+        )
+        self.assertEqual(list(payload)[-1], "translation_target")
+        self.assertLess(len(user), 5_000)
+
 
 if __name__ == "__main__":
     unittest.main()
