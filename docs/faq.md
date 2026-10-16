@@ -65,7 +65,7 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **Symptom:** The parent agent sees a provider's prose explanation or the affected dialogue and treats a route failure as a reason to omit content or stop patch creation.
 - **General cause:** Data-plane model output was copied into a control-plane message or audit record instead of being reduced to categorical metadata.
 - **Diagnosis:** Inspect schemas and logs with synthetic fixtures; parent-facing records should contain only target IDs, categorical status/error codes, counts, artifact paths, queue transitions, and deterministic issue codes.
-- **Resolution:** Keep text-bearing envelopes in the private workspace, normalize the explanation to a category such as `provider_refusal`, and continue the configured fallback route. If every route fails, preserve the exact source without removing the target.
+- **Resolution:** Keep text-bearing envelopes in the private workspace, normalize the parent-facing state to `fallback_required`, and continue the configured route without parent-side inspection. Preserve the exact source only when v2 route evidence proves every configured route was actually attempted and exhausted.
 - **Prevention:** Make workers read/write private artifacts directly and require metadata-only completion envelopes at every parent boundary.
 
 ## A resumed review refers to an older translation candidate
