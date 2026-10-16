@@ -74,6 +74,7 @@ from .workspace import (
     require_sdk_activation,
     require_sdk_selection,
     update_repository_policy,
+    verify_sdk_promotion_commit,
 )
 
 
@@ -1294,6 +1295,14 @@ def cmd_publish(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify_sdk_promotion(args: argparse.Namespace) -> int:
+    result = verify_sdk_promotion_commit(
+        Path(args.sdk_root).resolve(), args.branch, args.commit
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_steam_package(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
@@ -1807,6 +1816,15 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--commit", action="store_true")
     publish.add_argument("--push", action="store_true")
     publish.set_defaults(func=cmd_publish)
+
+    promotion_scope = sub.add_parser(
+        "verify-sdk-promotion",
+        help="Reject an SDK promotion commit that also changes main-owned files",
+    )
+    promotion_scope.add_argument("--sdk-root", required=True)
+    promotion_scope.add_argument("--branch", required=True)
+    promotion_scope.add_argument("--commit", default="HEAD")
+    promotion_scope.set_defaults(func=cmd_verify_sdk_promotion)
 
     steam_package = sub.add_parser(
         "steam-package",
