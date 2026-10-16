@@ -114,7 +114,7 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(manifest["worker_contract"]["parent_result"], "metadata_only")
         self.assertEqual(
             manifest["worker_contract"]["control_envelope_schema"],
-            "parr0t.control-envelope.v1",
+            "parr0t.control-envelope.v2",
         )
         self.assertEqual(
             manifest["worker_contract"]["worker_final_response"],

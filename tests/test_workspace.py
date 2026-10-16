@@ -87,6 +87,10 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(config["execution"]["native_shard_material_tokens"], 12000)
         self.assertEqual(config["execution"]["native_worker_history"], "none")
         self.assertFalse(config["execution"]["native_worker_reuse"])
+        self.assertEqual(
+            config["control_plane"]["envelope_schema"],
+            "parr0t.control-envelope.v2",
+        )
         self.assertTrue(config["control_plane"]["metadata_only_for_all_data_plane_stages"])
         self.assertTrue(config["control_plane"]["reject_free_form_worker_returns"])
         self.assertTrue(config["control_plane"]["rotate_after_leak"])
@@ -144,7 +148,9 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("zero model/context calls", generated_agents)
         self.assertIn("fresh native worker", generated_agents)
         self.assertIn("no parent conversation history", generated_agents)
-        self.assertIn("parr0t.control-envelope.v1", generated_agents)
+        self.assertIn("parr0t.control-envelope.v2", generated_agents)
+        self.assertIn("fallback_required", generated_agents)
+        self.assertIn("route evidence", generated_agents)
         self.assertIn("game-l10n validate-control-envelope", generated_agents)
         self.assertIn("game-l10n record-control-plane-leak", generated_agents)
         self.assertIn("fresh control plane", generated_agents)

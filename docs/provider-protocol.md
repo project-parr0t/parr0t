@@ -36,11 +36,11 @@ Each translation, judgment, or rewrite invocation has exactly one `translation_t
 
 Translation means faithful transformation of already-existing user-provided text. Fidelity includes communicative function, idiomatic target-language expression, supported allusions or wordplay, deliberate alterations, and text-function tone/rhythm—not mechanical source syntax alone. Providers must not continue the scene, roleplay, answer the dialogue, invent content or references, censor, euphemize, soften, or intensify it. If policy truly prevents the specific transformation, return a refusal for that target ID only.
 
-The provider JSON above is a data-plane envelope and stays inside the private worker/SDK boundary. This applies to inventory and context workers as well as translation and review workers. Native App workers must not paste provider data, source-bearing command output, or a semantic summary into their parent-facing response. They write detailed results to the assigned private artifact, write a separate `parr0t.control-envelope.v1` file, and return only that file's workspace-relative path. The full envelope is defined in [control-plane-contract.md](control-plane-contract.md) and is validated with `game-l10n validate-control-envelope`.
+The provider JSON above is a data-plane envelope and stays inside the private worker/SDK boundary. This applies to inventory and context workers as well as translation and review workers. Native App workers must not paste provider data, source-bearing command output, or a semantic summary into their parent-facing response. They write detailed results to the assigned private artifact, write a separate `parr0t.control-envelope.v2` file, and return only that file's workspace-relative path. The full envelope is defined in [control-plane-contract.md](control-plane-contract.md) and is validated with `game-l10n validate-control-envelope`.
 
 ```json
 {
-  "schema": "parr0t.control-envelope.v1",
+  "schema": "parr0t.control-envelope.v2",
   "worker_role": "translator",
   "stage": "translation",
   "status": "success",
@@ -48,8 +48,9 @@ The provider JSON above is a data-plane envelope and stays inside the private wo
   "counts": {"total": 1, "success": 1},
   "issue_codes": [],
   "artifact_paths": [".game-l10n/data-plane/fixture-1.json"],
-  "queue_transitions": []
+  "queue_transitions": [],
+  "route_evidence_path": ""
 }
 ```
 
-The control envelope must not contain source, candidate, translated text, context-pack content, reviewer prose, content classification, anticipated policy judgment, detailed semantic review categories, or a provider's prose refusal explanation. Meaning, omission, voice, tone, terminology, and similar findings stay inside the private review artifact; the parent receives only the affected target IDs and rewrite queue transition. Normalize actual provider refusals and operational failures to allowlisted categorical codes before they cross that boundary. Inventory workers cannot emit `provider_refusal`, and context workers cannot turn subject matter into an exclusion. Only the configured model/provider that actually processed an assigned context chunk, translation target, or review target may emit the categorical refusal. A refusal status authorizes only the next configured route; it is not a recommendation to omit the target.
+The control envelope must not contain source, candidate, translated text, context-pack content, reviewer prose, content classification, anticipated policy judgment, detailed semantic review categories, or a provider's prose refusal explanation. Meaning, omission, voice, tone, terminology, and similar findings stay inside the private review artifact; the parent receives only the affected target IDs and queue transition. Normalize provider-specific refusal details to the parent-safe `fallback_required` status before they cross that boundary. Inventory and context workers cannot turn subject matter into an exclusion, and no worker may pre-screen whether an authorized fallback is allowed to receive a target. A fresh isolated worker sends the exact target to the configured provider, which independently returns its own result. `source_preserved` additionally requires the complete text-free route evidence defined by [control-plane-contract.md](control-plane-contract.md).

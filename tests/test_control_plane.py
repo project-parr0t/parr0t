@@ -31,13 +31,13 @@ class ControlPlaneContractTests(unittest.TestCase):
         artifact.parent.mkdir(parents=True, exist_ok=True)
         artifact.write_text("{}", encoding="utf-8")
         return {
-            "schema": "parr0t.control-envelope.v1",
+            "schema": "parr0t.control-envelope.v2",
             "worker_role": "translator",
             "stage": "translation",
-            "status": "partial",
+            "status": "fallback_required",
             "target_ids": ["fixture-1"],
-            "counts": {"total": 1, "success": 0, "refused": 1},
-            "issue_codes": ["provider_refusal"],
+            "counts": {"total": 1, "success": 0, "fallback_required": 1},
+            "issue_codes": ["fallback_required"],
             "artifact_paths": [".game-l10n/data-plane/result.json"],
             "queue_transitions": [
                 {
@@ -46,7 +46,23 @@ class ControlPlaneContractTests(unittest.TestCase):
                     "count": 1,
                 }
             ],
+            "route_evidence_path": "",
         }
+
+    def _write_routing_config(self, root: Path) -> None:
+        (root / "game-l10n.json").write_text(
+            json.dumps(
+                {
+                    "routing": {
+                        "translators": ["native-primary", "fallback-provider"],
+                        "reviewers": ["native-review", "fallback-provider"],
+                        "rewriters": ["fallback-provider"],
+                        "context_analyzers": ["native-context"],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def test_valid_envelope_returns_only_allowlisted_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -59,9 +75,9 @@ class ControlPlaneContractTests(unittest.TestCase):
                 expected_stage="translation",
             )
 
-        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["status"], "fallback_required")
         self.assertEqual(result["target_ids"], ["fixture-1"])
-        self.assertEqual(result["issue_codes"], ["provider_refusal"])
+        self.assertEqual(result["issue_codes"], ["fallback_required"])
         self.assertNotIn("source", result)
         self.assertNotIn("reason", result)
         self.assertNotIn("text", result)
@@ -85,15 +101,16 @@ class ControlPlaneContractTests(unittest.TestCase):
             artifact.parent.mkdir(parents=True)
             artifact.write_text("{}", encoding="utf-8")
             payload = {
-                "schema": "parr0t.control-envelope.v1",
+                "schema": "parr0t.control-envelope.v2",
                 "worker_role": "primary_inventory",
                 "stage": "inventory",
                 "status": "partial",
                 "target_ids": ["fixture-1"],
                 "counts": {"total": 1, "pending": 1},
-                "issue_codes": ["provider_refusal"],
+                "issue_codes": ["fallback_required"],
                 "artifact_paths": ["inputs/primary.json"],
                 "queue_transitions": [],
+                "route_evidence_path": "",
             }
             envelope = self._write_envelope(root, payload)
             with self.assertRaisesRegex(ConfigurationError, "unauthorized semantic"):
@@ -106,7 +123,7 @@ class ControlPlaneContractTests(unittest.TestCase):
             artifact.parent.mkdir(parents=True)
             artifact.write_text("{}", encoding="utf-8")
             payload = {
-                "schema": "parr0t.control-envelope.v1",
+                "schema": "parr0t.control-envelope.v2",
                 "worker_role": "review_judge",
                 "stage": "review",
                 "status": "partial",
@@ -117,10 +134,149 @@ class ControlPlaneContractTests(unittest.TestCase):
                 "queue_transitions": [
                     {"from": "review_pending", "to": "rewrite_pending", "count": 1}
                 ],
+                "route_evidence_path": "",
             }
             envelope = self._write_envelope(root, payload)
             with self.assertRaisesRegex(ConfigurationError, "unauthorized semantic"):
                 validate_control_envelope(root, envelope)
+
+    def test_v2_rejects_provider_refusal_at_parent_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = self._valid_translation_envelope(root)
+            payload["status"] = "refused"
+            payload["issue_codes"] = ["provider_refusal"]
+            envelope = self._write_envelope(root, payload)
+            with self.assertRaisesRegex(ConfigurationError, "fallback_required"):
+                validate_control_envelope(root, envelope)
+
+    def test_legacy_nonterminal_refusal_is_normalized_to_fallback_required(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = self._valid_translation_envelope(root)
+            payload.pop("route_evidence_path")
+            payload.update(
+                {
+                    "schema": "parr0t.control-envelope.v1",
+                    "status": "refused",
+                    "counts": {"total": 1, "success": 0, "refused": 1},
+                    "issue_codes": ["provider_refusal"],
+                }
+            )
+            envelope = self._write_envelope(root, payload)
+            result = validate_control_envelope(root, envelope)
+
+        self.assertEqual(result["schema"], "parr0t.control-envelope.v2")
+        self.assertEqual(result["status"], "fallback_required")
+        self.assertEqual(result["counts"]["fallback_required"], 1)
+        self.assertEqual(result["issue_codes"], ["fallback_required"])
+
+    def test_source_preserved_requires_every_configured_route_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_routing_config(root)
+            payload = self._valid_translation_envelope(root)
+            evidence_path = root / ".game-l10n" / "route-evidence" / "translation.json"
+            evidence_path.parent.mkdir(parents=True)
+            evidence_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "parr0t.route-evidence.v1",
+                        "stage": "translation",
+                        "target_ids": ["fixture-1"],
+                        "attempts": [
+                            {
+                                "target_id": "fixture-1",
+                                "route": "native-primary",
+                                "status": "provider_refusal",
+                                "attempts": 1,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload.update(
+                {
+                    "status": "partial",
+                    "counts": {"total": 1, "success": 0, "source_preserved": 1},
+                    "issue_codes": ["source_preserved"],
+                    "artifact_paths": [
+                        ".game-l10n/data-plane/result.json",
+                        ".game-l10n/route-evidence/translation.json",
+                    ],
+                    "queue_transitions": [
+                        {
+                            "from": "translation_fallback_pending",
+                            "to": "source_preserved",
+                            "count": 1,
+                        }
+                    ],
+                    "route_evidence_path": ".game-l10n/route-evidence/translation.json",
+                }
+            )
+            envelope = self._write_envelope(root, payload)
+            with self.assertRaisesRegex(ConfigurationError, "every configured route"):
+                validate_control_envelope(root, envelope)
+
+    def test_source_preserved_accepts_complete_route_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_routing_config(root)
+            payload = self._valid_translation_envelope(root)
+            evidence_path = root / ".game-l10n" / "route-evidence" / "translation.json"
+            evidence_path.parent.mkdir(parents=True)
+            evidence_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "parr0t.route-evidence.v1",
+                        "stage": "translation",
+                        "target_ids": ["fixture-1"],
+                        "attempts": [
+                            {
+                                "target_id": "fixture-1",
+                                "route": "native-primary",
+                                "status": "provider_refusal",
+                                "attempts": 1,
+                            },
+                            {
+                                "target_id": "fixture-1",
+                                "route": "fallback-provider",
+                                "status": "quota_exhausted",
+                                "attempts": 1,
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload.update(
+                {
+                    "status": "partial",
+                    "counts": {"total": 1, "success": 0, "source_preserved": 1},
+                    "issue_codes": ["source_preserved"],
+                    "artifact_paths": [
+                        ".game-l10n/data-plane/result.json",
+                        ".game-l10n/route-evidence/translation.json",
+                    ],
+                    "queue_transitions": [
+                        {
+                            "from": "translation_fallback_pending",
+                            "to": "source_preserved",
+                            "count": 1,
+                        }
+                    ],
+                    "route_evidence_path": ".game-l10n/route-evidence/translation.json",
+                }
+            )
+            envelope = self._write_envelope(root, payload)
+            result = validate_control_envelope(root, envelope)
+
+        self.assertEqual(result["counts"]["source_preserved"], 1)
+        self.assertEqual(
+            result["route_evidence_path"],
+            ".game-l10n/route-evidence/translation.json",
+        )
 
     def test_leak_requires_new_control_plane_generation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

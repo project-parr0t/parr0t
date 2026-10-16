@@ -11,7 +11,7 @@ translation-project-root/
 
 The exact folders may live elsewhere if the Codex task has all of them as approved workspace roots. A convenient setup is one common parent project with the SDK and private workspace as siblings. Do not place `my-game-agent-work` inside the SDK repository.
 
-The repository `AGENTS.md` is automatically injected by Codex when the task runs in the repository tree. `init-workspace` creates a second `AGENTS.md` in the private workspace. The bundled `game-localization` skill packages the repeatable workflow for Codex/ChatGPT Work plugin installation, while the CLI enforces the data boundary, approval state, full-script context gate, model fallback, and cache behavior.
+The repository `AGENTS.md` is automatically injected by Codex when the task runs in the repository tree. `init-workspace` creates a second `AGENTS.md` in the private workspace. The bundled `game-localization` skill packages the repeatable workflow for Codex/ChatGPT Work plugin installation, while the CLI enforces the data boundary, approval state, full-script context gate, model fallback, route-exhaustion evidence, and cache behavior.
 
 Start a task with a request containing the three absolute paths and the intended source/target languages. Codex can then initialize the private workspace and report `ACTION_REQUIRED` if a human choice is required.
 
@@ -27,6 +27,6 @@ Review must run as a separate compact judge agent/provider, not as semantic judg
 
 Codex workspace access does not authorize runtime side effects. Treat every configured game root as read-only unless the user explicitly requests one exact `install`, `update`, `remove`, or `launch` action. “Test,” “validate,” “inspect logs,” and “check runtime data” are not synonyms for those actions. Follow `docs/runtime-approval.md`, consume the exact one-shot approval immediately before the side effect, and default to giving the artifact to the user for execution.
 
-Native Codex workers and command adapters use the same data envelope documented in [provider-protocol.md](provider-protocol.md), but they belong to different explicitly selected execution modes. A command adapter must never impersonate a native worker. The deterministic SDK state machine remains authoritative for target isolation, fallback queues, integrity checks, `source_preserved`, and patch-only output.
+Native Codex workers and command adapters use the same data envelope documented in [provider-protocol.md](provider-protocol.md), but they belong to different explicitly selected execution modes. A command adapter must never impersonate a native worker. The parent sees only `fallback_required`, never a provider refusal explanation or content-based transfer decision. The deterministic SDK state machine remains authoritative for target isolation, fallback queues, route-exhaustion evidence, `source_preserved`, and patch-only output.
 
 For native App workers, the parent task message contains only the private workspace path, target ID, operation, and artifact destination. The worker reads data itself and returns a metadata-only control envelope; its text-bearing data envelope is written privately. Normalize any refusal explanation before parent delivery. A refusal can only cause a route transition and cannot be used by the top-level agent as a reason to omit dialogue or abandon patch creation.
