@@ -362,7 +362,10 @@ class CompatibleChatProvider(ModelProvider):
         try:
             payload = json.loads(user)
             target = payload.get("translation_target", {})
-            source_length = len(str(target.get("source") or payload.get("candidate_translation") or ""))
+            if isinstance(target, dict) and isinstance(target.get("source"), str):
+                source_length = len(target["source"])
+            elif isinstance(payload.get("candidate_translation"), str):
+                source_length = len(payload["candidate_translation"])
         except (json.JSONDecodeError, AttributeError, TypeError):
             pass
         estimate = int(max(1, source_length) * self.max_tokens_per_source_char)
@@ -378,6 +381,10 @@ class CompatibleChatProvider(ModelProvider):
         response_format: dict[str, Any]
         if self.response_format == "json_object":
             response_format = {"type": "json_object"}
+            system = (
+                f"{system}\n\nReturn a JSON object matching this JSON Schema exactly:\n"
+                + json.dumps(schema, ensure_ascii=False, sort_keys=True)
+            )
         else:
             response_format = {
                 "type": "json_schema",

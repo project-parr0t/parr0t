@@ -46,6 +46,48 @@ def write_inventory(
 
 
 class CoverageTests(unittest.TestCase):
+    def test_retry_approval_requires_current_generation_and_approved_status(self) -> None:
+        segment = Segment("synthetic-retry", "SOURCE")
+        for stage in ("review-grace-retry", "review-refusal-retry"):
+            for generation, verdict, expected in (
+                (2, "approved", True),
+                (1, "approved", False),
+                (2, "error", False),
+            ):
+                with self.subTest(stage=stage, generation=generation, verdict=verdict):
+                    result = TranslationResult(
+                        segment_id=segment.id,
+                        source=segment.source,
+                        text="TARGET",
+                        status="reviewed",
+                        acceptance_authority="reviewer",
+                        candidate_generation=2,
+                        candidate_digest=stable_hash("TARGET"),
+                        attempts=[
+                            AttemptRecord(
+                                stage,
+                                "synthetic-reviewer",
+                                verdict,
+                                candidate_generation=generation,
+                            )
+                        ],
+                    )
+                    state = completion_attestation(
+                        [segment],
+                        [result],
+                        inventory_segments=[segment],
+                        inventory={
+                            "status": "static_verified",
+                            "static_complete": True,
+                            "primary_segments": 1,
+                            "primary_fingerprint": "synthetic",
+                        },
+                        runtime={"runtime_complete": False},
+                        review_required=True,
+                    )
+                    self.assertEqual(state["semantic_review"]["complete"], expected)
+                    self.assertEqual(state["static_completion"], expected)
+
     def test_independent_inventory_gate_is_bound_to_primary_fingerprint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
