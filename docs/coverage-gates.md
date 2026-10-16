@@ -66,13 +66,19 @@ Every existing target is re-judged. Integrity checks can trigger a focused repai
 
 ## Failure queue and held patches
 
-Operational failures are saved as target IDs, categorical failure codes, and blocking state only. They contain no source or translation text. The queue is not retried automatically in a later turn. After the user explicitly asks to continue, run:
+Retryable failures are saved as target IDs, categorical failure codes, and blocking state only. They contain no source or translation text. The queue is not retried automatically in a later turn. After the user explicitly asks to continue, run:
 
 ```text
 game-l10n resume-failures --workspace <workspace> --input <primary.json> --output <results.json> --user-requested
 ```
 
-An SDK marks a target `metadata.blocking_on_failure=true` when leaving that target untranslated would make the patch unusable or unsafe. If any blocking target is unresolved, Parr0t writes a private held checkpoint, returns status `held`, and does not emit the requested patch artifact. Optional targets may preserve exact source after route exhaustion, but the completion attestation remains explicit about them.
+`failed` entries remain in the retryable queue. `source_preserved` and user-approved `accepted_unreviewed` entries are terminal unresolved outcomes and are recorded separately; they are not silently retried by `resume-failures`. A new user request may reopen them only through a new explicit correction or translation decision, never by pretending the exhausted route is still pending.
+
+An SDK marks a target `metadata.blocking_on_failure=true` when leaving that target untranslated would make the patch unusable or unsafe. If any retryable or terminal blocking target is unresolved, Parr0t writes a private held checkpoint, returns status `held`, and does not emit the requested patch artifact. Optional targets may preserve exact source after route exhaustion; they can be packaged, but both the failure queue and completion attestation keep them visibly terminal-unresolved rather than translated.
+
+## Result-to-patch binding
+
+Finalization writes the result artifact first, records its absolute workspace path, SHA-256 digest, and byte length in the completion attestation, and never rewrites it after attestation. Packing accepts only that exact bound artifact. The pack cache also binds the completion-attestation digest, input digest, tool fingerprint, and output digest. A changed result, completion record, tool, or patch invalidates `local_patch_ready` and requires only the affected stage to run again.
 
 ## Runtime observations
 

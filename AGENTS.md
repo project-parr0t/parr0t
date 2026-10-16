@@ -7,7 +7,9 @@ Parr0t is an engine-neutral control framework and reusable SDK repository. Keep 
 1. Read this file.
 2. For a localization job, read `docs/agent-usage.md` and the external workspace `AGENTS.md`.
 3. Run `game-l10n status --workspace <workspace>`.
-4. Read only the contract named by the current status or active user request. Do not preload every document.
+4. Resolve each `required_contracts` entry against `contract_base` and read only those contracts. For a user-requested route not represented by workspace state, use the table below. Do not preload every document.
+
+`local_patch_ready` is the only terminal local-work status. It requires current static completion and an unchanged packed artifact bound to that completion attestation.
 
 ## Non-negotiable rules
 
@@ -19,7 +21,7 @@ Parr0t is an engine-neutral control framework and reusable SDK repository. Keep 
 6. **Treat refusal as routing.** Parent-facing refusal state is only `fallback_required` / “폴백 처리 필요”. It is never a content judgment, exclusion, batch cancellation, or authority to shrink scope. Preserve source only after metadata proves every configured route was attempted and exhausted.
 7. **Translate, do not invent.** Work on one target at a time with its relevant narrative, functional, or knowledge context. Preserve meaning, character voice, formality, scene state, UI function, conditions, units, order, terminology, placeholders, markup, control codes, supported allusions, and natural target-language effect. Segment isolation must not discard context.
 8. **Keep source and runtime immutable by default.** Build new artifacts in the workspace. Inspection, building, testing, log reading, or access to a game directory does not authorize install, update, restore/remove, launch, cleanup, or execution. Each real runtime action requires its own explicit approval under `docs/runtime-approval.md`.
-9. **Select before implementing.** Follow `docs/sdk-selection.md` before format work. Reuse or extend only an exact engine/version match. Code from another identity is reference evidence for `derive-new`, not permission to widen that SDK. `main` never imports engine-specific data from an SDK branch.
+9. **Select and activate before implementing.** Follow `docs/sdk-selection.md` before format or data-plane work. Reuse or extend only an exact engine/version match and execute it from the bound SDK checkout. Code from another identity is reference evidence for `derive-new`, not permission to widen that SDK. Generated pass-through tools are not an adapter. `main` never imports engine-specific data from an SDK branch.
 10. **Publication is dormant.** Do not propose, prepare, mention, commit, push, tag, publish, deploy, or create a release unless the user first requests that exact external action. SDK promotion additionally requires the user to confirm a successful patch. Per-game publication additionally requires `docs/instance-release.md` and its release gate.
 11. **Use proportional effort.** Follow `docs/execution-budget.md`; reuse unchanged checkpoints and passed validations, cap repeated failures, keep small coupled work in the current agent, and stop after the required checks pass.
 12. **Keep provider mode fixed.** A selected preset defines the authorized providers and roles. A key does not change mode or promote a fallback. Native App workers and API providers are distinct; never emulate a native worker with another Codex process or silently replace the locked route.
@@ -27,7 +29,7 @@ Parr0t is an engine-neutral control framework and reusable SDK repository. Keep 
 ## Standard job sequence
 
 1. Resolve repository, read-only game root, and writable external workspace. Ask once whether Git may be used for the game task and record the answer; refusal means no Git initialization or publication.
-2. Run `game-l10n status`, complete SDK inventory/evaluation/selection, and inspect an engine runbook entry only when its trigger occurs.
+2. Run `game-l10n status`, complete SDK inventory/evaluation/selection/activation, and inspect an engine runbook entry only when its trigger occurs.
 3. Produce and reconcile two independently implemented complete ordered inventories. User-visible exclusions remain unresolved; static alignment is not runtime coverage.
 4. Complete typed context analysis. If every context route fails, stop before translation.
 5. Run primary translation, translation fallback, complete independent review, selective rewriting, and review fallback in that order. Operational failures enter the resumable metadata-only failure queue; blocking failures hold the patch.
