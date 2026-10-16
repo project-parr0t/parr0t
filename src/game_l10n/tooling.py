@@ -86,6 +86,37 @@ def _write_tool_state(path: Path, state: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _write_private_tool_failure(
+    work_dir: Path,
+    *,
+    stage: str,
+    returncode: int,
+    stdout: str,
+    stderr: str,
+) -> None:
+    """Keep arbitrary adapter output in the data plane, never in the CLI exception."""
+
+    path = work_dir / ".game-l10n" / "tool-logs" / f"{stage}-latest.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "schema": "parr0t.private-tool-failure.v1",
+                "stage": stage,
+                "returncode": returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
 def cached_tool_state(work_dir: Path, stage: str) -> dict[str, Any]:
     """Return metadata-only validity for a cached unpack/pack artifact."""
     if stage not in {"unpack", "pack"}:
@@ -214,13 +245,22 @@ def run_cached_tool(
             check=False,
         )
     except OSError as exc:
-        raise ToolExecutionError(f"Could not start {stage} tool: {exc}") from exc
+        raise ToolExecutionError(f"E_TOOL_START_FAILED: stage={stage}") from exc
     if _immutability_snapshot(input_path) != input_snapshot:
         raise ToolExecutionError(
             f"{stage} tool modified its declared read-only input; discard its output"
         )
     if completed.returncode != 0:
-        raise ToolExecutionError(f"{stage} tool exited {completed.returncode}: {completed.stderr[-4000:]}")
+        _write_private_tool_failure(
+            work_dir,
+            stage=stage,
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+        raise ToolExecutionError(
+            f"E_TOOL_EXECUTION_FAILED: stage={stage}; details are in the private tool log"
+        )
     if not output_path.exists():
         raise ToolExecutionError(f"{stage} tool succeeded but did not create: {output_path}")
     state[stage] = {
