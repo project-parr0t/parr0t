@@ -1,6 +1,6 @@
 # Control-plane isolation contract
 
-The top-level Parr0t agent schedules work and advances queues. It does not inspect or judge game text. This boundary applies from the first inventory pass through final validation; it is not limited to translation and review providers.
+The top-level Parr0t agent schedules work and advances queues. It does not inspect or judge game text. This boundary applies from the first inventory pass through final validation; it is not limited to translation and review providers. Arbitrary subprocess output remains in private workspace logs; a parent-facing tool failure is categorical only.
 
 ## Data-plane stages
 
@@ -47,7 +47,7 @@ A valid envelope contains exactly these fields:
 }
 ```
 
-The CLI allowlists roles, stages, statuses, count names, queue names, and issue codes. Unknown fields and content-derived classifications are rejected without echoing their values. Detailed review findings such as meaning, omission, voice, tone, and terminology remain only in the private review artifact; the parent sees only the IDs and queue transition that require rewriting. Artifact paths must be relative, remain inside the private workspace, and already exist.
+The CLI allowlists roles, stages, statuses, count names, queue names, and issue codes. Unknown fields and content-derived classifications are rejected without echoing their values. Before returning an envelope to the parent, every data-plane target ID is deterministically replaced with a `ctl_<sha256>` alias; raw engine keys and source-derived IDs never cross the boundary. Detailed review findings such as meaning, omission, voice, tone, and terminology remain only in the private review artifact; the parent sees only opaque control IDs and the queue transition that requires rewriting. Artifact paths must be relative, remain inside the private workspace, and already exist.
 
 Provider-specific refusal status and prose stay inside the private data plane. Before a result crosses into the parent, the worker normalizes it to the parent-safe `fallback_required` status. The parent never receives `provider_refusal`, a refusal explanation, or a content-derived eligibility label. It advances the affected IDs to the configured next route without opening private content or deciding whether another provider should receive them.
 
@@ -97,14 +97,14 @@ game-l10n record-control-plane-leak \
 
 This writes a text-free `rotation_required` marker. All non-recovery CLI work, including native task preparation, import, merge, and envelope validation, then stops with `E_CONTROL_PLANE_ROTATION_REQUIRED`. Metadata-only status, diagnostics, incident recording, and rotation acknowledgment remain available. Preserve completed data-plane artifacts and queue metadata; do not delete or redo them.
 
-The contaminated top-level agent must stop. A fresh control plane, with no inherited game-content history, reads only the metadata checkpoint and acknowledges the matching incident:
+The contaminated top-level agent must stop and must not run or confirm the resume command. Status output intentionally omits the internal incident identifier. A fresh control plane, with no inherited game-content history, reads only the categorical state and acknowledges the current incident:
 
 ```text
 game-l10n resume-control-plane \
   --workspace <workspace> \
-  --incident-id <incident-id>
+  --fresh-session-confirmed
 ```
 
-Acknowledgment advances the control-plane generation; it does not approve omitted targets or discard pending work. The fresh agent resumes the configured primary/fallback/review order from existing checkpoints.
+The confirmation flag is an assertion by the newly started agent, not a recovery option for the contaminated one. Acknowledgment advances the control-plane generation; it does not approve omitted targets or discard pending work. The fresh agent resumes the configured primary/fallback/review order from existing checkpoints.
 
 Use `game-l10n control-plane-status --workspace <workspace>` to inspect the text-free generation and rotation state.
