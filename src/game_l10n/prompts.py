@@ -6,7 +6,19 @@ from typing import Any
 
 from .models import CharacterProfile, ContextPack, GlossaryEntry, ProjectContext, Segment
 
-PROMPT_VERSION = "2026-10-13.8"
+PROMPT_VERSION = "2026-10-17.1"
+
+_DUPLICATE_CONTEXT_METADATA_KEYS = {
+    "context_attachment",
+    "context_bundle",
+    "context_pack",
+    "focused_context_attachment",
+    "focused_context_bundle",
+    "focused_context_pack",
+    "target_context_attachment",
+    "target_context_bundle",
+    "target_context_pack",
+}
 
 TRANSLATION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -150,6 +162,26 @@ def _focused_evidence_entries(
     ][:limit]
 
 
+def _prompt_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Keep segment facts while removing duplicated context containers.
+
+    Typed context belongs in ``ContextPack`` and is projected separately.  Some
+    external handoffs attach that same pack to every segment; echoing it through
+    metadata makes a short target carry the whole pack again on every API call.
+    Scalar context identifiers remain available for evidence matching.
+    """
+
+    projected: dict[str, Any] = {}
+    for key, value in metadata.items():
+        normalized = str(key).casefold()
+        if normalized in _DUPLICATE_CONTEXT_METADATA_KEYS or normalized.endswith(
+            ("_context_attachment", "_context_bundle", "_context_pack")
+        ):
+            continue
+        projected[key] = value
+    return projected
+
+
 def _shared_context(
     project: ProjectContext,
     segment: Segment,
@@ -219,6 +251,8 @@ def _shared_context(
             ),
         }
     )
+    # Keep stable job-wide material first so compatible providers can reuse a
+    # common prompt prefix. Target-specific evidence and source text follow it.
     return {
         "project": {
             "title": project.game_title,
@@ -231,27 +265,7 @@ def _shared_context(
             "content_notes": list(project.content_notes),
             "content_context": project.fictional_content_note,
         },
-        "translation_target": {
-            "id": segment.id,
-            "source": segment.source,
-        },
-        "context_only_do_not_translate": {
-            "speaker": segment.speaker,
-            "scene": segment.scene,
-            "previous": segment.previous,
-            "next": segment.next,
-            "metadata": segment.metadata,
-        },
         "localization_context": localization_context,
-        "character": None
-        if character is None
-        else {
-            "name": character.name,
-            "aliases": list(character.aliases),
-            "voice": character.voice,
-            "relationships": character.relationships,
-            "notes": character.notes,
-        },
         "narrative_context": None
         if context_pack is None
         or (
@@ -261,7 +275,6 @@ def _shared_context(
         )
         else {
             "story_summary": context_pack.story_summary,
-            "global_style_rules": list(context_pack.global_style_rules),
             "current_scene": scene_context,
             "analyzed_character_guide": analyzed_character,
             "relationship_timeline": (
@@ -277,6 +290,15 @@ def _shared_context(
         },
         "functional_context": functional_context,
         "knowledge_context": knowledge_context,
+        "character": None
+        if character is None
+        else {
+            "name": character.name,
+            "aliases": list(character.aliases),
+            "voice": character.voice,
+            "relationships": character.relationships,
+            "notes": character.notes,
+        },
         "approved_same_speaker_style_anchors": style_anchors or [],
         "glossary": [
             {
@@ -291,6 +313,17 @@ def _shared_context(
                 else glossary
             )
         ],
+        "context_only_do_not_translate": {
+            "speaker": segment.speaker,
+            "scene": segment.scene,
+            "previous": segment.previous,
+            "next": segment.next,
+            "metadata": _prompt_metadata(segment.metadata),
+        },
+        "translation_target": {
+            "id": segment.id,
+            "source": segment.source,
+        },
     }
 
 
@@ -340,7 +373,16 @@ Otherwise translate it and leave reason empty. Return only the requested JSON ob
             "obfuscate or reinterpret the source to evade policy."
         )
     return system, json.dumps(
-        _shared_context(project, segment, glossary, character, context_pack, style_anchors), ensure_ascii=False
+        _shared_context(
+            project,
+            segment,
+            glossary,
+            character,
+            context_pack,
+            style_anchors,
+            focused=True,
+        ),
+        ensure_ascii=False,
     )
 
 
@@ -354,7 +396,16 @@ def review_prompt(
     style_anchors: list[dict[str, str]] | None = None,
     refusal_retry: bool = False,
 ) -> tuple[str, str]:
-    payload = _shared_context(project, segment, glossary, character, context_pack, style_anchors)
+    payload = _shared_context(
+        project,
+        segment,
+        glossary,
+        character,
+        context_pack,
+        style_anchors,
+        candidate=candidate,
+        focused=True,
+    )
     payload["candidate_translation"] = candidate
     system = """You are the independent game-localization reviewer, not a content generator or orchestrator.
 Compare the one pre-existing translation_target.source and candidate_translation for exact meaning, omissions,

@@ -66,6 +66,11 @@ CONFIG_TEMPLATE: dict[str, Any] = {
             "max_output_tokens": 8192,
             "review_verdict_format": "plain",
             "task_max_output_tokens": {"game_translation_review_judge": 24},
+            "task_max_input_chars": {
+                "game_translation": 24000,
+                "game_translation_review_judge": 24000,
+                "game_translation_review_rewrite": 24000
+            },
         },
         {
             "name": "openai-sol",
@@ -190,6 +195,7 @@ This private workspace contains game data and localization artifacts. Resolve th
 - Normalize every refusal to `fallback_required` / “폴백 처리 필요”. It is a routing event, never an exclusion, batch cancellation, or content decision. `source_preserved` requires route evidence that every configured route was attempted and exhausted.
 - Translate each target with its relevant narrative/voice, functional/UI, knowledge/prerequisite, adjacent, glossary, and immutable evidence. Preserve meaning, function, natural tone, character voice, terminology, allusions, placeholders, markup, control codes, conditions, units, and order.
 - Provider roles are fixed by the selected preset. An API key does not select or alter a mode. Fresh native workers use no parent history and return metadata only. Manual/fallback handoff uses only `parr0t.translation-exchange/v1`.
+- Send external fallback requests only through the configured provider adapter. Do not create a job-local API loop, embed a context pack inside segment metadata, or resend an unchanged successful target. The adapter enforces focused per-target input budgets; `budget_exhausted` queues that exact target without a network call or scope reduction.
 - Build and validate a new recoverable output here. Never mutate or launch the real game during automated validation. Real install, update, remove/restore, and launch each require their own explicit one-shot authorization.
 - Retryable failures stay in the metadata-only failure queue. Terminal source-preserved outcomes are recorded separately and are not retried as pending work; `metadata.blocking_on_failure=true` holds the entire patch.
 - Keep publication dormant and unmentioned until the user requests it. SDK promotion also requires confirmed patch success and the original exact target identity. Its separate engine-only commit must pass `game-l10n verify-sdk-promotion`; never mix a `main`-owned path into that commit.

@@ -113,6 +113,12 @@ class WorkspaceTests(unittest.TestCase):
                 )
             )
             entry_state = control_plane_entry_state(work)
+            legacy_config = json.loads(json.dumps(config))
+            next(
+                item for item in legacy_config["providers"] if item["name"] == "deepseek"
+            ).pop("task_max_input_chars")
+            legacy_deepseek = ProviderRegistry.from_config(legacy_config, work).get("deepseek")
+            legacy_input_caps = legacy_deepseek.fingerprint()["task_max_input_chars"]
 
         providers = {item["name"]: item for item in config["providers"]}
         self.assertEqual(config["provider_preset"], "openai-deepseek")
@@ -125,6 +131,15 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(providers["deepseek"]["thinking"], "disabled")
         self.assertEqual(providers["deepseek"]["reasoning_effort"], "none")
         self.assertEqual(providers["deepseek"]["review_verdict_format"], "plain")
+        self.assertEqual(
+            providers["deepseek"]["task_max_input_chars"],
+            {
+                "game_translation": 24000,
+                "game_translation_review_judge": 24000,
+                "game_translation_review_rewrite": 24000,
+            },
+        )
+        self.assertEqual(legacy_input_caps, providers["deepseek"]["task_max_input_chars"])
         self.assertEqual(providers["openai-sol"]["model"], "gpt-6.1-sol")
         self.assertEqual(providers["openai-luna"]["reasoning_effort"], "none")
         self.assertEqual(providers["openai-sol"]["reasoning_effort"], "low")
