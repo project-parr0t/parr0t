@@ -69,4 +69,4 @@ For launcher-neutral Windows packages, `-GameRoot` accepts absolute paths and pa
 
 ## Unity 2022.3 prototype branch
 
-Read `docs/unity-2022.3.md` for exact capability bounds. Bundle INI extraction remains incomplete; an independent inventory is mandatory. Standalone helpers support v22 little-endian object relocation, Font payload replacement and caller-supplied UI metrics. Build workspace artifacts and preserve unowned data. Static metrics do not prove runtime font or layout behavior; load the engine runbook only for a matching trigger.
+Read `docs/unity-2022.3.md` before any branch work.
