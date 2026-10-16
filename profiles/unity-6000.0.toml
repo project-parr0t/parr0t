@@ -1,0 +1,12 @@
+schema = "parr0t.sdk-capabilities.v1"
+engine = "unity"
+version = "6000.0"
+branch = "sdk-unity-6000.0"
+backends = ["mono"]
+cli = "python -m game_l10n.unity6000"
+requirements = "profiles/unity-6000.0-requirements.txt"
+contract = "docs/unity-6000.0.md"
+runbook = "docs/engine-faq.md"
+capabilities = ["serialized-string-selection", "single-line-tsv-cells", "targeted-unsigned-clr-ldstr", "caller-prepared-additive-tmp-fallback", "structural-ui-census", "reversible-delta-pack", "core-completion-artifact-binding"]
+requires_external_input = ["stripped-typetree-generation", "fallback-font-metrics-and-material", "runtime-visual-evidence"]
+exclusions = ["il2cpp", "other-unity-lines", "signed-native-or-overlay-assemblies", "split-or-encrypted-containers", "runtime-dynamic-text-coverage", "image-content-and-ocr", "glyph-generation", "automatic-layout", "runtime-install-or-launch"]

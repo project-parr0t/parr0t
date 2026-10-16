@@ -1,0 +1,4 @@
+UnityPy==1.25.0
+dnfile==0.18.0
+dncil==1.0.2
+fonttools==4.67.0
