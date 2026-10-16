@@ -30,6 +30,7 @@ For an existing job, start with status and reuse valid checkpoints. Do not repea
 ```text
 workspace and authorization
   -> SDK identity and selection
+  -> exact SDK implementation activation
   -> two independent ordered inventories
   -> inventory reconciliation
   -> typed context analysis
@@ -47,7 +48,7 @@ Do not skip or reorder barriers. One refusal, timeout, malformed result, capacit
 
 ## Operating rules
 
-- Select the SDK before writing format tooling. Exact engine/version matches may be reused or extended. A different identity may be a code reference for `derive-new`, never a compatibility or promotion destination.
+- Select and activate the SDK before data-plane work. Exact engine/version matches run from the bound branch checkout. A different identity may be a bound read-only code reference for `derive-new`, never a compatibility or promotion destination. Generated pass-through workspace tools are placeholders, not an active adapter.
 - Inventory completeness requires two independently implemented ordered manifests. Result alignment, semantic review coverage, and runtime observation are separate claims.
 - Context is target-scoped, not absent. Use narrative/voice, functional/UI, knowledge/prerequisite, adjacent, glossary, and immutable evidence relevant to that target.
 - The top-level agent is a text-free control plane. It handles IDs, counts, categorical status, queue movement, artifact paths, and deterministic codes. Workers access private text and return only validated metadata envelopes.
@@ -71,7 +72,7 @@ Use the routing table in repository `AGENTS.md`. Common short paths are:
 - publication: `instance-release.md` only after the user commands publication;
 - reusable SDK promotion: SDK branch and engine FAQ contracts only after confirmed patch success.
 
-After verified context, status routes to the complete primary translation/review pipeline. A missing, malformed, or stale completion attestation is never `ready`; incomplete results route to targeted gap resolution, and static completion routes to validation and packing. Status validates cached pack metadata against both the artifact digest and the current completion attestation before returning `local_patch_ready`. Malformed state returns one metadata-only repair action instead of a traceback, while a failure queue bound to another inventory returns a stale-queue reconciliation action rather than blocking the current inventory.
+After verified context, status routes to the complete primary translation/review pipeline. A missing, malformed, or stale completion attestation is never `ready`; incomplete results route to targeted gap resolution, and static completion routes to validation and packing. The completion attestation binds the exact result artifact, and the pack cache binds that input plus the current attestation and output digest before status can return `local_patch_ready`. Malformed state returns one metadata-only repair action instead of a traceback, while a failure queue bound to another inventory returns a stale-queue reconciliation action rather than blocking the current inventory.
 
 For non-Steam/launcher-neutral delivery, `filesystem-package` is authoritative. `-GameRoot` accepts an absolute path or a path relative to the startup current directory. If omitted, the installer tries that validated startup current directory before prompting. It never discovers or controls a store client.
 
@@ -84,6 +85,7 @@ game-l10n status --workspace <external-workspace>
 game-l10n sdk-inventory --workspace <external-workspace> --refresh-remote
 game-l10n sdk-evaluate --workspace <external-workspace> --target-engine <engine> --target-version <version-line> --branch <sdk-branch> --result <compatible|partial|reference|incompatible> --reason <reason-code> --evidence-path <public-contract-path>
 game-l10n sdk-select --workspace <external-workspace> --target-engine <engine> --target-version <version-line> --mode <reuse|extend|derive-new|private-new> [--branch <sdk-branch>]
+game-l10n sdk-activate --workspace <external-workspace> [--reference-checkout <reference-worktree>]
 ```
 
 These are agent execution boundaries, not a human command cookbook. With an OpenCodex-compatible proxy, configure the proxy separately and run Codex against the Parr0t checkout; keep proxy credentials and configuration outside this repository.

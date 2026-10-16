@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import sys
-from dataclasses import fields
+from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from .control_plane import (
 )
 from .errors import GameL10nError
 from .coverage import (
+    COMPLETION_SCHEMA,
     completion_attestation,
     record_runtime_coverage,
     require_inventory_attestation,
@@ -30,7 +32,12 @@ from .coverage import (
 )
 from .context_analysis import ContextAnalyzer, analyze_with_cache
 from .corrections import apply_user_corrections
-from .failure_queue import held_checkpoint_path, load_failure_queue, update_failure_queue
+from .failure_queue import (
+    FAILURE_QUEUE_SCHEMA,
+    held_checkpoint_path,
+    load_failure_queue,
+    update_failure_queue,
+)
 from .formats import (
     read_existing_translations,
     read_segments,
@@ -46,6 +53,7 @@ from .privacy import is_within, require_external_workdir
 from .providers import ProviderRegistry
 from .provider_policy import require_direct_provider_pipeline
 from .runtime_approval import create_runtime_approval
+from .store import stable_hash
 from .steam import build_steam_package, inspect_installed_state, validate_steam_package
 from .translation_exchange import prepare_translation_exchange, seal_translation_exchange
 from .tooling import cached_tool_state, run_cached_tool
@@ -55,8 +63,10 @@ from .workspace import (
     load_config,
     prepare_sdk_profile,
     publish_sdk_profile,
+    record_sdk_activation,
     record_sdk_evaluation,
     record_sdk_selection,
+    require_sdk_activation,
     require_sdk_selection,
     update_repository_policy,
 )
@@ -75,6 +85,10 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
         "docs/sdk-selection.md",
         "docs/sdk-branch-contract.md",
     ),
+    "activate_selected_sdk_implementation": (
+        "docs/sdk-selection.md",
+        "docs/sdk-branch-contract.md",
+    ),
     "unpack_and_extract_ordered_script": ("docs/coverage-gates.md",),
     "verify_independent_source_inventory": ("docs/coverage-gates.md",),
     "resolve_source_inventory_gaps": ("docs/coverage-gates.md",),
@@ -84,6 +98,11 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
         "docs/control-plane-contract.md",
     ),
     "await_explicit_user_request_to_resume_failure_queue": (
+        "docs/coverage-gates.md",
+        "docs/fallback-routing.md",
+        "docs/control-plane-contract.md",
+    ),
+    "resolve_blocking_terminal_unresolved": (
         "docs/coverage-gates.md",
         "docs/fallback-routing.md",
         "docs/control-plane-contract.md",
@@ -146,13 +165,18 @@ def _read_status_object(
     return payload, None
 
 
-def _context_state_valid(payload: dict[str, Any]) -> bool:
+def _context_state_valid(
+    payload: dict[str, Any], context_path: Path, source_segments_digest: str
+) -> bool:
     execution = payload.get("execution")
     if payload.get("status") != "success" or not isinstance(execution, dict):
         return False
     total = execution.get("total_parts")
     completed = execution.get("completed_parts")
     parts = execution.get("parts")
+    if not context_path.is_file():
+        return False
+    output_body = context_path.read_bytes()
     return bool(
         execution.get("status") == "success"
         and isinstance(total, int)
@@ -161,6 +185,9 @@ def _context_state_valid(payload: dict[str, Any]) -> bool:
         and isinstance(parts, list)
         and len(parts) == total
         and all(isinstance(item, dict) and item.get("status") == "success" for item in parts)
+        and payload.get("source_segments_digest") == source_segments_digest
+        and payload.get("output_sha256") == hashlib.sha256(output_body).hexdigest()
+        and payload.get("output_size") == len(output_body)
     )
 
 
@@ -169,20 +196,97 @@ def _completion_state_valid(payload: dict[str, Any]) -> bool:
     result_alignment = payload.get("result_alignment")
     target_scope = payload.get("target_scope")
     semantic_review = payload.get("semantic_review")
-    return bool(
+    result_artifact = payload.get("result_artifact")
+    structure_valid = bool(
         isinstance(source_inventory, dict)
         and isinstance(source_inventory.get("fingerprint"), str)
         and source_inventory.get("fingerprint")
+        and isinstance(source_inventory.get("static_complete"), bool)
         and isinstance(result_alignment, dict)
         and isinstance(result_alignment.get("complete"), bool)
         and isinstance(target_scope, dict)
         and isinstance(target_scope.get("full_inventory"), bool)
         and isinstance(semantic_review, dict)
         and isinstance(semantic_review.get("complete"), bool)
+        and isinstance(semantic_review.get("blocking_unresolved_count"), int)
+        and semantic_review.get("blocking_unresolved_count", -1) >= 0
+        and isinstance(semantic_review.get("terminal_unresolved_count"), int)
+        and semantic_review.get("terminal_unresolved_count", -1) >= 0
+        and isinstance(semantic_review.get("failed_count"), int)
+        and semantic_review.get("failed_count", -1) >= 0
+        and isinstance(payload.get("accounting_complete"), bool)
+        and isinstance(payload.get("semantic_completion"), bool)
         and isinstance(payload.get("target_completion"), bool)
         and isinstance(payload.get("static_completion"), bool)
         and isinstance(payload.get("issue_codes"), list)
+        and isinstance(result_artifact, dict)
+        and isinstance(result_artifact.get("path"), str)
+        and bool(result_artifact.get("path"))
+        and isinstance(result_artifact.get("sha256"), str)
+        and len(result_artifact.get("sha256", "")) == 64
+        and isinstance(result_artifact.get("size"), int)
+        and result_artifact.get("size", -1) >= 0
     )
+    if not structure_valid:
+        return False
+    accounting_complete = payload["accounting_complete"]
+    target_completion = payload["target_completion"]
+    static_completion = payload["static_completion"]
+    blocking_unresolved = semantic_review["blocking_unresolved_count"]
+    terminal_unresolved = semantic_review["terminal_unresolved_count"]
+    expected_accounting = bool(
+        result_alignment["complete"]
+        and semantic_review["complete"]
+        and semantic_review["failed_count"] == 0
+    )
+    if accounting_complete != expected_accounting:
+        return False
+    if payload["semantic_completion"] != bool(
+        accounting_complete and terminal_unresolved == 0
+    ):
+        return False
+    if target_completion != bool(accounting_complete and blocking_unresolved == 0):
+        return False
+    if static_completion != bool(
+        source_inventory["static_complete"]
+        and result_alignment["complete"]
+        and target_scope["full_inventory"]
+        and target_completion
+    ):
+        return False
+    return True
+
+
+def _result_artifact_binding(work_dir: Path, path: Path) -> dict[str, Any]:
+    resolved = path.resolve()
+    if not is_within(resolved, work_dir):
+        raise ValueError("Result artifact must stay inside the agent work directory")
+    body = resolved.read_bytes()
+    return {
+        "path": str(resolved),
+        "sha256": hashlib.sha256(body).hexdigest(),
+        "size": len(body),
+    }
+
+
+def _completion_result_issue(work_dir: Path, payload: dict[str, Any]) -> str | None:
+    artifact = payload.get("result_artifact")
+    if not isinstance(artifact, dict):
+        return "COMPLETION_RESULT_BINDING_MISSING"
+    path_value = artifact.get("path")
+    if not isinstance(path_value, str) or not path_value:
+        return "COMPLETION_RESULT_PATH_INVALID"
+    path = Path(path_value).resolve()
+    if not is_within(path, work_dir):
+        return "COMPLETION_RESULT_OUTSIDE_WORKSPACE"
+    if not path.is_file():
+        return "COMPLETION_RESULT_MISSING"
+    current = _result_artifact_binding(work_dir, path)
+    if current["sha256"] != artifact.get("sha256") or current["size"] != artifact.get(
+        "size"
+    ):
+        return "COMPLETION_RESULT_CHANGED"
+    return None
 
 
 def _sdk_root() -> Path:
@@ -319,6 +423,12 @@ def _finalize_translation_results(
         results,
         inventory_fingerprint=inventory_state["primary_fingerprint"],
     )
+    checkpoint = held_checkpoint_path(work_dir)
+    blocking = queue["blocking_count"] > 0
+    result_artifact = checkpoint if blocking else destination
+    write_results(result_artifact, results)
+    if queue["pending_count"] and not blocking:
+        write_results(checkpoint, results)
     runtime = runtime_coverage_state(work_dir, inventory_state["primary_fingerprint"])
     completion = completion_attestation(
         target_segments,
@@ -328,13 +438,11 @@ def _finalize_translation_results(
         runtime=runtime,
         review_required=review_required,
     )
+    completion["result_artifact"] = _result_artifact_binding(work_dir, result_artifact)
     completion_path = save_completion_attestation(work_dir, completion)
     failed = sum(item.status == "failed" for item in results)
     source_preserved = sum(item.status == "source_preserved" for item in results)
-    checkpoint = held_checkpoint_path(work_dir)
-    if queue["pending_count"]:
-        write_results(checkpoint, results)
-    if queue["blocking_count"]:
+    if blocking:
         return (
             {
                 "status": "held",
@@ -356,7 +464,6 @@ def _finalize_translation_results(
             },
             3,
         )
-    write_results(destination, results)
     static_complete = completion["static_completion"]
     target_complete = completion["target_completion"]
     return (
@@ -399,8 +506,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     if args.git_choice == "pending":
         print("ACTION_REQUIRED: ask the user whether Git use is allowed, then run `game-l10n policy`.")
     print(
-        "ACTION_REQUIRED: record the target engine/version identity, evaluate the inventoried SDK "
-        "branches against it, and run sdk-select before extraction."
+        "ACTION_REQUIRED: record the target engine/version identity, evaluate and select an SDK, "
+        "then run sdk-activate before extraction."
     )
     return 0
 
@@ -419,7 +526,7 @@ def cmd_translate(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     require_direct_provider_pipeline(config, "game-l10n translate")
-    require_sdk_selection(config)
+    require_sdk_activation(work_dir, config)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     destination = _path_in_workspace(work_dir, args.output)
     if destination == source:
@@ -464,7 +571,7 @@ def cmd_review_existing(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     require_direct_provider_pipeline(config, "game-l10n review-existing")
-    require_sdk_selection(config)
+    require_sdk_activation(work_dir, config)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     existing_path = _path_in_workspace(work_dir, args.existing, must_exist=True)
     destination = _path_in_workspace(work_dir, args.output)
@@ -510,7 +617,7 @@ def cmd_resume_failures(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     require_direct_provider_pipeline(config, "game-l10n resume-failures")
-    require_sdk_selection(config)
+    require_sdk_activation(work_dir, config)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     destination = _path_in_workspace(work_dir, args.output)
     context_source = _path_in_workspace(
@@ -574,7 +681,7 @@ def cmd_apply_user_correction(args: argparse.Namespace) -> int:
         raise ValueError("Exact correction requires explicit user-supplied or user-approved wording")
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
-    require_sdk_selection(config)
+    require_sdk_activation(work_dir, config)
     sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
     require_external_workdir(work_dir, sdk_root)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
@@ -605,7 +712,7 @@ def cmd_apply_user_correction(args: argparse.Namespace) -> int:
 
 def cmd_verify_inventory(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
-    require_sdk_selection(load_config(work_dir))
+    require_sdk_activation(work_dir, load_config(work_dir))
     primary = _path_in_workspace(work_dir, args.primary, must_exist=True)
     independent = _path_in_workspace(work_dir, args.independent, must_exist=True)
     if primary == independent:
@@ -617,6 +724,7 @@ def cmd_verify_inventory(args: argparse.Namespace) -> int:
 
 def cmd_record_runtime_coverage(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
+    require_sdk_activation(work_dir, load_config(work_dir))
     report = _path_in_workspace(work_dir, args.report, must_exist=True)
     state = record_runtime_coverage(work_dir, report)
     print(json.dumps(state))
@@ -627,7 +735,7 @@ def cmd_analyze_context(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     require_direct_provider_pipeline(config, "game-l10n analyze-context")
-    require_sdk_selection(config)
+    require_sdk_activation(work_dir, config)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     require_inventory_attestation(work_dir, source)
     context_pack, cached = _analyze_context(
@@ -661,7 +769,11 @@ def cmd_analyze_context(args: argparse.Namespace) -> int:
 def cmd_run_tool(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
-    require_sdk_selection(config)
+    activation = require_sdk_activation(work_dir, config)
+    if activation.get("workspace_tools") is None:
+        raise ValueError(
+            "The selected SDK owns its engine tools; run the adapter command from its activated checkout"
+        )
     sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
     require_external_workdir(work_dir, sdk_root)
     command = config.get("tools", {}).get(args.stage)
@@ -681,6 +793,7 @@ def cmd_run_tool(args: argparse.Namespace) -> int:
 
 def cmd_import_native_shard(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
+    require_sdk_activation(work_dir, load_config(work_dir))
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     result = import_native_shard(work_dir, source, args.name)
     print(json.dumps(result, ensure_ascii=False))
@@ -723,7 +836,7 @@ def cmd_resume_control_plane(args: argparse.Namespace) -> int:
 def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
-    require_sdk_selection(config)
+    require_sdk_activation(work_dir, config)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     output = _path_in_workspace(work_dir, args.output)
     execution = config.get("execution", {})
@@ -757,6 +870,7 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
 
 def cmd_merge_native_pass(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
+    require_sdk_activation(work_dir, load_config(work_dir))
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     destination = _path_in_workspace(work_dir, args.output)
     result = merge_native_pass(work_dir, read_segments(source), destination)
@@ -766,6 +880,7 @@ def cmd_merge_native_pass(args: argparse.Namespace) -> int:
 
 def cmd_prepare_translation_exchange(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
+    require_sdk_activation(work_dir, load_config(work_dir))
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     result = prepare_translation_exchange(
         work_dir,
@@ -781,6 +896,7 @@ def cmd_prepare_translation_exchange(args: argparse.Namespace) -> int:
 
 def cmd_seal_translation_exchange(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
+    require_sdk_activation(work_dir, load_config(work_dir))
     result = seal_translation_exchange(
         work_dir,
         _path_in_workspace(work_dir, args.bundle, must_exist=True),
@@ -826,12 +942,26 @@ def cmd_status(args: argparse.Namespace) -> int:
     elif action is None and missing_roots:
         action = "fix_missing_game_root"
     sdk_selection = config.get("sdk_selection", {})
+    sdk_activation: dict[str, Any] = {"status": "not_checked"}
     if action is None and sdk_selection.get("status") != "selected":
         if not sdk_selection.get("inventory_fingerprint"):
             action = "inventory_sdk_branches"
         else:
             action = "record_target_identity_evaluate_and_select_sdk"
     elif action is None:
+        try:
+            active = require_sdk_activation(work_dir, config)
+            sdk_activation = {
+                "status": "active",
+                "mode": active.get("mode"),
+                "target": active.get("target"),
+                "runtime_commit": active.get("runtime", {}).get("commit"),
+                "workspace_tools_bound": active.get("workspace_tools") is not None,
+            }
+        except (GameL10nError, OSError, ValueError, json.JSONDecodeError):
+            sdk_activation = {"status": "required"}
+            action = "activate_selected_sdk_implementation"
+    if action is None:
         if not any((work_dir / "inputs").glob("*")):
             action = "unpack_and_extract_ordered_script"
         else:
@@ -853,27 +983,45 @@ def cmd_status(args: argparse.Namespace) -> int:
                     and inventory_state.get("static_complete") is True
                     and isinstance(inventory_state.get("primary_fingerprint"), str)
                     and inventory_state.get("primary_fingerprint")
+                    and isinstance(inventory_state.get("primary_path"), str)
+                    and inventory_state.get("primary_path")
                 )
                 if not inventory_verified:
                     action = "resolve_source_inventory_gaps"
+                else:
+                    try:
+                        inventory_state = require_inventory_attestation(
+                            work_dir, Path(inventory_state["primary_path"])
+                        )
+                    except (GameL10nError, OSError, ValueError, json.JSONDecodeError):
+                        inventory_verified = False
+                        state_issue_codes.append("INVENTORY_ATTESTATION_STALE")
+                        action = "verify_independent_source_inventory"
             if inventory_verified and action is None:
                 failure_queue_path = work_dir / ".game-l10n" / "failure-queue.json"
                 queue_pending = False
+                queue_blocking_terminal = False
                 queue, queue_issue = _read_status_object(
                     failure_queue_path,
                     label="FAILURE_QUEUE",
-                    expected_schema="parr0t.failure-queue.v1",
+                    expected_schema=FAILURE_QUEUE_SCHEMA,
                 )
                 if queue_issue:
                     state_issue_codes.append(queue_issue)
                     action = "repair_invalid_workspace_state"
                 elif queue is not None:
                     pending_count = queue.get("pending_count")
-                    if not isinstance(pending_count, int) or pending_count < 0:
+                    terminal_count = queue.get("terminal_count", 0)
+                    if (
+                        not isinstance(pending_count, int)
+                        or pending_count < 0
+                        or not isinstance(terminal_count, int)
+                        or terminal_count < 0
+                    ):
                         state_issue_codes.append("FAILURE_QUEUE_COUNT_INVALID")
                         action = "repair_invalid_workspace_state"
                     elif (
-                        pending_count > 0
+                        pending_count + terminal_count > 0
                         and queue.get("inventory_fingerprint")
                         != inventory_state.get("primary_fingerprint")
                     ):
@@ -884,10 +1032,21 @@ def cmd_status(args: argparse.Namespace) -> int:
                     ) != pending_count:
                         state_issue_codes.append("FAILURE_QUEUE_ENTRIES_INVALID")
                         action = "repair_invalid_workspace_state"
+                    elif not isinstance(queue.get("terminal_entries", []), list) or len(
+                        queue.get("terminal_entries", [])
+                    ) != terminal_count:
+                        state_issue_codes.append("FAILURE_QUEUE_TERMINAL_ENTRIES_INVALID")
+                        action = "repair_invalid_workspace_state"
                     else:
                         queue_pending = pending_count > 0
+                        queue_blocking_terminal = any(
+                            isinstance(item, dict) and item.get("blocking") is True
+                            for item in queue.get("terminal_entries", [])
+                        )
                 if action is None and queue_pending:
                     action = "await_explicit_user_request_to_resume_failure_queue"
+                elif action is None and queue_blocking_terminal:
+                    action = "resolve_blocking_terminal_unresolved"
                 elif action is None:
                     context_path = _path_in_workspace(
                         work_dir,
@@ -899,13 +1058,20 @@ def cmd_status(args: argparse.Namespace) -> int:
                     context_state, context_issue = _read_status_object(
                         context_state_path, label="CONTEXT_ATTESTATION"
                     )
+                    source_segments_digest = stable_hash(
+                        [
+                            asdict(item)
+                            for item in read_segments(Path(inventory_state["primary_path"]))
+                        ]
+                    )
                     if context_issue:
                         state_issue_codes.append(context_issue)
                         action = "repair_invalid_workspace_state"
                     elif (
                         context_state is None
-                        or not context_path.is_file()
-                        or not _context_state_valid(context_state)
+                        or not _context_state_valid(
+                            context_state, context_path, source_segments_digest
+                        )
                     ):
                         action = "analyze_complete_script_context"
                     else:
@@ -915,7 +1081,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                         completion, completion_issue = _read_status_object(
                             completion_path,
                             label="COMPLETION_ATTESTATION",
-                            expected_schema="parr0t.completion-attestation.v1",
+                            expected_schema=COMPLETION_SCHEMA,
                         )
                         if completion_issue:
                             state_issue_codes.append(completion_issue)
@@ -931,6 +1097,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                             inventory_state.get("primary_fingerprint")
                         ):
                             state_issue_codes.append("COMPLETION_ATTESTATION_STALE")
+                            action = "rebuild_current_inventory_translation_attestation"
+                        elif result_issue := _completion_result_issue(work_dir, completion):
+                            state_issue_codes.append(result_issue)
                             action = "rebuild_current_inventory_translation_attestation"
                         elif completion.get("static_completion") is not True:
                             action = "resolve_translation_review_gaps"
@@ -957,6 +1126,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "execution_mode": config.get("execution_mode"),
                 "native_workflow": config.get("native_workflow"),
                 "sdk_selection": sdk_selection,
+                "sdk_activation": sdk_activation,
                 "execution": config.get("execution", {}),
                 "runtime": config.get("runtime", {"default_policy": "deny"}),
                 "control_plane": control_state,
@@ -1018,6 +1188,31 @@ def cmd_sdk_select(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sdk_activate(args: argparse.Namespace) -> int:
+    state = record_sdk_activation(
+        Path(args.workspace).resolve(),
+        reference_checkout=(
+            Path(args.reference_checkout).resolve() if args.reference_checkout else None
+        ),
+    )
+    print(
+        json.dumps(
+            {
+                "schema": state["schema"],
+                "mode": state["mode"],
+                "target": state["target"],
+                "runtime_commit": state["runtime"]["commit"],
+                "reference_commit": (
+                    state["reference"]["commit"] if state.get("reference") else None
+                ),
+                "workspace_tools_bound": state.get("workspace_tools") is not None,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def cmd_promote(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     export_root = prepare_sdk_profile(
@@ -1047,6 +1242,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
 def cmd_steam_package(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
     sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
     require_external_workdir(work_dir, sdk_root)
     result = build_steam_package(
@@ -1061,6 +1257,7 @@ def cmd_steam_package(args: argparse.Namespace) -> int:
 def cmd_verify_steam_package(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
     sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
     require_external_workdir(work_dir, sdk_root)
     result = validate_steam_package(_path_in_workspace(work_dir, args.package, must_exist=True))
@@ -1071,6 +1268,7 @@ def cmd_verify_steam_package(args: argparse.Namespace) -> int:
 def cmd_filesystem_package(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
     sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
     require_external_workdir(work_dir, sdk_root)
     result = build_filesystem_package(
@@ -1085,6 +1283,7 @@ def cmd_filesystem_package(args: argparse.Namespace) -> int:
 def cmd_verify_filesystem_package(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
     sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
     require_external_workdir(work_dir, sdk_root)
     result = validate_filesystem_package(
@@ -1097,6 +1296,7 @@ def cmd_verify_filesystem_package(args: argparse.Namespace) -> int:
 def cmd_instance_release_gate(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
     sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
     require_external_workdir(work_dir, sdk_root)
     result = validate_instance_release(
@@ -1118,6 +1318,7 @@ def cmd_instance_release_gate(args: argparse.Namespace) -> int:
 def cmd_inspect_installed_state(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
     sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
     require_external_workdir(work_dir, sdk_root)
     target = _source_path(work_dir, args.target, config)
@@ -1134,6 +1335,7 @@ def cmd_inspect_installed_state(args: argparse.Namespace) -> int:
 def cmd_approve_runtime(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
     sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
     require_external_workdir(work_dir, sdk_root)
     ttl_minutes = args.ttl_minutes
@@ -1497,6 +1699,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Target SDK compatibility line used in sdk-<engine>-<version>",
     )
     sdk_select.set_defaults(func=cmd_sdk_select)
+
+    sdk_activate = sub.add_parser(
+        "sdk-activate",
+        help="Bind the selected SDK decision to the implementation that will execute it",
+    )
+    sdk_activate.add_argument("--workspace", required=True)
+    sdk_activate.add_argument(
+        "--reference-checkout",
+        help="Exact clean reference checkout required only for derive-new",
+    )
+    sdk_activate.set_defaults(func=cmd_sdk_activate)
 
     status = sub.add_parser("status", help="Report the next safe action for a Codex orchestrator")
     status.add_argument("--workspace", required=True)
