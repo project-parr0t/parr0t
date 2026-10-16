@@ -41,7 +41,7 @@ payload/...
 
 ## Runtime behavior
 
-The player selects Install/Update, Restore, or Verify installed state. At startup the installer captures its current working directory. `-GameRoot` accepts an absolute path or a path relative to that captured directory. When `-GameRoot` is omitted, the installer first treats the captured current directory as the game folder; if its target markers do not match, the installer asks for an absolute or relative path or accepts a folder dragged into the window. `target.required_files` performs a presence check. Optional `target.source_bindings` use the same path/size/SHA-256/custom-error structure and original-backup rules as Steam source bindings.
+The player selects Install/Update, Restore, or Verify installed state. At startup the installer captures its current working directory. `-GameRoot` accepts an absolute path or a path relative to that captured directory, including `./`, `../`, `.\\`, and `..\\`. It trims surrounding whitespace and one matching pair of outer single or double quotes, so a path pasted or dragged into the prompt is handled consistently. When `-GameRoot` is omitted, the installer first treats the captured current directory as the game folder; if its target markers do not match, the installer asks for an absolute or relative path or accepts a folder dragged into the window. A missing path and an existing folder that lacks the required game markers produce distinct player guidance under `PARR0T-E002`. `target.required_files` performs a presence check. Optional `target.source_bindings` use the same path/size/SHA-256/custom-error structure and original-backup rules as Steam source bindings.
 
 The installer:
 
