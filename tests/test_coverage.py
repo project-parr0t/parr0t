@@ -168,6 +168,7 @@ class CoverageTests(unittest.TestCase):
             "status": "static_verified",
             "static_complete": True,
             "primary_segments": 1,
+            "primary_fingerprint": "synthetic-inventory-fingerprint",
         }
         runtime = {"status": "not_run", "runtime_complete": False, "issue_codes": ["REAL_RUNTIME_NOT_EXECUTED"]}
 
@@ -183,6 +184,10 @@ class CoverageTests(unittest.TestCase):
         self.assertTrue(state["result_alignment"]["complete"])
         self.assertTrue(state["semantic_review"]["complete"])
         self.assertTrue(state["static_completion"])
+        self.assertEqual(
+            state["source_inventory"]["fingerprint"],
+            "synthetic-inventory-fingerprint",
+        )
         self.assertFalse(state["runtime_completion"])
         self.assertIn("REAL_RUNTIME_NOT_EXECUTED", state["issue_codes"])
 
@@ -219,7 +224,11 @@ class CoverageTests(unittest.TestCase):
 
         self.assertEqual(state["operational_count"], 1)
         self.assertEqual(state["blocking_count"], 1)
-        self.assertTrue(loaded["entries"][0]["retryable_on_user_resume"])
+        self.assertEqual(state["pending_count"], 0)
+        self.assertEqual(state["terminal_count"], 1)
+        self.assertFalse(
+            loaded["terminal_entries"][0]["retryable_on_user_resume"]
+        )
 
     def test_blocking_failure_emits_checkpoint_but_no_patch(self) -> None:
         segment = Segment(
@@ -266,6 +275,61 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(exit_code, 3)
         self.assertEqual(summary["status"], "held")
         self.assertFalse(summary["artifact_emitted"])
+
+    def test_nonblocking_source_preservation_is_terminal_and_packable(self) -> None:
+        segment = Segment("synthetic-optional", "SOURCE_OPTIONAL")
+        result = TranslationResult(
+            segment_id=segment.id,
+            source=segment.source,
+            text=segment.source,
+            status="source_preserved",
+            attempts=[
+                AttemptRecord(
+                    stage="translate",
+                    provider="synthetic-provider",
+                    status="error",
+                    reason="quota_exhausted",
+                    issue_code="quota_exhausted",
+                )
+            ],
+        )
+        inventory = {
+            "status": "static_verified",
+            "static_complete": True,
+            "primary_segments": 1,
+            "primary_fingerprint": "synthetic-fingerprint",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destination = root / "patch.json"
+            summary, exit_code = _finalize_translation_results(
+                work_dir=root,
+                target_segments=[segment],
+                inventory_segments=[segment],
+                results=[result],
+                destination=destination,
+                inventory_state=inventory,
+                review_required=True,
+            )
+            queue = json.loads(
+                (root / ".game-l10n" / "failure-queue.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            completion = json.loads(
+                (root / ".game-l10n" / "completion-attestation.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            destination_exists = destination.exists()
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(destination_exists)
+        self.assertTrue(summary["artifact_emitted"])
+        self.assertEqual(queue["pending_count"], 0)
+        self.assertEqual(queue["terminal_count"], 1)
+        self.assertTrue(completion["static_completion"])
+        self.assertFalse(completion["semantic_completion"])
 
     def test_runtime_defaults_to_not_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -27,7 +27,23 @@ game-l10n sdk-select --workspace <workspace> --target-engine <engine> --target-v
 game-l10n sdk-select --workspace <workspace> --target-engine <engine> --target-version <version-line> --mode private-new
 ```
 
-Extraction, context analysis, translation, and new SDK promotion remain blocked until the decision is valid for the current inventory fingerprint.
+8. Activate the implementation that will actually execute the decision:
+
+```text
+# Run this from the exact selected SDK checkout for reuse/extend.
+game-l10n sdk-activate --workspace <workspace>
+
+# For derive-new, run from main after replacing both generated workspace tools,
+# and bind the exact clean reference checkout as well.
+game-l10n sdk-activate --workspace <workspace> --reference-checkout <reference-worktree>
+
+# For private-new, run from main after replacing both generated workspace tools.
+game-l10n sdk-activate --workspace <workspace>
+```
+
+`reuse` requires a clean runtime at the exact inventoried commit. `extend` requires a runtime descended from the selected same-identity commit. `derive-new` binds both the new workspace adapter and the exact reference commit. `private-new` binds the new workspace adapter. Generated pass-through tools never count as an adapter. The activation record fingerprints the executing checkout and, when applicable, the workspace tool manifest; changing either invalidates it.
+
+Extraction, context analysis, translation, packing, and SDK promotion remain blocked until both selection and activation are valid. For `reuse`/`extend`, use the selected branch's engine commands; the generic workspace `run-tool` command is reserved for a bound `derive-new` or `private-new` adapter.
 
 ## Two independent decisions
 

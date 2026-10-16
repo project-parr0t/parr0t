@@ -1,6 +1,6 @@
 {
-  "name": "agent-game-translation-sdk",
+  "name": "parr0t",
   "version": "0.1.0",
-  "description": "Context-first, refusal-aware game localization workflow for Codex and ChatGPT Work.",
+  "description": "Parr0t context-first, fallback-routed game localization workflow for Codex and ChatGPT Work.",
   "skills": "./skills/"
 }
