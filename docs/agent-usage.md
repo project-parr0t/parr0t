@@ -81,7 +81,7 @@ Configure providers by role rather than by company name:
 
 The recommended `codex-app-deepseek` hybrid uses native Codex collaboration workers for primary translation and compact judgment, with DeepSeek limited to refused translations, selective rewriting, and review fallback after the corresponding primary barriers. Supplying a key never changes the selected mode or role map. Native-only, API-only, command, compatible, and local combinations remain available through another preset selected at workspace creation; they cannot be injected into the locked App preset.
 
-Provider refusal is a routing event, not a semantic verdict. Return a categorical status to the parent and keep provider prose inside the private data plane. The top-level orchestrator must not receive source text, candidate text, translated text, or prose refusal explanations.
+Provider refusal is a routing event, not a semantic verdict. Return a categorical status to the parent and keep provider prose inside the private data plane. The same boundary applies to inventory and context analysis: workers return only a validated `parr0t.control-envelope.v1` path, never source text, content summaries, semantic safety labels, or anticipated provider-policy judgments. The top-level orchestrator must not receive source text, candidate text, translated text, or prose refusal explanations. Follow `docs/control-plane-contract.md`; if a leak reaches the parent, quarantine that generation and resume from metadata checkpoints in a fresh control plane.
 
 ## Patch and publication boundaries
 

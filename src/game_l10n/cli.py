@@ -9,6 +9,16 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
+from .control_plane import (
+    LEAK_INCIDENT_CODES,
+    ROLE_STAGES,
+    WORKER_ROLES,
+    acknowledge_control_plane_rotation,
+    control_plane_state,
+    record_control_plane_leak,
+    require_control_plane_ready,
+    validate_control_envelope,
+)
 from .errors import GameL10nError
 from .coverage import (
     completion_attestation,
@@ -553,6 +563,39 @@ def cmd_import_native_shard(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_validate_control_envelope(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    source = _path_in_workspace(work_dir, args.input, must_exist=True)
+    result = validate_control_envelope(
+        work_dir,
+        source,
+        expected_role=args.expected_role,
+        expected_stage=args.expected_stage,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_control_plane_status(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    print(json.dumps(control_plane_state(work_dir), ensure_ascii=False))
+    return 0
+
+
+def cmd_record_control_plane_leak(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    result = record_control_plane_leak(work_dir, args.incident_code)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_resume_control_plane(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    result = acknowledge_control_plane_rotation(work_dir, args.incident_id)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
@@ -600,6 +643,20 @@ def cmd_merge_native_pass(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
+    control_state = control_plane_state(work_dir)
+    if control_state["status"] == "rotation_required":
+        print(
+            json.dumps(
+                {
+                    "workspace": str(work_dir),
+                    "control_plane": control_state,
+                    "next_actions": ["resume_in_fresh_control_plane"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 1
     actions: list[str] = []
     policy = config.get("repository", {})
     visible_policy = {"initial_choice": policy.get("initial_choice", "pending")}
@@ -663,6 +720,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "sdk_selection": sdk_selection,
                 "execution": config.get("execution", {}),
                 "runtime": config.get("runtime", {"default_policy": "deny"}),
+                "control_plane": control_state,
                 "next_actions": actions or ["ready"],
             },
             ensure_ascii=False,
@@ -1033,6 +1091,42 @@ def build_parser() -> argparse.ArgumentParser:
     native_merge.add_argument("--output", required=True)
     native_merge.set_defaults(func=cmd_merge_native_pass)
 
+    control_validate = sub.add_parser(
+        "validate-control-envelope",
+        help="Validate and sanitize a data-plane worker result before the parent uses it",
+    )
+    control_validate.add_argument("--workspace", required=True)
+    control_validate.add_argument("--input", required=True)
+    control_validate.add_argument("--expected-role", choices=sorted(WORKER_ROLES))
+    control_validate.add_argument(
+        "--expected-stage",
+        choices=sorted({stage for stages in ROLE_STAGES.values() for stage in stages}),
+    )
+    control_validate.set_defaults(func=cmd_validate_control_envelope)
+
+    control_status = sub.add_parser(
+        "control-plane-status",
+        help="Report the text-free control-plane generation and rotation state",
+    )
+    control_status.add_argument("--workspace", required=True)
+    control_status.set_defaults(func=cmd_control_plane_status)
+
+    control_leak = sub.add_parser(
+        "record-control-plane-leak",
+        help="Quarantine a top-level agent after data-plane or semantic content crossed the boundary",
+    )
+    control_leak.add_argument("--workspace", required=True)
+    control_leak.add_argument("--incident-code", choices=sorted(LEAK_INCIDENT_CODES), required=True)
+    control_leak.set_defaults(func=cmd_record_control_plane_leak)
+
+    control_resume = sub.add_parser(
+        "resume-control-plane",
+        help="Acknowledge a recorded incident from a fresh metadata-only control plane",
+    )
+    control_resume.add_argument("--workspace", required=True)
+    control_resume.add_argument("--incident-id", required=True)
+    control_resume.set_defaults(func=cmd_resume_control_plane)
+
     sdk_inventory = sub.add_parser(
         "sdk-inventory",
         help="Refresh the read-only inventory of existing sdk-* branches",
@@ -1198,6 +1292,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        recovery_commands = {
+            cmd_init,
+            cmd_status,
+            cmd_doctor,
+            cmd_control_plane_status,
+            cmd_record_control_plane_leak,
+            cmd_resume_control_plane,
+        }
+        if args.func not in recovery_commands:
+            workspace = getattr(args, "workspace", None)
+            if workspace is not None:
+                require_control_plane_ready(Path(workspace).resolve())
         return int(args.func(args))
     except (GameL10nError, ValueError, OSError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
