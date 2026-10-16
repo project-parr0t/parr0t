@@ -53,6 +53,10 @@ Provider-specific refusal status and prose stay inside the private data plane. B
 
 A configured fallback is an ordinary authorized route. A fresh no-history worker sends the exact, unmodified target and its required context to that route. No generated worker contract may add a content-based pre-screen, transfer classification, or other eligibility gate. Only the configured provider can return its own categorical result after the invocation is attempted.
 
+## Fixed manual and fallback exchange
+
+When a direct provider pipeline cannot own the next translation step, the data plane uses only `parr0t.translation-exchange/v1`; see [translation exchange](translation-exchange.md). The CLI creates the immutable request rows and seals the fixed success/failure rows. The parent must not open any text-bearing exchange file, tell a worker to summarize it, or invent another handoff schema. It receives only the sealed metadata receipt and validated v2 envelope. A success moves to `review_pending`; an explicit failure or missing row stays `translation_fallback_pending` as `fallback_required`.
+
 ## Terminal route evidence
 
 `source_preserved` is legal only after every configured route for each affected target has actually been attempted and ended in a terminal categorical failure. A v2 envelope that transitions any target to `source_preserved` must include `route_evidence_path`, and that path must also appear in `artifact_paths`. The referenced text-free artifact has this exact shape:
