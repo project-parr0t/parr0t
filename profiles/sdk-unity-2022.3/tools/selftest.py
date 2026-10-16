@@ -3,9 +3,24 @@ from __future__ import annotations
 import unittest
 
 from unity_textasset import _select_source_locale, _token_mismatch, parse_ini, rewrite_ini
+from unity_serialized import pack_string, string_at
+from unity_layout import FontMetrics, Rect, TextLayout, resolve_rect_size, screen_text
 
 
 class UnityTextAssetPrototypeTests(unittest.TestCase):
+    def test_standalone_string_interface(self) -> None:
+        payload = pack_string("SOURCE_{0}")
+        self.assertEqual(string_at(payload, 0), ("SOURCE_{0}", len(payload)))
+
+    def test_pure_layout_interface(self) -> None:
+        size = resolve_rect_size({"canvas": Rect(), "label": Rect("canvas")},
+                                 "label", (100, 100))
+        metrics = FontMetrics(1000, 1200, {ord(ch): 500 for ch in "SOURCE"}, 1000)
+        result = screen_text("SOURCE", size, metrics, TextLayout(10))
+        self.assertFalse(result["conservative_overflow"])
+        self.assertEqual(result["missing_codepoints"], [])
+        self.assertFalse(result["runtime_verified"])
+
     def test_parse_and_rewrite_preserve_order_and_line_endings(self) -> None:
         source = "[Fixture]\r\nFirst=SOURCE_ONE\r\nSecond=SOURCE_TWO\r\n"
         entries = parse_ini(source)

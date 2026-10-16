@@ -14,4 +14,11 @@ The implementation was validated with `UnityPy==1.25.4`; install that exact depe
 
 `pack.py` accepts `REQUEST_JSON OUTPUT_DIRECTORY`. The request uses schema version 1 and supplies `game_root`, `segments_path`, `reviewed_path`, `source_bundle_relative`, `source_bundle_sha256`, and optionally `report_path`. `GAME_L10N_WORKDIR` must identify the private workspace and `GAME_L10N_STAGE` must be `pack`.
 
-This is deliberately not a complete Unity text-coverage adapter. Managed literals, non-INI assets, runtime-generated text, UI layout analysis, and an independent second inventory remain outside the prototype. Callers must keep static coverage incomplete until those paths are independently accounted for.
+This is deliberately not a complete Unity text-coverage adapter. Managed literals, non-INI assets, runtime-generated text, UI discovery, and an independent second inventory remain outside the prototype. Callers must keep static coverage incomplete until those paths are independently accounted for.
+
+Two separate libraries extend the same Unity 2022.3 identity:
+
+- `unity_serialized.py`: `pack_string`, `string_at` and `unique_boundary` provide explicitly bound string helpers. `rebuild_serialized(raw_bytes, changed_objects)` supports opaque replacement in standalone v22 little-endian serialized files only, preserving unowned bytes and protected metadata. `replace_font_payload(raw_bytes, object_id, font_bytes, family_names)` replaces an embedded Font payload and family names with typetree verification. These functions do not discover targets or handle UnityFS containers.
+- `unity_layout.py`: `Rect` and `resolve_rect_size(rectangles, node_id, canvas_size)` resolve anchor-based child dimensions, with roots representing the caller's canvas reference. `FontMetrics` takes codepoint advances and line-height units; `TextLayout` supplies wrapping and best-fit bounds. `screen_text(text, rect_size, metrics, layout, strip_rich_text=False)` returns conservative measurements, overflow and missing codepoints. No bundled fonts or mandatory font parser are required. Its `runtime_verified` is always false.
+
+See the SDK's `docs/unity-2022.3.md` for usable interfaces, a synthetic example and exact limits. Private inventories, target selection, patch orchestration, font sourcing and runtime observations remain caller responsibilities. Run `python selftest.py` in this tools directory for dependency-free smoke checks. Metric screening cannot prove Unity rendering, runtime font ingestion or screen coverage.
