@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from game_l10n.cli import cmd_status, cmd_translate
+from game_l10n.control_plane import record_control_plane_leak
 from game_l10n.errors import ConfigurationError
 from game_l10n.privacy import PrivacyViolation
 from game_l10n.providers import ProviderRegistry
@@ -44,6 +45,11 @@ class WorkspaceTests(unittest.TestCase):
             )
             config = load_config(work)
             generated_agents = (work / "AGENTS.md").read_text(encoding="utf-8")
+            control_state = json.loads(
+                (work / ".game-l10n" / "control-plane-state.json").read_text(
+                    encoding="utf-8"
+                )
+            )
 
         providers = {item["name"]: item for item in config["providers"]}
         self.assertEqual(config["provider_preset"], "openai-deepseek")
@@ -81,6 +87,11 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(config["execution"]["native_shard_material_tokens"], 12000)
         self.assertEqual(config["execution"]["native_worker_history"], "none")
         self.assertFalse(config["execution"]["native_worker_reuse"])
+        self.assertTrue(config["control_plane"]["metadata_only_for_all_data_plane_stages"])
+        self.assertTrue(config["control_plane"]["reject_free_form_worker_returns"])
+        self.assertTrue(config["control_plane"]["rotate_after_leak"])
+        self.assertEqual(control_state["status"], "ready")
+        self.assertEqual(control_state["generation"], 1)
         self.assertTrue(config["coverage"]["require_independent_inventory"])
         self.assertTrue(config["coverage"]["separate_static_and_runtime_completion"])
         self.assertTrue(config["failure_queue"]["resume_only_after_user_request"])
@@ -133,6 +144,10 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("zero model/context calls", generated_agents)
         self.assertIn("fresh native worker", generated_agents)
         self.assertIn("no parent conversation history", generated_agents)
+        self.assertIn("parr0t.control-envelope.v1", generated_agents)
+        self.assertIn("game-l10n validate-control-envelope", generated_agents)
+        self.assertIn("game-l10n record-control-plane-leak", generated_agents)
+        self.assertIn("fresh control plane", generated_agents)
         self.assertIn("preserve it once", generated_agents)
         self.assertIn("Never read or edit `localconfig.vdf`", generated_agents)
         self.assertIn("ad hoc game-workspace binary", generated_agents)
@@ -558,6 +573,24 @@ class WorkspaceTests(unittest.TestCase):
                 cmd_status(SimpleNamespace(workspace=str(work)))
             status = json.loads(output.getvalue())
             self.assertEqual(status["repository"], {"initial_choice": "enabled"})
+            self.assertEqual(status["control_plane"]["status"], "ready")
+
+    def test_status_reports_only_rotation_action_after_control_plane_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            initialize_workspace(work, sdk, git_choice="disabled")
+            record_control_plane_leak(work, "semantic_judgment_performed")
+            output = StringIO()
+            with redirect_stdout(output):
+                exit_code = cmd_status(SimpleNamespace(workspace=str(work)))
+            status = json.loads(output.getvalue())
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(status["control_plane"]["status"], "rotation_required")
+        self.assertEqual(status["next_actions"], ["resume_in_fresh_control_plane"])
 
 
 if __name__ == "__main__":

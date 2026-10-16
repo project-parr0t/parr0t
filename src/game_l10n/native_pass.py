@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
 
+from .control_plane import CONTROL_ENVELOPE_SCHEMA, require_control_plane_ready
 from .models import Segment
 from .store import stable_hash
 
@@ -65,6 +66,7 @@ def prepare_native_tasks(
     max_records: int = DEFAULT_MAX_RECORDS,
     max_material_tokens: int = DEFAULT_MAX_MATERIAL_TOKENS,
 ) -> dict[str, Any]:
+    require_control_plane_ready(work_dir)
     if not 1 <= max_records <= 2000:
         raise ValueError("max_records must be between 1 and 2000")
     if not 256 <= max_material_tokens <= 1_000_000:
@@ -166,6 +168,9 @@ def prepare_native_tasks(
             "max_followup_tasks": 0,
             "task_message_contains_game_text": False,
             "parent_result": "metadata_only",
+            "control_envelope_schema": CONTROL_ENVELOPE_SCHEMA,
+            "worker_final_response": "workspace_relative_envelope_path_only",
+            "free_form_parent_response_allowed": False,
         },
         "tasks": tasks,
     }
@@ -210,6 +215,7 @@ def _validate_row(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def import_native_shard(work_dir: Path, source: Path, shard_name: str) -> dict[str, Any]:
+    require_control_plane_ready(work_dir)
     safe_name = SAFE_NAME.sub("-", shard_name.casefold()).strip("-.")
     if not safe_name:
         raise ValueError("Native shard name is empty after normalization")
@@ -233,6 +239,7 @@ def merge_native_pass(
     segments: list[Segment],
     destination: Path,
 ) -> dict[str, Any]:
+    require_control_plane_ready(work_dir)
     order = {segment.id: index for index, segment in enumerate(segments)}
     if len(order) != len(segments):
         raise ValueError("Ordered source contains duplicate target IDs")

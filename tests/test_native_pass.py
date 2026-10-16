@@ -112,6 +112,15 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(manifest["max_material_tokens"], 300)
         self.assertEqual(manifest["worker_contract"]["max_followup_tasks"], 0)
         self.assertEqual(manifest["worker_contract"]["parent_result"], "metadata_only")
+        self.assertEqual(
+            manifest["worker_contract"]["control_envelope_schema"],
+            "parr0t.control-envelope.v1",
+        )
+        self.assertEqual(
+            manifest["worker_contract"]["worker_final_response"],
+            "workspace_relative_envelope_path_only",
+        )
+        self.assertFalse(manifest["worker_contract"]["free_form_parent_response_allowed"])
         self.assertTrue(
             all(task["records"] == 1 for task in manifest["tasks"])
         )
