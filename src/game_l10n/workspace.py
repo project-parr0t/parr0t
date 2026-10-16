@@ -192,7 +192,7 @@ This private workspace contains game data and localization artifacts. Resolve th
 - Provider roles are fixed by the selected preset. An API key does not select or alter a mode. Fresh native workers use no parent history and return metadata only. Manual/fallback handoff uses only `parr0t.translation-exchange/v1`.
 - Build and validate a new recoverable output here. Never mutate or launch the real game during automated validation. Real install, update, remove/restore, and launch each require their own explicit one-shot authorization.
 - Retryable failures stay in the metadata-only failure queue. Terminal source-preserved outcomes are recorded separately and are not retried as pending work; `metadata.blocking_on_failure=true` holds the entire patch.
-- Keep publication dormant and unmentioned until the user requests it. SDK promotion also requires confirmed patch success and the original exact target identity.
+- Keep publication dormant and unmentioned until the user requests it. SDK promotion also requires confirmed patch success and the original exact target identity. Its separate engine-only commit must pass `game-l10n verify-sdk-promotion`; never mix a `main`-owned path into that commit.
 - Use proportional checks, keep small coupled work in the current agent, and stop after the required layer passes.
 
 ## Status routes
@@ -1067,6 +1067,110 @@ def publish_sdk_profile(
     if commit or push:
         git("add", "--", str(destination.relative_to(sdk_root)))
         git("commit", "-m", f"Add {branch} game localization toolkit")
+        verify_sdk_promotion_commit(sdk_root, branch, "HEAD")
     if push:
         git("push", "-u", "origin", branch)
     return branch
+
+
+def verify_sdk_promotion_commit(
+    sdk_root: Path, branch: str, commit: str = "HEAD"
+) -> dict[str, Any]:
+    """Prove that one SDK promotion commit does not modify main-owned paths."""
+
+    sdk_root = sdk_root.resolve()
+    if not (sdk_root / ".git").exists():
+        raise ConfigurationError("E_SDK_PROMOTION_REPOSITORY: SDK repository is unavailable")
+    if (
+        not branch.startswith("sdk-")
+        or not branch.removeprefix("sdk-")
+        or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-." for character in branch)
+    ):
+        raise ConfigurationError("E_SDK_PROMOTION_BRANCH: target must be a safe sdk-* branch")
+    if (
+        not commit
+        or len(commit) > 128
+        or commit.startswith("-")
+        or any(
+            character
+            not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._/"
+            for character in commit
+        )
+    ):
+        raise ConfigurationError("E_SDK_PROMOTION_COMMIT: commit reference is unsafe")
+
+    def git(*args: str) -> str:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=sdk_root,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            shell=False,
+        )
+        if completed.returncode != 0:
+            raise ConfigurationError(
+                f"E_SDK_PROMOTION_GIT: git {' '.join(args)} failed"
+            )
+        return completed.stdout.strip()
+
+    def is_ancestor(ancestor: str, descendant: str) -> bool:
+        completed = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+            cwd=sdk_root,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            shell=False,
+        )
+        if completed.returncode not in {0, 1}:
+            raise ConfigurationError("E_SDK_PROMOTION_GIT: ancestry check failed")
+        return completed.returncode == 0
+
+    git("rev-parse", "--verify", "main^{commit}")
+    git("rev-parse", "--verify", f"{branch}^{{commit}}")
+    resolved = git("rev-parse", "--verify", f"{commit}^{{commit}}")
+    if not is_ancestor(resolved, branch):
+        raise ConfigurationError(
+            "E_SDK_PROMOTION_COMMIT: commit is not reachable from the target SDK branch"
+        )
+    ancestry = git("rev-list", "--parents", "-n", "1", resolved).split()
+    if len(ancestry) != 2:
+        raise ConfigurationError(
+            "E_SDK_PROMOTION_COMMIT: promotion must be one non-merge engine commit"
+        )
+    parent = ancestry[1]
+    if not is_ancestor("main", parent):
+        raise ConfigurationError(
+            "E_SDK_PROMOTION_BASE: merge the intended main revision before promotion"
+        )
+    changed_paths = sorted(
+        set(
+            git(
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "--no-renames",
+                "-r",
+                resolved,
+            ).splitlines()
+        )
+    )
+    if not changed_paths:
+        raise ConfigurationError("E_SDK_PROMOTION_COMMIT: promotion commit is empty")
+    main_paths = set(git("ls-tree", "-r", "--name-only", "main").splitlines())
+    core_paths = sorted(set(changed_paths) & main_paths)
+    if core_paths:
+        raise ConfigurationError(
+            "E_SDK_PROMOTION_CORE_PATH: promotion commit modifies main-owned paths: "
+            + ", ".join(core_paths)
+        )
+    return {
+        "schema": "parr0t.sdk-promotion-scope/v1",
+        "status": "ready",
+        "branch": branch,
+        "commit": resolved,
+        "base": git("rev-parse", "--verify", "main^{commit}"),
+        "changed_paths": changed_paths,
+        "main_owned_paths": [],
+    }
