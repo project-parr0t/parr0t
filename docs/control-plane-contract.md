@@ -1,11 +1,27 @@
 # Control-plane isolation contract
 
-The top-level Parr0t agent schedules work and advances queues. It does not inspect or judge game text. This boundary applies from the first inventory pass through final validation; it is not limited to translation and review providers. Arbitrary subprocess output remains in private workspace logs; a parent-facing tool failure is categorical only.
+The top-level Parr0t agent schedules work and advances queues. It does not inspect or judge game text. This boundary applies from preliminary discovery through final validation; it is not limited to translation and review providers. Arbitrary subprocess output remains in private workspace logs; a parent-facing tool failure is categorical only.
+
+## Entry gate
+
+The boundary begins before preliminary discovery. The top-level agent may confirm that repository, workspace, and supplied source paths exist, but it must not list, open, search, grep, preview, parse, or classify files inside a game root. README files, manifests, configuration, scripts, assets, archives, and existing locale files are all data-plane material. Existing-locale detection and engine/version discovery therefore run in a fresh isolated `source_probe` worker at the `discovery` stage. It records resulting SDK-selection metadata inside the private workspace and returns only a validated control-envelope path.
+
+Every new workspace starts with `parr0t.control-plane-entry.v1` in `pending`. Existing workspaces without this marker are also treated as pending. `game-l10n status` then returns only `establish_text_free_control_plane` and the contracts that must be read. If the parent has not inspected or received game content, it establishes the gate with:
+
+```text
+game-l10n enter-control-plane \
+  --workspace <workspace> \
+  --contracts-read \
+  --source-unopened
+```
+
+All ordinary CLI operations reject a pending gate with `E_CONTROL_PLANE_ENTRY_REQUIRED`. The assertion is invalid after any game-content exposure; record a leak and stop instead. Leak recording and fresh-session rotation reset the entry gate to pending so the replacement control plane must establish its own clean boundary.
 
 ## Data-plane stages
 
 The following roles are data-plane workers:
 
+- source and existing-locale discovery;
 - primary and independent inventory;
 - context analysis;
 - translation;

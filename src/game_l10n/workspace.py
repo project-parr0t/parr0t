@@ -7,7 +7,12 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .control_plane import CONTROL_STATE_PATH, initial_control_plane_state
+from .control_plane import (
+    CONTROL_ENTRY_PATH,
+    CONTROL_STATE_PATH,
+    initial_control_plane_entry_state,
+    initial_control_plane_state,
+)
 from .errors import ConfigurationError
 from .privacy import require_external_workdir, scan_tools
 from .provider_policy import (
@@ -168,10 +173,10 @@ This private workspace contains game data and localization artifacts. Resolve th
 
 ## First action
 
-1. Read the repository `AGENTS.md` and `docs/agent-usage.md`.
-2. Run `game-l10n status --workspace <this-directory>`.
-3. Perform only its single `next_actions` entry. Resolve only `required_contracts` against `contract_base`; reuse unchanged checkpoints.
-4. Stop local work only at `local_patch_ready`, which requires a current completion attestation and its unchanged packed artifact.
+1. Before listing, opening, searching, or reading any file inside a configured game root, read the repository `AGENTS.md` and `docs/agent-usage.md`.
+2. Run `game-l10n status --workspace <this-directory>` and perform only its single `next_actions` entry.
+3. When status requires `establish_text_free_control_plane`, read every returned contract, then run `game-l10n enter-control-plane --workspace <this-directory> --contracts-read --source-unopened`. If the parent already received or inspected game content, record a leak and stop instead.
+4. Resolve later `required_contracts` against `contract_base`; reuse unchanged checkpoints. Stop local work only at `local_patch_ready`, which requires a current completion attestation and its unchanged packed artifact.
 
 ## Core contract
 
@@ -180,6 +185,7 @@ This private workspace contains game data and localization artifacts. Resolve th
 - Select and activate the exact engine/version SDK before data-plane work. A different SDK may be a bound `reference` for `derive-new`; generated pass-through tools are not an adapter.
 - Require two independent complete ordered inventories, typed context analysis, primary translation, translation fallback for failures only, complete independent review, selective rewrite, review fallback for failures only, deterministic validation, then packing. Do not shrink scope or reorder barriers.
 - The top-level agent is a text-free control plane. It sees hashed control IDs, counts, categorical states, queue transitions, artifact paths, and deterministic codes only. Data-plane workers return a `parr0t.control-envelope.v2` path; validate it with `game-l10n validate-control-envelope`.
+- Existing-locale detection, engine/version discovery, source inventory, and content classification are data-plane work. The parent may pass the configured path to an isolated worker, but must not open the game README, manifest, configuration, script, asset, or extracted text itself. The worker records SDK-selection metadata inside the workspace and returns only a validated control envelope path.
 - If private text, provider refusal prose, content classification, or semantic judgment reaches the parent, run `game-l10n record-control-plane-leak` and stop. The contaminated agent must not run or confirm resume; only a fresh control plane with no inherited content history may use `resume-control-plane --fresh-session-confirmed`.
 - Normalize every refusal to `fallback_required` / “폴백 처리 필요”. It is a routing event, never an exclusion, batch cancellation, or content decision. `source_preserved` requires route evidence that every configured route was attempted and exhausted.
 - Translate each target with its relevant narrative/voice, functional/UI, knowledge/prerequisite, adjacent, glossary, and immutable evidence. Preserve meaning, function, natural tone, character voice, terminology, allusions, placeholders, markup, control codes, conditions, units, and order.
@@ -901,6 +907,9 @@ def initialize_workspace(
         ) + "\n",
         CONTROL_STATE_PATH: json.dumps(
             initial_control_plane_state(), ensure_ascii=False, indent=2
+        ) + "\n",
+        CONTROL_ENTRY_PATH: json.dumps(
+            initial_control_plane_entry_state(), ensure_ascii=False, indent=2
         ) + "\n",
         "AGENTS.md": AGENTS_TEXT,
         ".gitignore": GITIGNORE_TEXT,
