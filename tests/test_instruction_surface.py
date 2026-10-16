@@ -27,6 +27,8 @@ class InstructionSurfaceTests(unittest.TestCase):
 
         for required in (
             "Resolve each `required_contracts` entry against `contract_base`",
+            "before accessing game-root contents",
+            "game-l10n enter-control-plane",
             "Do not inspect images for text",
             "fallback_required",
             "parr0t.control-envelope.v2",
@@ -41,6 +43,15 @@ class InstructionSurfaceTests(unittest.TestCase):
 
         self.assertLess(agents.count("docs/instance-release.md"), 3)
         self.assertLess(agents.count("docs/runtime-approval.md"), 3)
+
+    def test_public_entry_prompts_keep_the_parent_out_of_game_content(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        prompts = (ROOT / "docs/prompt-examples.md").read_text(encoding="utf-8")
+
+        self.assertEqual(readme.count("text-free control-plane"), 3)
+        self.assertIn("Before listing, opening, searching, or reading", prompts)
+        self.assertIn("existing-locale detection and engine/version discovery", prompts)
+        self.assertIn("establish_text_free_control_plane", STATUS_ACTION_CONTRACTS)
 
     def test_status_contract_routes_exist_in_the_repository(self) -> None:
         for action, contracts in STATUS_ACTION_CONTRACTS.items():

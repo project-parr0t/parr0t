@@ -15,9 +15,13 @@ from .control_plane import (
     ROLE_STAGES,
     WORKER_ROLES,
     acknowledge_control_plane_rotation,
+    control_plane_entry_state,
     control_plane_state,
+    establish_control_plane_entry,
+    public_control_plane_entry_state,
     public_control_plane_state,
     record_control_plane_leak,
+    require_control_plane_entry,
     require_control_plane_ready,
     validate_control_envelope,
 )
@@ -75,6 +79,11 @@ from .workspace import (
 
 STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
     "stop_current_control_plane": ("docs/control-plane-contract.md",),
+    "establish_text_free_control_plane": (
+        "docs/control-plane-contract.md",
+        "docs/provider-protocol.md",
+        "docs/execution-budget.md",
+    ),
     "ask_user_for_initial_git_choice": ("skills/request-scope-guard/SKILL.md",),
     "configure_game_root": (),
     "fix_missing_game_root": (),
@@ -504,11 +513,9 @@ def cmd_init(args: argparse.Namespace) -> int:
         provider_preset=args.provider_preset,
     )
     print(f"Initialized private agent workspace: {Path(args.workspace).resolve()}")
-    if args.git_choice == "pending":
-        print("ACTION_REQUIRED: ask the user whether Git use is allowed, then run `game-l10n policy`.")
     print(
-        "ACTION_REQUIRED: record the target engine/version identity, evaluate and select an SDK, "
-        "then run sdk-activate before extraction."
+        "ACTION_REQUIRED: do not open or search the game root. Run `game-l10n status`, "
+        "read its required control-plane contracts, and establish the text-free entry gate first."
     )
     return 0
 
@@ -818,9 +825,27 @@ def cmd_control_plane_status(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     print(
         json.dumps(
-            public_control_plane_state(control_plane_state(work_dir)), ensure_ascii=False
+            {
+                "control_plane": public_control_plane_state(control_plane_state(work_dir)),
+                "entry_gate": public_control_plane_entry_state(
+                    control_plane_entry_state(work_dir)
+                ),
+            },
+            ensure_ascii=False,
         )
     )
+    return 0
+
+
+def cmd_enter_control_plane(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    if not args.contracts_read or not args.source_unopened:
+        raise ConfigurationError(
+            "E_CONTROL_PLANE_ENTRY_ASSERTION_REQUIRED: confirm the required contracts were "
+            "read and the parent has not opened or searched game content"
+        )
+    result = establish_control_plane_entry(work_dir)
+    print(json.dumps(public_control_plane_entry_state(result), ensure_ascii=False))
     return 0
 
 
@@ -937,6 +962,24 @@ def cmd_status(args: argparse.Namespace) -> int:
             )
         )
         return 1
+    entry_state = control_plane_entry_state(work_dir)
+    if entry_state["status"] != "ready":
+        action = "establish_text_free_control_plane"
+        print(
+            json.dumps(
+                {
+                    "workspace": str(work_dir),
+                    "control_plane": public_control_plane_state(control_state),
+                    "entry_gate": public_control_plane_entry_state(entry_state),
+                    "contract_base": contract_base,
+                    "next_actions": [action],
+                    "required_contracts": _status_contracts(action),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
     policy = config.get("repository", {})
     visible_policy = {"initial_choice": policy.get("initial_choice", "pending")}
     if policy.get("publish_approved") is True:
@@ -1141,6 +1184,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "execution": config.get("execution", {}),
                 "runtime": config.get("runtime", {"default_policy": "deny"}),
                 "control_plane": public_control_plane_state(control_state),
+                "entry_gate": public_control_plane_entry_state(entry_state),
                 "local_artifact": local_artifact,
                 "state_issue_codes": state_issue_codes,
                 "contract_base": contract_base,
@@ -1626,6 +1670,25 @@ def build_parser() -> argparse.ArgumentParser:
     control_status.add_argument("--workspace", required=True)
     control_status.set_defaults(func=cmd_control_plane_status)
 
+    control_enter = sub.add_parser(
+        "enter-control-plane",
+        help="Establish the text-free parent entry gate before any game-content operation",
+    )
+    control_enter.add_argument("--workspace", required=True)
+    control_enter.add_argument(
+        "--contracts-read",
+        action="store_true",
+        required=True,
+        help="Assert that every contract returned by status was read",
+    )
+    control_enter.add_argument(
+        "--source-unopened",
+        action="store_true",
+        required=True,
+        help="Assert that this parent has not listed, opened, searched, or classified game content",
+    )
+    control_enter.set_defaults(func=cmd_enter_control_plane)
+
     control_leak = sub.add_parser(
         "record-control-plane-leak",
         help="Quarantine a top-level agent after data-plane or semantic content crossed the boundary",
@@ -1843,6 +1906,7 @@ def main(argv: list[str] | None = None) -> int:
             cmd_status,
             cmd_doctor,
             cmd_control_plane_status,
+            cmd_enter_control_plane,
             cmd_record_control_plane_leak,
             cmd_resume_control_plane,
         }
@@ -1850,6 +1914,7 @@ def main(argv: list[str] | None = None) -> int:
             workspace = getattr(args, "workspace", None)
             if workspace is not None:
                 require_control_plane_ready(Path(workspace).resolve())
+                require_control_plane_entry(Path(workspace).resolve())
         return int(args.func(args))
     except ToolExecutionError:
         print("error: E_TOOL_EXECUTION_FAILED", file=sys.stderr)
