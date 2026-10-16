@@ -35,6 +35,13 @@ _REVIEW_ISSUE_CODES = {
     "slot_composition",
 }
 
+_DEFAULT_FOCUSED_TEXT_INPUT_CHARS = 24_000
+_FOCUSED_TEXT_SCHEMA_NAMES = (
+    "game_translation",
+    "game_translation_review_judge",
+    "game_translation_review_rewrite",
+)
+
 
 def _parse_plain_review_verdict(value: str) -> dict[str, Any]:
     line = value.strip()
@@ -74,6 +81,15 @@ def _normalized_usage(data: dict[str, Any]) -> dict[str, int]:
         reasoning = details.get("reasoning_tokens")
         if isinstance(reasoning, int) and reasoning >= 0:
             normalized["reasoning_tokens"] = reasoning
+    input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
+    cached = usage.get("prompt_cache_hit_tokens")
+    if not isinstance(cached, int) and isinstance(input_details, dict):
+        cached = input_details.get("cached_tokens")
+    if isinstance(cached, int) and cached >= 0:
+        normalized["cached_input_tokens"] = cached
+    cache_miss = usage.get("prompt_cache_miss_tokens")
+    if isinstance(cache_miss, int) and cache_miss >= 0:
+        normalized["cache_miss_input_tokens"] = cache_miss
     return normalized
 
 
@@ -317,6 +333,8 @@ class CompatibleChatProvider(ModelProvider):
         min_output_tokens: int = 96,
         max_output_tokens: int = 2048,
         task_max_output_tokens: dict[str, int] | None = None,
+        max_input_chars: int | None = None,
+        task_max_input_chars: dict[str, int] | None = None,
         review_verdict_format: str = "json",
     ):
         super().__init__(name)
@@ -347,6 +365,14 @@ class CompatibleChatProvider(ModelProvider):
         self.task_max_output_tokens = {
             str(key): int(value) for key, value in (task_max_output_tokens or {}).items()
         }
+        if max_input_chars is not None and max_input_chars < 1:
+            raise ConfigurationError("max_input_chars must be greater than zero")
+        self.max_input_chars = max_input_chars
+        self.task_max_input_chars = {
+            str(key): int(value) for key, value in (task_max_input_chars or {}).items()
+        }
+        if any(value < 1 for value in self.task_max_input_chars.values()):
+            raise ConfigurationError("task_max_input_chars values must be greater than zero")
         if review_verdict_format not in {"json", "plain"}:
             raise ConfigurationError("review_verdict_format must be json or plain")
         self.review_verdict_format = review_verdict_format
@@ -371,6 +397,11 @@ class CompatibleChatProvider(ModelProvider):
         estimate = int(max(1, source_length) * self.max_tokens_per_source_char)
         return max(self.min_output_tokens, min(self.max_output_tokens, estimate))
 
+    def _enforce_input_budget(self, system: str, user: str, schema_name: str) -> None:
+        limit = self.task_max_input_chars.get(schema_name, self.max_input_chars)
+        if limit is not None and len(system) + len(user) > limit:
+            raise ProviderFailure("budget_exhausted", retryable=False)
+
     def generate_json(
         self, *, system: str, user: str, schema: dict[str, Any], schema_name: str
     ) -> dict[str, Any]:
@@ -390,6 +421,7 @@ class CompatibleChatProvider(ModelProvider):
                 "type": "json_schema",
                 "json_schema": {"name": schema_name, "strict": True, "schema": schema},
             }
+        self._enforce_input_budget(system, user, schema_name)
         payload = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -432,6 +464,8 @@ class CompatibleChatProvider(ModelProvider):
             "min_output_tokens": self.min_output_tokens,
             "max_output_tokens": self.max_output_tokens,
             "task_max_output_tokens": self.task_max_output_tokens,
+            "max_input_chars": self.max_input_chars,
+            "task_max_input_chars": self.task_max_input_chars,
             "review_verdict_format": self.review_verdict_format,
         }
 
@@ -444,6 +478,7 @@ class CompatibleChatProvider(ModelProvider):
         if self.api_key_env and not api_key:
             raise ProviderFailure("authentication_error", retryable=False)
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        self._enforce_input_budget(system, user, schema_name)
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -573,6 +608,19 @@ class ProviderRegistry:
                     review_verdict_format=item.get("review_verdict_format", "json"),
                 )
             elif kind == "compatible_chat":
+                task_max_input_chars = item.get("task_max_input_chars")
+                if (
+                    task_max_input_chars is None
+                    and item.get("name") == "deepseek"
+                    and config.get("provider_preset")
+                    in {"openai-deepseek", "codex-app-deepseek"}
+                ):
+                    # Apply the current preset safety budget to old private
+                    # workspaces without rewriting their stored configuration.
+                    task_max_input_chars = {
+                        schema_name: _DEFAULT_FOCUSED_TEXT_INPUT_CHARS
+                        for schema_name in _FOCUSED_TEXT_SCHEMA_NAMES
+                    }
                 provider = CompatibleChatProvider(
                     **common,
                     model=item["model"],
@@ -594,6 +642,12 @@ class ProviderRegistry:
                     min_output_tokens=int(item.get("min_output_tokens", 96)),
                     max_output_tokens=int(item.get("max_output_tokens", 2048)),
                     task_max_output_tokens=item.get("task_max_output_tokens"),
+                    max_input_chars=(
+                        int(item["max_input_chars"])
+                        if item.get("max_input_chars") is not None
+                        else None
+                    ),
+                    task_max_input_chars=task_max_input_chars,
                     review_verdict_format=item.get("review_verdict_format", "json"),
                 )
             elif kind == "command":
