@@ -69,4 +69,4 @@ For launcher-neutral Windows packages, `-GameRoot` accepts absolute paths and pa
 
 ## Unity 2021.3 branch
 
-Read `docs/unity-2021.3.md` and run `game-l10n unity discover` before selecting Mono or IL2CPP tooling. Before `unity compile-payload`, require a serialized-resource primary inventory and an independently implemented type/index plus managed-callsite audit in the same stable order. Cover String Tables, TextAssets, static literals, and declared dynamic UI paths; unresolved user-visible classes keep static coverage incomplete. Keep player binaries, metadata, loader references, generated interop assemblies, bridges, and patch packages in read-only inputs or the private workspace as appropriate, never in this repository.
+Read `docs/unity-2021.3.md` before any branch work.
