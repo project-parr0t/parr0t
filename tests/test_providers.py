@@ -164,10 +164,61 @@ class CompatibleProviderTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(captured["url"], "https://api.deepseek.com/chat/completions")
         self.assertEqual(captured["payload"]["response_format"], {"type": "json_object"})
+        system_message = captured["payload"]["messages"][0]["content"]
+        self.assertTrue(system_message.startswith("Return JSON."))
+        self.assertEqual(json.loads(system_message.splitlines()[-1]), {"type": "object"})
         self.assertEqual(captured["payload"]["temperature"], 0.0)
         self.assertEqual(captured["payload"]["thinking"], {"type": "disabled"})
         self.assertEqual(captured["payload"]["reasoning_effort"], "none")
         self.assertEqual(captured["payload"]["max_tokens"], 128)
+
+    def test_context_request_keeps_material_size_and_transmits_schema(self) -> None:
+        captured = {}
+        context_schema = {
+            "type": "object",
+            "properties": {"status": {"enum": ["success", "refused", "error"]}},
+            "required": ["status"],
+            "additionalProperties": False,
+        }
+        material = json.dumps({"lines": [{"source": "SYNTHETIC_CONTEXT_" * 600}]})
+
+        def fake_post(url, headers, payload, timeout):
+            captured.update(payload)
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": '{"status":"success"}'},
+                    }
+                ]
+            }
+
+        provider = CompatibleChatProvider(
+            "fixture-context",
+            "fixture-model",
+            api_key_env="FIXTURE_API_KEY",
+            base_url="https://fixture.invalid",
+            response_format="json_object",
+            max_tokens_per_source_char=4.0,
+            min_output_tokens=128,
+            max_output_tokens=8192,
+        )
+        with patch.dict(os.environ, {"FIXTURE_API_KEY": "fixture-key"}), patch(
+            "game_l10n.providers._post_json", side_effect=fake_post
+        ):
+            provider.generate_json(
+                system="Analyze context.",
+                user=material,
+                schema=context_schema,
+                schema_name="game_functional_context",
+            )
+
+        self.assertEqual(captured["max_tokens"], 8192)
+        self.assertEqual(captured["messages"][1]["content"], material)
+        self.assertEqual(
+            json.loads(captured["messages"][0]["content"].splitlines()[-1]),
+            context_schema,
+        )
 
     def test_openai_reasoning_effort_is_explicit(self) -> None:
         captured = {}

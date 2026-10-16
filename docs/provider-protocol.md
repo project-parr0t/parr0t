@@ -1,5 +1,13 @@
 # Command provider protocol v1
 
+## JSON Object API adapters
+
+An API's `json_object` response format guarantees JSON syntax, not adherence to an application schema. The compatible adapter therefore includes the requested JSON Schema in its system message while preserving the original user payload. Deterministic result and evidence validators still decide whether the response is acceptable.
+
+Output sizing uses an explicit translation target or candidate when present. Context requests without either retain the size of their complete input material instead of falling back to an empty target. Per-task output caps remain authoritative for context and compact review workloads.
+
+## Command transport
+
 `type: command` is an integration point for explicitly selected `custom` provider workflows, including OpenCode-compatible, local-model, and internal runners. The SDK starts the configured argument array directly with `shell=False`.
 
 It is not a substitute for a native Codex App collaboration worker. A workspace locked to `codex-app-deepseek` rejects every command provider before input or prompt construction. Never wrap `codex.exe`, `codex exec`, a signed-in App session, or a second Codex session to evade that topology. Select `custom` at workspace creation only when the user actually requested a command-provider workflow.

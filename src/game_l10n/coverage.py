@@ -377,7 +377,13 @@ def completion_attestation(
     reviewed = []
     for item in rows:
         final_verdict = any(
-            attempt.stage in {"review", "review-confirm"}
+            attempt.stage
+            in {
+                "review",
+                "review-confirm",
+                "review-grace-retry",
+                "review-refusal-retry",
+            }
             and attempt.status == "approved"
             and attempt.candidate_generation == item.candidate_generation
             for attempt in item.attempts
