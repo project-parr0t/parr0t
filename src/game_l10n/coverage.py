@@ -10,6 +10,9 @@ from .models import Segment, TranslationResult
 from .store import stable_hash
 
 
+COMPLETION_SCHEMA = "parr0t.completion-attestation.v2"
+
+
 INVENTORY_SCHEMA = "parr0t.source-inventory.v1"
 RUNTIME_SCHEMA = "parr0t.runtime-coverage.v1"
 UI_COMPOSITION_FIELDS = (
@@ -359,6 +362,7 @@ def completion_attestation(
     review_required: bool,
 ) -> dict[str, Any]:
     rows = list(results)
+    segment_by_id = {item.id: item for item in segments}
     source_by_id = {item.id: item.source for item in segments}
     inventory_by_id = {item.id: item.source for item in inventory_segments}
     result_ids = [item.segment_id for item in rows]
@@ -386,12 +390,24 @@ def completion_attestation(
         ):
             reviewed.append(item)
     reused = [item for item in rows if item.metadata.get("candidate_origin") == "existing"]
-    reused_reviewed = [item for item in reviewed if item.metadata.get("candidate_origin") == "existing"]
     source_preserved = [item for item in rows if item.status == "source_preserved"]
+    accepted_unreviewed = [item for item in rows if item.status == "accepted_unreviewed"]
     failed = [item for item in rows if item.status == "failed"]
-    review_denominator = len(rows) - len(source_preserved) - len(failed)
+    terminal_unresolved = [*source_preserved, *accepted_unreviewed]
+    unresolved_ids = {item.segment_id for item in terminal_unresolved}
+    failed_ids = {item.segment_id for item in failed}
+    reviewable_reused = [
+        item
+        for item in reused
+        if item.segment_id not in unresolved_ids | failed_ids
+    ]
+    reused_reviewed = [
+        item for item in reviewed if item.metadata.get("candidate_origin") == "existing"
+    ]
+    review_denominator = len(rows) - len(terminal_unresolved) - len(failed)
     review_complete = not review_required or (
-        len(reviewed) == review_denominator and len(reused_reviewed) == len(reused)
+        len(reviewed) == review_denominator
+        and len(reused_reviewed) == len(reviewable_reused)
     )
     alignment_complete = not (
         missing_ids or extra_ids or duplicate_count or source_mismatch_count
@@ -406,16 +422,26 @@ def completion_attestation(
         issue_codes.append("PARTIAL_TRANSLATION_SCOPE")
     if source_preserved:
         issue_codes.append("SOURCE_PRESERVED_AFTER_ROUTE_EXHAUSTION")
+    if accepted_unreviewed:
+        issue_codes.append("USER_ACCEPTED_UNREVIEWED_AFTER_ROUTE_EXHAUSTION")
     issue_codes.extend(runtime.get("issue_codes", []))
+    blocking_unresolved = sum(
+        item.segment_id in unresolved_ids
+        and bool(segment_by_id[item.segment_id].metadata.get("blocking_on_failure", False))
+        for item in rows
+        if item.segment_id in source_by_id
+    )
+    accounting_complete = bool(alignment_complete and review_complete and not failed)
     target_completion = bool(
-        alignment_complete and review_complete and not failed and not source_preserved
+        accounting_complete and blocking_unresolved == 0
     )
     return {
-        "schema": "parr0t.completion-attestation.v1",
+        "schema": COMPLETION_SCHEMA,
         "source_inventory": {
             "status": inventory["status"],
             "static_complete": inventory["static_complete"],
             "segment_count": inventory["primary_segments"],
+            "fingerprint": inventory["primary_fingerprint"],
         },
         "result_alignment": {
             "complete": alignment_complete,
@@ -437,9 +463,14 @@ def completion_attestation(
             "reused_candidate_count": len(reused),
             "reused_reviewed_count": len(reused_reviewed),
             "source_preserved_count": len(source_preserved),
+            "accepted_unreviewed_count": len(accepted_unreviewed),
+            "terminal_unresolved_count": len(terminal_unresolved),
+            "blocking_unresolved_count": blocking_unresolved,
             "failed_count": len(failed),
         },
         "runtime_coverage": runtime,
+        "accounting_complete": accounting_complete,
+        "semantic_completion": bool(accounting_complete and not terminal_unresolved),
         "target_completion": target_completion,
         "static_completion": bool(
             inventory["static_complete"]

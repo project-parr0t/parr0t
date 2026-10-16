@@ -170,13 +170,14 @@ This private workspace contains game data and localization artifacts. Resolve th
 
 1. Read the repository `AGENTS.md` and `docs/agent-usage.md`.
 2. Run `game-l10n status --workspace <this-directory>`.
-3. Perform only the reported next action and load only its linked contract. Reuse unchanged checkpoints.
+3. Perform only its single `next_actions` entry. Resolve only `required_contracts` against `contract_base`; reuse unchanged checkpoints.
+4. Stop local work only at `local_patch_ready`, which requires a current completion attestation and its unchanged packed artifact.
 
 ## Core contract
 
 - Apply the repository `skills/request-scope-guard/SKILL.md` after every scope-changing user message and before optional or external effects. Git, provider, installation, launch, and publication permissions are separate; never infer one from access or another approval.
 - This is a text-localization workspace. Do not inspect images for text, run OCR, plan image translation, or create image tooling unless the user specifically requests image translation.
-- Select the exact engine/version SDK before format work. A different SDK may be a `reference` for `derive-new`; it is not a compatibility or promotion target.
+- Select and activate the exact engine/version SDK before data-plane work. A different SDK may be a bound `reference` for `derive-new`; generated pass-through tools are not an adapter.
 - Require two independent complete ordered inventories, typed context analysis, primary translation, translation fallback for failures only, complete independent review, selective rewrite, review fallback for failures only, deterministic validation, then packing. Do not shrink scope or reorder barriers.
 - The top-level agent is a text-free control plane. It sees IDs, counts, categorical states, queue transitions, artifact paths, and deterministic codes only. Data-plane workers return a `parr0t.control-envelope.v2` path; validate it with `game-l10n validate-control-envelope`.
 - If private text, provider refusal prose, content classification, or semantic judgment reaches the parent, run `game-l10n record-control-plane-leak`, stop that generation, and resume metadata checkpoints in a fresh control plane.
@@ -184,7 +185,7 @@ This private workspace contains game data and localization artifacts. Resolve th
 - Translate each target with its relevant narrative/voice, functional/UI, knowledge/prerequisite, adjacent, glossary, and immutable evidence. Preserve meaning, function, natural tone, character voice, terminology, allusions, placeholders, markup, control codes, conditions, units, and order.
 - Provider roles are fixed by the selected preset. An API key does not select or alter a mode. Fresh native workers use no parent history and return metadata only. Manual/fallback handoff uses only `parr0t.translation-exchange/v1`.
 - Build and validate a new recoverable output here. Never mutate or launch the real game during automated validation. Real install, update, remove/restore, and launch each require their own explicit one-shot authorization.
-- Operational failures stay in the metadata-only failure queue. Retry only after a later explicit user request; `metadata.blocking_on_failure=true` holds the entire patch.
+- Retryable failures stay in the metadata-only failure queue. Terminal source-preserved outcomes are recorded separately and are not retried as pending work; `metadata.blocking_on_failure=true` holds the entire patch.
 - Keep publication dormant and unmentioned until the user requests it. SDK promotion also requires confirmed patch success and the original exact target identity.
 - Use proportional checks, keep small coupled work in the current agent, and stop after the required layer passes.
 
@@ -252,6 +253,9 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 '''
+
+SDK_ACTIVATION_PATH = ".game-l10n/sdk-activation.json"
+SDK_ACTIVATION_SCHEMA = "parr0t.sdk-activation.v1"
 
 
 SDK_EVALUATION_REASONS = {
@@ -584,6 +588,205 @@ def require_sdk_selection(config: dict[str, Any]) -> dict[str, Any]:
     return decision
 
 
+def _json_fingerprint(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _selected_candidate(config: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any] | None:
+    branch = decision.get("branch")
+    if not branch:
+        return None
+    for candidate in config.get("sdk_selection", {}).get("candidates", []):
+        if candidate.get("branch") == branch:
+            return candidate
+    raise ConfigurationError("Selected SDK branch is no longer present in the recorded inventory")
+
+
+def _workspace_tool_binding(work_dir: Path) -> dict[str, Any]:
+    tool_root = work_dir / "tools"
+    manifest = scan_tools(tool_root)
+    defaults = {
+        "pack.py": PASS_THROUGH_TOOL.encode("utf-8"),
+        "unpack.py": PASS_THROUGH_TOOL.encode("utf-8"),
+    }
+    unchanged = [
+        name
+        for name, content in defaults.items()
+        if (tool_root / name).is_file() and (tool_root / name).read_bytes() == content
+    ]
+    return {
+        "manifest": manifest,
+        "fingerprint": _json_fingerprint(manifest),
+        "default_pass_through_tools": sorted(unchanged),
+    }
+
+
+def _git_checkout_binding(checkout: Path) -> dict[str, Any]:
+    checkout = checkout.resolve()
+    if not checkout.is_dir() or not (checkout / ".git").exists():
+        raise ConfigurationError(f"SDK activation requires a Git checkout or worktree: {checkout}")
+    status = _run_git(checkout, "status", "--porcelain").strip()
+    diff = subprocess.run(
+        ["git", "diff", "--binary", "HEAD"],
+        cwd=checkout,
+        capture_output=True,
+        check=False,
+        shell=False,
+    )
+    if diff.returncode != 0:
+        raise ConfigurationError("Unable to fingerprint the SDK runtime checkout")
+    untracked = _run_git(checkout, "ls-files", "--others", "--exclude-standard").splitlines()
+    dirty = hashlib.sha256(diff.stdout)
+    for relative in sorted(item for item in untracked if item):
+        path = checkout / relative
+        dirty.update(relative.encode("utf-8"))
+        if path.is_file():
+            dirty.update(hashlib.sha256(path.read_bytes()).digest())
+    return {
+        "path": str(checkout),
+        "commit": _run_git(checkout, "rev-parse", "HEAD").strip(),
+        "dirty": bool(status),
+        "worktree_fingerprint": dirty.hexdigest(),
+    }
+
+
+def record_sdk_activation(
+    work_dir: Path,
+    *,
+    runtime_root: Path | None = None,
+    reference_checkout: Path | None = None,
+) -> dict[str, Any]:
+    """Bind a selected SDK decision to the implementation that will actually execute it."""
+
+    work_dir = work_dir.resolve()
+    config = load_config(work_dir)
+    decision = require_sdk_selection(config)
+    candidate = _selected_candidate(config, decision)
+    mode = decision["mode"]
+    runtime_root = (runtime_root or Path(__file__).resolve().parents[2]).resolve()
+    runtime = _git_checkout_binding(runtime_root)
+    tools: dict[str, Any] | None = None
+    reference: dict[str, Any] | None = None
+
+    if mode in {"reuse", "extend"}:
+        if candidate is None:
+            raise ConfigurationError("Selected SDK activation has no candidate commit")
+        expected = str(candidate.get("commit", ""))
+        if mode == "reuse" and (runtime["commit"] != expected or runtime["dirty"]):
+            raise ConfigurationError(
+                "Reuse activation must run from a clean checkout of the exact inventoried SDK commit"
+            )
+        if mode == "extend":
+            try:
+                _run_git(runtime_root, "merge-base", "--is-ancestor", expected, runtime["commit"])
+            except ConfigurationError as exc:
+                raise ConfigurationError(
+                    "Extended SDK runtime must descend from the inventoried same-identity commit"
+                ) from exc
+    else:
+        tools = _workspace_tool_binding(work_dir)
+        if tools["default_pass_through_tools"]:
+            raise ConfigurationError(
+                "A new SDK adapter is not active while generated pass-through tools remain: "
+                + ", ".join(tools["default_pass_through_tools"])
+            )
+        if mode == "derive-new":
+            if candidate is None or reference_checkout is None:
+                raise ConfigurationError(
+                    "derive-new activation requires the selected reference SDK checkout"
+                )
+            reference = _git_checkout_binding(reference_checkout)
+            if reference["dirty"]:
+                raise ConfigurationError(
+                    "derive-new requires a clean checkout of the selected reference SDK"
+                )
+            if reference["commit"] != candidate.get("commit"):
+                raise ConfigurationError(
+                    "Reference checkout does not match the inventoried SDK commit "
+                    f"({reference['commit']} != {candidate.get('commit')})"
+                )
+        elif reference_checkout is not None:
+            raise ConfigurationError("private-new activation does not accept a reference checkout")
+
+    selection_binding = {
+        "decision": decision,
+        "candidate_commit": candidate.get("commit") if candidate else None,
+    }
+    state = {
+        "schema": SDK_ACTIVATION_SCHEMA,
+        "selection_fingerprint": _json_fingerprint(selection_binding),
+        "mode": mode,
+        "target": decision["target"],
+        "runtime": runtime,
+        "reference": reference,
+        "workspace_tools": tools,
+    }
+    path = work_dir / SDK_ACTIVATION_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    temporary.replace(path)
+    return state
+
+
+def require_sdk_activation(
+    work_dir: Path,
+    config: dict[str, Any] | None = None,
+    *,
+    runtime_root: Path | None = None,
+) -> dict[str, Any]:
+    work_dir = work_dir.resolve()
+    config = config or load_config(work_dir)
+    decision = require_sdk_selection(config)
+    candidate = _selected_candidate(config, decision)
+    selection_binding = {
+        "decision": decision,
+        "candidate_commit": candidate.get("commit") if candidate else None,
+    }
+    path = work_dir / SDK_ACTIVATION_PATH
+    if not path.is_file():
+        raise ConfigurationError(
+            "Selected SDK implementation is not active; run sdk-activate from the intended runtime"
+        )
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigurationError("SDK activation record is unreadable; activate it again") from exc
+    if (
+        state.get("schema") != SDK_ACTIVATION_SCHEMA
+        or state.get("selection_fingerprint") != _json_fingerprint(selection_binding)
+        or state.get("mode") != decision.get("mode")
+        or state.get("target") != decision.get("target")
+    ):
+        raise ConfigurationError("SDK activation is stale for the current selection")
+
+    expected_runtime = state.get("runtime")
+    current_runtime = _git_checkout_binding(
+        (runtime_root or Path(__file__).resolve().parents[2]).resolve()
+    )
+    if expected_runtime != current_runtime:
+        raise ConfigurationError(
+            "This command is not running from the SDK implementation recorded by sdk-activate"
+        )
+
+    tools = state.get("workspace_tools")
+    if tools is not None:
+        current_tools = _workspace_tool_binding(work_dir)
+        if current_tools != tools or current_tools["default_pass_through_tools"]:
+            raise ConfigurationError("Workspace SDK adapter changed after activation")
+
+    reference = state.get("reference")
+    if reference is not None and _git_checkout_binding(Path(reference["path"])) != reference:
+        raise ConfigurationError("Selected SDK reference checkout changed after activation")
+    return state
+
+
 def _write_config(work_dir: Path, config: dict[str, Any]) -> None:
     (work_dir / "game-l10n.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -755,7 +958,9 @@ def update_repository_policy(work_dir: Path, *, initial_choice: str | None = Non
 def prepare_sdk_profile(work_dir: Path, engine: str, version: str, *, user_confirmed_success: bool) -> Path:
     if not user_confirmed_success:
         raise ConfigurationError("The user must explicitly confirm a successful translation/patch before promotion")
-    selection = require_sdk_selection(load_config(work_dir))
+    config = load_config(work_dir)
+    selection = require_sdk_selection(config)
+    require_sdk_activation(work_dir, config)
     if selection.get("mode") not in {"derive-new", "private-new"}:
         raise ConfigurationError(
             "An existing SDK branch was selected; reuse or extend that branch instead of creating a duplicate profile"
@@ -812,6 +1017,7 @@ def publish_sdk_profile(
         raise ConfigurationError("SDK repository is not initialized; this command never runs git init")
     profile_data = json.loads((profile_root / "profile.json").read_text(encoding="utf-8"))
     selection = require_sdk_selection(config)
+    require_sdk_activation(work_dir, config)
     target = selection["target"]
     expected_reference = (
         selection.get("branch") if selection.get("mode") == "derive-new" else None

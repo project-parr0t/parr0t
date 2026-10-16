@@ -41,11 +41,13 @@ An engine SDK branch owns:
 - engine payload assembly, packing, and round-trip verification;
 - engine-specific documentation, manual exception runbooks, ignore rules, and synthetic fixtures.
 
+After its deterministic pack and round-trip verification succeeds, an engine branch records the artifact through the core `record_verified_pack_artifact` API. This binds the engine output to the exact completed translation result without routing engine logic into `main`. An unverified output, a generic pass-through copy, or a pack built from another result must not create core pack state.
+
 ## Selection before implementation
 
 The agent must complete `docs/sdk-selection.md` before it writes provisional format tooling. A compatible SDK branch with the same engine/version identity is reused directly. A partial same-identity match is extended with the smallest missing capability. A different identity with reusable implementation is recorded as a reference and selected through `derive-new`; it is not extended. A new private adapter without a reference is allowed only after every inventoried candidate is evaluated as incompatible. Neither the current checkout nor the absence of a local branch is evidence that no reusable SDK exists.
 
-The decision is bound to candidate commits and an explicit target engine/version identity in the external workspace. It must be refreshed when refs or that identity change. This state is job control metadata and must never be promoted into an SDK branch.
+The decision is bound to candidate commits and an explicit target engine/version identity in the external workspace. A separate activation record binds the actual executing checkout and, for a new adapter, its workspace tool manifest. Data-plane work must validate both records; merely selecting a branch while continuing from `main` or the generated pass-through tools is invalid. Either record must be refreshed when its bound refs, checkout, tools, or target identity change. This state is job control metadata and must never be promoted into an SDK branch.
 
 ## Promotion ownership
 

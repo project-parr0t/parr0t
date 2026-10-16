@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import asdict
@@ -701,9 +702,10 @@ def analyze_with_cache(
     force: bool = False,
 ) -> tuple[ContextPack, bool]:
     mode = analyzer.resolve_mode(segments)
+    source_segments_digest = stable_hash([asdict(item) for item in segments])
     fingerprint = stable_hash(
         {
-            "segments": [asdict(item) for item in segments],
+            "source_segments_digest": source_segments_digest,
             "providers": analyzer.registry.fingerprints(analyzer.provider_chain),
             "max_chunk_chars": analyzer.max_chunk_chars,
             "configured_context_mode": analyzer.context_mode,
@@ -714,7 +716,13 @@ def analyze_with_cache(
     )
     if not force and output_path.exists() and state_path.exists():
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        if state.get("fingerprint") == fingerprint:
+        output_body = output_path.read_bytes()
+        if (
+            state.get("fingerprint") == fingerprint
+            and state.get("source_segments_digest") == source_segments_digest
+            and state.get("output_sha256") == hashlib.sha256(output_body).hexdigest()
+            and state.get("output_size") == len(output_body)
+        ):
             data = json.loads(output_path.read_text(encoding="utf-8"))
             context_pack = ContextPack(**data)
             attestation = context_attestation(segments, context_pack, analyzer)
@@ -730,14 +738,17 @@ def analyze_with_cache(
     state_path.parent.mkdir(parents=True, exist_ok=True)
     output_temporary = output_path.with_name(f"{output_path.name}.tmp")
     state_temporary = state_path.with_name(f"{state_path.name}.tmp")
-    output_temporary.write_text(
-        json.dumps(asdict(context_pack), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    output_text = json.dumps(asdict(context_pack), ensure_ascii=False, indent=2) + "\n"
+    output_bytes = output_text.encode("utf-8")
+    output_temporary.write_bytes(output_bytes)
     state_temporary.write_text(
         json.dumps(
             {
                 "status": "success",
                 "fingerprint": fingerprint,
+                "source_segments_digest": source_segments_digest,
+                "output_sha256": hashlib.sha256(output_bytes).hexdigest(),
+                "output_size": len(output_bytes),
                 "attestation": attestation,
                 "execution": execution,
             },

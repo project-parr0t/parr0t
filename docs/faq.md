@@ -26,7 +26,7 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **General cause:** Branch discovery was advisory, only the current checkout was inspected, or a branch name was treated as the complete compatibility test.
 - **Diagnosis:** Inspect the external workspace's SDK inventory, per-candidate commit-bound evaluations, and selected mode. A missing decision or an unevaluated plausible branch means implementation started too early.
 - **Resolution:** Stop the duplicate implementation, refresh visible local and remote-tracking refs, inspect each plausible public contract, and record same-identity `reuse` or `extend` when possible. Record useful different-identity code as `reference` and select `derive-new`. Select `private-new` only after every candidate is categorically incompatible and none is a reusable reference.
-- **Prevention:** Keep the `docs/sdk-selection.md` gate before extraction and let the CLI block data-plane stages and SDK promotion until a current decision exists.
+- **Prevention:** Keep the `docs/sdk-selection.md` gate before extraction and let the CLI block data-plane stages and SDK promotion until both the current decision and its exact implementation activation are valid.
 
 ## Reusable SDK code is assigned to the wrong engine-version branch
 
