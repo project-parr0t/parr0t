@@ -56,6 +56,8 @@ Every valid candidate carries a content digest and monotonically increasing gene
 
 Retryable malformed responses, temporary provider failures, rate limits, timeouts, and integrity-invalid outputs receive the configured `routing.grace_retries` attempts on the same isolated target. Explicit provider refusals, authentication failures, and exhausted quota move directly to the next route. Every attempt records its ordinal, model, categorical issue code, candidate generation, and duration without provider prose or game text.
 
+Retries do not relax the per-request input budget. The preset-compatible adapter removes duplicated context containers from segment metadata, projects only target-relevant context, places stable material before target-specific material, and rejects an oversized translation/review request as `budget_exhausted` before the network call. Do not replace this adapter with a job-local DeepSeek request loop. Provider cache-hit and cache-miss token counts are retained when returned so repeated context cost remains auditable.
+
 `routing.review_refusal_policy` is explicit:
 
 - `fallback`: use the next reviewer and preserve source after exhaustion when configured;
