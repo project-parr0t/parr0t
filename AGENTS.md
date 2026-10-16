@@ -4,10 +4,10 @@ Parr0t is an engine-neutral control framework and reusable SDK repository. Keep 
 
 ## Read order
 
-1. Read this file.
-2. For a localization job, read `docs/agent-usage.md` and the external workspace `AGENTS.md`.
-3. Run `game-l10n status --workspace <workspace>`.
-4. Resolve each `required_contracts` entry against `contract_base` and read only those contracts. For a user-requested route not represented by workspace state, use the table below. Do not preload every document.
+1. Read this file before accessing game-root contents; path existence may be checked only for workspace initialization.
+2. Read `docs/agent-usage.md`, initialize or resume the external workspace without content inspection, then read its `AGENTS.md`.
+3. Run `game-l10n status --workspace <workspace>`. For `establish_text_free_control_plane`, read its contracts and run `game-l10n enter-control-plane --workspace <workspace> --contracts-read --source-unopened` before other work.
+4. Resolve each `required_contracts` entry against `contract_base` and read only those contracts. For a user-requested route outside workspace state, use the table below.
 
 `local_patch_ready` is the only terminal local-work status. It requires current static completion and an unchanged packed artifact bound to that completion attestation.
 
@@ -16,7 +16,7 @@ Parr0t is an engine-neutral control framework and reusable SDK repository. Keep 
 1. **Stay within the request.** Apply `skills/request-scope-guard/SKILL.md` whenever scope is limited, the task is inspection-only, or an action is optional, destructive, or externally consequential. Re-evaluate after every user message. Access and API-key availability are not authorization.
 2. **Separate locations.** The repository holds reusable code only; the source game root is read-only; generated work belongs in an external workspace created with `game-l10n init-workspace`.
 3. **Text is the default scope.** Do not inspect images for text, run OCR, plan image translation, or create image tooling unless the user specifically requests image translation.
-4. **Keep the control plane text-free.** The top-level agent may receive opaque control IDs, counts, categorical states, queue transitions, artifact paths, and deterministic issue codes only. It must not open source/candidate/result text or receive provider refusal prose. Data-plane workers return a validated `parr0t.control-envelope.v2` path. On leakage, record it with `game-l10n record-control-plane-leak` and stop; the contaminated agent must not run or confirm resume. A fresh control plane resumes metadata checkpoints under `docs/control-plane-contract.md`.
+4. **Keep the control plane text-free from entry.** Before the entry gate is established, the top-level agent must not list, open, search, grep, classify, or preview any game-root file, including README, manifests, configuration, scripts, assets, archives, or extracted text. Existing-locale detection, engine/version discovery, inventory, and every semantic/content check belong to isolated data-plane workers. The parent may receive opaque control IDs, counts, categorical states, queue transitions, artifact paths, public SDK-selection state, and deterministic issue codes only. Data-plane workers return a validated `parr0t.control-envelope.v2` path. On leakage, record it with `game-l10n record-control-plane-leak` and stop; the contaminated agent must not run or confirm resume. A fresh control plane resumes metadata checkpoints under `docs/control-plane-contract.md`.
 5. **Preserve the pipeline order.** Verify two independent ordered inventories; complete typed context analysis; translate every confirmed target with the primary route; process only failures through translation fallback; independently review the complete translated set; rewrite only flagged targets; process only review failures through judge fallback; then validate and pack.
 6. **Treat refusal as routing.** Parent-facing refusal state is only `fallback_required` / “폴백 처리 필요”. It is never a content judgment, exclusion, batch cancellation, or authority to shrink scope. Preserve source only after metadata proves every configured route was attempted and exhausted.
 7. **Translate, do not invent.** Work on one target at a time with its relevant narrative, functional, or knowledge context. Preserve meaning, character voice, formality, scene state, UI function, conditions, units, order, terminology, placeholders, markup, control codes, supported allusions, and natural target-language effect. Segment isolation must not discard context.
@@ -28,8 +28,8 @@ Parr0t is an engine-neutral control framework and reusable SDK repository. Keep 
 
 ## Standard job sequence
 
-1. Resolve repository, read-only game root, and writable external workspace. Ask once whether Git may be used for the game task and record the answer; refusal means no Git initialization or publication.
-2. Run `game-l10n status`, complete SDK inventory/evaluation/selection/activation, and inspect an engine runbook entry only when its trigger occurs.
+1. Initialize the external workspace with the read-only game-root path without inspecting contents. Establish the entry gate, then ask once whether Git is allowed; refusal means no Git initialization or publication.
+2. Run status. An isolated worker records existing-locale and engine/version discovery as SDK-selection state and returns only a control envelope. Complete SDK selection/activation; inspect an engine runbook only on its trigger.
 3. Produce and reconcile two independently implemented complete ordered inventories. User-visible exclusions remain unresolved; static alignment is not runtime coverage.
 4. Complete typed context analysis. If every context route fails, stop before translation.
 5. Run primary translation, translation fallback, complete independent review, selective rewriting, and review fallback in that order. Operational failures enter the resumable metadata-only failure queue; blocking failures hold the patch.

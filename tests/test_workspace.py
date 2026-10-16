@@ -15,7 +15,11 @@ from unittest.mock import patch
 from dataclasses import asdict
 
 from game_l10n.cli import _completion_state_valid, cmd_status, cmd_translate
-from game_l10n.control_plane import record_control_plane_leak
+from game_l10n.control_plane import (
+    control_plane_entry_state,
+    establish_control_plane_entry,
+    record_control_plane_leak,
+)
 from game_l10n.coverage import save_inventory_attestation
 from game_l10n.errors import ConfigurationError, ToolExecutionError
 from game_l10n.privacy import PrivacyViolation
@@ -107,6 +111,7 @@ class WorkspaceTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
+            entry_state = control_plane_entry_state(work)
 
         providers = {item["name"]: item for item in config["providers"]}
         self.assertEqual(config["provider_preset"], "openai-deepseek")
@@ -153,6 +158,8 @@ class WorkspaceTests(unittest.TestCase):
         self.assertTrue(config["control_plane"]["rotate_after_leak"])
         self.assertEqual(control_state["status"], "ready")
         self.assertEqual(control_state["generation"], 1)
+        self.assertEqual(entry_state["status"], "pending")
+        self.assertEqual(entry_state["issue_code"], "control_plane_entry_required")
         self.assertTrue(config["coverage"]["require_independent_inventory"])
         self.assertTrue(config["coverage"]["separate_static_and_runtime_completion"])
         self.assertTrue(config["failure_queue"]["resume_only_after_user_request"])
@@ -175,6 +182,8 @@ class WorkspaceTests(unittest.TestCase):
         self.assertLessEqual(len(generated_agents.split()), 1000)
         for required in (
             "game-l10n status",
+            "game-l10n enter-control-plane",
+            "Before listing, opening, searching, or reading any file",
             "skills/request-scope-guard/SKILL.md",
             "Do not inspect images for text",
             "two independent complete ordered inventories",
@@ -757,6 +766,7 @@ class WorkspaceTests(unittest.TestCase):
             sdk.mkdir()
             initialize_workspace(work, sdk, git_choice="enabled")
             update_repository_policy(work, publish_approved=False)
+            establish_control_plane_entry(work)
             output = StringIO()
             with redirect_stdout(output):
                 cmd_status(SimpleNamespace(workspace=str(work)))
@@ -779,24 +789,35 @@ class WorkspaceTests(unittest.TestCase):
                 cmd_status(SimpleNamespace(workspace=str(work)))
             first = json.loads(first_output.getvalue())
 
-            update_repository_policy(work, initial_choice="disabled")
+            establish_control_plane_entry(work)
             second_output = StringIO()
             with redirect_stdout(second_output):
                 cmd_status(SimpleNamespace(workspace=str(work)))
             second = json.loads(second_output.getvalue())
 
-        self.assertEqual(first["next_actions"], ["ask_user_for_initial_git_choice"])
+            update_repository_policy(work, initial_choice="disabled")
+            third_output = StringIO()
+            with redirect_stdout(third_output):
+                cmd_status(SimpleNamespace(workspace=str(work)))
+            third = json.loads(third_output.getvalue())
+
+        self.assertEqual(first["next_actions"], ["establish_text_free_control_plane"])
         self.assertEqual(first["contract_base"], str(sdk.resolve()))
         self.assertEqual(
             first["required_contracts"],
-            ["skills/request-scope-guard/SKILL.md"],
+            [
+                "docs/control-plane-contract.md",
+                "docs/provider-protocol.md",
+                "docs/execution-budget.md",
+            ],
         )
+        self.assertEqual(second["next_actions"], ["ask_user_for_initial_git_choice"])
         self.assertEqual(
-            second["next_actions"],
+            third["next_actions"],
             ["record_target_identity_evaluate_and_select_sdk"],
         )
         self.assertEqual(
-            second["required_contracts"],
+            third["required_contracts"],
             ["docs/sdk-selection.md", "docs/sdk-branch-contract.md"],
         )
 
@@ -809,6 +830,7 @@ class WorkspaceTests(unittest.TestCase):
             sdk.mkdir()
             game.mkdir()
             initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+            establish_control_plane_entry(work)
             record_sdk_selection(
                 work,
                 "private-new",
@@ -838,6 +860,7 @@ class WorkspaceTests(unittest.TestCase):
             work = root / "work"
             sdk.mkdir()
             initialize_workspace(work, sdk, game_roots=[missing_game])
+            establish_control_plane_entry(work)
 
             first_output = StringIO()
             with redirect_stdout(first_output):
@@ -885,6 +908,7 @@ class WorkspaceTests(unittest.TestCase):
             sdk.mkdir()
             game.mkdir()
             initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+            establish_control_plane_entry(work)
             record_sdk_selection(
                 work,
                 "private-new",
@@ -1050,6 +1074,7 @@ class WorkspaceTests(unittest.TestCase):
             sdk.mkdir()
             game.mkdir()
             initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+            establish_control_plane_entry(work)
             record_sdk_selection(
                 work,
                 "private-new",

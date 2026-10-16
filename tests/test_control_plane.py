@@ -10,9 +10,12 @@ from pathlib import Path
 from game_l10n.cli import main
 from game_l10n.control_plane import (
     acknowledge_control_plane_rotation,
+    control_plane_entry_state,
     control_target_id,
     control_plane_state,
+    establish_control_plane_entry,
     record_control_plane_leak,
+    require_control_plane_entry,
     validate_control_envelope,
 )
 from game_l10n.errors import ConfigurationError
@@ -65,6 +68,48 @@ class ControlPlaneContractTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_entry_gate_is_pending_until_clean_parent_confirms_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(ConfigurationError, "ENTRY_REQUIRED"):
+                require_control_plane_entry(root)
+            result = establish_control_plane_entry(root)
+
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["issue_code"], "")
+
+    def test_cli_blocks_ordinary_work_before_entry_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stderr = io.StringIO()
+            stdout = io.StringIO()
+            with redirect_stderr(stderr), redirect_stdout(stdout):
+                blocked = main(
+                    [
+                        "verify-inventory",
+                        "--workspace",
+                        str(root),
+                        "--primary",
+                        "primary.json",
+                        "--independent",
+                        "independent.json",
+                    ]
+                )
+                entered = main(
+                    [
+                        "enter-control-plane",
+                        "--workspace",
+                        str(root),
+                        "--contracts-read",
+                        "--source-unopened",
+                    ]
+                )
+
+        self.assertEqual(blocked, 2)
+        self.assertEqual(entered, 0)
+        self.assertIn("E_CONTROL_PLANE_ENTRY_REQUIRED", stderr.getvalue())
+        self.assertIn('"status": "ready"', stdout.getvalue())
+
     def test_valid_envelope_returns_only_allowlisted_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -83,6 +128,36 @@ class ControlPlaneContractTests(unittest.TestCase):
         self.assertNotIn("source", result)
         self.assertNotIn("reason", result)
         self.assertNotIn("text", result)
+
+    def test_source_probe_can_return_metadata_only_discovery_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / ".game-l10n" / "sdk-selection.json"
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_text("{}", encoding="utf-8")
+            payload = {
+                "schema": "parr0t.control-envelope.v2",
+                "worker_role": "source_probe",
+                "stage": "discovery",
+                "status": "success",
+                "target_ids": [],
+                "counts": {"total": 1, "success": 1},
+                "issue_codes": [],
+                "artifact_paths": [".game-l10n/sdk-selection.json"],
+                "queue_transitions": [],
+                "route_evidence_path": "",
+            }
+            envelope = self._write_envelope(root, payload)
+            result = validate_control_envelope(
+                root,
+                envelope,
+                expected_role="source_probe",
+                expected_stage="discovery",
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["target_ids"], [])
+        self.assertEqual(result["issue_codes"], [])
 
     def test_parent_unsafe_field_is_rejected_without_echoing_value(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -297,6 +372,8 @@ class ControlPlaneContractTests(unittest.TestCase):
                 )
 
             resumed = acknowledge_control_plane_rotation(root, incident["incident_id"])
+            self.assertEqual(control_plane_entry_state(root)["status"], "pending")
+            establish_control_plane_entry(root)
             result = prepare_native_tasks(
                 root,
                 source,
