@@ -38,6 +38,7 @@ from game_l10n.workspace import (
     refresh_sdk_inventory,
     require_sdk_selection,
     update_repository_policy,
+    verify_sdk_promotion_commit,
 )
 
 
@@ -597,6 +598,47 @@ class WorkspaceTests(unittest.TestCase):
             update_repository_policy(work, publish_approved=True)
             with self.assertRaises(Exception):
                 publish_sdk_profile(work, sdk, profile)
+
+    def test_sdk_promotion_commit_cannot_modify_main_owned_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            sdk.mkdir()
+
+            def git(*args: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["git", *args],
+                    cwd=sdk,
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                    shell=False,
+                    check=True,
+                )
+
+            git("init", "-b", "main")
+            git("config", "user.name", "Fixture")
+            git("config", "user.email", "fixture@example.invalid")
+            git("config", "commit.gpgsign", "false")
+            (sdk / "core.txt").write_text("core\n", encoding="utf-8")
+            git("add", "core.txt")
+            git("commit", "-m", "Add core")
+            git("switch", "-c", "sdk-fixture-1.0")
+            engine_file = sdk / "profiles" / "sdk-fixture-1.0" / "tool.py"
+            engine_file.parent.mkdir(parents=True)
+            engine_file.write_text("# fixture\n", encoding="utf-8")
+            git("add", "profiles")
+            git("commit", "-m", "Add fixture SDK")
+
+            valid = verify_sdk_promotion_commit(sdk, "sdk-fixture-1.0", "HEAD")
+            self.assertEqual(valid["status"], "ready")
+            self.assertEqual(valid["main_owned_paths"], [])
+
+            (sdk / "core.txt").write_text("changed by SDK\n", encoding="utf-8")
+            git("add", "core.txt")
+            git("commit", "-m", "Mix core into promotion")
+            with self.assertRaisesRegex(ConfigurationError, "CORE_PATH"):
+                verify_sdk_promotion_commit(sdk, "sdk-fixture-1.0", "HEAD")
 
     def test_tool_output_cannot_overwrite_its_input(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

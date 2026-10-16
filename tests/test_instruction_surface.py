@@ -29,6 +29,7 @@ class InstructionSurfaceTests(unittest.TestCase):
             "Resolve each `required_contracts` entry against `contract_base`",
             "before accessing game-root contents",
             "game-l10n enter-control-plane",
+            "game-l10n verify-sdk-promotion",
             "Do not inspect images for text",
             "fallback_required",
             "parr0t.control-envelope.v2",
