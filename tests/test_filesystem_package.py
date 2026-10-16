@@ -111,18 +111,21 @@ class FilesystemPackageTests(unittest.TestCase):
             powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
             if powershell:
                 extracted = root / "extracted"
-                game = root / "game"
+                game = root / "game folder"
                 game.mkdir()
                 (game / "fixture-game.exe").write_bytes(b"fixture")
                 with zipfile.ZipFile(first) as archive:
                     archive.extractall(extracted)
                 script = extracted / "Install-Translation-Patch.ps1"
+                runner = game / "installer-cwd"
+                runner.mkdir()
 
                 def run_menu(
                     answers: str,
                     *,
                     game_root: str | None,
                     cwd: Path,
+                    diagnostic: bool = False,
                 ) -> subprocess.CompletedProcess[str]:
                     def quote(value: str) -> str:
                         return "'" + value.replace("'", "''") + "'"
@@ -133,6 +136,8 @@ class FilesystemPackageTests(unittest.TestCase):
                     )
                     if game_root is not None:
                         invocation += f" -GameRoot {quote(game_root)}"
+                    if diagnostic:
+                        invocation += " -Diagnostic"
                     invocation += "; exit $LASTEXITCODE"
                     command = [
                             powershell,
@@ -151,10 +156,35 @@ class FilesystemPackageTests(unittest.TestCase):
                         check=False,
                     )
 
+                for supplied_root, cwd in (
+                    ("./", game),
+                    ("../", runner),
+                    ('"../"', runner),
+                    ("'../'", runner),
+                    (f'"{game}"', runner),
+                ):
+                    unresolved = run_menu("3\n", game_root=supplied_root, cwd=cwd)
+                    self.assertEqual(unresolved.returncode, 1)
+                    self.assertIn("PARR0T-E008", unresolved.stdout + unresolved.stderr)
+
+                dragged = run_menu('3\n"../"\n', game_root=None, cwd=runner)
+                self.assertEqual(dragged.returncode, 1)
+                self.assertIn("PARR0T-E008", dragged.stdout + dragged.stderr)
+
+                missing = run_menu(
+                    "3\n", game_root="../missing", cwd=runner, diagnostic=True
+                )
+                self.assertEqual(missing.returncode, 1)
+                self.assertIn("E_GAME_ROOT_NOT_FOUND", missing.stdout + missing.stderr)
+
+                wrong_root = run_menu("3\n", game_root="./", cwd=runner, diagnostic=True)
+                self.assertEqual(wrong_root.returncode, 1)
+                self.assertIn("E_GAME_ROOT_MARKERS_MISSING", wrong_root.stdout + wrong_root.stderr)
+
                 installed = run_menu("1\ny\n", game_root=None, cwd=game)
                 self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
                 self.assertTrue((game / "localization.dat").is_file())
-                verified = run_menu("3\n", game_root="game", cwd=root)
+                verified = run_menu("3\n", game_root="game folder", cwd=root)
                 self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
                 restored = run_menu("2\ny\n", game_root=None, cwd=game)
                 self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)

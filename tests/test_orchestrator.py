@@ -5,13 +5,72 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from game_l10n.errors import ProviderError
+from game_l10n.coverage import completion_attestation
+from game_l10n.errors import ProviderError, ProviderFailure
 from game_l10n.models import ContextPack, GlossaryEntry, ProjectContext, Segment
 from game_l10n.orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from game_l10n.providers import ProviderRegistry, ScriptedProvider
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_successful_review_retry_completes_initial_and_corrected_candidates(self) -> None:
+        for confirmation in (False, True):
+            with self.subTest(confirmation=confirmation):
+                calls = 0
+
+                def judge_handler(**_):
+                    nonlocal calls
+                    calls += 1
+                    if confirmation and calls == 1:
+                        return {"verdict": "rewrite", "issues": ["voice"]}
+                    if calls == (2 if confirmation else 1):
+                        raise ProviderFailure("malformed_response", retryable=True)
+                    return {"verdict": "ok", "issues": []}
+
+                translator = ScriptedProvider(
+                    "synthetic-translator",
+                    lambda **_: {"status": "success", "text": "TARGET_A", "reason": ""},
+                )
+                judge = ScriptedProvider("synthetic-judge", judge_handler)
+                rewriter = ScriptedProvider(
+                    "synthetic-rewriter",
+                    lambda **_: {"status": "success", "text": "TARGET_B"},
+                )
+                registry = ProviderRegistry(
+                    {provider.name: provider for provider in (translator, judge, rewriter)}
+                )
+                segment = Segment("synthetic-retry", "SOURCE")
+                with tempfile.TemporaryDirectory() as directory:
+                    result = LocalizationOrchestrator(
+                        registry=registry,
+                        config=OrchestratorConfig(
+                            [translator.name],
+                            [judge.name],
+                            grace_retries=1,
+                            rewriter_chain=[rewriter.name],
+                        ),
+                        project=ProjectContext("SYNTHETIC", "src", "dst"),
+                        context_pack=ContextPack(story_summary="SYNTHETIC_STORY"),
+                        work_dir=Path(directory),
+                    ).translate_one(segment)
+                state = completion_attestation(
+                    [segment],
+                    [result],
+                    inventory_segments=[segment],
+                    inventory={
+                        "status": "static_verified",
+                        "static_complete": True,
+                        "primary_segments": 1,
+                        "primary_fingerprint": "synthetic",
+                    },
+                    runtime={"runtime_complete": False},
+                    review_required=True,
+                )
+                self.assertTrue(state["semantic_review"]["complete"])
+                self.assertTrue(state["static_completion"])
+                self.assertEqual(result.candidate_generation, 2 if confirmation else 1)
+                self.assertEqual(calls, 3 if confirmation else 2)
+
     def test_compact_review_skips_rewriter_for_approved_candidate(self) -> None:
         translator = ScriptedProvider(
             "fixture-translator",
