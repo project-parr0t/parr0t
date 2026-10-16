@@ -10,6 +10,7 @@ from pathlib import Path
 from game_l10n.cli import main
 from game_l10n.control_plane import (
     acknowledge_control_plane_rotation,
+    control_target_id,
     control_plane_state,
     record_control_plane_leak,
     validate_control_envelope,
@@ -76,7 +77,8 @@ class ControlPlaneContractTests(unittest.TestCase):
             )
 
         self.assertEqual(result["status"], "fallback_required")
-        self.assertEqual(result["target_ids"], ["fixture-1"])
+        self.assertEqual(result["target_ids"], [control_target_id("fixture-1")])
+        self.assertNotIn("fixture-1", result["target_ids"])
         self.assertEqual(result["issue_codes"], ["fallback_required"])
         self.assertNotIn("source", result)
         self.assertNotIn("reason", result)
@@ -316,10 +318,61 @@ class ControlPlaneContractTests(unittest.TestCase):
 
         self.assertEqual(state["status"], "rotation_required")
 
+    def test_control_state_rejects_unknown_fields_without_echoing_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / ".game-l10n" / "control-plane-state.json"
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "parr0t.control-plane-state.v1",
+                        "status": "ready",
+                        "generation": 1,
+                        "incident_id": "",
+                        "issue_code": "",
+                        "incident_code": "",
+                        "source": "PRIVATE_SOURCE_VALUE",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ConfigurationError) as captured:
+                control_plane_state(root)
+
+        self.assertIn("unsupported fields", str(captured.exception))
+        self.assertNotIn("PRIVATE_SOURCE_VALUE", str(captured.exception))
+
+    def test_cli_hides_incident_id_and_requires_fresh_session_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            incident = record_control_plane_leak(root, "source_or_candidate_received")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                status = main(["control-plane-status", "--workspace", str(root)])
+                rejected = main(["resume-control-plane", "--workspace", str(root)])
+            self.assertEqual(control_plane_state(root)["status"], "rotation_required")
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                resumed = main(
+                    [
+                        "resume-control-plane",
+                        "--workspace",
+                        str(root),
+                        "--fresh-session-confirmed",
+                    ]
+                )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(rejected, 2)
+        self.assertEqual(resumed, 0)
+        self.assertNotIn(incident["incident_id"], stdout.getvalue())
+        self.assertIn("E_CONTROL_PLANE_FRESH_SESSION_REQUIRED", stderr.getvalue())
+
     def test_rotation_blocks_non_recovery_cli_commands(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            record_control_plane_leak(root, "semantic_judgment_performed")
+            incident = record_control_plane_leak(root, "semantic_judgment_performed")
             stderr = io.StringIO()
             stdout = io.StringIO()
             with redirect_stderr(stderr), redirect_stdout(stdout):
@@ -340,6 +393,7 @@ class ControlPlaneContractTests(unittest.TestCase):
         self.assertIn("E_CONTROL_PLANE_ROTATION_REQUIRED", stderr.getvalue())
         self.assertEqual(status, 0)
         self.assertIn("rotation_required", stdout.getvalue())
+        self.assertNotIn(incident["incident_id"], stdout.getvalue())
 
 
 if __name__ == "__main__":

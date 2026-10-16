@@ -17,7 +17,7 @@ from dataclasses import asdict
 from game_l10n.cli import _completion_state_valid, cmd_status, cmd_translate
 from game_l10n.control_plane import record_control_plane_leak
 from game_l10n.coverage import save_inventory_attestation
-from game_l10n.errors import ConfigurationError
+from game_l10n.errors import ConfigurationError, ToolExecutionError
 from game_l10n.privacy import PrivacyViolation
 from game_l10n.providers import ProviderRegistry
 from game_l10n.formats import read_segments
@@ -699,6 +699,35 @@ class WorkspaceTests(unittest.TestCase):
                 )
             self.assertFalse((work / ".game-l10n" / "tool-state.json").exists())
 
+    def test_tool_failure_keeps_arbitrary_stderr_in_private_log(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            source = work / "source.bin"
+            source.write_bytes(b"original")
+            tool = work / "failing-tool.py"
+            tool.write_text(
+                "import sys\n"
+                "sys.stderr.write('PRIVATE_SOURCE_VALUE')\n"
+                "raise SystemExit(7)\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ToolExecutionError) as captured:
+                run_cached_tool(
+                    stage="unpack",
+                    command=["python", str(tool), "{input}", "{output}"],
+                    input_path=source,
+                    output_path=work / "output.bin",
+                    work_dir=work,
+                )
+            private_log = json.loads(
+                (work / ".game-l10n" / "tool-logs" / "unpack-latest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertNotIn("PRIVATE_SOURCE_VALUE", str(captured.exception))
+        self.assertEqual(private_log["stderr"], "PRIVATE_SOURCE_VALUE")
+
     def test_publish_approval_requires_initial_git_choice(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -842,7 +871,7 @@ class WorkspaceTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(status["control_plane"]["status"], "rotation_required")
-        self.assertEqual(status["next_actions"], ["resume_in_fresh_control_plane"])
+        self.assertEqual(status["next_actions"], ["stop_current_control_plane"])
         self.assertEqual(
             status["required_contracts"], ["docs/control-plane-contract.md"]
         )

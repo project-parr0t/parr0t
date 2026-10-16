@@ -30,7 +30,7 @@ class ConfigurationError(GameL10nError):
 
 
 class ToolExecutionError(GameL10nError):
-    """An unpack/pack tool failed."""
+    """An unpack/pack tool failed; its message is private data-plane diagnostics."""
 
 
 class RuntimeApprovalError(GameL10nError):
