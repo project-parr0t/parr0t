@@ -37,6 +37,7 @@ from .formats import (
     read_translation_results,
     write_results,
 )
+from .filesystem_package import build_filesystem_package, validate_filesystem_package
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext
 from .instance_release import validate_instance_release
 from .native_pass import import_native_shard, merge_native_pass, prepare_native_tasks
@@ -46,6 +47,7 @@ from .providers import ProviderRegistry
 from .provider_policy import require_direct_provider_pipeline
 from .runtime_approval import create_runtime_approval
 from .steam import build_steam_package, inspect_installed_state, validate_steam_package
+from .translation_exchange import prepare_translation_exchange, seal_translation_exchange
 from .tooling import run_cached_tool
 from .workspace import (
     initialize_workspace,
@@ -639,6 +641,31 @@ def cmd_merge_native_pass(args: argparse.Namespace) -> int:
     return 0 if result["complete"] else 1
 
 
+def cmd_prepare_translation_exchange(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    source = _path_in_workspace(work_dir, args.input, must_exist=True)
+    result = prepare_translation_exchange(
+        work_dir,
+        read_segments(source),
+        _path_in_workspace(work_dir, args.output),
+        exchange_id=args.exchange_id,
+        mode=args.mode,
+        source_queue=args.source_queue,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_seal_translation_exchange(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    result = seal_translation_exchange(
+        work_dir,
+        _path_in_workspace(work_dir, args.bundle, must_exist=True),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["status"] == "complete" else 1
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
@@ -811,6 +838,32 @@ def cmd_verify_steam_package(args: argparse.Namespace) -> int:
     sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
     require_external_workdir(work_dir, sdk_root)
     result = validate_steam_package(_path_in_workspace(work_dir, args.package, must_exist=True))
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_filesystem_package(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
+    require_external_workdir(work_dir, sdk_root)
+    result = build_filesystem_package(
+        _path_in_workspace(work_dir, args.payload, must_exist=True),
+        _path_in_workspace(work_dir, args.spec, must_exist=True),
+        _path_in_workspace(work_dir, args.output),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_verify_filesystem_package(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
+    require_external_workdir(work_dir, sdk_root)
+    result = validate_filesystem_package(
+        _path_in_workspace(work_dir, args.package, must_exist=True)
+    )
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -1090,6 +1143,30 @@ def build_parser() -> argparse.ArgumentParser:
     native_merge.add_argument("--output", required=True)
     native_merge.set_defaults(func=cmd_merge_native_pass)
 
+    exchange_prepare = sub.add_parser(
+        "prepare-translation-exchange",
+        help="Create the fixed private manual/fallback translation exchange bundle",
+    )
+    exchange_prepare.add_argument("--workspace", required=True)
+    exchange_prepare.add_argument("--input", required=True, help="Ordered source segment file")
+    exchange_prepare.add_argument("--output", required=True, help="New private exchange directory")
+    exchange_prepare.add_argument("--exchange-id", required=True)
+    exchange_prepare.add_argument("--mode", choices=["manual", "fallback"], required=True)
+    exchange_prepare.add_argument(
+        "--source-queue",
+        choices=["primary_pending", "translation_fallback_pending"],
+        required=True,
+    )
+    exchange_prepare.set_defaults(func=cmd_prepare_translation_exchange)
+
+    exchange_seal = sub.add_parser(
+        "seal-translation-exchange",
+        help="Validate a fixed exchange and emit only its metadata-only receipt and control envelope",
+    )
+    exchange_seal.add_argument("--workspace", required=True)
+    exchange_seal.add_argument("--bundle", required=True)
+    exchange_seal.set_defaults(func=cmd_seal_translation_exchange)
+
     control_validate = sub.add_parser(
         "validate-control-envelope",
         help="Validate and sanitize a data-plane worker result before the parent uses it",
@@ -1231,6 +1308,24 @@ def build_parser() -> argparse.ArgumentParser:
     verify_steam.add_argument("--workspace", required=True)
     verify_steam.add_argument("--package", required=True)
     verify_steam.set_defaults(func=cmd_verify_steam_package)
+
+    filesystem_package = sub.add_parser(
+        "filesystem-package",
+        help="Build a launcher-neutral package that asks for an explicit game folder",
+    )
+    filesystem_package.add_argument("--workspace", required=True)
+    filesystem_package.add_argument("--payload", required=True)
+    filesystem_package.add_argument("--spec", required=True)
+    filesystem_package.add_argument("--output", required=True)
+    filesystem_package.set_defaults(func=cmd_filesystem_package)
+
+    verify_filesystem = sub.add_parser(
+        "verify-filesystem-package",
+        help="Verify a launcher-neutral Parr0t package without installing it",
+    )
+    verify_filesystem.add_argument("--workspace", required=True)
+    verify_filesystem.add_argument("--package", required=True)
+    verify_filesystem.set_defaults(func=cmd_verify_filesystem_package)
 
     instance_release = sub.add_parser(
         "instance-release-gate",
