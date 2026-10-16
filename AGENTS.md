@@ -69,4 +69,4 @@ For launcher-neutral Windows packages, `-GameRoot` accepts absolute paths and pa
 
 ## WOLF RPG Pro SDK branch
 
-WOLF extraction, semantic inventory, raw-JSON audit, runtime-key protection, archive packing, ignore rules, synthetic tests, and engine FAQ stay here. `wolf prepare-batches` must produce independently implemented semantic and raw-shape inventories; stable IDs, source identity, and order must pass the shared gate. User-visible `--exclude-json` keeps coverage incomplete; debug exclusions remain declared metadata. Import the reviewed set with `wolf import-reviewed`; ID matches are not review evidence. Import, apply, and pack must honor the verified inventory fingerprint and stop on blocking failures. Keep source/key archives and external tools outside the repository; run core and `test_wolf_*` suites before publication.
+Read `docs/wolf-rpg-pro.md` before any branch work.
