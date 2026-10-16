@@ -18,10 +18,10 @@ Text translation is the default. Do not inspect images for text or consider OCR/
 
 For a new job:
 
-1. Confirm repository/source readability and workspace writability.
-2. Ask once whether Git may be used for this game task and record the choice. Disabled means no `git init`, commit, branch, remote, or push for that job.
-3. Initialize the workspace, then run `game-l10n status`.
-4. Follow the single `next_actions` entry. Resolve only its `required_contracts` against `contract_base`; load another contract only when a new user request activates a route outside workspace state. `local_patch_ready` is the only terminal local-work action and requires a current completion attestation bound to an unchanged packed artifact.
+1. Confirm repository/workspace access and only that the source path exists; do not inspect its contents.
+2. Initialize with that path and run status. For `establish_text_free_control_plane`, read its contracts and run `game-l10n enter-control-plane --workspace <workspace> --contracts-read --source-unopened`. If the parent already saw game content, record a leak and stop.
+3. Ask once whether Git may be used for this game task and record the choice. Disabled means no `git init`, commit, branch, remote, or push for that job.
+4. Follow the single later `next_actions`. Resolve only its `required_contracts`; load another contract only for a new user route. Isolated workers perform locale/engine discovery, inventory, and classification, update private state, and return validated envelope paths. Only `local_patch_ready` is terminal.
 
 For an existing job, start with status and reuse valid checkpoints. Do not repeat extraction, context work, translation, or validation whose input fingerprint is unchanged.
 
@@ -52,6 +52,7 @@ Do not skip or reorder barriers. One refusal, timeout, malformed result, capacit
 - Inventory completeness requires two independently implemented ordered manifests. Result alignment, semantic review coverage, and runtime observation are separate claims.
 - Context is target-scoped, not absent. Use narrative/voice, functional/UI, knowledge/prerequisite, adjacent, glossary, and immutable evidence relevant to that target.
 - The top-level agent is a text-free control plane. It handles IDs, counts, categorical status, queue movement, artifact paths, and deterministic codes. Workers access private text and return only validated metadata envelopes.
+- The top-level agent never inspects game-root files, including preliminary discovery; it passes paths to isolated workers. A missing SDK does not relax this boundary.
 - Provider roles come from the selected preset. A key does not select a mode, change a role, or authorize another service. Parent-facing refusal is only `fallback_required`; provider rationale remains private.
 - Translation is faithful transformation, not content generation. Independent review checks meaning, omission, voice, tone, function, conditions, units, terminology, allusions, placeholders, markup, control codes, ordering, and material layout risk.
 - Build new outputs in the workspace. Automated checks use synthetic targets and never install or launch the real game.
@@ -82,6 +83,7 @@ For non-Steam/launcher-neutral delivery, `filesystem-package` is authoritative. 
 python -m pip install -e .
 game-l10n init-workspace <external-workspace> --sdk-root <repository> --game-root <source-root>
 game-l10n status --workspace <external-workspace>
+game-l10n enter-control-plane --workspace <external-workspace> --contracts-read --source-unopened
 game-l10n sdk-inventory --workspace <external-workspace> --refresh-remote
 game-l10n sdk-evaluate --workspace <external-workspace> --target-engine <engine> --target-version <version-line> --branch <sdk-branch> --result <compatible|partial|reference|incompatible> --reason <reason-code> --evidence-path <public-contract-path>
 game-l10n sdk-select --workspace <external-workspace> --target-engine <engine> --target-version <version-line> --mode <reuse|extend|derive-new|private-new> [--branch <sdk-branch>]

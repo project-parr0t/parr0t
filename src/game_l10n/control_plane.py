@@ -15,6 +15,8 @@ LEGACY_CONTROL_ENVELOPE_SCHEMA = "parr0t.control-envelope.v1"
 ROUTE_EVIDENCE_SCHEMA = "parr0t.route-evidence.v1"
 CONTROL_STATE_SCHEMA = "parr0t.control-plane-state.v1"
 CONTROL_STATE_PATH = ".game-l10n/control-plane-state.json"
+CONTROL_ENTRY_SCHEMA = "parr0t.control-plane-entry.v1"
+CONTROL_ENTRY_PATH = ".game-l10n/control-plane-entry.json"
 
 _CONTROL_STATE_FIELDS = {
     "schema",
@@ -27,6 +29,7 @@ _CONTROL_STATE_FIELDS = {
 _CONTROL_STATE_RESUMED_FIELDS = _CONTROL_STATE_FIELDS | {"resumed_from_incident"}
 
 WORKER_ROLES = {
+    "source_probe",
     "primary_inventory",
     "independent_inventory",
     "context_analyzer",
@@ -38,6 +41,7 @@ WORKER_ROLES = {
 }
 
 ROLE_STAGES = {
+    "source_probe": {"discovery"},
     "primary_inventory": {"inventory"},
     "independent_inventory": {"inventory"},
     "context_analyzer": {"context"},
@@ -116,6 +120,12 @@ INVENTORY_ISSUE_CODES = {
     "inventory_not_declared_complete",
 }
 
+DISCOVERY_ISSUE_CODES = {
+    "existing_target_locale_present",
+    "source_identity_unresolved",
+    "sdk_selection_incomplete",
+}
+
 CONTEXT_ISSUE_CODES = {
     "context_coverage_incomplete",
     "context_execution_incomplete",
@@ -145,6 +155,7 @@ VALIDATION_ISSUE_CODES = {
 }
 
 ISSUE_CODES_BY_STAGE = {
+    "discovery": COMMON_ISSUE_CODES | DISCOVERY_ISSUE_CODES,
     "inventory": COMMON_ISSUE_CODES | INVENTORY_ISSUE_CODES,
     "context": COMMON_ISSUE_CODES | ROUTING_ISSUE_CODES | CONTEXT_ISSUE_CODES,
     "translation": COMMON_ISSUE_CODES | ROUTING_ISSUE_CODES | TRANSLATION_ISSUE_CODES,
@@ -192,6 +203,67 @@ LEAK_INCIDENT_CODES = {
     "prose_refusal_explanation_received",
     "source_or_candidate_received",
 }
+
+
+def initial_control_plane_entry_state() -> dict[str, Any]:
+    return {
+        "schema": CONTROL_ENTRY_SCHEMA,
+        "status": "pending",
+        "issue_code": "control_plane_entry_required",
+    }
+
+
+def control_plane_entry_state(work_dir: Path) -> dict[str, Any]:
+    path = work_dir / CONTROL_ENTRY_PATH
+    if not path.is_file():
+        return initial_control_plane_entry_state()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema",
+        "status",
+        "issue_code",
+    }:
+        raise ConfigurationError(
+            "E_CONTROL_PLANE_ENTRY_STATE: state contains unsupported fields"
+        )
+    if payload.get("schema") != CONTROL_ENTRY_SCHEMA:
+        raise ConfigurationError("E_CONTROL_PLANE_ENTRY_STATE: unsupported schema")
+    status = payload.get("status")
+    issue_code = payload.get("issue_code")
+    if status not in {"pending", "ready"}:
+        raise ConfigurationError("E_CONTROL_PLANE_ENTRY_STATE: invalid status")
+    if issue_code != ("control_plane_entry_required" if status == "pending" else ""):
+        raise ConfigurationError("E_CONTROL_PLANE_ENTRY_STATE: invalid issue code")
+    return dict(payload)
+
+
+def public_control_plane_entry_state(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": state["schema"],
+        "status": state["status"],
+        "issue_code": state["issue_code"],
+    }
+
+
+def require_control_plane_entry(work_dir: Path) -> dict[str, Any]:
+    state = control_plane_entry_state(work_dir)
+    if state["status"] != "ready":
+        raise ConfigurationError(
+            "E_CONTROL_PLANE_ENTRY_REQUIRED: read the required control-plane contracts "
+            "and establish a text-free control plane before any game-content operation"
+        )
+    return state
+
+
+def establish_control_plane_entry(work_dir: Path) -> dict[str, Any]:
+    require_control_plane_ready(work_dir)
+    state = {
+        "schema": CONTROL_ENTRY_SCHEMA,
+        "status": "ready",
+        "issue_code": "",
+    }
+    _atomic_json(work_dir / CONTROL_ENTRY_PATH, state)
+    return state
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -295,6 +367,7 @@ def record_control_plane_leak(work_dir: Path, incident_code: str) -> dict[str, A
         "incident_code": incident_code,
     }
     _atomic_json(work_dir / CONTROL_STATE_PATH, contaminated)
+    _atomic_json(work_dir / CONTROL_ENTRY_PATH, initial_control_plane_entry_state())
     return contaminated
 
 
@@ -314,6 +387,7 @@ def acknowledge_control_plane_rotation(work_dir: Path, incident_id: str) -> dict
         "resumed_from_incident": incident_id,
     }
     _atomic_json(work_dir / CONTROL_STATE_PATH, resumed)
+    _atomic_json(work_dir / CONTROL_ENTRY_PATH, initial_control_plane_entry_state())
     return resumed
 
 
