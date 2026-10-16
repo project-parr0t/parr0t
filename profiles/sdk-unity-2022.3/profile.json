@@ -11,13 +11,23 @@
     },
     {
       "path": "README.md",
-      "bytes": 1595,
-      "sha256": "09e0aa0bdd605d09aa6dea654f93157fa2df5b44817898cc905cffc697d256f8"
+      "bytes": 3101,
+      "sha256": "3c6e657d7f9328faf942143a674ce5082e39f787ffb62b25d3c5f2998d5eea52"
     },
     {
       "path": "selftest.py",
-      "bytes": 1682,
-      "sha256": "c40d38cded7a4808c96d383b603b8922a2230957f19b07563efe5f19812c3bde"
+      "bytes": 2506,
+      "sha256": "5fb032acc190e342422f25dcbe6c9eb3adc4faa5bb2a82f221c1b38fe97efdc5"
+    },
+    {
+      "path": "unity_layout.py",
+      "bytes": 5085,
+      "sha256": "4de5d461b0a2c702645bbf707d8ce21159359ccf9cebb49b2df1224bfc5c9a3a"
+    },
+    {
+      "path": "unity_serialized.py",
+      "bytes": 5933,
+      "sha256": "049fc004053fef4bc0b84aa3d5f848d6648c784813a3a28be5eae23fba97e115"
     },
     {
       "path": "unity_textasset.py",

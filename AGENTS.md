@@ -69,4 +69,4 @@ For launcher-neutral Windows packages, `-GameRoot` accepts absolute paths and pa
 
 ## Unity 2022.3 prototype branch
 
-Read `docs/unity-2022.3.md` before using this profile. It supports only Unity 2022.3 Mono players whose ordered INI locale tables are `TextAsset` objects in one UnityFS bundle. Treat its traversal as one primary inventory, obtain an independently implemented second inventory, and keep static coverage incomplete for every unaccounted user-visible class. Build the replacement bundle in the private workspace and verify that non-target objects and locale assets remain unchanged.
+Read `docs/unity-2022.3.md` for exact capability bounds. Bundle INI extraction remains incomplete; an independent inventory is mandatory. Standalone helpers support v22 little-endian object relocation, Font payload replacement and caller-supplied UI metrics. Build workspace artifacts and preserve unowned data. Static metrics do not prove runtime font or layout behavior; load the engine runbook only for a matching trigger.

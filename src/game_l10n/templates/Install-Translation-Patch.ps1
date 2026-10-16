@@ -33,8 +33,14 @@ function Get-PublicFailure([string]$InternalCode) {
         '^E_(MANIFEST_MISSING|UNSAFE_PATH|ARTIFACT_FINGERPRINT|CHECKPOINT_MISSING|CHECKPOINT_SIZE|CHECKPOINT_HASH|PAYLOAD_MISSING|PAYLOAD_SIZE|PAYLOAD_HASH)$' {
             return @("PARR0T-E001", "설치 패키지가 손상되었거나 구성이 올바르지 않습니다.", "ZIP을 다시 다운로드한 뒤 모든 파일을 한 폴더에 압축 해제해 주세요.")
         }
+        '^E_GAME_ROOT_NOT_FOUND$' {
+            return @("PARR0T-E002", "입력한 게임 폴더를 찾을 수 없습니다.", ("상대 경로 기준 폴더는 '{0}'입니다. 이 위치를 기준으로 경로를 다시 입력해 주세요." -f $InvocationRoot))
+        }
+        '^E_GAME_ROOT_MARKERS_MISSING$' {
+            return @("PARR0T-E002", "입력한 폴더는 존재하지만 이 패치가 지원하는 게임 폴더로 확인되지 않았습니다.", "게임 실행 파일과 패치 대상 파일이 들어 있는 최상위 폴더를 선택해 주세요.")
+        }
         '^E_GAME_ROOT_INVALID$' {
-            return @("PARR0T-E002", "올바른 게임 설치 폴더를 찾지 못했습니다.", "게임의 설치 폴더를 확인한 뒤 그 폴더를 다시 입력하거나 창으로 끌어 놓아 주세요.")
+            return @("PARR0T-E002", "게임 폴더 경로 형식이 올바르지 않습니다.", ("상대 경로 기준 폴더는 '{0}'입니다. 경로를 다시 입력하거나 폴더를 창으로 끌어 놓아 주세요." -f $InvocationRoot))
         }
         '^E_RUNTIME_APPROVAL_REQUIRED$' {
             return @("PARR0T-E005", "자동 설치에 필요한 승인이 없습니다.", "직접 설치하려면 배치 파일을 더블클릭하세요. 에이전트 자동 실행이라면 해당 작업의 일회성 승인을 전달해야 합니다.")
@@ -228,15 +234,51 @@ function Find-GameRoot($Manifest) {
     return $null
 }
 
-function Resolve-GameRootInput([string]$Value) {
+function Normalize-GameRootInput([string]$Value) {
     if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-    if ([IO.Path]::IsPathRooted($Value)) { return $Value }
-    return [IO.Path]::GetFullPath([IO.Path]::Combine($InvocationRoot, $Value))
+    $normalized = $Value.Trim()
+    if ($normalized.Length -ge 2) {
+        $first = $normalized[0]
+        $last = $normalized[$normalized.Length - 1]
+        if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
+            $normalized = $normalized.Substring(1, $normalized.Length - 2).Trim()
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($normalized)) { throw "E_GAME_ROOT_INVALID" }
+    return $normalized
+}
+
+function Resolve-GameRootInput([string]$Value) {
+    $normalized = Normalize-GameRootInput $Value
+    if ($null -eq $normalized) { return $null }
+    try {
+        if ([IO.Path]::IsPathRooted($normalized)) {
+            return [IO.Path]::GetFullPath($normalized)
+        }
+        return [IO.Path]::GetFullPath([IO.Path]::Combine($InvocationRoot, $normalized))
+    } catch {
+        throw "E_GAME_ROOT_INVALID"
+    }
+}
+
+function Resolve-VerifiedGameRoot([string]$Value, $Manifest) {
+    $candidate = Resolve-GameRootInput $Value
+    if ($null -eq $candidate) { throw "E_GAME_ROOT_INVALID" }
+    if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+        throw "E_GAME_ROOT_NOT_FOUND"
+    }
+    if (-not (Test-GameRoot $candidate $Manifest)) {
+        throw "E_GAME_ROOT_MARKERS_MISSING"
+    }
+    return (Resolve-Path -LiteralPath $candidate).Path
 }
 
 function Resolve-GameRoot($Manifest) {
     $requested = Resolve-GameRootInput $GameRoot
     if (Test-GameRoot $requested $Manifest) { return (Resolve-Path -LiteralPath $requested).Path }
+    if (-not [string]::IsNullOrWhiteSpace($GameRoot) -and $null -ne $Manifest.target) {
+        return Resolve-VerifiedGameRoot $GameRoot $Manifest
+    }
     if ([string]::IsNullOrWhiteSpace($GameRoot) -and $null -ne $Manifest.target) {
         if (Test-GameRoot $InvocationRoot $Manifest) { return (Resolve-Path -LiteralPath $InvocationRoot).Path }
     }
@@ -248,9 +290,7 @@ function Resolve-GameRoot($Manifest) {
         Write-PatchStatus "안내" "이 패키지는 사용자가 게임 설치 폴더를 직접 선택해야 합니다." Yellow
     }
     $manual = Read-Host "게임 설치 폴더를 절대/상대 경로로 입력하거나 탐색기에서 이 창으로 끌어 놓으세요"
-    $manualPath = Resolve-GameRootInput $manual
-    if (-not (Test-GameRoot $manualPath $Manifest)) { throw "E_GAME_ROOT_INVALID" }
-    return (Resolve-Path -LiteralPath $manualPath).Path
+    return Resolve-VerifiedGameRoot $manual $Manifest
 }
 
 function Get-ReceiptPath([string]$Root, $Manifest) {
