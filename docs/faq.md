@@ -257,8 +257,16 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **Symptom:** A large translation or review pass has reasonable unique input and output, but aggregate input is orders of magnitude larger, cached input dominates usage, later workers become slower, or a worker accumulates thousands of model events.
 - **General cause:** Data-plane agents inherit the parent conversation or remain alive across multiple shards. Every next target replays prior targets, tool output, reasoning, and results, so context cost grows superlinearly even when most tokens are cached.
 - **Diagnosis:** Compare root and worker counts, model-event counts, aggregate input, cached input, uncached input, and output without reading game text. Inspect whether workers used parent-history forks or received follow-up tasks after completing a shard.
-- **Resolution:** Regenerate `prepare-native-pass` v2 tasks with bounded ID and estimated-material limits. Start one fresh no-history worker per task, pass only artifact paths and the immutable contract, write results directly to private files, and return metadata only. Do not repair a long worker with more summaries or compaction.
+- **Resolution:** Regenerate `prepare-native-pass` v3 tasks with bounded ID and estimated-material limits. Start one fresh no-history worker per task, pass only artifact paths and the immutable contract, write results directly to private files, and return metadata only. Do not repair a long worker with more summaries or compaction.
 - **Prevention:** Keep the default 32-ID/12,000-estimated-material-token bounds, never reuse completed native workers, and treat a high cached-input ratio as a rotation signal rather than evidence that long-lived sessions are efficient.
+
+## A handful of residual review items takes hours to finish
+
+- **Symptom:** The complete pass is done and only a few corrections remain, but the job creates controllers, ownership or lease records, liveness checks, proof bundles, repeated context supplements, or dozens of status waits instead of finishing the targets.
+- **General cause:** Bulk-work reliability machinery was recursively rebuilt for the residual tail. Capacity failures then restarted a long-lived root turn, so metadata and conversation history grew while the remaining target count did not.
+- **Diagnosis:** Compare the frozen residual count with worker dispatches and state changes. More than one task for at most 32 targets, any job-local orchestration layer, repeated identical progress snapshots, or a capacity restart of the root turn violates the residual convergence contract.
+- **Resolution:** Keep every passed result, generate one `prepare-native-pass` v3 residual task, run it in one fresh no-history worker, and aggregate once. On capacity or startup failure, preserve that exact task in resumable operational state and return; do not create another controller or automatic continuation.
+- **Prevention:** Keep `residual_direct_records=32`, `job_local_controller_allowed=false`, `automatic_capacity_restart_allowed=false`, `max_unchanged_progress_observations=1`, and `max_control_actions_without_progress=2`. Report only at wave boundaries or blockers. Semantic quality checks and the existing two-round review limit still apply; only orchestration churn is removed.
 
 ## A short API fallback target consumes tens of thousands of input tokens
 
