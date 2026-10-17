@@ -1,0 +1,59 @@
+{
+  "profile": "sdk-unity-6000.4",
+  "engine": "unity",
+  "version": "6000.4",
+  "selection_mode": "derive-new",
+  "reference_branch": "sdk-unity-2022.3",
+  "contains_game_data": false,
+  "backend": "Mono",
+  "dependencies": {
+    "UnityPy": "1.25.4",
+    "Mono_Cecil": "0.11.6"
+  },
+  "capabilities": [
+    "explicit_typed_string_fields",
+    "explicit_raw_string_spans",
+    "unityfs_opaque_preservation",
+    "managed_cil_explicit_ldstr",
+    "explicit_tmp_dynamic_fallback_serialization"
+  ],
+  "static_discovery_complete": false,
+  "runtime_verified": false,
+  "files": [
+    {
+      "path": "ManagedLiteralWriter.cs",
+      "bytes": 8235,
+      "sha256": "cbab0ab1419ffdad89ad4325eb6dc0ffe59fcbaa24d6108b1dcc9b1c0df6bd6b"
+    },
+    {
+      "path": "pack.py",
+      "bytes": 450,
+      "sha256": "871ff3e2e8f824ee1e4f6689ad2793aa124b7223837a57f36d45d76bbb80fa3b"
+    },
+    {
+      "path": "README.md",
+      "bytes": 1073,
+      "sha256": "d3fa603f2a7e118d91611f0860328108bea96c96e00e9d8c05d9be21bc8a14d5"
+    },
+    {
+      "path": "unity_adapter.py",
+      "bytes": 10890,
+      "sha256": "8d314b92b85e9d7a15ac4f7eaa8200834b8a291baa3c9182d7028d04b1048ea5"
+    },
+    {
+      "path": "unity_fonts.py",
+      "bytes": 12822,
+      "sha256": "90308ae3c4752bb0db7418852c45b65b1f5123f419de8c94df22394c96812e70"
+    },
+    {
+      "path": "unity_serialized.py",
+      "bytes": 12976,
+      "sha256": "781fa78a6f375c46ca53556d7a570431021a886a375943c5675c8fa77e0eeb64"
+    },
+    {
+      "path": "unpack.py",
+      "bytes": 451,
+      "sha256": "356f918f9404412413c66328dc6dc4ead7b01fd895c5169a7cfb0f432ef1ee4c"
+    }
+  ]
+}
