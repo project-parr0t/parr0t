@@ -133,6 +133,13 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "native_shard_material_tokens": 12000,
         "native_worker_history": "none",
         "native_worker_reuse": False,
+        "residual_direct_records": 32,
+        "job_local_controller_allowed": False,
+        "automatic_capacity_restart_allowed": False,
+        "max_unchanged_progress_observations": 1,
+        "max_control_actions_without_progress": 2,
+        "aggregate_once_per_wave": True,
+        "progress_report_mode": "wave_boundary_or_blocker_only",
     },
     "control_plane": {
         "envelope_schema": "parr0t.control-envelope.v2",
@@ -199,7 +206,7 @@ This private workspace contains game data and localization artifacts. Resolve th
 - Build and validate a new recoverable output here. Never mutate or launch the real game during automated validation. Real install, update, remove/restore, and launch each require their own explicit one-shot authorization.
 - Retryable failures stay in the metadata-only failure queue. Terminal source-preserved outcomes are recorded separately and are not retried as pending work; `metadata.blocking_on_failure=true` holds the entire patch.
 - Keep publication dormant and unmentioned until the user requests it. SDK promotion also requires confirmed patch success and the original exact target identity. Its separate engine-only commit must pass `game-l10n verify-sdk-promotion`; never mix a `main`-owned path into that commit.
-- Use proportional checks, keep small coupled work in the current agent, and stop after the required layer passes.
+- Use proportional checks, keep small coupled work in the current agent, and stop after the required layer passes. Once a pass leaves no more than `execution.residual_direct_records`, use one fresh worker on one cached residual task; do not create a job-local scheduler, controller, lease/owner system, liveness proof, memoization layer, or supplemental evidence pack. A native capacity failure ends that worker attempt and enters resumable state; it must not auto-restart the root turn. Aggregate once per wave, report progress only at a wave boundary or blocker, and stop after one unchanged progress observation or two control actions without measurable progress.
 
 ## Status routes
 
