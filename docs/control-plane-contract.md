@@ -2,6 +2,8 @@
 
 The top-level Parr0t agent schedules work and advances queues. It does not inspect or judge game text. This boundary applies from preliminary discovery through final validation; it is not limited to translation and review providers. Arbitrary subprocess output remains in private workspace logs; a parent-facing tool failure is categorical only.
 
+Deterministic native-wave collection is part of the private data plane. `import-native-wave` may parse result text locally, but its stdout is limited to wave/task/record counts and workspace-relative artifact paths. It validates the complete wave before writing shards. The parent must not open those shards; it uses the same task manifest for the final aggregate merge so unrelated files cannot enter the pass.
+
 ## Entry gate
 
 The boundary begins before preliminary discovery. The top-level agent may confirm that repository, workspace, and supplied source paths exist, but it must not list, open, search, grep, preview, parse, or classify files inside a game root. README files, manifests, configuration, scripts, assets, archives, and existing locale files are all data-plane material. Existing-locale detection and engine/version discovery therefore run in a fresh isolated `source_probe` worker at the `discovery` stage. It records resulting SDK-selection metadata inside the private workspace and returns only a validated control-envelope path.
