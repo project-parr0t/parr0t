@@ -108,7 +108,7 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(summary["tasks"], 3)
         self.assertTrue(summary["fresh_worker_per_task"])
         self.assertEqual(summary["history_mode"], "none")
-        self.assertEqual(manifest["version"], 2)
+        self.assertEqual(manifest["version"], 3)
         self.assertEqual(manifest["max_material_tokens"], 300)
         self.assertEqual(manifest["worker_contract"]["max_followup_tasks"], 0)
         self.assertEqual(manifest["worker_contract"]["parent_result"], "metadata_only")
@@ -121,8 +121,55 @@ class NativePassTests(unittest.TestCase):
             "workspace_relative_envelope_path_only",
         )
         self.assertFalse(manifest["worker_contract"]["free_form_parent_response_allowed"])
+        self.assertEqual(
+            manifest["execution_contract"]["strategy"],
+            "bounded_slot_queue",
+        )
+        self.assertFalse(
+            manifest["execution_contract"]["job_local_controller_allowed"]
+        )
+        self.assertFalse(
+            manifest["execution_contract"]["automatic_root_turn_restart_allowed"]
+        )
+        self.assertEqual(
+            manifest["execution_contract"]["max_unchanged_progress_observations"],
+            1,
+        )
+        self.assertEqual(
+            manifest["execution_contract"]["max_control_actions_without_progress"],
+            2,
+        )
+        self.assertEqual(
+            manifest["execution_contract"]["progress_reporting"],
+            "wave_boundary_or_blocker_only",
+        )
         self.assertTrue(
             all(task["records"] == 1 for task in manifest["tasks"])
+        )
+
+    def test_small_residual_pass_uses_one_direct_task_without_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "fixture-source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            output = root / "fixture-tasks"
+            summary = prepare_native_tasks(
+                root,
+                source,
+                [Segment(f"fixture-{index}", f"SOURCE_{index}") for index in range(4)],
+                output,
+                max_records=32,
+            )
+
+        contract = summary["execution_contract"]
+        self.assertEqual(summary["tasks"], 1)
+        self.assertEqual(contract["strategy"], "direct_single_task")
+        self.assertFalse(contract["job_local_controller_allowed"])
+        self.assertFalse(contract["task_replanning_allowed"])
+        self.assertFalse(contract["new_proof_layers_allowed"])
+        self.assertEqual(
+            contract["capacity_failure_action"],
+            "defer_task_and_end_worker_attempt",
         )
 
 
