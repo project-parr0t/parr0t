@@ -129,10 +129,22 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "same_failure_limit": 2,
         "reuse_unchanged_checks": True,
         "delegate_simple_tasks": False,
-        "native_shard_records": 32,
-        "native_shard_material_tokens": 12000,
+        "native_shard_policy_version": 2,
+        "native_shard_records": 64,
+        "native_shard_min_records": 8,
+        "native_shard_material_tokens": 24000,
         "native_worker_history": "none",
         "native_worker_reuse": False,
+        "native_agent_max_depth": 1,
+        "model_controller_allowed": False,
+        "worker_delegation_allowed": False,
+        "max_root_model_calls_per_wave": 12,
+        "max_root_model_calls_per_turn": 64,
+        "max_root_input_tokens_per_turn": 5000000,
+        "max_root_progress_messages_per_wave": 1,
+        "max_worker_model_calls_per_task": 16,
+        "budget_exhaustion_action": "checkpoint_and_return_control",
+        "contract_reload_policy": "digest_change_or_new_control_generation_only",
         "residual_direct_records": 32,
         "job_local_controller_allowed": False,
         "automatic_capacity_restart_allowed": False,
@@ -206,6 +218,7 @@ This private workspace contains game data and localization artifacts. Resolve th
 - Build and validate a new recoverable output here. Never mutate or launch the real game during automated validation. Real install, update, remove/restore, and launch each require their own explicit one-shot authorization.
 - Retryable failures stay in the metadata-only failure queue. Terminal source-preserved outcomes are recorded separately and are not retried as pending work; `metadata.blocking_on_failure=true` holds the entire patch.
 - Keep publication dormant and unmentioned until the user requests it. SDK promotion also requires confirmed patch success and the original exact target identity. Its separate engine-only commit must pass `game-l10n verify-sdk-promotion`; never mix a `main`-owned path into that commit.
+- Native orchestration is root-direct for the entire pass: the root dispatches prepared tasks straight to fresh workers, and neither a controller agent nor worker delegation is permitted. Obey the manifest's depth, per-wave, root-call, worker-call, and input-token ceilings. On any ceiling, checkpoint and return control instead of compacting, summarizing, or spawning another controller. Do not reread an unchanged contract set; `status.contract_set.digest` changes when reloading is required.
 - Use proportional checks, keep small coupled work in the current agent, and stop after the required layer passes. Once a pass leaves no more than `execution.residual_direct_records`, use one fresh worker on one cached residual task; do not create a job-local scheduler, controller, lease/owner system, liveness proof, memoization layer, or supplemental evidence pack. A native capacity failure ends that worker attempt and enters resumable state; it must not auto-restart the root turn. Aggregate once per wave, report progress only at a wave boundary or blocker, and stop after one unchanged progress observation or two control actions without measurable progress.
 
 ## Status routes
@@ -811,6 +824,31 @@ def _write_config(work_dir: Path, config: dict[str, Any]) -> None:
     )
 
 
+def _apply_execution_defaults(config: dict[str, Any]) -> None:
+    execution = config.setdefault("execution", {})
+    if not isinstance(execution, dict):
+        raise ConfigurationError("Workspace execution policy must be an object")
+    try:
+        policy_version = int(execution.get("native_shard_policy_version", 1))
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError("native_shard_policy_version must be an integer") from exc
+    if policy_version < 2 and (
+        (
+            execution.get("native_shard_records") == 256
+            and "native_shard_material_tokens" not in execution
+        )
+        or (
+            execution.get("native_shard_records") == 32
+            and execution.get("native_shard_material_tokens") == 12_000
+        )
+    ):
+        execution["native_shard_records"] = 64
+        execution["native_shard_material_tokens"] = 24_000
+    for key, value in CONFIG_TEMPLATE["execution"].items():
+        execution.setdefault(key, value)
+    execution["native_shard_policy_version"] = 2
+
+
 def initialize_workspace(
     work_dir: Path,
     sdk_root: Path,
@@ -946,6 +984,7 @@ def load_config(work_dir: Path) -> dict[str, Any]:
     if not path.is_file():
         raise ConfigurationError(f"Workspace config not found: {path}")
     config = json.loads(path.read_text(encoding="utf-8"))
+    _apply_execution_defaults(config)
     lock_path = work_dir / MODE_LOCK_PATH
     mode_lock = (
         json.loads(lock_path.read_text(encoding="utf-8"))
