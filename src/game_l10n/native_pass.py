@@ -14,14 +14,30 @@ from .store import stable_hash
 
 ALLOWED_STATUSES = {"success", "refused", "error", "invalid"}
 SAFE_NAME = re.compile(r"[^a-z0-9._-]+")
-TASK_MANIFEST_VERSION = 3
-DEFAULT_MAX_RECORDS = 32
-DEFAULT_MAX_MATERIAL_TOKENS = 12_000
+TASK_MANIFEST_VERSION = 4
+DEFAULT_MAX_RECORDS = 64
+DEFAULT_MIN_RECORDS = 8
+DEFAULT_MAX_MATERIAL_TOKENS = 24_000
+DEFAULT_MAX_WORKERS = 8
 
 
-def _execution_contract(task_count: int) -> dict[str, Any]:
+def _execution_contract(task_count: int, max_workers: int) -> dict[str, Any]:
     return {
         "strategy": "direct_single_task" if task_count == 1 else "bounded_slot_queue",
+        "orchestration_owner": "root_control_plane",
+        "model_controller_allowed": False,
+        "max_agent_depth": 1,
+        "worker_delegation_allowed": False,
+        "max_parallel_workers": max_workers,
+        "max_tasks_per_wave": max_workers,
+        "estimated_waves": (task_count + max_workers - 1) // max_workers,
+        "max_root_model_calls_per_wave": 12,
+        "max_root_model_calls_per_turn": 64,
+        "max_root_input_tokens_per_turn": 5_000_000,
+        "max_root_progress_messages_per_wave": 1,
+        "max_worker_model_calls_per_task": 16,
+        "budget_exhaustion_action": "checkpoint_and_return_control",
+        "contract_reload_policy": "digest_change_or_new_control_generation_only",
         "job_local_controller_allowed": False,
         "task_replanning_allowed": False,
         "new_proof_layers_allowed": False,
@@ -32,6 +48,60 @@ def _execution_contract(task_count: int) -> dict[str, Any]:
         "capacity_failure_action": "defer_task_and_end_worker_attempt",
         "automatic_root_turn_restart_allowed": False,
     }
+
+
+def _batch_fits(
+    batch: list[tuple[int, Segment, int]],
+    *,
+    max_records: int,
+    max_material_tokens: int,
+) -> bool:
+    if not batch or len(batch) > max_records:
+        return False
+    oversized = [item for item in batch if item[2] > max_material_tokens]
+    if oversized:
+        return len(batch) == 1
+    return sum(item[2] for item in batch) <= max_material_tokens
+
+
+def _rebalance_small_tail(
+    batches: list[list[tuple[int, Segment, int]]],
+    *,
+    min_records: int,
+    max_records: int,
+    max_material_tokens: int,
+) -> None:
+    """Avoid a tiny final worker task when two bounded tasks can be balanced."""
+
+    if len(batches) < 2 or len(batches[-1]) >= min_records:
+        return
+    combined = batches[-2] + batches[-1]
+    choices: list[tuple[int, int, int, int]] = []
+    for split in range(1, len(combined)):
+        left = combined[:split]
+        right = combined[split:]
+        if not _batch_fits(
+            left,
+            max_records=max_records,
+            max_material_tokens=max_material_tokens,
+        ) or not _batch_fits(
+            right,
+            max_records=max_records,
+            max_material_tokens=max_material_tokens,
+        ):
+            continue
+        smallest = min(len(left), len(right))
+        choices.append(
+            (
+                0 if smallest >= min_records else 1,
+                abs(len(left) - len(right)),
+                -smallest,
+                split,
+            )
+        )
+    if choices:
+        split = min(choices)[-1]
+        batches[-2:] = [combined[:split], combined[split:]]
 
 
 def _atomic_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
@@ -79,13 +149,21 @@ def prepare_native_tasks(
     output_dir: Path,
     *,
     max_records: int = DEFAULT_MAX_RECORDS,
+    min_records: int | None = None,
     max_material_tokens: int = DEFAULT_MAX_MATERIAL_TOKENS,
+    max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> dict[str, Any]:
     require_control_plane_ready(work_dir)
     if not 1 <= max_records <= 2000:
         raise ValueError("max_records must be between 1 and 2000")
+    if min_records is None:
+        min_records = min(DEFAULT_MIN_RECORDS, max_records)
+    if not 1 <= min_records <= max_records:
+        raise ValueError("min_records must be between 1 and max_records")
     if not 256 <= max_material_tokens <= 1_000_000:
         raise ValueError("max_material_tokens must be between 256 and 1000000")
+    if not 1 <= max_workers <= 64:
+        raise ValueError("max_workers must be between 1 and 64")
     if not segments:
         raise ValueError("Ordered source contains no segments")
     ids = [segment.id for segment in segments]
@@ -105,10 +183,12 @@ def prepare_native_tasks(
             manifest.get("version") == TASK_MANIFEST_VERSION
             and manifest.get("source_fingerprint") == fingerprint
             and manifest.get("max_records") == max_records
+            and manifest.get("min_records") == min_records
             and manifest.get("max_material_tokens") == max_material_tokens
+            and manifest.get("max_workers") == max_workers
         ):
             task_rows = manifest.get("tasks", [])
-            expected_execution_contract = _execution_contract(len(task_rows))
+            expected_execution_contract = _execution_contract(len(task_rows), max_workers)
             valid = (
                 bool(task_rows)
                 and manifest.get("execution_contract") == expected_execution_contract
@@ -125,7 +205,9 @@ def prepare_native_tasks(
                     "records": len(segments),
                     "tasks": len(task_rows),
                     "max_records": max_records,
+                    "min_records": min_records,
                     "max_material_tokens": max_material_tokens,
+                    "max_workers": max_workers,
                     "fresh_worker_per_task": True,
                     "history_mode": "none",
                     "execution_contract": execution_contract,
@@ -152,6 +234,12 @@ def prepare_native_tasks(
         current_tokens += estimated_tokens
     if current:
         batches.append(current)
+    _rebalance_small_tail(
+        batches,
+        min_records=min_records,
+        max_records=max_records,
+        max_material_tokens=max_material_tokens,
+    )
 
     for batch in batches:
         number = len(tasks) + 1
@@ -166,6 +254,8 @@ def prepare_native_tasks(
         tasks.append(
             {
                 "file": name,
+                "wave": (number - 1) // max_workers + 1,
+                "slot": (number - 1) % max_workers + 1,
                 "records": len(rows),
                 "estimated_material_tokens": sum(item[2] for item in batch),
                 "oversized_target_count": sum(
@@ -177,18 +267,25 @@ def prepare_native_tasks(
     for stale in output_dir.glob("task-*.jsonl"):
         if stale.name not in expected:
             stale.unlink()
-    execution_contract = _execution_contract(len(tasks))
+    execution_contract = _execution_contract(len(tasks), max_workers)
     manifest = {
         "version": TASK_MANIFEST_VERSION,
         "source_artifact": source_artifact,
         "source_fingerprint": fingerprint,
         "max_records": max_records,
+        "min_records": min_records,
         "max_material_tokens": max_material_tokens,
+        "max_workers": max_workers,
         "records": len(segments),
         "worker_contract": {
             "history_mode": "none",
             "fresh_worker_per_task": True,
             "max_followup_tasks": 0,
+            "max_agent_depth": 1,
+            "delegation_allowed": False,
+            "model_controller_role_allowed": False,
+            "max_model_calls_per_task": 16,
+            "max_parent_progress_messages": 0,
             "task_message_contains_game_text": False,
             "parent_result": "metadata_only",
             "control_envelope_schema": CONTROL_ENVELOPE_SCHEMA,
@@ -206,7 +303,9 @@ def prepare_native_tasks(
         "records": len(segments),
         "tasks": len(tasks),
         "max_records": max_records,
+        "min_records": min_records,
         "max_material_tokens": max_material_tokens,
+        "max_workers": max_workers,
         "fresh_worker_per_task": True,
         "history_mode": "none",
         "execution_contract": execution_contract,

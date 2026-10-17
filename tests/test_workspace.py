@@ -73,6 +73,47 @@ def activate_workspace_adapter(work: Path, *, reference_checkout: Path | None = 
 
 
 class WorkspaceTests(unittest.TestCase):
+    def test_legacy_native_execution_defaults_upgrade_in_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            initialize_workspace(work, sdk, git_choice="disabled")
+            config_path = work / "game-l10n.json"
+            legacy = json.loads(config_path.read_text(encoding="utf-8"))
+            execution = legacy["execution"]
+            execution["native_shard_records"] = 32
+            execution["native_shard_material_tokens"] = 12_000
+            for key in (
+                "native_shard_policy_version",
+                "native_shard_min_records",
+                "native_agent_max_depth",
+                "model_controller_allowed",
+                "worker_delegation_allowed",
+                "max_root_model_calls_per_wave",
+                "max_root_model_calls_per_turn",
+                "max_root_input_tokens_per_turn",
+                "max_root_progress_messages_per_wave",
+                "max_worker_model_calls_per_task",
+                "budget_exhaustion_action",
+                "contract_reload_policy",
+            ):
+                execution.pop(key, None)
+            config_path.write_text(
+                json.dumps(legacy, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            upgraded = load_config(work)["execution"]
+
+        self.assertEqual(upgraded["native_shard_policy_version"], 2)
+        self.assertEqual(upgraded["native_shard_records"], 64)
+        self.assertEqual(upgraded["native_shard_min_records"], 8)
+        self.assertEqual(upgraded["native_shard_material_tokens"], 24_000)
+        self.assertFalse(upgraded["model_controller_allowed"])
+        self.assertFalse(upgraded["worker_delegation_allowed"])
+        self.assertEqual(upgraded["max_root_model_calls_per_turn"], 64)
+
     def test_completion_state_rejects_contradictory_semantic_claims(self) -> None:
         state = {
             "source_inventory": {"fingerprint": "fixture", "static_complete": True},
@@ -161,10 +202,24 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(config["execution"]["validation_profile"], "proportional")
         self.assertEqual(config["execution"]["same_failure_limit"], 2)
         self.assertFalse(config["execution"]["delegate_simple_tasks"])
-        self.assertEqual(config["execution"]["native_shard_records"], 32)
-        self.assertEqual(config["execution"]["native_shard_material_tokens"], 12000)
+        self.assertEqual(config["execution"]["native_shard_policy_version"], 2)
+        self.assertEqual(config["execution"]["native_shard_records"], 64)
+        self.assertEqual(config["execution"]["native_shard_min_records"], 8)
+        self.assertEqual(config["execution"]["native_shard_material_tokens"], 24000)
         self.assertEqual(config["execution"]["native_worker_history"], "none")
         self.assertFalse(config["execution"]["native_worker_reuse"])
+        self.assertEqual(config["execution"]["native_agent_max_depth"], 1)
+        self.assertFalse(config["execution"]["model_controller_allowed"])
+        self.assertFalse(config["execution"]["worker_delegation_allowed"])
+        self.assertEqual(config["execution"]["max_root_model_calls_per_wave"], 12)
+        self.assertEqual(config["execution"]["max_root_model_calls_per_turn"], 64)
+        self.assertEqual(
+            config["execution"]["max_root_input_tokens_per_turn"], 5_000_000
+        )
+        self.assertEqual(
+            config["execution"]["budget_exhaustion_action"],
+            "checkpoint_and_return_control",
+        )
         self.assertEqual(config["execution"]["residual_direct_records"], 32)
         self.assertFalse(config["execution"]["job_local_controller_allowed"])
         self.assertFalse(config["execution"]["automatic_capacity_restart_allowed"])
@@ -238,6 +293,8 @@ class WorkspaceTests(unittest.TestCase):
             "docs/instance-release.md",
             "startup-current-directory-relative paths",
             "one cached residual task",
+            "root-direct for the entire pass",
+            "status.contract_set.digest",
             "must not auto-restart the root turn",
             "report progress only at a wave boundary or blocker",
         ):
@@ -880,6 +937,13 @@ class WorkspaceTests(unittest.TestCase):
                 "docs/provider-protocol.md",
                 "docs/execution-budget.md",
             ],
+        )
+        self.assertEqual(first["contract_set"]["schema"], "parr0t.contract-set.v1")
+        self.assertEqual(len(first["contract_set"]["digest"]), 64)
+        self.assertEqual(first["contract_set"]["control_generation"], 1)
+        self.assertEqual(
+            first["contract_set"]["reload_policy"],
+            "digest_change_or_new_control_generation_only",
         )
         self.assertEqual(second["next_actions"], ["ask_user_for_initial_git_choice"])
         self.assertEqual(

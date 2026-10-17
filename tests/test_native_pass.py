@@ -108,9 +108,26 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(summary["tasks"], 3)
         self.assertTrue(summary["fresh_worker_per_task"])
         self.assertEqual(summary["history_mode"], "none")
-        self.assertEqual(manifest["version"], 3)
+        self.assertEqual(manifest["version"], 4)
+        self.assertEqual(manifest["min_records"], 8)
         self.assertEqual(manifest["max_material_tokens"], 300)
+        self.assertEqual(manifest["max_workers"], 8)
+        self.assertEqual(
+            [(task["wave"], task["slot"]) for task in manifest["tasks"]],
+            [(1, 1), (1, 2), (1, 3)],
+        )
         self.assertEqual(manifest["worker_contract"]["max_followup_tasks"], 0)
+        self.assertEqual(manifest["worker_contract"]["max_agent_depth"], 1)
+        self.assertFalse(manifest["worker_contract"]["delegation_allowed"])
+        self.assertFalse(
+            manifest["worker_contract"]["model_controller_role_allowed"]
+        )
+        self.assertEqual(
+            manifest["worker_contract"]["max_model_calls_per_task"], 16
+        )
+        self.assertEqual(
+            manifest["worker_contract"]["max_parent_progress_messages"], 0
+        )
         self.assertEqual(manifest["worker_contract"]["parent_result"], "metadata_only")
         self.assertEqual(
             manifest["worker_contract"]["control_envelope_schema"],
@@ -127,6 +144,33 @@ class NativePassTests(unittest.TestCase):
         )
         self.assertFalse(
             manifest["execution_contract"]["job_local_controller_allowed"]
+        )
+        self.assertFalse(
+            manifest["execution_contract"]["model_controller_allowed"]
+        )
+        self.assertFalse(
+            manifest["execution_contract"]["worker_delegation_allowed"]
+        )
+        self.assertEqual(manifest["execution_contract"]["max_agent_depth"], 1)
+        self.assertEqual(
+            manifest["execution_contract"]["orchestration_owner"],
+            "root_control_plane",
+        )
+        self.assertEqual(
+            manifest["execution_contract"]["max_root_model_calls_per_wave"],
+            12,
+        )
+        self.assertEqual(
+            manifest["execution_contract"]["max_root_model_calls_per_turn"],
+            64,
+        )
+        self.assertEqual(
+            manifest["execution_contract"]["max_root_input_tokens_per_turn"],
+            5_000_000,
+        )
+        self.assertEqual(
+            manifest["execution_contract"]["budget_exhaustion_action"],
+            "checkpoint_and_return_control",
         )
         self.assertFalse(
             manifest["execution_contract"]["automatic_root_turn_restart_allowed"]
@@ -170,6 +214,31 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(
             contract["capacity_failure_action"],
             "defer_task_and_end_worker_attempt",
+        )
+
+    def test_small_tail_is_rebalanced_instead_of_creating_one_record_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "fixture-source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            output = root / "fixture-tasks"
+            summary = prepare_native_tasks(
+                root,
+                source,
+                [Segment(f"fixture-{index}", "S") for index in range(65)],
+                output,
+                max_records=64,
+                min_records=8,
+                max_material_tokens=1_000_000,
+            )
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(summary["tasks"], 2)
+        self.assertEqual(
+            [task["records"] for task in manifest["tasks"]],
+            [32, 33],
         )
 
 

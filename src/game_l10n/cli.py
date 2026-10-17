@@ -52,7 +52,15 @@ from .formats import (
 from .filesystem_package import build_filesystem_package, validate_filesystem_package
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext
 from .instance_release import validate_instance_release
-from .native_pass import import_native_shard, merge_native_pass, prepare_native_tasks
+from .native_pass import (
+    DEFAULT_MAX_MATERIAL_TOKENS,
+    DEFAULT_MAX_RECORDS,
+    DEFAULT_MAX_WORKERS,
+    DEFAULT_MIN_RECORDS,
+    import_native_shard,
+    merge_native_pass,
+    prepare_native_tasks,
+)
 from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from .privacy import is_within, require_external_workdir
 from .providers import ProviderRegistry
@@ -158,6 +166,28 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
 
 def _status_contracts(action: str) -> list[str]:
     return list(STATUS_ACTION_CONTRACTS[action])
+
+
+def _status_contract_set(
+    contract_base: str | None,
+    action: str,
+    control_generation: int,
+) -> dict[str, Any]:
+    paths = _status_contracts(action)
+    digest = hashlib.sha256()
+    base = Path(contract_base).resolve() if contract_base else None
+    for relative in paths:
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        path = base / relative if base is not None else None
+        digest.update(path.read_bytes() if path is not None and path.is_file() else b"<missing>")
+        digest.update(b"\0")
+    return {
+        "schema": "parr0t.contract-set.v1",
+        "digest": digest.hexdigest(),
+        "control_generation": control_generation,
+        "reload_policy": "digest_change_or_new_control_generation_only",
+    }
 
 
 def _read_status_object(
@@ -877,21 +907,42 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     output = _path_in_workspace(work_dir, args.output)
     execution = config.get("execution", {})
-    legacy_default = (
-        execution.get("native_shard_records") == 256
-        and "native_shard_material_tokens" not in execution
+    stored_records = execution.get("native_shard_records")
+    stored_material = execution.get("native_shard_material_tokens")
+    legacy_default = int(execution.get("native_shard_policy_version", 1)) < 2 and (
+        (stored_records == 256 and stored_material is None)
+        or (stored_records == 32 and stored_material == 12_000)
     )
     max_records = (
         args.max_records
         if args.max_records is not None
-        else 32
+        else DEFAULT_MAX_RECORDS
         if legacy_default
-        else int(execution.get("native_shard_records", 32))
+        else int(execution.get("native_shard_records", DEFAULT_MAX_RECORDS))
     )
     max_material_tokens = (
         args.max_material_tokens
         if args.max_material_tokens is not None
-        else int(execution.get("native_shard_material_tokens", 12_000))
+        else DEFAULT_MAX_MATERIAL_TOKENS
+        if legacy_default
+        else int(
+            execution.get(
+                "native_shard_material_tokens", DEFAULT_MAX_MATERIAL_TOKENS
+            )
+        )
+    )
+    min_records = (
+        args.min_records
+        if args.min_records is not None
+        else min(
+            int(execution.get("native_shard_min_records", DEFAULT_MIN_RECORDS)),
+            max_records,
+        )
+    )
+    max_workers = (
+        args.max_workers
+        if args.max_workers is not None
+        else int(config.get("routing", {}).get("max_workers", DEFAULT_MAX_WORKERS))
     )
     result = prepare_native_tasks(
         work_dir,
@@ -899,7 +950,9 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
         read_segments(source),
         output,
         max_records=max_records,
+        min_records=min_records,
         max_material_tokens=max_material_tokens,
+        max_workers=max_workers,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -957,6 +1010,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "contract_base": contract_base,
                     "next_actions": [action],
                     "required_contracts": _status_contracts(action),
+                    "contract_set": _status_contract_set(
+                        contract_base, action, int(control_state.get("generation", 0))
+                    ),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -975,6 +1031,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "contract_base": contract_base,
                     "next_actions": [action],
                     "required_contracts": _status_contracts(action),
+                    "contract_set": _status_contract_set(
+                        contract_base, action, int(control_state.get("generation", 0))
+                    ),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -1191,6 +1250,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "contract_base": contract_base,
                 "next_actions": [action],
                 "required_contracts": _status_contracts(action),
+                "contract_set": _status_contract_set(
+                    contract_base, action, int(control_state.get("generation", 0))
+                ),
             },
             ensure_ascii=False,
             indent=2,
@@ -1611,9 +1673,19 @@ def build_parser() -> argparse.ArgumentParser:
     native_prepare.add_argument("--output", required=True, help="Private task directory")
     native_prepare.add_argument("--max-records", type=int)
     native_prepare.add_argument(
+        "--min-records",
+        type=int,
+        help="Preferred minimum records per native task when bounds allow",
+    )
+    native_prepare.add_argument(
         "--max-material-tokens",
         type=int,
         help="Estimated private input-material cap per fresh native worker task",
+    )
+    native_prepare.add_argument(
+        "--max-workers",
+        type=int,
+        help="Maximum direct root-to-worker dispatches active in one wave",
     )
     native_prepare.set_defaults(func=cmd_prepare_native_pass)
 
