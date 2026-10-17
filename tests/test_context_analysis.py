@@ -170,6 +170,33 @@ class ContextAnalysisTests(unittest.TestCase):
         self.assertEqual(first.story_summary, second.story_summary)
         self.assertEqual(provider.call_count, 1)
 
+    def test_cached_context_adds_inventory_binding_without_model_reanalysis(self) -> None:
+        provider = ScriptedProvider("context", successful_context)
+        analyzer = ContextAnalyzer(ProviderRegistry({"context": provider}), ["context"])
+        segments = [Segment("1", "SOURCE", speaker="A", scene="S")]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            analyze_with_cache(
+                analyzer=analyzer,
+                segments=segments,
+                output_path=root / "context.json",
+                state_path=root / "state.json",
+            )
+            _, cached = analyze_with_cache(
+                analyzer=analyzer,
+                segments=segments,
+                output_path=root / "context.json",
+                state_path=root / "state.json",
+                source_inventory_fingerprint="verified-inventory",
+            )
+            state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(cached)
+        self.assertEqual(provider.call_count, 1)
+        self.assertEqual(
+            state["source_inventory_fingerprint"], "verified-inventory"
+        )
+
     def test_preserves_supported_reference_cues_and_segment_metadata(self) -> None:
         captured = {}
 
