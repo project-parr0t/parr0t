@@ -14,9 +14,24 @@ from .store import stable_hash
 
 ALLOWED_STATUSES = {"success", "refused", "error", "invalid"}
 SAFE_NAME = re.compile(r"[^a-z0-9._-]+")
-TASK_MANIFEST_VERSION = 2
+TASK_MANIFEST_VERSION = 3
 DEFAULT_MAX_RECORDS = 32
 DEFAULT_MAX_MATERIAL_TOKENS = 12_000
+
+
+def _execution_contract(task_count: int) -> dict[str, Any]:
+    return {
+        "strategy": "direct_single_task" if task_count == 1 else "bounded_slot_queue",
+        "job_local_controller_allowed": False,
+        "task_replanning_allowed": False,
+        "new_proof_layers_allowed": False,
+        "aggregate_once_per_wave": True,
+        "progress_reporting": "wave_boundary_or_blocker_only",
+        "max_unchanged_progress_observations": 1,
+        "max_control_actions_without_progress": 2,
+        "capacity_failure_action": "defer_task_and_end_worker_attempt",
+        "automatic_root_turn_restart_allowed": False,
+    }
 
 
 def _atomic_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
@@ -93,12 +108,18 @@ def prepare_native_tasks(
             and manifest.get("max_material_tokens") == max_material_tokens
         ):
             task_rows = manifest.get("tasks", [])
-            valid = bool(task_rows) and all(
-                (output_dir / item["file"]).is_file()
-                and _file_sha256(output_dir / item["file"]) == item["sha256"]
-                for item in task_rows
+            expected_execution_contract = _execution_contract(len(task_rows))
+            valid = (
+                bool(task_rows)
+                and manifest.get("execution_contract") == expected_execution_contract
+                and all(
+                    (output_dir / item["file"]).is_file()
+                    and _file_sha256(output_dir / item["file"]) == item["sha256"]
+                    for item in task_rows
+                )
             )
             if valid:
+                execution_contract = expected_execution_contract
                 return {
                     "cached": True,
                     "records": len(segments),
@@ -107,6 +128,7 @@ def prepare_native_tasks(
                     "max_material_tokens": max_material_tokens,
                     "fresh_worker_per_task": True,
                     "history_mode": "none",
+                    "execution_contract": execution_contract,
                     "manifest": str(manifest_path),
                     "artifacts": [str(output_dir / item["file"]) for item in task_rows],
                 }
@@ -155,6 +177,7 @@ def prepare_native_tasks(
     for stale in output_dir.glob("task-*.jsonl"):
         if stale.name not in expected:
             stale.unlink()
+    execution_contract = _execution_contract(len(tasks))
     manifest = {
         "version": TASK_MANIFEST_VERSION,
         "source_artifact": source_artifact,
@@ -172,6 +195,7 @@ def prepare_native_tasks(
             "worker_final_response": "workspace_relative_envelope_path_only",
             "free_form_parent_response_allowed": False,
         },
+        "execution_contract": execution_contract,
         "tasks": tasks,
     }
     temporary = manifest_path.with_name(f"{manifest_path.name}.tmp")
@@ -185,6 +209,7 @@ def prepare_native_tasks(
         "max_material_tokens": max_material_tokens,
         "fresh_worker_per_task": True,
         "history_mode": "none",
+        "execution_contract": execution_contract,
         "manifest": str(manifest_path),
         "artifacts": [str(output_dir / item["file"]) for item in tasks],
     }
