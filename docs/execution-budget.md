@@ -39,7 +39,7 @@ Use subagents when work divides into independent, non-overlapping bulk translati
 
 Every delegated worker must have an exclusive output and a clear completion envelope. Do not delegate a duplicate review of a deterministic pass merely to increase confidence.
 
-For native bulk localization, create stable exclusive ID tasks once with `prepare-native-pass`. Each target retains its own candidate and refusal status. Keep only the available worker slots active, use bounded waits, and dispatch the next task when a slot opens. Do not launch one subagent per target or poll every worker repeatedly.
+For native bulk localization, create stable exclusive ID tasks once with `prepare-native-pass`. Each target retains its own candidate and refusal status. Keep only the available worker slots active, use bounded waits, and dispatch the next task when a slot opens. After every task in a wave finishes, run `import-native-wave` once instead of importing each shard in separate root turns. Do not launch one subagent per target or poll every worker repeatedly.
 
 ## Codex control-turn budget
 
@@ -47,7 +47,7 @@ Native orchestration is root-direct. The root control plane prepares a determini
 
 The v4 task manifest is the executable budget. One wave uses at most `routing.max_workers` direct workers, 12 root model calls, and one root progress message. One root turn stops at 64 model calls or 5,000,000 reported input tokens, whichever comes first. A worker stops after its one task, at 16 model calls, with no parent-facing progress messages or follow-up task. Reaching a limit checkpoints unchanged queue state and returns control; it must not trigger a summary, compaction, replacement controller, nested worker, or automatic continuation.
 
-Read each required contract set once per control-plane generation. `game-l10n status` returns `contract_set.digest`; reread only when that digest or the generation changes. Tool output and worker responses stay in artifacts. The root receives only fixed-size metadata and must not turn each command, wait, shard completion, or unchanged observation into another narrated model turn.
+Read each required contract set once per control-plane generation. `game-l10n status` returns `contract_set.digest`; reread only when that digest or the generation changes. A context state bound to the current independently verified inventory fingerprint is sufficient for status; do not parse the same ordered inventory again merely to reproduce its segment digest. Tool output and worker responses stay in artifacts. The root receives only fixed-size metadata and must not turn each command, wait, shard completion, or unchanged observation into another narrated model turn.
 
 ## Residual convergence gate
 
@@ -64,6 +64,8 @@ Native workers are data-plane executors, not long-lived chats. Start every trans
 One worker processes one task and then ends. Do not send another shard through a follow-up turn, even when the worker is idle. Long-lived workers accumulate every previous target and tool result; replaying that history on each next target makes input usage grow superlinearly while adding no translation evidence.
 
 `prepare-native-pass` v4 defaults to at most 64 IDs and 24,000 estimated private material tokens per task, with a preferred eight-record minimum when two adjacent bounded tasks can be balanced. Its manifest also carries the complete root-direct execution contract: no model controller, no worker delegation, one aggregation per wave, bounded root/worker calls, and no automatic root-turn restart after capacity failure. The estimate sizes scheduling material only and is not a provider billing claim. Lower either hard maximum when focused context, source records, or expected target output is large. A single oversized target remains isolated in its own task. Reuse the cached task manifest only when the source fingerprint, all sizing/worker bounds, and manifest version match.
+
+Workers write result files using their task filenames in a private wave result directory. `import-native-wave` validates every result against the exclusive task order before writing any shard and prints aggregate counts and private artifact paths only. Merge with the same manifest so stale or unrelated shards are ignored. The legacy one-shard import and unbound merge remain compatibility paths, not the preferred bulk route.
 
 An older workspace that still has either the former implicit 256-record setting or the v3 32/12,000 defaults and no v4 policy marker automatically receives the new v4 bounds. Explicit `--max-records`, `--min-records`, `--max-material-tokens`, and `--max-workers` values remain authoritative.
 

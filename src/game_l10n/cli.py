@@ -58,6 +58,7 @@ from .native_pass import (
     DEFAULT_MAX_WORKERS,
     DEFAULT_MIN_RECORDS,
     import_native_shard,
+    import_native_wave,
     merge_native_pass,
     prepare_native_tasks,
 )
@@ -207,7 +208,10 @@ def _read_status_object(
 
 
 def _context_state_valid(
-    payload: dict[str, Any], context_path: Path, source_segments_digest: str
+    payload: dict[str, Any],
+    context_path: Path,
+    source_segments_digest: str | None,
+    source_inventory_fingerprint: str,
 ) -> bool:
     execution = payload.get("execution")
     if payload.get("status") != "success" or not isinstance(execution, dict):
@@ -218,6 +222,17 @@ def _context_state_valid(
     if not context_path.is_file():
         return False
     output_body = context_path.read_bytes()
+    recorded_inventory = payload.get("source_inventory_fingerprint")
+    if "source_inventory_fingerprint" in payload:
+        source_binding_valid = bool(
+            isinstance(recorded_inventory, str)
+            and recorded_inventory == source_inventory_fingerprint
+        )
+    else:
+        source_binding_valid = bool(
+            source_segments_digest is not None
+            and payload.get("source_segments_digest") == source_segments_digest
+        )
     return bool(
         execution.get("status") == "success"
         and isinstance(total, int)
@@ -226,7 +241,7 @@ def _context_state_valid(
         and isinstance(parts, list)
         and len(parts) == total
         and all(isinstance(item, dict) and item.get("status") == "success" for item in parts)
-        and payload.get("source_segments_digest") == source_segments_digest
+        and source_binding_valid
         and payload.get("output_sha256") == hashlib.sha256(output_body).hexdigest()
         and payload.get("output_size") == len(output_body)
     )
@@ -425,7 +440,12 @@ def _orchestrator(work_dir: Path, context_pack: ContextPack) -> LocalizationOrch
 
 
 def _analyze_context(
-    work_dir: Path, segments: list, *, force: bool = False, context_mode: str | None = None
+    work_dir: Path,
+    segments: list,
+    *,
+    source_inventory_fingerprint: str | None = None,
+    force: bool = False,
+    context_mode: str | None = None,
 ) -> tuple[ContextPack, bool]:
     config = load_config(work_dir)
     require_direct_provider_pipeline(config, "direct context-provider execution")
@@ -444,6 +464,7 @@ def _analyze_context(
         segments=segments,
         output_path=_path_in_workspace(work_dir, context_relative),
         state_path=work_dir / ".game-l10n" / "context-state.json",
+        source_inventory_fingerprint=source_inventory_fingerprint,
         force=force,
     )
 
@@ -581,6 +602,7 @@ def cmd_translate(args: argparse.Namespace) -> int:
     context_pack, context_cached = _analyze_context(
         work_dir,
         inventory_segments,
+        source_inventory_fingerprint=inventory_state["primary_fingerprint"],
         force=args.force_context,
         context_mode=args.context_mode,
     )
@@ -627,6 +649,7 @@ def cmd_review_existing(args: argparse.Namespace) -> int:
     context_pack, context_cached = _analyze_context(
         work_dir,
         inventory_segments,
+        source_inventory_fingerprint=inventory_state["primary_fingerprint"],
         force=args.force_context,
         context_mode=args.context_mode,
     )
@@ -687,6 +710,7 @@ def cmd_resume_failures(args: argparse.Namespace) -> int:
     context_pack, context_cached = _analyze_context(
         work_dir,
         inventory_segments,
+        source_inventory_fingerprint=inventory_state["primary_fingerprint"],
         force=args.force_context,
         context_mode=args.context_mode,
     )
@@ -776,10 +800,11 @@ def cmd_analyze_context(args: argparse.Namespace) -> int:
     require_direct_provider_pipeline(config, "game-l10n analyze-context")
     require_sdk_activation(work_dir, config)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
-    require_inventory_attestation(work_dir, source)
+    inventory_state = require_inventory_attestation(work_dir, source)
     context_pack, cached = _analyze_context(
         work_dir,
         read_segments(source),
+        source_inventory_fingerprint=inventory_state["primary_fingerprint"],
         force=args.force,
         context_mode=args.context_mode,
     )
@@ -835,6 +860,19 @@ def cmd_import_native_shard(args: argparse.Namespace) -> int:
     require_sdk_activation(work_dir, load_config(work_dir))
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     result = import_native_shard(work_dir, source, args.name)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_import_native_wave(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    require_sdk_activation(work_dir, load_config(work_dir))
+    result = import_native_wave(
+        work_dir,
+        _path_in_workspace(work_dir, args.manifest, must_exist=True),
+        _path_in_workspace(work_dir, args.input_dir, must_exist=True),
+        args.wave,
+    )
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -963,7 +1001,18 @@ def cmd_merge_native_pass(args: argparse.Namespace) -> int:
     require_sdk_activation(work_dir, load_config(work_dir))
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     destination = _path_in_workspace(work_dir, args.output)
-    result = merge_native_pass(work_dir, read_segments(source), destination)
+    manifest_arg = getattr(args, "manifest", None)
+    manifest = (
+        _path_in_workspace(work_dir, manifest_arg, must_exist=True)
+        if manifest_arg
+        else None
+    )
+    result = merge_native_pass(
+        work_dir,
+        read_segments(source),
+        destination,
+        manifest_path=manifest,
+    )
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result["complete"] else 1
 
@@ -1172,19 +1221,31 @@ def cmd_status(args: argparse.Namespace) -> int:
                     context_state, context_issue = _read_status_object(
                         context_state_path, label="CONTEXT_ATTESTATION"
                     )
-                    source_segments_digest = stable_hash(
-                        [
-                            asdict(item)
-                            for item in read_segments(Path(inventory_state["primary_path"]))
-                        ]
-                    )
+                    source_segments_digest = None
+                    if (
+                        context_state is not None
+                        and not isinstance(
+                            context_state.get("source_inventory_fingerprint"), str
+                        )
+                    ):
+                        source_segments_digest = stable_hash(
+                            [
+                                asdict(item)
+                                for item in read_segments(
+                                    Path(inventory_state["primary_path"])
+                                )
+                            ]
+                        )
                     if context_issue:
                         state_issue_codes.append(context_issue)
                         action = "repair_invalid_workspace_state"
                     elif (
                         context_state is None
                         or not _context_state_valid(
-                            context_state, context_path, source_segments_digest
+                            context_state,
+                            context_path,
+                            source_segments_digest,
+                            inventory_state["primary_fingerprint"],
                         )
                     ):
                         action = "analyze_complete_script_context"
@@ -1698,6 +1759,20 @@ def build_parser() -> argparse.ArgumentParser:
     native_import.add_argument("--name", required=True)
     native_import.set_defaults(func=cmd_import_native_shard)
 
+    native_wave_import = sub.add_parser(
+        "import-native-wave",
+        help="Validate and import every exclusive native result in one completed wave",
+    )
+    native_wave_import.add_argument("--workspace", required=True)
+    native_wave_import.add_argument("--manifest", required=True)
+    native_wave_import.add_argument(
+        "--input-dir",
+        required=True,
+        help="Private directory containing result files named like the manifest task files",
+    )
+    native_wave_import.add_argument("--wave", required=True, type=int)
+    native_wave_import.set_defaults(func=cmd_import_native_wave)
+
     native_merge = sub.add_parser(
         "merge-native-pass",
         help="Merge exclusive native-agent shards in stable source order",
@@ -1705,6 +1780,10 @@ def build_parser() -> argparse.ArgumentParser:
     native_merge.add_argument("--workspace", required=True)
     native_merge.add_argument("--input", required=True, help="Ordered source segment file")
     native_merge.add_argument("--output", required=True)
+    native_merge.add_argument(
+        "--manifest",
+        help="Prepared task manifest; when provided, ignore unrelated or stale shard files",
+    )
     native_merge.set_defaults(func=cmd_merge_native_pass)
 
     exchange_prepare = sub.add_parser(

@@ -130,6 +130,84 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
+    try:
+        manifest_path.resolve().relative_to(work_dir.resolve())
+    except ValueError as exc:
+        raise ValueError("Native task manifest must stay inside the private workspace") from exc
+    if not manifest_path.is_file():
+        raise ValueError("Native task manifest does not exist")
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Native task manifest must be version {TASK_MANIFEST_VERSION}")
+    tasks = payload.get("tasks")
+    if payload.get("version") != TASK_MANIFEST_VERSION or not isinstance(tasks, list) or not tasks:
+        raise ValueError(f"Native task manifest must be version {TASK_MANIFEST_VERSION}")
+    if not isinstance(payload.get("source_fingerprint"), str) or not payload["source_fingerprint"]:
+        raise ValueError("Native task manifest source fingerprint is missing")
+    seen_files: set[str] = set()
+    for task in tasks:
+        if not isinstance(task, dict):
+            raise ValueError("Native task manifest contains an invalid task")
+        name = task.get("file")
+        wave = task.get("wave")
+        records = task.get("records")
+        digest = task.get("sha256")
+        if (
+            not isinstance(name, str)
+            or not name
+            or Path(name).name != name
+            or name in seen_files
+            or not isinstance(wave, int)
+            or isinstance(wave, bool)
+            or wave < 1
+            or not isinstance(records, int)
+            or isinstance(records, bool)
+            or records < 1
+            or not isinstance(digest, str)
+            or not digest
+        ):
+            raise ValueError("Native task manifest contains an invalid task binding")
+        task_path = manifest_path.parent / name
+        if not task_path.is_file() or _file_sha256(task_path) != digest:
+            raise ValueError("Native task manifest references a missing or changed task")
+        seen_files.add(name)
+    return payload
+
+
+def _manifest_shard_path(
+    work_dir: Path, manifest: dict[str, Any], task: dict[str, Any]
+) -> Path:
+    binding = stable_hash(
+        {
+            "source_fingerprint": manifest["source_fingerprint"],
+            "task_file": task["file"],
+        }
+    )[:16]
+    stem = Path(task["file"]).stem
+    return work_dir / ".game-l10n" / "native" / "shards" / f"{binding}-{stem}.jsonl"
+
+
+def _task_target_ids(task_path: Path) -> list[str]:
+    rows = _read_jsonl(task_path)
+    ids: list[str] = []
+    for row in rows:
+        target_id = row.get("target_id")
+        ordinal = row.get("ordinal")
+        if (
+            not isinstance(target_id, str)
+            or not target_id
+            or not isinstance(ordinal, int)
+            or isinstance(ordinal, bool)
+            or ordinal < 0
+        ):
+            raise ValueError("Native task file contains an invalid target binding")
+        ids.append(target_id)
+    if len(ids) != len(set(ids)):
+        raise ValueError("Native task file contains duplicate target bindings")
+    return ids
+
+
 def _estimated_material_tokens(segment: Segment) -> int:
     """Estimate private input material for shard sizing, not provider billing."""
 
@@ -358,10 +436,75 @@ def import_native_shard(work_dir: Path, source: Path, shard_name: str) -> dict[s
     }
 
 
+def import_native_wave(
+    work_dir: Path,
+    manifest_path: Path,
+    source_dir: Path,
+    wave: int,
+) -> dict[str, Any]:
+    """Validate and import one completed manifest wave without exposing result text."""
+
+    require_control_plane_ready(work_dir)
+    if not isinstance(wave, int) or isinstance(wave, bool) or wave < 1:
+        raise ValueError("Native wave must be a positive integer")
+    try:
+        source_dir.resolve().relative_to(work_dir.resolve())
+    except ValueError as exc:
+        raise ValueError("Native wave results must stay inside the private workspace") from exc
+    if not source_dir.is_dir():
+        raise ValueError("Native wave result directory does not exist")
+
+    manifest = _load_task_manifest(work_dir, manifest_path)
+    tasks = [task for task in manifest["tasks"] if task["wave"] == wave]
+    if not tasks:
+        raise ValueError("Native task manifest does not contain the requested wave")
+
+    planned: list[tuple[Path, list[dict[str, Any]]]] = []
+    wave_ids: set[str] = set()
+    for task in tasks:
+        expected_ids = _task_target_ids(manifest_path.parent / task["file"])
+        if len(expected_ids) != task["records"]:
+            raise ValueError("Native task record count does not match its manifest binding")
+        result_path = source_dir / task["file"]
+        if not result_path.is_file():
+            raise ValueError("Native wave result is incomplete")
+        try:
+            rows = [_validate_row(row) for row in _read_jsonl(result_path)]
+        except (ValueError, json.JSONDecodeError):
+            raise ValueError("Native wave result is invalid") from None
+        result_ids = [row["target_id"] for row in rows]
+        if result_ids != expected_ids:
+            raise ValueError("Native wave result does not match its exclusive task binding")
+        if wave_ids.intersection(result_ids):
+            raise ValueError("Native wave results overlap")
+        wave_ids.update(result_ids)
+        planned.append((_manifest_shard_path(work_dir, manifest, task), rows))
+
+    for destination, rows in planned:
+        _atomic_jsonl(destination, rows)
+
+    records = sum(len(rows) for _, rows in planned)
+    success = sum(row["status"] == "success" for _, rows in planned for row in rows)
+    return {
+        "schema": "parr0t.native-wave-import.v1",
+        "wave": wave,
+        "tasks": len(planned),
+        "records": records,
+        "success": success,
+        "failed": records - success,
+        "artifacts": [
+            destination.resolve().relative_to(work_dir.resolve()).as_posix()
+            for destination, _ in planned
+        ],
+    }
+
+
 def merge_native_pass(
     work_dir: Path,
     segments: list[Segment],
     destination: Path,
+    *,
+    manifest_path: Path | None = None,
 ) -> dict[str, Any]:
     require_control_plane_ready(work_dir)
     order = {segment.id: index for index, segment in enumerate(segments)}
@@ -369,13 +512,54 @@ def merge_native_pass(
         raise ValueError("Ordered source contains duplicate target IDs")
     collected: dict[str, dict[str, Any]] = {}
     shard_root = work_dir / ".game-l10n" / "native" / "shards"
-    for shard in sorted(shard_root.glob("*.jsonl")):
-        for raw in _read_jsonl(shard):
-            row = _validate_row(raw)
+    manifest_bound = manifest_path is not None
+    expected_shards = 0
+    shard_bindings: list[tuple[Path, list[str] | None]] = []
+    if manifest_path is not None:
+        manifest = _load_task_manifest(work_dir, manifest_path)
+        fingerprint = stable_hash([asdict(segment) for segment in segments])
+        if (
+            manifest.get("source_fingerprint") != fingerprint
+            or manifest.get("records") != len(segments)
+        ):
+            raise ValueError("Native task manifest targets a different ordered source")
+        expected_shards = len(manifest["tasks"])
+        shard_bindings = [
+            (
+                _manifest_shard_path(work_dir, manifest, task),
+                _task_target_ids(manifest_path.parent / task["file"]),
+            )
+            for task in manifest["tasks"]
+        ]
+    else:
+        shard_bindings = [(path, None) for path in sorted(shard_root.glob("*.jsonl"))]
+        expected_shards = len(shard_bindings)
+
+    imported_shards = 0
+    for shard, expected_ids in shard_bindings:
+        if not shard.is_file():
+            continue
+        if expected_ids is None:
+            rows = [_validate_row(raw) for raw in _read_jsonl(shard)]
+        else:
+            try:
+                rows = [_validate_row(raw) for raw in _read_jsonl(shard)]
+            except (ValueError, json.JSONDecodeError):
+                raise ValueError("Imported native shard is invalid") from None
+        if expected_ids is not None and [row["target_id"] for row in rows] != expected_ids:
+            raise ValueError("Imported native shard no longer matches its task binding")
+        imported_shards += 1
+        for row in rows:
             target_id = row["target_id"]
             if target_id not in order:
-                raise ValueError(f"Native shard target ID is absent from ordered source: {target_id}")
+                if manifest_bound:
+                    raise ValueError("Imported native shard is outside the ordered source")
+                raise ValueError(
+                    f"Native shard target ID is absent from ordered source: {target_id}"
+                )
             if target_id in collected:
+                if manifest_bound:
+                    raise ValueError("Imported native shards overlap")
                 raise ValueError(f"Native shards overlap on target ID: {target_id}")
             if row["status"] == "success":
                 row["candidate_generation"] = 1
@@ -390,5 +574,8 @@ def merge_native_pass(
         "failed": sum(row["status"] != "success" for row in merged),
         "missing": missing,
         "complete": missing == 0,
+        "manifest_bound": manifest_bound,
+        "expected_shards": expected_shards,
+        "imported_shards": imported_shards,
         "artifact": str(destination),
     }

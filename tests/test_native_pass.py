@@ -6,7 +6,12 @@ import unittest
 from pathlib import Path
 
 from game_l10n.models import Segment
-from game_l10n.native_pass import import_native_shard, merge_native_pass, prepare_native_tasks
+from game_l10n.native_pass import (
+    import_native_shard,
+    import_native_wave,
+    merge_native_pass,
+    prepare_native_tasks,
+)
 
 
 class NativePassTests(unittest.TestCase):
@@ -61,6 +66,128 @@ class NativePassTests(unittest.TestCase):
                     [Segment("fixture-1", "SOURCE")],
                     root / "merged.jsonl",
                 )
+
+    def test_wave_import_validates_all_results_then_manifest_merge_ignores_stale_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            segments = [
+                Segment(f"fixture-{index}", f"SOURCE_{index}") for index in range(4)
+            ]
+            tasks = root / "tasks"
+            prepare_native_tasks(
+                root,
+                source,
+                segments,
+                tasks,
+                max_records=2,
+                max_workers=2,
+            )
+            results = root / "results"
+            results.mkdir()
+            for number in (1, 2):
+                task_path = tasks / f"task-{number:04d}.jsonl"
+                task_rows = [
+                    json.loads(line)
+                    for line in task_path.read_text(encoding="utf-8").splitlines()
+                ]
+                self._write_rows(
+                    results / task_path.name,
+                    [
+                        {
+                            "target_id": row["target_id"],
+                            "status": "success",
+                            "text": f"TARGET_{row['ordinal']}",
+                        }
+                        for row in task_rows
+                    ],
+                )
+
+            summary = import_native_wave(root, tasks / "manifest.json", results, 1)
+            stale = root / ".game-l10n" / "native" / "shards" / "stale.jsonl"
+            self._write_rows(
+                stale,
+                [{"target_id": "not-in-source", "status": "success", "text": "STALE"}],
+            )
+            output = root / "merged.jsonl"
+            merged = merge_native_pass(
+                root,
+                segments,
+                output,
+                manifest_path=tasks / "manifest.json",
+            )
+            rows = [
+                json.loads(line)
+                for line in output.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(summary["tasks"], 2)
+        self.assertEqual(summary["records"], 4)
+        self.assertEqual(summary["success"], 4)
+        self.assertEqual(summary["failed"], 0)
+        self.assertNotIn("fixture-", json.dumps(summary))
+        self.assertNotIn("TARGET_", json.dumps(summary))
+        self.assertTrue(merged["manifest_bound"])
+        self.assertEqual(merged["expected_shards"], 2)
+        self.assertEqual(merged["imported_shards"], 2)
+        self.assertTrue(merged["complete"])
+        self.assertEqual(
+            [row["target_id"] for row in rows],
+            [f"fixture-{index}" for index in range(4)],
+        )
+
+    def test_wave_import_is_atomic_when_any_result_breaks_its_task_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            segments = [Segment(f"fixture-{index}", "SOURCE") for index in range(4)]
+            tasks = root / "tasks"
+            prepare_native_tasks(
+                root,
+                source,
+                segments,
+                tasks,
+                max_records=2,
+                max_workers=2,
+            )
+            results = root / "results"
+            results.mkdir()
+            first_rows = [
+                json.loads(line)
+                for line in (tasks / "task-0001.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self._write_rows(
+                results / "task-0001.jsonl",
+                [
+                    {
+                        "target_id": row["target_id"],
+                        "status": "success",
+                        "text": "TARGET",
+                    }
+                    for row in first_rows
+                ],
+            )
+            self._write_rows(
+                results / "task-0002.jsonl",
+                [
+                    {
+                        "target_id": "wrong-binding",
+                        "status": "success",
+                        "text": "TARGET",
+                    }
+                ],
+            )
+
+            with self.assertRaisesRegex(ValueError, "exclusive task binding"):
+                import_native_wave(root, tasks / "manifest.json", results, 1)
+            shard_root = root / ".game-l10n" / "native" / "shards"
+            imported = list(shard_root.glob("*.jsonl")) if shard_root.exists() else []
+
+        self.assertEqual(imported, [])
 
     def test_native_tasks_are_exclusive_and_cached(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

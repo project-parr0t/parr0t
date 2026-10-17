@@ -14,7 +14,12 @@ from unittest.mock import patch
 
 from dataclasses import asdict
 
-from game_l10n.cli import _completion_state_valid, cmd_status, cmd_translate
+from game_l10n.cli import (
+    _completion_state_valid,
+    _context_state_valid,
+    cmd_status,
+    cmd_translate,
+)
 from game_l10n.control_plane import (
     control_plane_entry_state,
     establish_control_plane_entry,
@@ -73,6 +78,39 @@ def activate_workspace_adapter(work: Path, *, reference_checkout: Path | None = 
 
 
 class WorkspaceTests(unittest.TestCase):
+    def test_context_status_binding_supports_fast_and_legacy_states(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            context = Path(directory) / "context.json"
+            body = b"{}\n"
+            context.write_bytes(body)
+            payload = {
+                "status": "success",
+                "source_segments_digest": "segments-v1",
+                "output_sha256": hashlib.sha256(body).hexdigest(),
+                "output_size": len(body),
+                "execution": {
+                    "status": "success",
+                    "total_parts": 1,
+                    "completed_parts": 1,
+                    "parts": [{"status": "success"}],
+                },
+            }
+            self.assertTrue(
+                _context_state_valid(
+                    payload,
+                    context,
+                    "segments-v1",
+                    "inventory-v1",
+                )
+            )
+            payload["source_inventory_fingerprint"] = "inventory-v1"
+            self.assertTrue(
+                _context_state_valid(payload, context, None, "inventory-v1")
+            )
+            self.assertFalse(
+                _context_state_valid(payload, context, None, "inventory-v2")
+            )
+
     def test_legacy_native_execution_defaults_upgrade_in_memory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1064,6 +1102,7 @@ class WorkspaceTests(unittest.TestCase):
                     {
                         "status": "success",
                         "source_segments_digest": source_segments_digest,
+                        "source_inventory_fingerprint": inventory_fingerprint,
                         "output_sha256": hashlib.sha256(context_body).hexdigest(),
                         "output_size": len(context_body),
                         "execution": {
@@ -1088,8 +1127,12 @@ class WorkspaceTests(unittest.TestCase):
             }
 
             translation_output = StringIO()
-            with redirect_stdout(translation_output):
-                translation_exit = cmd_status(SimpleNamespace(workspace=str(work)))
+            with patch(
+                "game_l10n.cli.read_segments",
+                side_effect=AssertionError("status reparsed an inventory already bound by fingerprint"),
+            ):
+                with redirect_stdout(translation_output):
+                    translation_exit = cmd_status(SimpleNamespace(workspace=str(work)))
             translation_status = json.loads(translation_output.getvalue())
 
             (state_root / "completion-attestation.json").write_text(
