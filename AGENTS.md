@@ -67,6 +67,4 @@ For launcher-neutral Windows packages, `-GameRoot` accepts absolute paths and pa
 - Before committing repository changes, run `python scripts/check_repo_privacy.py` and `python -m unittest discover -s tests -t . -v`.
 - API keys belong only in environment variables and must never be printed or persisted.
 
-## WOLF RPG Pro SDK branch
-
-Read `docs/wolf-rpg-pro.md` before any branch work.
+See `docs/wolf-rpg-pro.md`.
