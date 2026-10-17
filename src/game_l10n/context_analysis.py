@@ -699,6 +699,7 @@ def analyze_with_cache(
     segments: list[Segment],
     output_path: Path,
     state_path: Path,
+    source_inventory_fingerprint: str | None = None,
     force: bool = False,
 ) -> tuple[ContextPack, bool]:
     mode = analyzer.resolve_mode(segments)
@@ -729,6 +730,18 @@ def analyze_with_cache(
             require_complete_context(attestation)
             _require_successful_execution(state.get("execution"))
             if state.get("attestation") == attestation:
+                if (
+                    source_inventory_fingerprint is not None
+                    and state.get("source_inventory_fingerprint")
+                    != source_inventory_fingerprint
+                ):
+                    state["source_inventory_fingerprint"] = source_inventory_fingerprint
+                    state_temporary = state_path.with_name(f"{state_path.name}.tmp")
+                    state_temporary.write_text(
+                        json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    state_temporary.replace(state_path)
                 return context_pack, True
     context_pack = analyzer.analyze(segments)
     execution = _require_successful_execution(analyzer.last_execution)
@@ -747,6 +760,11 @@ def analyze_with_cache(
                 "status": "success",
                 "fingerprint": fingerprint,
                 "source_segments_digest": source_segments_digest,
+                **(
+                    {"source_inventory_fingerprint": source_inventory_fingerprint}
+                    if source_inventory_fingerprint is not None
+                    else {}
+                ),
                 "output_sha256": hashlib.sha256(output_bytes).hexdigest(),
                 "output_size": len(output_bytes),
                 "attestation": attestation,

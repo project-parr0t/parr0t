@@ -6,7 +6,12 @@ import unittest
 from pathlib import Path
 
 from game_l10n.models import Segment
-from game_l10n.native_pass import import_native_shard, merge_native_pass, prepare_native_tasks
+from game_l10n.native_pass import (
+    import_native_shard,
+    import_native_wave,
+    merge_native_pass,
+    prepare_native_tasks,
+)
 
 
 class NativePassTests(unittest.TestCase):
@@ -62,6 +67,128 @@ class NativePassTests(unittest.TestCase):
                     root / "merged.jsonl",
                 )
 
+    def test_wave_import_validates_all_results_then_manifest_merge_ignores_stale_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            segments = [
+                Segment(f"fixture-{index}", f"SOURCE_{index}") for index in range(4)
+            ]
+            tasks = root / "tasks"
+            prepare_native_tasks(
+                root,
+                source,
+                segments,
+                tasks,
+                max_records=2,
+                max_workers=2,
+            )
+            results = root / "results"
+            results.mkdir()
+            for number in (1, 2):
+                task_path = tasks / f"task-{number:04d}.jsonl"
+                task_rows = [
+                    json.loads(line)
+                    for line in task_path.read_text(encoding="utf-8").splitlines()
+                ]
+                self._write_rows(
+                    results / task_path.name,
+                    [
+                        {
+                            "target_id": row["target_id"],
+                            "status": "success",
+                            "text": f"TARGET_{row['ordinal']}",
+                        }
+                        for row in task_rows
+                    ],
+                )
+
+            summary = import_native_wave(root, tasks / "manifest.json", results, 1)
+            stale = root / ".game-l10n" / "native" / "shards" / "stale.jsonl"
+            self._write_rows(
+                stale,
+                [{"target_id": "not-in-source", "status": "success", "text": "STALE"}],
+            )
+            output = root / "merged.jsonl"
+            merged = merge_native_pass(
+                root,
+                segments,
+                output,
+                manifest_path=tasks / "manifest.json",
+            )
+            rows = [
+                json.loads(line)
+                for line in output.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(summary["tasks"], 2)
+        self.assertEqual(summary["records"], 4)
+        self.assertEqual(summary["success"], 4)
+        self.assertEqual(summary["failed"], 0)
+        self.assertNotIn("fixture-", json.dumps(summary))
+        self.assertNotIn("TARGET_", json.dumps(summary))
+        self.assertTrue(merged["manifest_bound"])
+        self.assertEqual(merged["expected_shards"], 2)
+        self.assertEqual(merged["imported_shards"], 2)
+        self.assertTrue(merged["complete"])
+        self.assertEqual(
+            [row["target_id"] for row in rows],
+            [f"fixture-{index}" for index in range(4)],
+        )
+
+    def test_wave_import_is_atomic_when_any_result_breaks_its_task_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            segments = [Segment(f"fixture-{index}", "SOURCE") for index in range(4)]
+            tasks = root / "tasks"
+            prepare_native_tasks(
+                root,
+                source,
+                segments,
+                tasks,
+                max_records=2,
+                max_workers=2,
+            )
+            results = root / "results"
+            results.mkdir()
+            first_rows = [
+                json.loads(line)
+                for line in (tasks / "task-0001.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self._write_rows(
+                results / "task-0001.jsonl",
+                [
+                    {
+                        "target_id": row["target_id"],
+                        "status": "success",
+                        "text": "TARGET",
+                    }
+                    for row in first_rows
+                ],
+            )
+            self._write_rows(
+                results / "task-0002.jsonl",
+                [
+                    {
+                        "target_id": "wrong-binding",
+                        "status": "success",
+                        "text": "TARGET",
+                    }
+                ],
+            )
+
+            with self.assertRaisesRegex(ValueError, "exclusive task binding"):
+                import_native_wave(root, tasks / "manifest.json", results, 1)
+            shard_root = root / ".game-l10n" / "native" / "shards"
+            imported = list(shard_root.glob("*.jsonl")) if shard_root.exists() else []
+
+        self.assertEqual(imported, [])
+
     def test_native_tasks_are_exclusive_and_cached(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -108,9 +235,26 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(summary["tasks"], 3)
         self.assertTrue(summary["fresh_worker_per_task"])
         self.assertEqual(summary["history_mode"], "none")
-        self.assertEqual(manifest["version"], 3)
+        self.assertEqual(manifest["version"], 4)
+        self.assertEqual(manifest["min_records"], 8)
         self.assertEqual(manifest["max_material_tokens"], 300)
+        self.assertEqual(manifest["max_workers"], 8)
+        self.assertEqual(
+            [(task["wave"], task["slot"]) for task in manifest["tasks"]],
+            [(1, 1), (1, 2), (1, 3)],
+        )
         self.assertEqual(manifest["worker_contract"]["max_followup_tasks"], 0)
+        self.assertEqual(manifest["worker_contract"]["max_agent_depth"], 1)
+        self.assertFalse(manifest["worker_contract"]["delegation_allowed"])
+        self.assertFalse(
+            manifest["worker_contract"]["model_controller_role_allowed"]
+        )
+        self.assertEqual(
+            manifest["worker_contract"]["max_model_calls_per_task"], 16
+        )
+        self.assertEqual(
+            manifest["worker_contract"]["max_parent_progress_messages"], 0
+        )
         self.assertEqual(manifest["worker_contract"]["parent_result"], "metadata_only")
         self.assertEqual(
             manifest["worker_contract"]["control_envelope_schema"],
@@ -127,6 +271,33 @@ class NativePassTests(unittest.TestCase):
         )
         self.assertFalse(
             manifest["execution_contract"]["job_local_controller_allowed"]
+        )
+        self.assertFalse(
+            manifest["execution_contract"]["model_controller_allowed"]
+        )
+        self.assertFalse(
+            manifest["execution_contract"]["worker_delegation_allowed"]
+        )
+        self.assertEqual(manifest["execution_contract"]["max_agent_depth"], 1)
+        self.assertEqual(
+            manifest["execution_contract"]["orchestration_owner"],
+            "root_control_plane",
+        )
+        self.assertEqual(
+            manifest["execution_contract"]["max_root_model_calls_per_wave"],
+            12,
+        )
+        self.assertEqual(
+            manifest["execution_contract"]["max_root_model_calls_per_turn"],
+            64,
+        )
+        self.assertEqual(
+            manifest["execution_contract"]["max_root_input_tokens_per_turn"],
+            5_000_000,
+        )
+        self.assertEqual(
+            manifest["execution_contract"]["budget_exhaustion_action"],
+            "checkpoint_and_return_control",
         )
         self.assertFalse(
             manifest["execution_contract"]["automatic_root_turn_restart_allowed"]
@@ -170,6 +341,31 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(
             contract["capacity_failure_action"],
             "defer_task_and_end_worker_attempt",
+        )
+
+    def test_small_tail_is_rebalanced_instead_of_creating_one_record_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "fixture-source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            output = root / "fixture-tasks"
+            summary = prepare_native_tasks(
+                root,
+                source,
+                [Segment(f"fixture-{index}", "S") for index in range(65)],
+                output,
+                max_records=64,
+                min_records=8,
+                max_material_tokens=1_000_000,
+            )
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(summary["tasks"], 2)
+        self.assertEqual(
+            [task["records"] for task in manifest["tasks"]],
+            [32, 33],
         )
 
 
