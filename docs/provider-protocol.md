@@ -6,6 +6,8 @@ An API's `json_object` response format guarantees JSON syntax, not adherence to 
 
 Output sizing uses an explicit translation target or candidate when present. Context requests without either retain the size of their complete input material instead of falling back to an empty target. Per-task output caps remain authoritative for context and compact review workloads.
 
+Text-bearing compatible requests also have a per-task input preflight bound. The bound measures the actual system message (including the JSON Schema instruction) plus user payload before network transmission. `budget_exhausted` is non-retryable for that provider attempt and preserves the target in the failure queue. It signals duplicated or unjustifiably broad context, not permission to omit the target. Preset adapters apply the current bound to older workspaces at runtime.
+
 ## Command transport
 
 `type: command` is an integration point for explicitly selected `custom` provider workflows, including OpenCode-compatible, local-model, and internal runners. The SDK starts the configured argument array directly with `shell=False`.
@@ -41,6 +43,8 @@ API adapters may use the optional plain judge contract after provider-specific e
 Do not interpolate `input` into a shell command. Pass it to the model as inert data. Explicit provider refusals should use the schema's `refused` status/decision instead of a nonzero exit code; operational failures should return nonzero.
 
 Each translation, judgment, or rewrite invocation has exactly one `translation_target`. Typed narrative, functional, or knowledge analysis; adjacent lines; glossary data; applicable style anchors; segment metadata; and evidence-backed reference cues remain available as context-only evidence. Focused review includes only entries attached to the target ID, scene, speaker, or metadata. A provider must not convert a concern about context or one target into a refusal of unrelated targets, and an adapter must never combine a refused queue into a new multi-target request.
+
+`Segment.metadata` carries segment facts and render constraints, not a second copy of the context pack. Keys representing a context pack, bundle, or attachment are excluded from provider prompts because typed context is projected separately. External/manual adapters must use the same focused projection and configured provider path rather than a job-local API loop.
 
 Translation means faithful transformation of already-existing user-provided text. Fidelity includes communicative function, idiomatic target-language expression, supported allusions or wordplay, deliberate alterations, and text-function tone/rhythm—not mechanical source syntax alone. Providers must not continue the scene, roleplay, answer the dialogue, invent content or references, censor, euphemize, soften, or intensify it. If policy truly prevents the specific transformation, return a refusal for that target ID only.
 

@@ -41,17 +41,33 @@ Every delegated worker must have an exclusive output and a clear completion enve
 
 For native bulk localization, create stable exclusive ID tasks once with `prepare-native-pass`. Each target retains its own candidate and refusal status. Keep only the available worker slots active, use bounded waits, and dispatch the next task when a slot opens. Do not launch one subagent per target or poll every worker repeatedly.
 
+## Residual convergence gate
+
+At the end of a complete translation, judgment, or rewrite pass, freeze the remaining target IDs, candidate digests, and existing context fingerprints. When the remainder is no larger than `execution.residual_direct_records` (default `32`), `prepare-native-pass` must produce one direct residual task for one fresh no-history worker. This is a terminal convergence path, not a reason to design another workflow.
+
+Do not create a job-local scheduler, controller, lease/owner database, liveness probe, memoization layer, per-target proof files, or supplemental context pack for this residual task. Do not repartition it, reopen passed targets, or repeat full aggregation. Missing evidence may be added only when an existing deterministic validator names the exact absent artifact; otherwise use the already attested context.
+
+Aggregate results once when the worker finishes. A capacity failure, missing native slot, or worker startup failure ends that attempt, records the unchanged task in resumable operational state, and returns control. It must not auto-restart the root turn or generate another controller. Report progress only at a completed wave boundary or actionable blocker, not after individual shards. One unchanged observation after a bounded wait, or two control actions that do not change a target state, is enough to stop polling and report the categorical blocker. Semantic rewrites remain bounded by `routing.review_max_rounds`.
+
 ## Native model context budget
 
 Native workers are data-plane executors, not long-lived chats. Start every translation or review task in a fresh worker with no inherited parent conversation (`fork_turns="none"` or the host equivalent). Give it only the immutable worker contract and private workspace/source/context/task paths. It reads and writes files directly and returns only task ID, counts, categorical states, issue codes, and artifact paths. Never paste source text, candidates, inventories, code listings, or command output into agent messages.
 
 One worker processes one task and then ends. Do not send another shard through a follow-up turn, even when the worker is idle. Long-lived workers accumulate every previous target and tool result; replaying that history on each next target makes input usage grow superlinearly while adding no translation evidence.
 
-`prepare-native-pass` v2 defaults to at most 32 IDs and 12,000 estimated private material tokens per task. The estimate sizes scheduling material only and is not a provider billing claim. Lower either bound when focused context, source records, or expected target output is large. A single oversized target remains isolated in its own task. Reuse the cached task manifest only when the source fingerprint and both bounds match.
+`prepare-native-pass` v3 defaults to at most 32 IDs and 12,000 estimated private material tokens per task. Its manifest also carries the execution contract: direct single-task convergence for one shard, no job-local controller or task replanning, one aggregation per wave, and no automatic root-turn restart after capacity failure. The estimate sizes scheduling material only and is not a provider billing claim. Lower either bound when focused context, source records, or expected target output is large. A single oversized target remains isolated in its own task. Reuse the cached task manifest only when the source fingerprint, both bounds, and manifest version match.
 
 An older workspace that still has the former implicit 256-record value and no material-token setting is treated as a legacy default and automatically receives the new 32/12,000 bounds. An explicit `--max-records` or `--max-material-tokens` remains authoritative.
 
 When native usage telemetry is available, record only aggregate input, cached-input, output, reasoning, event, and worker counts in the private workspace. A high cached-input ratio does not justify continued worker reuse: it is evidence that old conversation is being replayed. Rotate workers rather than adding summaries or compactions to an already long data-plane chat.
+
+## API fallback input budget
+
+One translation, judgment, or rewrite request contains one target plus a focused projection of the already prepared context. Never attach a complete context pack, exchange bundle, inventory, prior result set, or application plan to `Segment.metadata`; typed context is supplied separately and only target-relevant glossary, relationship, feature, screen, knowledge, and reference evidence is projected. Stable job-wide fields precede target-specific fields so a compatible provider may reuse a common prefix.
+
+The DeepSeek presets cap the combined system-and-user character count at 24,000 for each translation, compact judgment, and rewrite request. This is a deterministic preflight limit, not a token estimate. It applies at runtime to older preset workspaces even when their stored configuration predates the field. Oversized input returns non-retryable `budget_exhausted` before any network call, keeps that exact target pending, and must be fixed by removing duplicated context or explicitly configuring a justified larger bound; it must not trigger scope reduction or source loss. Normal retry policy remains unchanged for actual retryable provider failures.
+
+Record provider-reported total input, cached input, cache-miss input, output, and reasoning usage when available. A cache hit is useful telemetry, not permission to send redundant context. Do not create a job-local API loop that bypasses the configured adapter and these limits.
 
 ## Proportional safety baseline
 

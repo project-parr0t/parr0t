@@ -113,6 +113,12 @@ class WorkspaceTests(unittest.TestCase):
                 )
             )
             entry_state = control_plane_entry_state(work)
+            legacy_config = json.loads(json.dumps(config))
+            next(
+                item for item in legacy_config["providers"] if item["name"] == "deepseek"
+            ).pop("task_max_input_chars")
+            legacy_deepseek = ProviderRegistry.from_config(legacy_config, work).get("deepseek")
+            legacy_input_caps = legacy_deepseek.fingerprint()["task_max_input_chars"]
 
         providers = {item["name"]: item for item in config["providers"]}
         self.assertEqual(config["provider_preset"], "openai-deepseek")
@@ -125,6 +131,15 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(providers["deepseek"]["thinking"], "disabled")
         self.assertEqual(providers["deepseek"]["reasoning_effort"], "none")
         self.assertEqual(providers["deepseek"]["review_verdict_format"], "plain")
+        self.assertEqual(
+            providers["deepseek"]["task_max_input_chars"],
+            {
+                "game_translation": 24000,
+                "game_translation_review_judge": 24000,
+                "game_translation_review_rewrite": 24000,
+            },
+        )
+        self.assertEqual(legacy_input_caps, providers["deepseek"]["task_max_input_chars"])
         self.assertEqual(providers["openai-sol"]["model"], "gpt-6.1-sol")
         self.assertEqual(providers["openai-luna"]["reasoning_effort"], "none")
         self.assertEqual(providers["openai-sol"]["reasoning_effort"], "low")
@@ -150,6 +165,16 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(config["execution"]["native_shard_material_tokens"], 12000)
         self.assertEqual(config["execution"]["native_worker_history"], "none")
         self.assertFalse(config["execution"]["native_worker_reuse"])
+        self.assertEqual(config["execution"]["residual_direct_records"], 32)
+        self.assertFalse(config["execution"]["job_local_controller_allowed"])
+        self.assertFalse(config["execution"]["automatic_capacity_restart_allowed"])
+        self.assertEqual(config["execution"]["max_unchanged_progress_observations"], 1)
+        self.assertEqual(config["execution"]["max_control_actions_without_progress"], 2)
+        self.assertTrue(config["execution"]["aggregate_once_per_wave"])
+        self.assertEqual(
+            config["execution"]["progress_report_mode"],
+            "wave_boundary_or_blocker_only",
+        )
         self.assertEqual(
             config["control_plane"]["envelope_schema"],
             "parr0t.control-envelope.v2",
@@ -212,6 +237,9 @@ class WorkspaceTests(unittest.TestCase):
             "docs/wrapper-executable.md",
             "docs/instance-release.md",
             "startup-current-directory-relative paths",
+            "one cached residual task",
+            "must not auto-restart the root turn",
+            "report progress only at a wave boundary or blocker",
         ):
             self.assertIn(required, generated_agents)
         self.assertLess(
