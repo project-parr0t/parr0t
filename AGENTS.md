@@ -67,6 +67,4 @@ For launcher-neutral Windows packages, `-GameRoot` accepts absolute paths and pa
 - Before committing repository changes, run `python scripts/check_repo_privacy.py` and `python -m unittest discover -s tests -t . -v`.
 - API keys belong only in environment variables and must never be printed or persisted.
 
-## Unity 2022.3 prototype branch
-
-Read `docs/unity-2022.3.md` before any branch work.
+See `docs/unity-2022.3.md`.
