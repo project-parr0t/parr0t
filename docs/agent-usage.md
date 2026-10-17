@@ -57,6 +57,7 @@ Do not skip or reorder barriers. One refusal, timeout, malformed result, capacit
 - Translation is faithful transformation, not content generation. Independent review checks meaning, omission, voice, tone, function, conditions, units, terminology, allusions, placeholders, markup, control codes, ordering, and material layout risk.
 - Build new outputs in the workspace. Automated checks use synthetic targets and never install or launch the real game.
 - Apply proportional verification and stop after the changed layer passes. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.
+- Native passes are root-direct: no model controllers or worker delegation. Obey manifest budgets, checkpoint on any ceiling, and reread contracts only when their digest or control generation changes.
 
 ## Status-driven routes
 
