@@ -24,6 +24,8 @@ This selective rewrite optimization does not make review selective. Every newly 
 
 `routing.review_max_rounds` bounds judge/rewrite cycles. The recommended value is `2`: one initial judgment and one confirmation after at most one rewrite. Increase it only when representative evaluations show that another correction cycle improves accepted quality enough to justify the extra calls.
 
+After a complete review pass, freeze the flagged target set. If no more than `execution.residual_direct_records` remain, process them as one cached residual task in one fresh no-history worker, then aggregate once. Do not create a new controller, ownership/lease layer, proof bundle, or supplemental context workflow for the tail, and never reopen already approved candidates. A capacity failure preserves the exact residual task for resumption instead of restarting the control turn.
+
 ## Focused evidence, not context removal
 
 The judge receives global style and terminology rules plus only the typed evidence attached to the target: current scene/speaker and same-speaker anchors for narrative text, relevant screen/feature entries for functional text, or relevant nodes/prerequisites for knowledge text. It also receives adjacent lines, segment metadata, glossary entries present in the source/candidate, relevant relationship entries, and up to four evidence-backed reference cues. The rewriter receives the same focused evidence plus categorical issue codes.
