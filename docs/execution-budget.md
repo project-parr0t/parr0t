@@ -21,6 +21,16 @@ Use the lowest sufficient level:
 
 Stop when the required level passes. Broaden or repeat validation only after input changes, a failed check, or an unresolved concrete risk.
 
+## SDK promotion budget
+
+Follow the preparation and fixed-base sequence in `docs/sdk-branch-contract.md`: consolidate acceptance criteria, check planned path ownership, freeze the intended `main` hash, implement, run focused checks, then run final acceptance on fixed inputs. Generalization and missing synthetic fixtures are implementation work, not deployment overhead. Keep small coupled changes in the current agent.
+
+Run the broad core/adapter suites and privacy/FAQ gates once after the final code and base are settled. Reuse passing evidence for unchanged inputs; changes to relevant code, contracts, fixtures, or dependencies require the affected checks again. Do not weaken a gate to meet the time budget. Create the final delivery archive, export, and report after acceptance, once. Never package midway through a review loop merely to report progress.
+
+Measure implementation, final validation/packaging, user wait, and external publication separately. Use actual command elapsed times for network or signing claims. Parallel review overlaps implementation and must not be added again to wall-clock totals. A readiness check must not expand into a new scheduler, duplicate verifier, credential probe, or speculative deployment system.
+
+For all-branch maintenance, follow `docs/branch-update-contract.md`. Refresh refs once and reuse one pinned inventory. Skip merge preparation and broad validation for already synchronized targets, hold known core overrides early, and reuse unchanged evidence for remaining candidates. Equivalent current core content may skip a history-only merge; a successful future-core simulation does not mean missing core changes are already installed. Do not rerun suites after an applied merge whose tree exactly matches the validated tree.
+
 ## Exact correction budget
 
 When the user supplies the final replacement wording for a typo or small translation fix, use `docs/minimal-corrections.md`. Resolve its stable IDs, run `game-l10n apply-user-correction`, repack the owning payload once, and verify the package once. The expected model-call and context-analysis budget is zero. Do not delegate the correction, reopen full source discovery, re-read every translation, rehash the game tree, or create a job-specific apply/validation script. If reverse dependencies exist, review only those IDs; if mapping is ambiguous, perform one narrow static lookup before changing anything.
@@ -39,7 +49,39 @@ Use subagents when work divides into independent, non-overlapping bulk translati
 
 Every delegated worker must have an exclusive output and a clear completion envelope. Do not delegate a duplicate review of a deterministic pass merely to increase confidence.
 
-For native bulk localization, create stable exclusive ID tasks once with `prepare-native-pass`. Each target retains its own candidate and refusal status. Keep only the available worker slots active, use bounded waits, and dispatch the next task when a slot opens. Do not launch one subagent per target or poll every worker repeatedly.
+For native bulk localization, create stable exclusive ID tasks once with `prepare-native-pass`, then let `native-pass-step` select every wave. Dispatch only the returned task/result paths, use one bounded wait, and call the step again; it imports the complete wave and returns one next action. Do not inspect the manifest to choose work, launch one subagent per target, import individual shards, or poll repeatedly.
+
+The v6 task file contains the complete bound segment payload. A worker reads it once and must not open or scan the complete ordered source artifact. That artifact is framework-owned validation input, not a worker prompt source. This prevents every fresh worker from replaying the whole inventory before processing its small exclusive shard.
+
+## Codex control-turn budget
+
+Native orchestration is root-direct. The root control plane prepares a deterministic queue and dispatches each task straight to one fresh worker. A model session must never act as a scheduler, recovery controller, owner/lease manager, or intermediary between the root and a worker. Native workers must not delegate. The maximum agent depth is one below the root.
+
+The root also does not select a wave. `native-pass-step` persists the pass control state, counts repeated observations, records idempotent aggregate usage events, validates complete result sets, imports them atomically, and emits one of `dispatch_authorized_wave`, `wait_for_active_wave`, `checkpoint_and_stop`, or `aggregate_completed_pass`. Any other recovery sequence is outside the contract.
+
+The v6 task manifest is the executable budget and detail contract. One wave uses at most `routing.max_workers` direct workers, 12 root model calls, and one root progress message. One root turn stops at 64 model calls or 5,000,000 reported input tokens, whichever comes first. A worker stops after its one task, at 16 control/tool turns and one semantic batch call, with no parent-facing progress messages or follow-up task. Reaching a limit checkpoints unchanged queue state and returns control; it must not trigger a summary, compaction, replacement controller, nested worker, or automatic continuation.
+
+Read each required contract set once per control-plane generation. `game-l10n status` returns `contract_set.digest`; reread only when that digest or the generation changes. A context state bound to the current independently verified inventory fingerprint is sufficient for status; do not parse the same ordered inventory again merely to reproduce its segment digest. Tool output and worker responses stay in artifacts. The root receives only fixed-size metadata and must not turn each command, wait, shard completion, or unchanged observation into another narrated model turn.
+
+Emit one progress update after a complete wave or on an actionable blocker. Per-task, per-small-batch, per-wait, and unchanged status narration is not progress and is outside the control-turn budget.
+
+## Executable detail-contract budget
+
+Follow `docs/detail-contract.md`. The native v6 manifest is the only executable job/task detail contract. Do not promote a generated Markdown plan, incident ledger, repair diary, or coordinator note into worker policy. Such a note cannot raise a limit, alter provider/pipeline/isolation/authorization rules, require repeated proof, or convert a prepared batch into per-record semantic calls.
+
+One multi-target task permits one semantic model/API batch call and one ordered batched result containing a status for every bound target. Load shared context once. Do not generate one prompt artifact per record, run an inner model/API loop, or count a directory of per-record calls as one task. If a provider accepts only one target, repartition before dispatch so the manifest makes that cost visible.
+
+For a pass at or above `execution.bulk_budget_gate_records` (default 4,096), wave 1 is a measurement pilot. A later wave requires user-approved whole-pass ceilings for elapsed minutes and aggregate input tokens plus either metered provider cost or an unmetered declaration. `native-pass-step` imports the pilot, returns `checkpoint_and_stop`, and preserves its usage/checkpoint across the regenerated approved manifest. Use the pilot telemetry to propose the smallest realistic cap; never infer approval from the original request or evade the gate by subsetting the same pass.
+
+## Residual convergence gate
+
+At the end of a complete translation, judgment, or rewrite pass, freeze the remaining target IDs, candidate digests, and existing context fingerprints. When the remainder is no larger than `execution.residual_direct_records` (default `32`), `prepare-native-pass` must produce one direct residual task for one fresh no-history worker. This is a terminal convergence path, not a reason to design another workflow.
+
+Do not create a job-local scheduler, controller, lease/owner database, liveness probe, memoization layer, per-target proof files, or supplemental context pack for this residual task. Do not repartition it, reopen passed targets, or repeat full aggregation. Missing evidence may be added only when an existing deterministic validator names the exact absent artifact; otherwise use the already attested context.
+
+Aggregate results once when the worker finishes. A capacity failure, missing native slot, or worker startup failure ends that attempt, records the unchanged task in resumable operational state, and returns control. It must not auto-restart the root turn or generate another controller. Report progress only at a completed wave boundary or actionable blocker, not after individual shards. One unchanged observation after a bounded wait, or two control actions that do not change a target state, is enough to stop polling and report the categorical blocker. Semantic rewrites remain bounded by `routing.review_max_rounds`.
+
+After semantic completion, packaging, README assembly, release metadata, and deterministic finalization stay in the current agent. Do not open new translation or review workers for those serial steps. If a framework bug blocks finalization, hold the instance checkpoint, fix the reusable core separately, and rerun only the failed deterministic gate; do not re-review unchanged results.
 
 ## Native model context budget
 
@@ -47,11 +89,15 @@ Native workers are data-plane executors, not long-lived chats. Start every trans
 
 One worker processes one task and then ends. Do not send another shard through a follow-up turn, even when the worker is idle. Long-lived workers accumulate every previous target and tool result; replaying that history on each next target makes input usage grow superlinearly while adding no translation evidence.
 
-`prepare-native-pass` v2 defaults to at most 32 IDs and 12,000 estimated private material tokens per task. The estimate sizes scheduling material only and is not a provider billing claim. Lower either bound when focused context, source records, or expected target output is large. A single oversized target remains isolated in its own task. Reuse the cached task manifest only when the source fingerprint and both bounds match.
+Keep one canonical extraction/source snapshot and delta outputs. A review wave, package revision, synthetic test, or documentation update must not make another full game-tree copy. Temporary extracted or build trees must have one declared owner and be removed or retained by a deterministic checkpoint rule, not accumulated per attempt.
 
-An older workspace that still has the former implicit 256-record value and no material-token setting is treated as a legacy default and automatically receives the new 32/12,000 bounds. An explicit `--max-records` or `--max-material-tokens` remains authoritative.
+`prepare-native-pass` v6 defaults to at most 64 IDs and 24,000 estimated private material tokens per task, with a preferred eight-record minimum when two adjacent bounded tasks can be balanced. Its manifest also carries the immutable detail, worker, and root-direct execution contracts: one semantic batch per task, no per-record inner model loop, no model controller, no worker delegation, one aggregation per wave, bounded root/worker calls, and no automatic root-turn restart after capacity failure. The estimate sizes scheduling material only and is not a provider billing claim. Lower either hard maximum when focused context, source records, or expected target output is large. A single oversized target remains isolated in its own task. Reuse the cached task manifest only when the source fingerprint, all sizing/worker/budget bounds, contract fingerprint, and manifest version match.
 
-When native usage telemetry is available, record only aggregate input, cached-input, output, reasoning, event, and worker counts in the private workspace. A high cached-input ratio does not justify continued worker reuse: it is evidence that old conversation is being replayed. Rotate workers rather than adding summaries or compactions to an already long data-plane chat.
+Workers write result files using the exact task/result paths returned by `native-pass-step`. On the next call, it validates every result against the exclusive task order before writing any shard and returns aggregate counts only. Merge with the same manifest so stale or unrelated shards are ignored. `import-native-wave`, the one-shard import, and unbound merge remain compatibility paths, not model-selected recovery routes.
+
+An older workspace that still has either the former implicit 256-record setting or the v3 32/12,000 defaults and no v4 policy marker automatically receives the new v4 bounds. Explicit `--max-records`, `--min-records`, `--max-material-tokens`, and `--max-workers` values remain authoritative.
+
+When native usage telemetry is available, record only aggregate input, cached-input, output, reasoning, event, and worker counts in the private workspace. Count root and every descendant separately. A high cached-input ratio does not justify continued reuse: cached input is still repeated input and is evidence that old conversation is being replayed. End the bounded turn rather than adding summaries or compactions to an already long chat.
 
 ## API fallback input budget
 
@@ -74,6 +120,8 @@ Every patch still requires these boundaries:
 - deny real install, update, remove, and launch by default; follow `docs/runtime-approval.md` when the user explicitly requests one.
 
 These boundaries do not imply a full game backup, hashing every source file, embedding the previous package, supporting unknown legacy states, or designing automatic rollback across arbitrary versions. Add those capabilities only when the user requests them or a concrete target requires them.
+
+Runtime patch code must cache immutable translation tables and indexes outside hot lookup paths. Per-lookup full-table reads or scans, per-frame scene-wide scans, and per-event global object scans are invalid even when a small synthetic fixture passes.
 
 ## Completion report
 

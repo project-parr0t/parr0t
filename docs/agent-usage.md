@@ -1,6 +1,6 @@
 # Parr0t agent operation guide
 
-This is the short operating entry point for coding agents. `AGENTS.md` defines invariants; dedicated documents define stage details. Do not load unrelated contracts in advance.
+Operating entry point for coding agents. `AGENTS.md` defines invariants; dedicated documents define stage details. Do not load unrelated contracts in advance.
 
 ## Supported control paths
 
@@ -57,13 +57,14 @@ Do not skip or reorder barriers. One refusal, timeout, malformed result, capacit
 - Translation is faithful transformation, not content generation. Independent review checks meaning, omission, voice, tone, function, conditions, units, terminology, allusions, placeholders, markup, control codes, ordering, and material layout risk.
 - Build new outputs in the workspace. Automated checks use synthetic targets and never install or launch the real game.
 - Apply proportional verification and stop after the changed layer passes. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.
+- Native passes are root-direct without delegation. After `prepare-native-pass`, only `native-pass-step` may select or advance waves; dispatch its returned tasks and wait once.
 
 ## Status-driven routes
 
 Use the routing table in repository `AGENTS.md`. Common short paths are:
 
 - full job: `sdk-selection.md` → `coverage-gates.md` → `review-pipeline.md`;
-- native worker/control-plane work: `control-plane-contract.md` and `execution-budget.md`;
+- native worker/control-plane work: `control-plane-contract.md`, `execution-budget.md`, and `detail-contract.md`;
 - manual/API fallback exchange: `translation-exchange.md`;
 - exact user-approved wording correction: `minimal-corrections.md` without model or context calls;
 - prior release, game update, or selective continuation: `release-checkpoint.md`;
@@ -71,6 +72,7 @@ Use the routing table in repository `AGENTS.md`. Common short paths are:
 - real runtime action: `runtime-approval.md` only after the matching explicit request;
 - Windows delivery: `installer-contract.md` plus the selected Steam or filesystem packaging contract;
 - publication: `instance-release.md` only after the user commands publication;
+- SDK branch maintenance/update: `branch-update-contract.md`;
 - reusable SDK promotion: SDK branch and engine FAQ contracts only after confirmed patch success.
 
 After verified context, status routes to the complete primary translation/review pipeline. A missing, malformed, or stale completion attestation is never `ready`; incomplete results route to targeted gap resolution, and static completion routes to validation and packing. The completion attestation binds the exact result artifact, and the pack cache binds that input plus the current attestation and output digest before status can return `local_patch_ready`. Malformed state returns one metadata-only repair action instead of a traceback, while a failure queue bound to another inventory returns a stale-queue reconciliation action rather than blocking the current inventory.
@@ -88,6 +90,7 @@ game-l10n sdk-inventory --workspace <external-workspace> --refresh-remote
 game-l10n sdk-evaluate --workspace <external-workspace> --target-engine <engine> --target-version <version-line> --branch <sdk-branch> --result <compatible|partial|reference|incompatible> --reason <reason-code> --evidence-path <public-contract-path>
 game-l10n sdk-select --workspace <external-workspace> --target-engine <engine> --target-version <version-line> --mode <reuse|extend|derive-new|private-new> [--branch <sdk-branch>]
 game-l10n sdk-activate --workspace <external-workspace> [--reference-checkout <reference-worktree>]
+game-l10n native-pass-step --workspace <external-workspace> --manifest <private-manifest> --results-dir <private-wave-results>
 ```
 
 These are agent execution boundaries, not a human command cookbook. With an OpenCodex-compatible proxy, configure the proxy separately and run Codex against the Parr0t checkout; keep proxy credentials and configuration outside this repository.

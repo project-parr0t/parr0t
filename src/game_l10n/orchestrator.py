@@ -36,6 +36,12 @@ from .prompts import (
     translation_prompt,
 )
 from .providers import ModelProvider, ProviderRegistry
+from .review_selection import (
+    DEFAULT_STRONG_REVIEW_CATEGORIES,
+    DEFAULT_STRONG_REVIEW_SAMPLE_PERCENT,
+    review_category,
+    strong_review_selection_reasons,
+)
 from .store import AuditLog, ResultStore, stable_hash
 from .validators import validate_integrity
 
@@ -66,6 +72,11 @@ class OrchestratorConfig:
     review_refusal_policy: str = "fallback"
     review_max_rounds: int = 2
     rewriter_chain: list[str] = field(default_factory=list)
+    review_triager_chain: list[str] = field(default_factory=list)
+    strong_review_sample_percent: float = DEFAULT_STRONG_REVIEW_SAMPLE_PERCENT
+    strong_review_high_risk_categories: list[str] = field(
+        default_factory=lambda: list(DEFAULT_STRONG_REVIEW_CATEGORIES)
+    )
 
 
 T = TypeVar("T")
@@ -93,6 +104,8 @@ class LocalizationOrchestrator:
             raise ValueError("grace_retries must be zero or greater")
         if config.review_max_rounds < 1:
             raise ValueError("review_max_rounds must be one or greater")
+        if not 0.0 <= config.strong_review_sample_percent <= 100.0:
+            raise ValueError("strong_review_sample_percent must be between 0 and 100")
         if config.review_refusal_policy not in {
             "fallback",
             "accept_candidate_unreviewed",
@@ -156,6 +169,7 @@ class LocalizationOrchestrator:
                     list(
                         dict.fromkeys(
                             self.config.translator_chain
+                            + self.config.review_triager_chain
                             + self.config.reviewer_chain
                             + self.config.rewriter_chain
                         )
@@ -509,14 +523,17 @@ class LocalizationOrchestrator:
         anchors: list[dict[str, str]],
         *,
         confirmation: bool = False,
+        stage_prefix: str = "review",
     ) -> ReviewVerdictEnvelope | None:
         ordinal = 0
         refusal_retried = False
-        retry_stage = "review-grace-retry"
+        retry_stage = f"{stage_prefix}-grace-retry"
         while True:
             ordinal += 1
             started = time.monotonic()
-            stage = ("review-confirm" if confirmation else "review") if ordinal == 1 else retry_stage
+            stage = (
+                f"{stage_prefix}-confirm" if confirmation else stage_prefix
+            ) if ordinal == 1 else retry_stage
             try:
                 review = self._call_review_judge(
                     provider,
@@ -564,13 +581,13 @@ class LocalizationOrchestrator:
                     ),
                 )
                 if retryable and self._can_grace_retry(code, ordinal):
-                    retry_stage = "review-grace-retry"
+                    retry_stage = f"{stage_prefix}-grace-retry"
                     continue
                 return None
             if review.verdict is ReviewVerdict.REFUSED:
                 if self.config.retry_refusals_once and not refusal_retried:
                     refusal_retried = True
-                    retry_stage = "review-refusal-retry"
+                    retry_stage = f"{stage_prefix}-refusal-retry"
                     continue
                 return review
             if review.verdict is ReviewVerdict.ERROR:
@@ -768,6 +785,115 @@ class LocalizationOrchestrator:
             self._set_candidate(result, working)
         return ReviewEnvelope(ReviewDecision.ERROR, text=working)
 
+    def _strong_review_reasons(self, segment: Segment) -> list[str]:
+        return strong_review_selection_reasons(
+            segment,
+            sample_percent=self.config.strong_review_sample_percent,
+            high_risk_categories=self.config.strong_review_high_risk_categories,
+        )
+
+    def _mark_triage_approved(
+        self,
+        result: TranslationResult,
+        segment: Segment,
+        candidate: str,
+        triager_name: str,
+    ) -> None:
+        result.text = candidate
+        result.status = "reviewed"
+        result.reviewer = triager_name
+        result.review_outcome = ReviewDecision.APPROVED.value
+        result.acceptance_authority = "reviewer"
+        result.metadata["review_tier"] = "triage"
+        result.metadata["review_category"] = review_category(segment)
+
+    def _triage_requires_strong_review(
+        self,
+        result: TranslationResult,
+        segment: Segment,
+        candidate: str,
+        anchors: list[dict[str, str]],
+    ) -> bool:
+        if not self.config.review_triager_chain:
+            return True
+        for triager_name in self.config.review_triager_chain:
+            outcome = self._triage_with_provider(
+                result, triager_name, segment, candidate, anchors
+            )
+            if outcome == "unresolved":
+                continue
+            return outcome == "strong"
+        result.metadata["review_tier"] = "strong_pending"
+        result.metadata["review_category"] = review_category(segment)
+        result.metadata["strong_review_reasons"] = ["triage_unresolved"]
+        return True
+
+    def _triage_with_provider(
+        self,
+        result: TranslationResult,
+        triager_name: str,
+        segment: Segment,
+        candidate: str,
+        anchors: list[dict[str, str]],
+    ) -> str:
+        verdict = self._judge_with_refusal_retry(
+            result,
+            self.registry.get(triager_name),
+            segment,
+            candidate,
+            anchors,
+            stage_prefix="review-triage",
+        )
+        if verdict is None or verdict.verdict in {
+            ReviewVerdict.REFUSED,
+            ReviewVerdict.ERROR,
+        }:
+            return "unresolved"
+        reasons = self._strong_review_reasons(segment)
+        if verdict.verdict is ReviewVerdict.REWRITE:
+            reasons.insert(0, "triage_flagged")
+        if verdict.text and verdict.text != candidate:
+            reasons.insert(0, "legacy_triage_returned_candidate")
+        if reasons:
+            result.metadata["review_tier"] = "strong_pending"
+            result.metadata["review_category"] = review_category(segment)
+            result.metadata["strong_review_reasons"] = list(dict.fromkeys(reasons))
+            return "strong"
+        self._mark_triage_approved(result, segment, candidate, triager_name)
+        return "approved"
+
+    def _run_strong_review(
+        self,
+        result: TranslationResult,
+        segment: Segment,
+        candidate: str,
+        anchors: list[dict[str, str]],
+    ) -> str:
+        for reviewer_name in self.config.reviewer_chain:
+            review = self._review_with_refusal_retry(
+                result,
+                self.registry.get(reviewer_name),
+                segment,
+                candidate,
+                anchors,
+            )
+            if review is not None and review.text:
+                candidate = review.text
+                self._set_candidate(result, candidate)
+            if review is None or review.decision in {
+                ReviewDecision.REFUSED,
+                ReviewDecision.ERROR,
+            }:
+                continue
+            result.text = candidate
+            result.status = "reviewed"
+            result.reviewer = reviewer_name
+            result.review_outcome = review.decision.value
+            result.acceptance_authority = "reviewer"
+            result.metadata["review_tier"] = "strong"
+            return candidate
+        return candidate
+
     def translate_one(self, segment: Segment, *, force: bool = False) -> TranslationResult:
         anchors = self._anchors(segment.speaker)
         cache_key = self._cache_key(segment, anchors)
@@ -799,25 +925,13 @@ class LocalizationOrchestrator:
             result.text = candidate
             result.status = "translated"
         else:
-            for reviewer_name in self.config.reviewer_chain:
-                reviewer = self.registry.get(reviewer_name)
-                review = self._review_with_refusal_retry(
-                    result, reviewer, segment, candidate, anchors
+            needs_strong_review = self._triage_requires_strong_review(
+                result, segment, candidate, anchors
+            )
+            if needs_strong_review:
+                candidate = self._run_strong_review(
+                    result, segment, candidate, anchors
                 )
-                if review is not None and review.text:
-                    candidate = review.text
-                    self._set_candidate(result, candidate)
-                if review is None or review.decision in {
-                    ReviewDecision.REFUSED,
-                    ReviewDecision.ERROR,
-                }:
-                    continue
-                result.text = candidate
-                result.status = "reviewed"
-                result.reviewer = reviewer_name
-                result.review_outcome = review.decision.value
-                result.acceptance_authority = "reviewer"
-                break
             if result.status != "reviewed":
                 result.errors.append("All review routes were exhausted")
                 self._accept_after_review_refusal(result, candidate)
@@ -893,24 +1007,12 @@ class LocalizationOrchestrator:
                 result.errors.append("Existing candidate failed deterministic integrity repair")
                 return self._preserve_or_fail_existing(segment, result)
 
-        for reviewer_name in self.config.reviewer_chain:
-            reviewer = self.registry.get(reviewer_name)
-            review = self._review_with_refusal_retry(
-                result, reviewer, segment, candidate, anchors
-            )
-            if review is not None and review.text:
-                candidate = review.text
-                self._set_candidate(result, candidate)
-            if review is None or review.decision in {
-                ReviewDecision.REFUSED,
-                ReviewDecision.ERROR,
-            }:
-                continue
-            result.text = candidate
-            result.status = "reviewed"
-            result.reviewer = reviewer_name
-            result.review_outcome = review.decision.value
-            result.acceptance_authority = "reviewer"
+        needs_strong_review = self._triage_requires_strong_review(
+            result, segment, candidate, anchors
+        )
+        if needs_strong_review:
+            candidate = self._run_strong_review(result, segment, candidate, anchors)
+        if result.status == "reviewed":
             self._remember(segment, result.text)
             self.audit.append(
                 {"segment_id": result.segment_id, "stage": "complete", "status": result.status}
@@ -963,6 +1065,7 @@ class LocalizationOrchestrator:
         refused = any(
             item.stage.startswith("review")
             and not item.stage.startswith("review-rewrite")
+            and not item.stage.startswith("review-triage")
             and item.status == ReviewDecision.REFUSED.value
             for item in result.attempts
         )
@@ -998,6 +1101,7 @@ class LocalizationOrchestrator:
                     list(
                         dict.fromkeys(
                             self.config.translator_chain
+                            + self.config.review_triager_chain
                             + self.config.reviewer_chain
                             + self.config.rewriter_chain
                         )
@@ -1103,6 +1207,7 @@ class LocalizationOrchestrator:
             cached = self.store.get(cache_keys[index]) if not force else None
             if cached:
                 results[index] = cached
+                self._remember_result(segment, cached)
                 continue
             saved_result = saved_results.get(str(index))
             if isinstance(saved_result, dict):
@@ -1110,6 +1215,7 @@ class LocalizationOrchestrator:
                     partial = self._result_from_state(saved_result)
                     if partial.segment_id == segment.id and partial.source == segment.source:
                         results[index] = partial
+                        self._remember_result(segment, partial)
                 except (TypeError, ValueError):
                     results[index] = None
             if results[index] is None:
@@ -1202,6 +1308,73 @@ class LocalizationOrchestrator:
                 self._remember(items[index], result.text)
             pending_review = []
         else:
+            if self.config.review_triager_chain:
+                strong_pending: list[int] = []
+                triage_pending: list[int] = []
+                for index in pending_review:
+                    result = results[index]
+                    assert result is not None
+                    if result.metadata.get("review_tier") == "strong_pending":
+                        strong_pending.append(index)
+                        continue
+                    triage_pending.append(index)
+                for triager_name in self.config.review_triager_chain:
+                    if not triage_pending:
+                        break
+
+                    def triage_at(index: int) -> str:
+                        result = results[index]
+                        assert result is not None
+                        segment = items[index]
+                        review_anchors = (
+                            self._anchors(segment.speaker)
+                            if self.config.use_style_memory
+                            else anchors[index]
+                        )
+                        return self._triage_with_provider(
+                            result,
+                            triager_name,
+                            segment,
+                            candidates[index],
+                            review_anchors,
+                        )
+
+                    next_triage_pending: list[int] = []
+                    if self.config.use_style_memory:
+                        triaged_items = (
+                            (index, triage_at(index)) for index in triage_pending
+                        )
+                    else:
+                        triaged_items = iter(
+                            self._run_deferred_stage(triage_pending, triage_at)
+                        )
+                    for index, outcome in triaged_items:
+                        result = results[index]
+                        assert result is not None
+                        if outcome == "unresolved":
+                            next_triage_pending.append(index)
+                        elif outcome == "strong":
+                            strong_pending.append(index)
+                        else:
+                            self.store.put(cache_keys[index], result)
+                            self._remember(items[index], result.text)
+                    triage_pending = next_triage_pending
+                for index in triage_pending:
+                    result = results[index]
+                    assert result is not None
+                    result.metadata["review_tier"] = "strong_pending"
+                    result.metadata["review_category"] = review_category(items[index])
+                    result.metadata["strong_review_reasons"] = ["triage_unresolved"]
+                    strong_pending.append(index)
+                pending_review = sorted(strong_pending)
+                self._save_deferred_state(
+                    state_path,
+                    batch_key,
+                    results,
+                    candidates,
+                    completed_translators,
+                    completed_reviewers,
+                )
             for route_index, reviewer_name in enumerate(self.config.reviewer_chain):
                 if not pending_review:
                     break
@@ -1213,10 +1386,6 @@ class LocalizationOrchestrator:
                     result = results[index]
                     assert result is not None
                     segment = items[index]
-                    for prior_index in range(index):
-                        prior_result = results[prior_index]
-                        if prior_result is not None:
-                            self._remember_result(items[prior_index], prior_result)
                     review_anchors = (
                         self._anchors(segment.speaker)
                         if self.config.use_style_memory
@@ -1258,6 +1427,7 @@ class LocalizationOrchestrator:
                     result.reviewer = reviewer_name
                     result.review_outcome = review_outcome
                     result.acceptance_authority = "reviewer"
+                    result.metadata["review_tier"] = "strong"
                     self.store.put(cache_keys[index], result)
                     self._remember(items[index], result.text)
                 pending_review = next_pending

@@ -52,7 +52,18 @@ from .formats import (
 from .filesystem_package import build_filesystem_package, validate_filesystem_package
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext
 from .instance_release import validate_instance_release
-from .native_pass import import_native_shard, merge_native_pass, prepare_native_tasks
+from .native_pass import (
+    DEFAULT_BULK_BUDGET_GATE_RECORDS,
+    DEFAULT_MAX_MATERIAL_TOKENS,
+    DEFAULT_MAX_RECORDS,
+    DEFAULT_MAX_WORKERS,
+    DEFAULT_MIN_RECORDS,
+    import_native_shard,
+    import_native_wave,
+    merge_native_pass,
+    native_control_step,
+    prepare_native_tasks,
+)
 from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from .privacy import is_within, require_external_workdir
 from .providers import ProviderRegistry
@@ -134,6 +145,7 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
         "docs/provider-protocol.md",
         "docs/control-plane-contract.md",
         "docs/execution-budget.md",
+        "docs/detail-contract.md",
     ),
     "resolve_translation_review_gaps": (
         "docs/coverage-gates.md",
@@ -142,6 +154,7 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
         "docs/provider-protocol.md",
         "docs/control-plane-contract.md",
         "docs/execution-budget.md",
+        "docs/detail-contract.md",
     ),
     "rebuild_current_inventory_translation_attestation": (
         "docs/coverage-gates.md",
@@ -158,6 +171,28 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
 
 def _status_contracts(action: str) -> list[str]:
     return list(STATUS_ACTION_CONTRACTS[action])
+
+
+def _status_contract_set(
+    contract_base: str | None,
+    action: str,
+    control_generation: int,
+) -> dict[str, Any]:
+    paths = _status_contracts(action)
+    digest = hashlib.sha256()
+    base = Path(contract_base).resolve() if contract_base else None
+    for relative in paths:
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        path = base / relative if base is not None else None
+        digest.update(path.read_bytes() if path is not None and path.is_file() else b"<missing>")
+        digest.update(b"\0")
+    return {
+        "schema": "parr0t.contract-set.v1",
+        "digest": digest.hexdigest(),
+        "control_generation": control_generation,
+        "reload_policy": "digest_change_or_new_control_generation_only",
+    }
 
 
 def _read_status_object(
@@ -177,7 +212,10 @@ def _read_status_object(
 
 
 def _context_state_valid(
-    payload: dict[str, Any], context_path: Path, source_segments_digest: str
+    payload: dict[str, Any],
+    context_path: Path,
+    source_segments_digest: str | None,
+    source_inventory_fingerprint: str,
 ) -> bool:
     execution = payload.get("execution")
     if payload.get("status") != "success" or not isinstance(execution, dict):
@@ -188,6 +226,17 @@ def _context_state_valid(
     if not context_path.is_file():
         return False
     output_body = context_path.read_bytes()
+    recorded_inventory = payload.get("source_inventory_fingerprint")
+    if "source_inventory_fingerprint" in payload:
+        source_binding_valid = bool(
+            isinstance(recorded_inventory, str)
+            and recorded_inventory == source_inventory_fingerprint
+        )
+    else:
+        source_binding_valid = bool(
+            source_segments_digest is not None
+            and payload.get("source_segments_digest") == source_segments_digest
+        )
     return bool(
         execution.get("status") == "success"
         and isinstance(total, int)
@@ -196,7 +245,7 @@ def _context_state_valid(
         and isinstance(parts, list)
         and len(parts) == total
         and all(isinstance(item, dict) and item.get("status") == "success" for item in parts)
-        and payload.get("source_segments_digest") == source_segments_digest
+        and source_binding_valid
         and payload.get("output_sha256") == hashlib.sha256(output_body).hexdigest()
         and payload.get("output_size") == len(output_body)
     )
@@ -347,6 +396,7 @@ def _orchestrator(work_dir: Path, context_pack: ContextPack) -> LocalizationOrch
     orchestrator_config = OrchestratorConfig(
         translator_chain=list(routing["translators"]),
         reviewer_chain=list(routing.get("reviewers", [])),
+        review_triager_chain=list(routing.get("review_triagers", [])),
         rewriter_chain=list(routing.get("rewriters", [])),
         require_review=bool(routing.get("require_review", True)),
         review_max_rounds=int(routing.get("review_max_rounds", 2)),
@@ -374,6 +424,22 @@ def _orchestrator(work_dir: Path, context_pack: ContextPack) -> LocalizationOrch
         ),
         preserve_source_on_failure=bool(routing.get("preserve_source_on_failure", False)),
         review_refusal_policy=str(routing.get("review_refusal_policy", "fallback")),
+        strong_review_sample_percent=float(
+            routing.get("strong_review_sample_percent", 5.0)
+        ),
+        strong_review_high_risk_categories=list(
+            routing.get(
+                "strong_review_high_risk_categories",
+                [
+                    "allusion",
+                    "critical_logic",
+                    "parody",
+                    "quest_title",
+                    "script_sensitive",
+                    "wordplay",
+                ],
+            )
+        ),
     )
     file_config = config.get("files", {})
     glossary = _load_dataclass_list(
@@ -395,7 +461,12 @@ def _orchestrator(work_dir: Path, context_pack: ContextPack) -> LocalizationOrch
 
 
 def _analyze_context(
-    work_dir: Path, segments: list, *, force: bool = False, context_mode: str | None = None
+    work_dir: Path,
+    segments: list,
+    *,
+    source_inventory_fingerprint: str | None = None,
+    force: bool = False,
+    context_mode: str | None = None,
 ) -> tuple[ContextPack, bool]:
     config = load_config(work_dir)
     require_direct_provider_pipeline(config, "direct context-provider execution")
@@ -414,6 +485,7 @@ def _analyze_context(
         segments=segments,
         output_path=_path_in_workspace(work_dir, context_relative),
         state_path=work_dir / ".game-l10n" / "context-state.json",
+        source_inventory_fingerprint=source_inventory_fingerprint,
         force=force,
     )
 
@@ -551,6 +623,7 @@ def cmd_translate(args: argparse.Namespace) -> int:
     context_pack, context_cached = _analyze_context(
         work_dir,
         inventory_segments,
+        source_inventory_fingerprint=inventory_state["primary_fingerprint"],
         force=args.force_context,
         context_mode=args.context_mode,
     )
@@ -597,6 +670,7 @@ def cmd_review_existing(args: argparse.Namespace) -> int:
     context_pack, context_cached = _analyze_context(
         work_dir,
         inventory_segments,
+        source_inventory_fingerprint=inventory_state["primary_fingerprint"],
         force=args.force_context,
         context_mode=args.context_mode,
     )
@@ -657,6 +731,7 @@ def cmd_resume_failures(args: argparse.Namespace) -> int:
     context_pack, context_cached = _analyze_context(
         work_dir,
         inventory_segments,
+        source_inventory_fingerprint=inventory_state["primary_fingerprint"],
         force=args.force_context,
         context_mode=args.context_mode,
     )
@@ -746,10 +821,11 @@ def cmd_analyze_context(args: argparse.Namespace) -> int:
     require_direct_provider_pipeline(config, "game-l10n analyze-context")
     require_sdk_activation(work_dir, config)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
-    require_inventory_attestation(work_dir, source)
+    inventory_state = require_inventory_attestation(work_dir, source)
     context_pack, cached = _analyze_context(
         work_dir,
         read_segments(source),
+        source_inventory_fingerprint=inventory_state["primary_fingerprint"],
         force=args.force,
         context_mode=args.context_mode,
     )
@@ -805,6 +881,34 @@ def cmd_import_native_shard(args: argparse.Namespace) -> int:
     require_sdk_activation(work_dir, load_config(work_dir))
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     result = import_native_shard(work_dir, source, args.name)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_import_native_wave(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    require_sdk_activation(work_dir, load_config(work_dir))
+    result = import_native_wave(
+        work_dir,
+        _path_in_workspace(work_dir, args.manifest, must_exist=True),
+        _path_in_workspace(work_dir, args.input_dir, must_exist=True),
+        args.wave,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_native_pass_step(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    require_sdk_activation(work_dir, load_config(work_dir))
+    result = native_control_step(
+        work_dir,
+        _path_in_workspace(work_dir, args.manifest, must_exist=True),
+        _path_in_workspace(work_dir, args.results_dir),
+        usage_event_id=args.usage_event_id,
+        input_tokens=args.input_tokens,
+        provider_cost_usd=args.provider_cost_usd,
+    )
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -877,21 +981,68 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     output = _path_in_workspace(work_dir, args.output)
     execution = config.get("execution", {})
-    legacy_default = (
-        execution.get("native_shard_records") == 256
-        and "native_shard_material_tokens" not in execution
+    stored_records = execution.get("native_shard_records")
+    stored_material = execution.get("native_shard_material_tokens")
+    legacy_default = int(execution.get("native_shard_policy_version", 1)) < 2 and (
+        (stored_records == 256 and stored_material is None)
+        or (stored_records == 32 and stored_material == 12_000)
     )
     max_records = (
         args.max_records
         if args.max_records is not None
-        else 32
+        else DEFAULT_MAX_RECORDS
         if legacy_default
-        else int(execution.get("native_shard_records", 32))
+        else int(execution.get("native_shard_records", DEFAULT_MAX_RECORDS))
     )
     max_material_tokens = (
         args.max_material_tokens
         if args.max_material_tokens is not None
-        else int(execution.get("native_shard_material_tokens", 12_000))
+        else DEFAULT_MAX_MATERIAL_TOKENS
+        if legacy_default
+        else int(
+            execution.get(
+                "native_shard_material_tokens", DEFAULT_MAX_MATERIAL_TOKENS
+            )
+        )
+    )
+    min_records = (
+        args.min_records
+        if args.min_records is not None
+        else min(
+            int(execution.get("native_shard_min_records", DEFAULT_MIN_RECORDS)),
+            max_records,
+        )
+    )
+    max_workers = (
+        args.max_workers
+        if args.max_workers is not None
+        else int(config.get("routing", {}).get("max_workers", DEFAULT_MAX_WORKERS))
+    )
+    bulk_budget_gate_records = int(
+        execution.get("bulk_budget_gate_records", DEFAULT_BULK_BUDGET_GATE_RECORDS)
+    )
+    max_elapsed_minutes = (
+        args.max_elapsed_minutes
+        if args.max_elapsed_minutes is not None
+        else execution.get("bulk_max_elapsed_minutes")
+    )
+    max_input_tokens = (
+        args.max_input_tokens
+        if args.max_input_tokens is not None
+        else execution.get("bulk_max_input_tokens")
+    )
+    max_provider_cost_usd = (
+        args.max_provider_cost_usd
+        if args.max_provider_cost_usd is not None
+        else execution.get("bulk_max_provider_cost_usd")
+    )
+    provider_cost_unmetered = bool(
+        args.provider_cost_unmetered
+        or execution.get("bulk_provider_cost_unmetered", False)
+    )
+    user_approved_budget = bool(
+        args.user_approved_budget
+        or execution.get("bulk_budget_user_approved", False)
     )
     result = prepare_native_tasks(
         work_dir,
@@ -899,7 +1050,15 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
         read_segments(source),
         output,
         max_records=max_records,
+        min_records=min_records,
         max_material_tokens=max_material_tokens,
+        max_workers=max_workers,
+        bulk_budget_gate_records=bulk_budget_gate_records,
+        max_elapsed_minutes=max_elapsed_minutes,
+        max_input_tokens=max_input_tokens,
+        max_provider_cost_usd=max_provider_cost_usd,
+        provider_cost_unmetered=provider_cost_unmetered,
+        user_approved_budget=user_approved_budget,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -910,7 +1069,18 @@ def cmd_merge_native_pass(args: argparse.Namespace) -> int:
     require_sdk_activation(work_dir, load_config(work_dir))
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     destination = _path_in_workspace(work_dir, args.output)
-    result = merge_native_pass(work_dir, read_segments(source), destination)
+    manifest_arg = getattr(args, "manifest", None)
+    manifest = (
+        _path_in_workspace(work_dir, manifest_arg, must_exist=True)
+        if manifest_arg
+        else None
+    )
+    result = merge_native_pass(
+        work_dir,
+        read_segments(source),
+        destination,
+        manifest_path=manifest,
+    )
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result["complete"] else 1
 
@@ -957,6 +1127,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "contract_base": contract_base,
                     "next_actions": [action],
                     "required_contracts": _status_contracts(action),
+                    "contract_set": _status_contract_set(
+                        contract_base, action, int(control_state.get("generation", 0))
+                    ),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -975,6 +1148,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "contract_base": contract_base,
                     "next_actions": [action],
                     "required_contracts": _status_contracts(action),
+                    "contract_set": _status_contract_set(
+                        contract_base, action, int(control_state.get("generation", 0))
+                    ),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -1113,19 +1289,31 @@ def cmd_status(args: argparse.Namespace) -> int:
                     context_state, context_issue = _read_status_object(
                         context_state_path, label="CONTEXT_ATTESTATION"
                     )
-                    source_segments_digest = stable_hash(
-                        [
-                            asdict(item)
-                            for item in read_segments(Path(inventory_state["primary_path"]))
-                        ]
-                    )
+                    source_segments_digest = None
+                    if (
+                        context_state is not None
+                        and not isinstance(
+                            context_state.get("source_inventory_fingerprint"), str
+                        )
+                    ):
+                        source_segments_digest = stable_hash(
+                            [
+                                asdict(item)
+                                for item in read_segments(
+                                    Path(inventory_state["primary_path"])
+                                )
+                            ]
+                        )
                     if context_issue:
                         state_issue_codes.append(context_issue)
                         action = "repair_invalid_workspace_state"
                     elif (
                         context_state is None
                         or not _context_state_valid(
-                            context_state, context_path, source_segments_digest
+                            context_state,
+                            context_path,
+                            source_segments_digest,
+                            inventory_state["primary_fingerprint"],
                         )
                     ):
                         action = "analyze_complete_script_context"
@@ -1191,6 +1379,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "contract_base": contract_base,
                 "next_actions": [action],
                 "required_contracts": _status_contracts(action),
+                "contract_set": _status_contract_set(
+                    contract_base, action, int(control_state.get("generation", 0))
+                ),
             },
             ensure_ascii=False,
             indent=2,
@@ -1297,7 +1488,10 @@ def cmd_publish(args: argparse.Namespace) -> int:
 
 def cmd_verify_sdk_promotion(args: argparse.Namespace) -> int:
     result = verify_sdk_promotion_commit(
-        Path(args.sdk_root).resolve(), args.branch, args.commit
+        Path(args.sdk_root).resolve(), args.branch, args.commit or "HEAD",
+        working_tree=args.working_tree,
+        planned_paths=args.planned_path,
+        expected_main=args.expected_main,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -1502,7 +1696,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     review_existing = sub.add_parser(
         "review-existing",
-        help="Independently re-review every reused candidate against the current full context",
+        help="Triage every reused candidate and selectively strong-review it in current context",
     )
     review_existing.add_argument("--workspace", required=True)
     review_existing.add_argument("--input", required=True, help="Current ordered source targets")
@@ -1604,18 +1798,73 @@ def build_parser() -> argparse.ArgumentParser:
 
     native_prepare = sub.add_parser(
         "prepare-native-pass",
-        help="Create cached exclusive target-ID task files for native workers",
+        help="Create cached exclusive bound-segment task payloads for native workers",
     )
     native_prepare.add_argument("--workspace", required=True)
     native_prepare.add_argument("--input", required=True, help="Ordered source segment file")
     native_prepare.add_argument("--output", required=True, help="Private task directory")
     native_prepare.add_argument("--max-records", type=int)
     native_prepare.add_argument(
+        "--min-records",
+        type=int,
+        help="Preferred minimum records per native task when bounds allow",
+    )
+    native_prepare.add_argument(
         "--max-material-tokens",
         type=int,
         help="Estimated private input-material cap per fresh native worker task",
     )
+    native_prepare.add_argument(
+        "--max-workers",
+        type=int,
+        help="Maximum direct root-to-worker dispatches active in one wave",
+    )
+    native_prepare.add_argument(
+        "--max-elapsed-minutes",
+        type=int,
+        help="User-approved elapsed-time ceiling for a gated bulk pass",
+    )
+    native_prepare.add_argument(
+        "--max-input-tokens",
+        type=int,
+        help="User-approved aggregate input-token ceiling for a gated bulk pass",
+    )
+    cost_group = native_prepare.add_mutually_exclusive_group()
+    cost_group.add_argument(
+        "--max-provider-cost-usd",
+        type=float,
+        help="User-approved provider-cost ceiling for a metered bulk pass",
+    )
+    cost_group.add_argument(
+        "--provider-cost-unmetered",
+        action="store_true",
+        help="Declare that the selected route has no measurable provider charge",
+    )
+    native_prepare.add_argument(
+        "--user-approved-budget",
+        action="store_true",
+        help="Assert that the user supplied the bound bulk time, token, and cost policy",
+    )
     native_prepare.set_defaults(func=cmd_prepare_native_pass)
+
+    native_step = sub.add_parser(
+        "native-pass-step",
+        help="Advance one native pass using the deterministic core wave controller",
+    )
+    native_step.add_argument("--workspace", required=True)
+    native_step.add_argument("--manifest", required=True)
+    native_step.add_argument(
+        "--results-dir",
+        required=True,
+        help="Private directory where workers write task-named results",
+    )
+    native_step.add_argument(
+        "--usage-event-id",
+        help="Stable unique ID for one aggregate provider-usage observation",
+    )
+    native_step.add_argument("--input-tokens", type=int, default=0)
+    native_step.add_argument("--provider-cost-usd", type=float, default=0.0)
+    native_step.set_defaults(func=cmd_native_pass_step)
 
     native_import = sub.add_parser(
         "import-native-shard",
@@ -1626,6 +1875,20 @@ def build_parser() -> argparse.ArgumentParser:
     native_import.add_argument("--name", required=True)
     native_import.set_defaults(func=cmd_import_native_shard)
 
+    native_wave_import = sub.add_parser(
+        "import-native-wave",
+        help="Validate and import every exclusive native result in one completed wave",
+    )
+    native_wave_import.add_argument("--workspace", required=True)
+    native_wave_import.add_argument("--manifest", required=True)
+    native_wave_import.add_argument(
+        "--input-dir",
+        required=True,
+        help="Private directory containing result files named like the manifest task files",
+    )
+    native_wave_import.add_argument("--wave", required=True, type=int)
+    native_wave_import.set_defaults(func=cmd_import_native_wave)
+
     native_merge = sub.add_parser(
         "merge-native-pass",
         help="Merge exclusive native-agent shards in stable source order",
@@ -1633,6 +1896,10 @@ def build_parser() -> argparse.ArgumentParser:
     native_merge.add_argument("--workspace", required=True)
     native_merge.add_argument("--input", required=True, help="Ordered source segment file")
     native_merge.add_argument("--output", required=True)
+    native_merge.add_argument(
+        "--manifest",
+        help="Prepared task manifest; when provided, ignore unrelated or stale shard files",
+    )
     native_merge.set_defaults(func=cmd_merge_native_pass)
 
     exchange_prepare = sub.add_parser(
@@ -1819,11 +2086,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     promotion_scope = sub.add_parser(
         "verify-sdk-promotion",
-        help="Reject an SDK promotion commit that also changes main-owned files",
+        help="Check SDK path ownership before implementation or on a final commit",
     )
     promotion_scope.add_argument("--sdk-root", required=True)
     promotion_scope.add_argument("--branch", required=True)
-    promotion_scope.add_argument("--commit", default="HEAD")
+    promotion_mode = promotion_scope.add_mutually_exclusive_group()
+    promotion_mode.add_argument("--commit", help="Final promotion commit (default: HEAD)")
+    promotion_mode.add_argument("--working-tree", action="store_true", help="Read-only preflight before implementation")
+    promotion_scope.add_argument("--planned-path", action="append", default=[], help="Planned repository-relative file; repeatable, preflight only")
+    promotion_scope.add_argument("--expected-main", help="Full base hash returned by the first preflight; reject drift")
     promotion_scope.set_defaults(func=cmd_verify_sdk_promotion)
 
     steam_package = sub.add_parser(

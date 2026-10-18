@@ -7,8 +7,13 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from game_l10n.cli import main
+from game_l10n.cli import build_parser, main
 from game_l10n.control_plane import (
+    REVIEW_CONTROL_ALLOWED_ACTIONS,
+    REVIEW_CONTROL_CONTRACT_SCHEMA,
+    REVIEW_CONTROL_MODE,
+    review_control_contract,
+    validate_review_control_action,
     acknowledge_control_plane_rotation,
     control_plane_entry_state,
     control_target_id,
@@ -20,10 +25,86 @@ from game_l10n.control_plane import (
 )
 from game_l10n.errors import ConfigurationError
 from game_l10n.models import Segment
-from game_l10n.native_pass import prepare_native_tasks
+from game_l10n.native_pass import _detail_contract, prepare_native_tasks
 
 
 class ControlPlaneContractTests(unittest.TestCase):
+    def test_native_pass_step_cli_is_registered(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "native-pass-step",
+                "--workspace",
+                "fixture-workspace",
+                "--manifest",
+                "tasks/manifest.json",
+                "--results-dir",
+                "results",
+            ]
+        )
+        self.assertEqual(args.func.__name__, "cmd_native_pass_step")
+
+    def test_review_control_contract_is_deterministic_and_text_free(self) -> None:
+        contract = review_control_contract()
+
+        self.assertEqual(contract["schema"], REVIEW_CONTROL_CONTRACT_SCHEMA)
+        self.assertEqual(contract["mode"], REVIEW_CONTROL_MODE)
+        self.assertEqual(
+            contract["allowed_actions"], list(REVIEW_CONTROL_ALLOWED_ACTIONS)
+        )
+        self.assertFalse(contract["semantic_access_allowed"])
+        self.assertFalse(contract["free_form_planning_allowed"])
+        self.assertFalse(contract["ad_hoc_contracts_allowed"])
+        self.assertFalse(contract["autonomous_resume_allowed"])
+        self.assertFalse(contract["autonomous_sdk_or_tool_changes_allowed"])
+        self.assertTrue(contract["status_action_match_required"])
+        self.assertTrue(contract["native_step_command_required"])
+        self.assertEqual(
+            contract["native_step_command"], "game-l10n native-pass-step"
+        )
+        self.assertFalse(contract["model_selected_wave_or_recovery_allowed"])
+        self.assertEqual(
+            contract["halted_state_allowed_actions"],
+            ["read_status", "record_aggregate_usage", "checkpoint_and_stop"],
+        )
+        self.assertEqual(
+            contract["resume_requirements"],
+            [
+                "explicit_user_approval",
+                "complete_budget_contract",
+                "regenerated_validated_manifest",
+            ],
+        )
+        self.assertEqual(contract["unknown_state_action"], "checkpoint_and_stop")
+        self.assertEqual(
+            contract["review_stage_order"],
+            [
+                "deterministic_validation",
+                "complete_low_cost_triage",
+                "selective_strong_review",
+                "flagged_only_rewrite",
+                "review_fallback_for_failures_only",
+            ],
+        )
+        self.assertFalse(contract["universal_strong_review_required"])
+        self.assertEqual(_detail_contract()["review_control"], contract)
+
+    def test_review_control_action_allowlist_rejects_autonomous_recovery(self) -> None:
+        permit = validate_review_control_action("dispatch_authorized_task")
+        self.assertTrue(permit["authorized"])
+
+        for action in (
+            "resume_review",
+            "clone_framework",
+            "rebind_sdk",
+            "repair_tool",
+            "invent_result_format",
+        ):
+            with self.subTest(action=action):
+                with self.assertRaisesRegex(
+                    ConfigurationError, "E_REVIEW_CONTROL_ACTION_DENIED"
+                ):
+                    validate_review_control_action(action)
+
     def _write_envelope(self, root: Path, payload: dict) -> Path:
         path = root / ".game-l10n" / "control" / "worker.json"
         path.parent.mkdir(parents=True, exist_ok=True)

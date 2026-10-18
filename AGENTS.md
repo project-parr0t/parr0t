@@ -1,6 +1,6 @@
 # AGENTS.md — Parr0t repository
 
-Parr0t is an engine-neutral control framework and reusable SDK repository. Keep all real game data, extracted text, translations, prompts, caches, logs, credentials, job metadata, and title-specific evidence in an external workspace.
+Parr0t is engine-neutral. Keep game data, translations, prompts, caches, logs, credentials, job metadata, and title evidence in an external workspace.
 
 ## Read order
 
@@ -17,13 +17,13 @@ Parr0t is an engine-neutral control framework and reusable SDK repository. Keep 
 2. **Separate locations.** The repository holds reusable code only; the source game root is read-only; generated work belongs in an external workspace created with `game-l10n init-workspace`.
 3. **Text is the default scope.** Do not inspect images for text, run OCR, plan image translation, or create image tooling unless the user specifically requests image translation.
 4. **Keep the control plane text-free from entry.** Before the entry gate is established, the top-level agent must not list, open, search, grep, classify, or preview any game-root file, including README, manifests, configuration, scripts, assets, archives, or extracted text. Existing-locale detection, engine/version discovery, inventory, and every semantic/content check belong to isolated data-plane workers. The parent may receive opaque control IDs, counts, categorical states, queue transitions, artifact paths, public SDK-selection state, and deterministic issue codes only. Data-plane workers return a validated `parr0t.control-envelope.v2` path. On leakage, record it with `game-l10n record-control-plane-leak` and stop; the contaminated agent must not run or confirm resume. A fresh control plane resumes metadata checkpoints under `docs/control-plane-contract.md`.
-5. **Preserve the pipeline order.** Verify two independent ordered inventories; complete typed context analysis; translate every confirmed target with the primary route; process only failures through translation fallback; independently review the complete translated set; rewrite only flagged targets; process only review failures through judge fallback; then validate and pack.
+5. **Preserve pipeline order.** Verify paired inventories; analyze typed context; run primary translation, failure-only translation fallback, complete low-cost triage, selective strong review for flags/risk/sample, flagged-only rewrite, failure-only judge fallback, validation, then packing.
 6. **Treat refusal as routing.** Parent-facing refusal state is only `fallback_required` / “폴백 처리 필요”. It is never a content judgment, exclusion, batch cancellation, or authority to shrink scope. Preserve source only after metadata proves every configured route was attempted and exhausted.
-7. **Translate, do not invent.** Work on one target at a time with its relevant narrative, functional, or knowledge context. Preserve meaning, character voice, formality, scene state, UI function, conditions, units, order, terminology, placeholders, markup, control codes, supported allusions, and natural target-language effect. Segment isolation must not discard context.
+7. **Translate, do not invent.** Preserve target-scoped narrative, functional, or knowledge context for every item in the prepared batch; target isolation does not require separate model calls. Preserve meaning, character voice, formality, scene state, UI function, conditions, units, order, terminology, placeholders, markup, control codes, supported allusions, and natural target-language effect.
 8. **Keep source and runtime immutable by default.** Build new artifacts in the workspace. Inspection, building, testing, log reading, or access to a game directory does not authorize install, update, restore/remove, launch, cleanup, or execution. Each real runtime action requires its own explicit approval under `docs/runtime-approval.md`.
 9. **Select and activate before implementing.** Follow `docs/sdk-selection.md` before format or data-plane work. Reuse or extend only an exact engine/version match and execute it from the bound SDK checkout. Code from another identity is reference evidence for `derive-new`, not permission to widen that SDK. Generated pass-through tools are not an adapter. `main` never imports engine-specific data from an SDK branch.
-10. **Publication is dormant.** Do not propose, prepare, mention, commit, push, tag, publish, deploy, or create a release unless the user first requests that exact external action. SDK promotion additionally requires confirmed patch success. Its engine-only commit must not touch a path present on `main`; verify it with `game-l10n verify-sdk-promotion`. Per-game publication additionally requires `docs/instance-release.md` and its release gate.
-11. **Use proportional effort.** Follow `docs/execution-budget.md`; reuse unchanged checkpoints and passed validations, cap repeated failures, keep small coupled work in the current agent, and stop after the required checks pass.
+10. **Publication is dormant.** Do not propose, prepare, mention, commit, push, tag, publish, deploy, or create a release unless the user first requests that exact external action. SDK promotion requires confirmed patch success. Its engine-only commit must not touch `main` paths; check paths with `game-l10n verify-sdk-promotion --working-tree`, pin its base, and verify the final commit before packaging. Per-game publication requires `docs/instance-release.md` and its release gate.
+11. **Keep review control deterministic.** After `prepare-native-pass`, only `game-l10n native-pass-step` selects or advances waves. Dispatch its exact returned wave after one bounded wait; each task keeps one semantic batch call. V6 tasks embed bound segments; workers never open the validation-only full source. Root reads metadata only; no model controllers or worker delegation. Never choose recovery, models, batches, budgets, or resume. Unknown state means checkpoint and stop.
 12. **Keep provider mode fixed.** A selected preset defines the authorized providers and roles. A key does not change mode or promote a fallback. Native App workers and API providers are distinct; never emulate a native worker with another Codex process or silently replace the locked route.
 
 ## Standard job sequence
@@ -32,7 +32,7 @@ Parr0t is an engine-neutral control framework and reusable SDK repository. Keep 
 2. Run status. An isolated worker records existing-locale and engine/version discovery as SDK-selection state and returns only a control envelope. Complete SDK selection/activation; inspect an engine runbook only on its trigger.
 3. Produce and reconcile two independently implemented complete ordered inventories. User-visible exclusions remain unresolved; static alignment is not runtime coverage.
 4. Complete typed context analysis. If every context route fails, stop before translation.
-5. Run primary translation, translation fallback, complete independent review, selective rewriting, and review fallback in that order. Operational failures enter the resumable metadata-only failure queue; blocking failures hold the patch.
+5. Run primary translation, failure-only translation fallback, complete low-cost triage, selective strong review, flagged-only rewrite, and failure-only review fallback. Operational failures enter the resumable metadata queue; blocking failures hold the patch.
 6. Build and verify a recoverable patch in the workspace. Never mutate or launch the supplied game during automated validation.
 7. Report categorical completion states, counts, artifact paths, unresolved queues, and only the next required user decision. Do not expose private text.
 
@@ -43,7 +43,7 @@ Parr0t is an engine-neutral control framework and reusable SDK repository. Keep 
 | Start/resume or SDK choice | `docs/agent-usage.md`, `docs/sdk-selection.md`, `docs/sdk-branch-contract.md` |
 | Construct a user-facing task prompt | `docs/prompt-examples.md` |
 | Inventory, context, translation, or review | `docs/coverage-gates.md`, `docs/review-pipeline.md`, `docs/fallback-routing.md`, `docs/provider-protocol.md` |
-| Control-plane worker or native pass | `docs/control-plane-contract.md`, `docs/execution-budget.md` |
+| Control-plane worker or native pass | `docs/control-plane-contract.md`, `docs/execution-budget.md`, `docs/detail-contract.md` |
 | Codex App + DeepSeek preset | `docs/codex-app-deepseek.md` |
 | Manual or external fallback exchange | `docs/translation-exchange.md` |
 | Existing release, game update, or selective continuation | `docs/release-checkpoint.md` |
@@ -53,11 +53,12 @@ Parr0t is an engine-neutral control framework and reusable SDK repository. Keep 
 | Windows package | `docs/installer-contract.md` plus `docs/filesystem-packaging.md` or `docs/steam-packaging.md` |
 | Steam discovery or Play-button integration | `docs/steam-faq.md`, `docs/wrapper-executable.md` |
 | User-requested per-game publication | `docs/instance-release.md` |
+| SDK branch maintenance/update | `docs/branch-update-contract.md` |
 | Confirmed SDK promotion/publication | `docs/sdk-branch-contract.md`, `docs/engine-faq-contract.md` |
 | Framework troubleshooting | `docs/faq.md` |
 | Triggered engine exception | selected SDK branch `docs/engine-faq.md` under `docs/engine-faq-contract.md` |
 
-For launcher-neutral Windows packages, `-GameRoot` accepts absolute paths and paths relative to the startup current directory; when omitted, the validated startup current directory is tried before prompting.
+Launcher-neutral packages accept absolute or startup-relative `-GameRoot`; omission uses the validated startup directory before prompting.
 
 ## Repository acceptance
 
