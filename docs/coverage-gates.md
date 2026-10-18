@@ -89,3 +89,5 @@ game-l10n record-runtime-coverage --workspace <workspace> --report <runtime-repo
 ```
 
 This records evidence only. It does not install, update, launch, or close a game.
+
+A synthetic fixture proves only the exercised static or synthetic property. It must not be reported as “working in game”. Player-visible placeholder/default strings, language-registration assumptions, and runtime interception behavior remain blocking or explicitly unverified until deterministic engine evidence or an authorized/user-executed runtime observation establishes them.
