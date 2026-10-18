@@ -61,6 +61,7 @@ from .native_pass import (
     import_native_shard,
     import_native_wave,
     merge_native_pass,
+    native_control_step,
     prepare_native_tasks,
 )
 from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
@@ -893,6 +894,21 @@ def cmd_import_native_wave(args: argparse.Namespace) -> int:
         _path_in_workspace(work_dir, args.manifest, must_exist=True),
         _path_in_workspace(work_dir, args.input_dir, must_exist=True),
         args.wave,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_native_pass_step(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    require_sdk_activation(work_dir, load_config(work_dir))
+    result = native_control_step(
+        work_dir,
+        _path_in_workspace(work_dir, args.manifest, must_exist=True),
+        _path_in_workspace(work_dir, args.results_dir),
+        usage_event_id=args.usage_event_id,
+        input_tokens=args.input_tokens,
+        provider_cost_usd=args.provider_cost_usd,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -1828,6 +1844,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Assert that the user supplied the bound bulk time, token, and cost policy",
     )
     native_prepare.set_defaults(func=cmd_prepare_native_pass)
+
+    native_step = sub.add_parser(
+        "native-pass-step",
+        help="Advance one native pass using the deterministic core wave controller",
+    )
+    native_step.add_argument("--workspace", required=True)
+    native_step.add_argument("--manifest", required=True)
+    native_step.add_argument(
+        "--results-dir",
+        required=True,
+        help="Private directory where workers write task-named results",
+    )
+    native_step.add_argument(
+        "--usage-event-id",
+        help="Stable unique ID for one aggregate provider-usage observation",
+    )
+    native_step.add_argument("--input-tokens", type=int, default=0)
+    native_step.add_argument("--provider-cost-usd", type=float, default=0.0)
+    native_step.set_defaults(func=cmd_native_pass_step)
 
     native_import = sub.add_parser(
         "import-native-shard",
