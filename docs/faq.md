@@ -96,7 +96,7 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 
 - **Symptom:** Task files contain many IDs, yet prompt count and model/API calls grow almost one-for-one with records; input greatly exceeds output and elapsed time scales serially.
 - **General cause:** Target-level failure isolation was misread as a requirement for target-level requests, or a job-local coordinator contract overrode the batch intent.
-- **Diagnosis:** Compare task count, record count, prompt artifacts, and semantic call count. More than one semantic request for a multi-target native task violates its v6 detail contract.
+- **Diagnosis:** Compare pass kind, task count, record count, prompt artifacts, and semantic call count. Translation/rewrite permits one semantic request. Review permits only its manifest-declared failed-subset binary split; any per-record loop or successful-row retry violates the v6 detail contract.
 - **Resolution:** Preserve completed shards, discard only the conflicting local execution instructions, and regenerate the remaining v6 manifest. Load shared context once, produce one ordered batched verdict set, and retain failures per target. If the provider truly accepts one target, repartition before dispatch.
 - **Prevention:** Treat `parr0t.detail-contract.v1` as supplemental-only, reject free-form execution contracts, and enforce the bulk pilot/budget gate before later waves.
 

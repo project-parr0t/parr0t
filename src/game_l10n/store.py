@@ -7,7 +7,7 @@ import threading
 from contextlib import closing
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .models import AttemptRecord, TranslationResult
 
@@ -15,6 +15,28 @@ from .models import AttemptRecord, TranslationResult
 def stable_hash(value: Any) -> str:
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def stable_hash_sequence(values: Iterable[Any]) -> str:
+    """Hash a JSON array without materializing its complete encoded form."""
+
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    first = True
+    for value in values:
+        if not first:
+            digest.update(b",")
+        first = False
+        digest.update(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+    digest.update(b"]")
+    return digest.hexdigest()
 
 
 class ResultStore:

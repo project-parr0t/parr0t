@@ -29,6 +29,22 @@ from game_l10n.native_pass import _detail_contract, prepare_native_tasks
 
 
 class ControlPlaneContractTests(unittest.TestCase):
+    def test_native_review_pass_kind_is_registered(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "prepare-native-pass",
+                "--workspace",
+                "fixture-workspace",
+                "--input",
+                "source.jsonl",
+                "--output",
+                "tasks",
+                "--pass-kind",
+                "review",
+            ]
+        )
+        self.assertEqual(args.pass_kind, "review")
+
     def test_native_pass_step_cli_is_registered(self) -> None:
         args = build_parser().parse_args(
             [
