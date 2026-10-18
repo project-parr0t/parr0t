@@ -49,6 +49,6 @@ Use `game-l10n` as the execution boundary. Read the repository `AGENTS.md`, `doc
 
 ## Unity 2021.3 branch
 
-Read `docs/unity-2021.3.md` and run `game-l10n unity discover` before choosing a build path. Keep the existing Mono workflow for Mono players. For IL2CPP players, generate compatible interop assemblies in the private workspace, then compile the private bridge with `build-il2cpp`; treat all player and loader inputs as read-only.
+Read `docs/unity-2021.3.md`; keep runtime inputs read-only and generated assemblies private.
 
-Never copy private game data, text, translations, prompts, caches, logs, keys, generated assemblies, or job provenance into the SDK repository.
+Never copy private game data, text, translations, prompts, caches, logs, keys, or job provenance into the SDK repository.
