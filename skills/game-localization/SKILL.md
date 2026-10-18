@@ -47,8 +47,8 @@ Use `game-l10n` as the execution boundary. Read the repository `AGENTS.md`, `doc
 - User-requested public instance: `docs/instance-release.md`.
 - Successful reusable SDK promotion: `docs/sdk-branch-contract.md` and `docs/engine-faq-contract.md`.
 
-## Unity 2022.3 prototype branch
+## Unity 2022.3 branch
 
-Read `docs/unity-2022.3.md` before selecting this profile. Use it only for its declared Unity 2022.3 Mono and single-UnityFS/ordered-INI `TextAsset` shape. Its bundle traversal is one inventory path; require an independent second inventory before context analysis or translation.
+Read `docs/unity-2022.3.md`; use only its declared profile and independently verify inventory.
 
-Never copy private game data, text, translations, prompts, caches, logs, keys, replacement bundles, or job provenance into the SDK repository.
+Never copy private game data, text, translations, prompts, caches, logs, keys, or job provenance into the SDK repository.
