@@ -10,6 +10,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class InstructionSurfaceTests(unittest.TestCase):
+    def test_ci_installs_sdk_requirements_before_collecting_tests(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text(
+            encoding="utf-8"
+        )
+        dependency_install = workflow.index("requirements-*.txt")
+        test_collection = workflow.index("python -m unittest discover")
+
+        self.assertLess(dependency_install, test_collection)
+        self.assertIn("--requirement \"$requirements\"", workflow)
+
     def test_review_control_is_documented_as_a_deterministic_router(self) -> None:
         root = Path(__file__).resolve().parents[1]
         contract = (root / "docs" / "control-plane-contract.md").read_text(
