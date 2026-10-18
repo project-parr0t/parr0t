@@ -142,10 +142,17 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "same_failure_limit": 2,
         "reuse_unchanged_checks": True,
         "delegate_simple_tasks": False,
-        "native_shard_policy_version": 3,
+        "native_shard_policy_version": 4,
         "native_shard_records": 64,
         "native_shard_min_records": 8,
         "native_shard_material_tokens": 24000,
+        "native_review_shard_records": 2048,
+        "native_review_shard_min_records": 64,
+        "native_review_shard_material_tokens": 262144,
+        "large_inventory_threshold_records": 10000,
+        "startup_full_inventory_scan_limit": 2,
+        "startup_per_record_artifacts_allowed": False,
+        "startup_attestation_fast_path": True,
         "native_worker_history": "none",
         "native_worker_reuse": False,
         "native_task_payload_schema": "parr0t.native-task-payload.v1",
@@ -872,7 +879,7 @@ def _apply_execution_defaults(config: dict[str, Any]) -> None:
         execution["native_shard_material_tokens"] = 24_000
     for key, value in CONFIG_TEMPLATE["execution"].items():
         execution.setdefault(key, value)
-    execution["native_shard_policy_version"] = 3
+    execution["native_shard_policy_version"] = 4
 
 
 def _apply_review_routing_defaults(config: dict[str, Any]) -> None:
