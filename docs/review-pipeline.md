@@ -27,11 +27,15 @@ For native App review, compact output alone is not enough: each bounded review t
 
 Within that fresh worker, the prepared task is still one batch. The judge loads shared rules/context once and produces all bound `ok | rewrite | refused | error` verdicts in one semantic response. It must not create or submit one prompt per candidate. A per-target verdict isolates the outcome, not the request: one failed target remains failed while successful neighbors remain usable in the same batch result.
 
+The worker reads only its bound v6 task payload plus the referenced focused context. It must not reopen the complete ordered source or prior result set for every batch. The full artifacts remain framework validation inputs; repeating them in each worker turns a linear pass into superlinear input cost without improving verdict evidence.
+
 This is selective **strong** review, not selective review coverage. Every new or reused candidate receives a fresh triage verdict through the configured route. Prior approval never exempts a candidate. An unselected candidate counts as reviewed only when a current-generation `review-triage` approval and candidate digest both match; selected candidates require a current strong approval. With no `review_triagers` route, Parr0t retains the legacy behavior and sends every candidate through `reviewers`.
 
 `routing.review_max_rounds` bounds judge/rewrite cycles. The recommended value is `2`: one initial judgment and one confirmation after at most one rewrite. Increase it only when representative evaluations show that another correction cycle improves accepted quality enough to justify the extra calls.
 
 After a complete review pass, freeze the flagged target set. If no more than `execution.residual_direct_records` remain, process them as one cached residual task in one fresh no-history worker, then aggregate once. Do not create a new controller, ownership/lease layer, proof bundle, or supplemental context workflow for the tail, and never reopen already approved candidates. A capacity failure preserves the exact residual task for resumption instead of restarting the control turn.
+
+Once the final verdict is imported, review is over. Package construction, README/release metadata, and deterministic integrity checks must not spawn another reviewer or request semantic reassurance. A finalization defect reopens only the exact failed deterministic gate unless it changes candidate text.
 
 ## Focused evidence, not context removal
 

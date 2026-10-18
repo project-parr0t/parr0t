@@ -47,8 +47,4 @@ Use `game-l10n` as the execution boundary. Read the repository `AGENTS.md`, `doc
 - User-requested public instance: `docs/instance-release.md`.
 - Successful reusable SDK promotion: `docs/sdk-branch-contract.md` and `docs/engine-faq-contract.md`.
 
-## Unity 2021.3 branch
-
-Read `docs/unity-2021.3.md`; keep runtime inputs read-only and generated assemblies private.
-
 Never copy private game data, text, translations, prompts, caches, logs, keys, or job provenance into the SDK repository.

@@ -38,7 +38,7 @@ BepInEx, MelonLoader, and native project loaders use different entry contracts. 
 ## Discover
 
 ```powershell
-game-l10n unity discover `
+python -m game_l10n.unity discover `
   --workspace <agent-workspace> `
   --game-root <configured-player-root>
 ```
@@ -87,7 +87,7 @@ The method names and implementation fingerprints must differ. Both inventories m
 Run the normal context-first translation and compact review pipeline, then compile only reviewed or source-preserved results:
 
 ```powershell
-game-l10n unity compile-payload `
+python -m game_l10n.unity compile-payload `
   --workspace <agent-workspace> `
   --segments inputs\unity-primary.json `
   --reviewed outputs\fixture-reviewed.json `
@@ -100,7 +100,7 @@ game-l10n unity compile-payload `
 ## Build a private Mono loader bridge
 
 ```powershell
-game-l10n unity build-managed `
+python -m game_l10n.unity build-managed `
   --workspace <agent-workspace> `
   --managed-root <configured-player-root>\Fixture_Data\Managed `
   --source bridge\FixtureBridge.cs `
@@ -117,7 +117,7 @@ The compiler receives argument arrays directly, reads the installed managed asse
 Keep the player files read-only and extract the compatible BepInEx IL2CPP distribution and Unity base libraries into the private workspace. Then run:
 
 ```powershell
-game-l10n unity generate-interop `
+python -m game_l10n.unity generate-interop `
   --workspace <agent-workspace> `
   --game-root <configured-player-root> `
   --loader-root dependencies\fixture-loader `
@@ -132,7 +132,7 @@ The BepInEx distribution must contain the public Cpp2IL, LibCpp2IL, AsmResolver,
 ## Build a private IL2CPP loader bridge
 
 ```powershell
-game-l10n unity build-il2cpp `
+python -m game_l10n.unity build-il2cpp `
   --workspace <agent-workspace> `
   --loader-root dependencies\fixture-loader `
   --source bridge\FixtureBridge.cs `
@@ -161,12 +161,12 @@ Create a workspace-only patch specification:
 Then create and verify the sidecar archive:
 
 ```powershell
-game-l10n unity pack `
+python -m game_l10n.unity pack `
   --workspace <agent-workspace> `
   --spec patch\fixture-spec.json `
   --output output\fixture-patch.zip
 
-game-l10n unity verify `
+python -m game_l10n.unity verify `
   --workspace <agent-workspace> `
   --archive output\fixture-patch.zip
 ```
@@ -181,3 +181,7 @@ The archive is never installed automatically. Installation requires a separate u
 - It does not treat the presence of Unity Localization as proof that every visible string comes from a String Table.
 - It does not install or redistribute BepInEx, Unity base libraries, or generated interop assemblies as though they were owned by the SDK.
 - It does not choose a BepInEx/Cpp2IL release for an unknown metadata version; compatibility must be pinned and verified in the private workspace.
+
+## Core update compatibility
+
+Use the standalone engine module commands above. The framework CLI and root package remain identical to main. Import engine APIs from the engine subpackage.

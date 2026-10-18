@@ -1,0 +1,1 @@
+recursive-include src/game_l10n/unity/resources *.cs

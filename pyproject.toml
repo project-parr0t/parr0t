@@ -20,7 +20,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 game_l10n = ["templates/*.bat", "templates/*.ps1"]
-"game_l10n.unity" = ["resources/*.cs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

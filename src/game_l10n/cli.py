@@ -87,7 +87,6 @@ from .workspace import (
     update_repository_policy,
     verify_sdk_promotion_commit,
 )
-from .unity.cli import register_unity_parser
 
 
 STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
@@ -1489,7 +1488,10 @@ def cmd_publish(args: argparse.Namespace) -> int:
 
 def cmd_verify_sdk_promotion(args: argparse.Namespace) -> int:
     result = verify_sdk_promotion_commit(
-        Path(args.sdk_root).resolve(), args.branch, args.commit
+        Path(args.sdk_root).resolve(), args.branch, args.commit or "HEAD",
+        working_tree=args.working_tree,
+        planned_paths=args.planned_path,
+        expected_main=args.expected_main,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -1796,7 +1798,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     native_prepare = sub.add_parser(
         "prepare-native-pass",
-        help="Create cached exclusive target-ID task files for native workers",
+        help="Create cached exclusive bound-segment task payloads for native workers",
     )
     native_prepare.add_argument("--workspace", required=True)
     native_prepare.add_argument("--input", required=True, help="Ordered source segment file")
@@ -2084,11 +2086,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     promotion_scope = sub.add_parser(
         "verify-sdk-promotion",
-        help="Reject an SDK promotion commit that also changes main-owned files",
+        help="Check SDK path ownership before implementation or on a final commit",
     )
     promotion_scope.add_argument("--sdk-root", required=True)
     promotion_scope.add_argument("--branch", required=True)
-    promotion_scope.add_argument("--commit", default="HEAD")
+    promotion_mode = promotion_scope.add_mutually_exclusive_group()
+    promotion_mode.add_argument("--commit", help="Final promotion commit (default: HEAD)")
+    promotion_mode.add_argument("--working-tree", action="store_true", help="Read-only preflight before implementation")
+    promotion_scope.add_argument("--planned-path", action="append", default=[], help="Planned repository-relative file; repeatable, preflight only")
+    promotion_scope.add_argument("--expected-main", help="Full base hash returned by the first preflight; reject drift")
     promotion_scope.set_defaults(func=cmd_verify_sdk_promotion)
 
     steam_package = sub.add_parser(
@@ -2177,8 +2183,6 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="Check workspace configuration without sending game data")
     doctor.add_argument("--workspace", required=True)
     doctor.set_defaults(func=cmd_doctor)
-
-    register_unity_parser(sub)
     return parser
 
 

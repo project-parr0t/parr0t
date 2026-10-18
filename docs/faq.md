@@ -96,33 +96,9 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 
 - **Symptom:** Task files contain many IDs, yet prompt count and model/API calls grow almost one-for-one with records; input greatly exceeds output and elapsed time scales serially.
 - **General cause:** Target-level failure isolation was misread as a requirement for target-level requests, or a job-local coordinator contract overrode the batch intent.
-- **Diagnosis:** Compare task count, record count, prompt artifacts, and semantic call count. More than one semantic request for a multi-target native task violates its v5 detail contract.
-- **Resolution:** Preserve completed shards, discard only the conflicting local execution instructions, and regenerate the remaining v5 manifest. Load shared context once, produce one ordered batched verdict set, and retain failures per target. If the provider truly accepts one target, repartition before dispatch.
+- **Diagnosis:** Compare task count, record count, prompt artifacts, and semantic call count. More than one semantic request for a multi-target native task violates its v6 detail contract.
+- **Resolution:** Preserve completed shards, discard only the conflicting local execution instructions, and regenerate the remaining v6 manifest. Load shared context once, produce one ordered batched verdict set, and retain failures per target. If the provider truly accepts one target, repartition before dispatch.
 - **Prevention:** Treat `parr0t.detail-contract.v1` as supplemental-only, reject free-form execution contracts, and enforce the bulk pilot/budget gate before later waves.
-
-## A managed Unity patch builds but does not load in another project
-
-- **Symptom:** A compiled localization assembly works with one mod-enabled Unity player but is ignored or rejected by another.
-- **General cause:** Unity does not define one universal managed mod entry point. Native project loaders, BepInEx, and MelonLoader have different manifests, base classes, attributes, lifecycle methods, and dependency locations.
-- **Diagnosis:** Confirm the exact Unity series and backend first, then compare the target loader's public entry contract with the private bridge source. Do not infer compatibility from the `Mods` directory name alone.
-- **Resolution:** Keep the common discovery, payload, compilation, packaging, and verification stages, but implement the loader entry bridge in the private workspace against that loader's documented API.
-- **Prevention:** Test one synthetic bridge per supported loader and keep loader-specific references explicit in the patch specification.
-
-## A Unity localization patch changes identifiers or executable metadata
-
-- **Symptom:** Text appears translated, but a table lookup, Smart String, TextAsset lookup, or dynamic UI path stops working.
-- **General cause:** A display string was confused with its stable key, or extraction omitted engine metadata needed by the runtime bridge.
-- **Diagnosis:** Compare source and rebuilt inventories by String Table collection and entry ID, TextAsset key, Smart String flag, and approved UI path. Treat keys and paths as protected fields.
-- **Resolution:** Restore the original identifiers and compile only reviewed target text into the runtime payload. Reject duplicate or conflicting runtime locations.
-- **Prevention:** Give every segment a stable framework ID plus explicit `unity_kind` location metadata, and validate the complete set before packing.
-
-## A Unity patch ZIP accidentally contains player runtime assemblies
-
-- **Symptom:** A patch is unexpectedly large or includes assemblies copied from the installed player's managed directory.
-- **General cause:** Build references were staged as distributable dependencies instead of remaining read-only compiler inputs.
-- **Diagnosis:** Inspect the ZIP manifest and reject game assemblies, Unity engine modules, localization packages, and base framework assemblies.
-- **Resolution:** Package only the newly built entry assembly, the loader manifest, approved redistributable dependencies, and the localization payload.
-- **Prevention:** Keep build references outside the staging tree and run the adapter verifier before presenting the patch.
 
 ## A semantically accurate title or short line still reads like a literal translation
 
@@ -188,13 +164,13 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **Resolution:** Keep all artifacts local, remove the unsolicited publication step from the active plan and user-facing status, and continue or stop at the requested local deliverable. Do not convert the correction into a new request for publication approval.
 - **Prevention:** Keep publication workflows dormant and silent until activated by a user-originated command. Generated profiles and ordinary status output must not advertise publication; a successful patch, local Git choice, or SDK promotion never activates it.
 
-## A GitHub Release title omits the compatible game version
+## A GitHub Release uses the wrong patch revision or compatibility name
 
-- **Symptom:** The visible release title contains only a patch version or uses a vague label such as `latest`, leaving players unable to tell which original game version it supports.
-- **General cause:** Patch identity and original-game compatibility were maintained as separate metadata and the title was not validated against the supported-build matrix.
-- **Diagnosis:** Compare the visible title with the README, release notes, manifest, asset metadata, and installer binding checks. The exact supported game-version set must agree everywhere.
-- **Resolution:** Before publication, set the title to `<Game Display Name> Patch <Patch Version> (Game Version <Game Version>)`; use the exact enumerated `Game Versions` form only for multiple validated builds. If the game version is unknown, keep the release private and unresolved.
-- **Prevention:** Make the release-title format a required gate and reject bare patch versions, unverified ranges, and ambiguous compatibility labels.
+- **Symptom:** The patch uses SemVer, a loose tag, or a title that omits its language or exact compatible game version/build.
+- **General cause:** Patch identity and original-game compatibility were maintained as separate metadata instead of one canonical release name.
+- **Diagnosis:** Require `patch_version`, `release_id`, and tag to equal `r<positive revision>`, then compare the visible title and asset with the README, release notes, manifest, and installer bindings.
+- **Resolution:** Before publication, use `<Game Display Name>-<Language>-r<Revision> (Game Version <Game Version>)` or the corresponding `Game Build`/exact plural form, and name the ZIP `<Game>-<Language>-r<Revision>.zip`. If the exact version/build is unknown, keep the release private and unresolved.
+- **Prevention:** Enforce the v2 instance-release gate; reject SemVer, aliases, ambiguous compatibility labels, title drift, and asset-name drift.
 
 ## A release works on the build agent but not on the player's machine
 
@@ -289,7 +265,7 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **Symptom:** A large translation or review pass has reasonable unique input and output, but aggregate input is orders of magnitude larger, cached input dominates usage, the root makes hundreds of model calls, controller agents spawn more agents, or a worker remains alive across several shards.
 - **General cause:** Long root/control sessions and nested model controllers replay instructions, tool definitions, conversation history, command results, and prior progress on every call. Cache hits reduce repeated computation but do not turn the repeated input into zero usage.
 - **Diagnosis:** Compare root and descendant session counts, maximum agent depth, model-call counts, aggregate input, cached input, output, progress messages, and work completed without reading game text. Any model controller, depth above one, follow-up shard, repeated contract read with the same digest, or continued turn beyond the manifest ceiling violates the execution contract.
-- **Resolution:** Regenerate v5 tasks with `prepare-native-pass`, then use `native-pass-step` as the only scheduler. Dispatch only its exact returned wave to fresh no-history workers, wait once, and call it again to import and advance. Do not repair a long session with direct manifest selection, per-shard turns, summaries, compaction, recovery controllers, or nested agents.
+- **Resolution:** Regenerate v6 tasks with `prepare-native-pass`, then use `native-pass-step` as the only scheduler. Dispatch only its exact returned wave to fresh no-history workers, wait once, and call it again to import and advance. Do not repair a long session with direct manifest selection, per-shard turns, summaries, compaction, recovery controllers, or nested agents.
 - **Prevention:** Keep the default 64-ID/24,000-estimated-material-token bounds and preferred eight-record minimum, never reuse completed workers, prohibit worker delegation, and require the persisted deterministic step state for every wave. Treat a high cached-input ratio as a stop signal rather than evidence that a long session is efficient.
 
 ## A handful of residual review items takes hours to finish
@@ -297,7 +273,7 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **Symptom:** The complete pass is done and only a few corrections remain, but the job creates controllers, ownership or lease records, liveness checks, proof bundles, repeated context supplements, or dozens of status waits instead of finishing the targets.
 - **General cause:** Bulk-work reliability machinery was recursively rebuilt for the residual tail. Capacity failures then restarted a long-lived root turn, so metadata and conversation history grew while the remaining target count did not.
 - **Diagnosis:** Compare the frozen residual count with worker dispatches and state changes. More than one task for at most 32 targets, any job-local orchestration layer, repeated identical progress snapshots, or a capacity restart of the root turn violates the residual convergence contract.
-- **Resolution:** Keep every passed result, generate one v5 residual task with `prepare-native-pass`, and enter it through `native-pass-step`. Run the returned task in one fresh no-history worker and call the step once more to import and aggregate. On capacity or startup failure, preserve that exact task and return; do not create another controller or automatic continuation.
+- **Resolution:** Keep every passed result, generate one v6 residual task with `prepare-native-pass`, and enter it through `native-pass-step`. Run the returned task in one fresh no-history worker and call the step once more to import and aggregate. On capacity or startup failure, preserve that exact task and return; do not create another controller or automatic continuation.
 - **Prevention:** Keep `residual_direct_records=32`, `job_local_controller_allowed=false`, `automatic_capacity_restart_allowed=false`, `max_unchanged_progress_observations=1`, and `max_control_actions_without_progress=2`. Report only at wave boundaries or blockers. Semantic quality checks and the existing two-round review limit still apply; only orchestration churn is removed.
 
 ## A short API fallback target consumes tens of thousands of input tokens
@@ -307,11 +283,3 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **Diagnosis:** Use aggregate character and provider-usage telemetry without opening game text. Compare request count, average combined input size, cached-input/cache-miss counts, and the configured per-task bound; check structurally whether metadata contains a context pack, bundle, or attachment.
 - **Resolution:** Stop the job-local loop, retain completed successes, and resume only pending IDs through the configured adapter. Move shared analysis back to the typed `ContextPack`, let the prompt builder project relevant evidence, and keep `budget_exhausted` targets queued until duplicated context is removed or a larger bound is explicitly justified.
 - **Prevention:** Keep the preset 24,000-character text-request preflight, never embed full context containers in `Segment.metadata`, preserve stable-field-first prompt order, and retain provider cache telemetry. Retry counts need not be reduced; every retry is still subject to the same per-request bound.
-
-## IL2CPP interop generation rejects the metadata version
-
-- **Symptom:** Offline interop generation stops while parsing metadata and reports an unsupported format version.
-- **General cause:** The player metadata format is newer than the Cpp2IL/LibCpp2IL build bundled with the selected BepInEx IL2CPP distribution.
-- **Diagnosis:** Run Unity discovery and compare the reported `metadata_version` with the documented support of the private workspace toolchain. Do not infer the version from the Unity editor version alone.
-- **Resolution:** Replace the private workspace loader toolchain with a compatible release, regenerate into a fresh output directory, and keep the player binary and metadata unchanged.
-- **Prevention:** Pin the loader archive outside the SDK repository and run offline metadata parsing plus interop generation before building or distributing a bridge.
