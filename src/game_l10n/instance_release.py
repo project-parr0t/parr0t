@@ -13,12 +13,12 @@ from .release_checkpoint import CHECKPOINT_NAME, CHECKPOINT_SCHEMA, canonical_ch
 from .steam import MANIFEST_NAME, validate_steam_package
 
 
-INSTANCE_RELEASE_SCHEMA = "parr0t.instance-release/v1"
+INSTANCE_RELEASE_SCHEMA = "parr0t.instance-release/v2"
 INSTANCE_RELEASE_NAME = "parr0t-instance-release.json"
-GATE_SCHEMA = "parr0t.instance-release-gate/v1"
+GATE_SCHEMA = "parr0t.instance-release-gate/v2"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-fA-F]{7,64}$")
-_PATCH_VERSION = re.compile(r"^v?[0-9][0-9A-Za-z._-]*$")
+_PATCH_VERSION = re.compile(r"^r[1-9][0-9]*$")
 _LEGAL_NAMES = re.compile(
     r"^(?:licen[cs]e|copying|notice|authors?|credits?)(?:[._-].*)?$",
     re.IGNORECASE,
@@ -130,9 +130,25 @@ def _git(root: Path, *arguments: str, check: bool = True) -> str:
     return process.stdout.strip()
 
 
-def _expected_title(display_name: str, patch_version: str, versions: list[str]) -> str:
-    label = "Game Version" if len(versions) == 1 else "Game Versions"
-    return f"{display_name} Patch {patch_version} ({label} {', '.join(versions)})"
+def _filename_component(value: str, *, field: str) -> str:
+    component = re.sub(r"[^\w.-]+", "-", value.strip(), flags=re.UNICODE)
+    component = re.sub(r"-+", "-", component).strip("._-")
+    if not component:
+        raise InstanceReleaseError(f"{field} cannot form a package name")
+    return component
+
+
+def _expected_title(
+    display_name: str,
+    language: str,
+    patch_version: str,
+    versions: list[str],
+    display_type: str,
+) -> str:
+    label = "Game Build" if display_type == "build" else "Game Version"
+    if len(versions) != 1:
+        label += "s"
+    return f"{display_name}-{language}-{patch_version} ({label} {', '.join(versions)})"
 
 
 def _validate_metadata(payload: Any) -> dict[str, Any]:
@@ -145,6 +161,7 @@ def _validate_metadata(payload: Any) -> dict[str, Any]:
             "patch_id",
             "release_id",
             "display_name",
+            "language",
             "patch_version",
             "tag",
             "release_title",
@@ -160,11 +177,22 @@ def _validate_metadata(payload: Any) -> dict[str, Any]:
     )
     if payload["schema"] != INSTANCE_RELEASE_SCHEMA:
         raise InstanceReleaseError("Instance release metadata schema is unsupported")
-    for field in ("patch_id", "release_id", "display_name", "tag", "release_title"):
+    for field in (
+        "patch_id",
+        "release_id",
+        "display_name",
+        "language",
+        "tag",
+        "release_title",
+    ):
         _text(payload[field], field=field)
     patch_version = _text(payload["patch_version"], field="patch_version")
     if not _PATCH_VERSION.fullmatch(patch_version):
-        raise InstanceReleaseError("patch_version must be a stable visible version")
+        raise InstanceReleaseError("patch_version must be r followed by a positive revision")
+    if payload["release_id"] != patch_version:
+        raise InstanceReleaseError("release_id must exactly match patch_version")
+    if payload["tag"] != patch_version:
+        raise InstanceReleaseError("tag must exactly match patch_version")
 
     target = payload["target"]
     if not isinstance(target, dict):
@@ -182,21 +210,42 @@ def _validate_metadata(payload: Any) -> dict[str, Any]:
         raise InstanceReleaseError("supported_game_builds must list every verified build")
     build_ids: set[str] = set()
     versions: list[str] = []
+    display_types: set[str] = set()
     for index, build in enumerate(builds):
         if not isinstance(build, dict):
             raise InstanceReleaseError(f"supported_game_builds[{index}] must be an object")
-        _required_keys(build, {"id", "display_version"}, scope=f"supported_game_builds[{index}]")
+        _required_keys(
+            build,
+            {"id", "display_version", "display_type"},
+            scope=f"supported_game_builds[{index}]",
+        )
         build_id = _text(build["id"], field=f"supported_game_builds[{index}].id")
         version = _text(
             build["display_version"], field=f"supported_game_builds[{index}].display_version"
         )
+        display_type = _text(
+            build["display_type"], field=f"supported_game_builds[{index}].display_type"
+        )
+        if display_type not in {"build", "version"}:
+            raise InstanceReleaseError(
+                f"supported_game_builds[{index}].display_type must be build or version"
+            )
         if build_id in build_ids:
             raise InstanceReleaseError("supported game build IDs must be unique")
         build_ids.add(build_id)
         versions.append(version)
+        display_types.add(display_type)
     if len(versions) != len(set(versions)):
         raise InstanceReleaseError("supported game display versions must be unique")
-    expected_title = _expected_title(payload["display_name"], patch_version, versions)
+    if len(display_types) != 1:
+        raise InstanceReleaseError("supported game builds must use one display_type")
+    expected_title = _expected_title(
+        payload["display_name"],
+        payload["language"],
+        patch_version,
+        versions,
+        display_types.pop(),
+    )
     if payload["release_title"] != expected_title:
         raise InstanceReleaseError(f"release_title must be exactly: {expected_title}")
 
@@ -219,6 +268,13 @@ def _validate_metadata(payload: Any) -> dict[str, Any]:
         raise InstanceReleaseError("asset.format has no registered instance-release validator")
     if Path(_text(asset["name"], field="asset.name")).name != asset["name"]:
         raise InstanceReleaseError("asset.name must be one file name")
+    expected_asset_name = (
+        f"{_filename_component(payload['display_name'], field='display_name')}-"
+        f"{_filename_component(payload['language'], field='language')}-"
+        f"{patch_version}.zip"
+    )
+    if asset["name"] != expected_asset_name:
+        raise InstanceReleaseError(f"asset.name must be exactly: {expected_asset_name}")
     if not isinstance(asset["bytes"], int) or asset["bytes"] < 1:
         raise InstanceReleaseError("asset.bytes must be positive")
     _digest(asset["sha256"], field="asset.sha256")
@@ -390,6 +446,8 @@ def validate_instance_release(
         "instance_commit": instance_commit,
         "tag": metadata["tag"],
         "release_id": metadata["release_id"],
+        "patch_version": metadata["patch_version"],
+        "language": metadata["language"],
         "release_title": metadata["release_title"],
         "asset": asset_contract,
         "checkpoint": checkpoint_contract,

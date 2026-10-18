@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -349,8 +350,57 @@ class NativePassTests(unittest.TestCase):
         self.assertFalse(first["cached"])
         self.assertTrue(second["cached"])
         self.assertEqual(first["tasks"], 3)
+        self.assertEqual(first["task_payload_schema"], "parr0t.native-task-payload.v1")
         self.assertEqual([row["target_id"] for row in task_rows], [f"fixture-{index}" for index in range(5)])
         self.assertEqual([row["ordinal"] for row in task_rows], list(range(5)))
+        self.assertEqual(
+            [row["segment"]["source"] for row in task_rows],
+            [f"SOURCE_{index}" for index in range(5)],
+        )
+        self.assertEqual(
+            [row["segment"]["id"] for row in task_rows],
+            [row["target_id"] for row in task_rows],
+        )
+
+    def test_legacy_v5_id_only_manifest_remains_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "fixture-source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            segments = [Segment("fixture-1", "SOURCE")]
+            tasks = root / "tasks"
+            prepare_native_tasks(root, source, segments, tasks)
+            manifest_path = tasks / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["version"] = 5
+            task_path = tasks / manifest["tasks"][0]["file"]
+            rows = [
+                {
+                    "target_id": row["target_id"],
+                    "ordinal": row["ordinal"],
+                }
+                for row in (
+                    json.loads(line)
+                    for line in task_path.read_text(encoding="utf-8").splitlines()
+                )
+            ]
+            self._write_rows(task_path, rows)
+            manifest["tasks"][0]["sha256"] = hashlib.sha256(
+                task_path.read_bytes()
+            ).hexdigest()
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            summary = merge_native_pass(
+                root,
+                segments,
+                root / "merged.jsonl",
+                manifest_path=manifest_path,
+            )
+
+        self.assertFalse(summary["complete"])
 
     def test_native_tasks_bound_fresh_workers_by_records_and_material(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -377,7 +427,11 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(summary["tasks"], 3)
         self.assertTrue(summary["fresh_worker_per_task"])
         self.assertEqual(summary["history_mode"], "none")
-        self.assertEqual(manifest["version"], 5)
+        self.assertEqual(manifest["version"], 6)
+        self.assertEqual(
+            manifest["task_payload_schema"],
+            "parr0t.native-task-payload.v1",
+        )
         self.assertEqual(manifest["min_records"], 8)
         self.assertEqual(manifest["max_material_tokens"], 300)
         self.assertEqual(manifest["max_workers"], 8)
@@ -388,6 +442,13 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(manifest["worker_contract"]["max_followup_tasks"], 0)
         self.assertEqual(manifest["worker_contract"]["max_agent_depth"], 1)
         self.assertFalse(manifest["worker_contract"]["delegation_allowed"])
+        self.assertTrue(
+            manifest["worker_contract"]["task_payload_contains_bound_segments"]
+        )
+        self.assertEqual(
+            manifest["worker_contract"]["full_source_artifact_access"],
+            "validation_only",
+        )
         self.assertFalse(
             manifest["worker_contract"]["model_controller_role_allowed"]
         )
@@ -537,7 +598,7 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(summary["wave"], 2)
         self.assertEqual(summary["records"], 2)
 
-    def test_changed_v5_detail_contract_is_rejected_before_import(self) -> None:
+    def test_changed_v6_detail_contract_is_rejected_before_import(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "fixture-source.jsonl"
