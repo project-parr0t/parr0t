@@ -1,6 +1,6 @@
 # Parr0t agent operation guide
 
-This is the short operating entry point for coding agents. `AGENTS.md` defines invariants; dedicated documents define stage details. Do not load unrelated contracts in advance.
+Operating entry point for coding agents. `AGENTS.md` defines invariants; dedicated documents define stage details. Do not load unrelated contracts in advance.
 
 ## Supported control paths
 
@@ -72,6 +72,7 @@ Use the routing table in repository `AGENTS.md`. Common short paths are:
 - real runtime action: `runtime-approval.md` only after the matching explicit request;
 - Windows delivery: `installer-contract.md` plus the selected Steam or filesystem packaging contract;
 - publication: `instance-release.md` only after the user commands publication;
+- SDK branch maintenance/update: `branch-update-contract.md`;
 - reusable SDK promotion: SDK branch and engine FAQ contracts only after confirmed patch success.
 
 After verified context, status routes to the complete primary translation/review pipeline. A missing, malformed, or stale completion attestation is never `ready`; incomplete results route to targeted gap resolution, and static completion routes to validation and packing. The completion attestation binds the exact result artifact, and the pack cache binds that input plus the current attestation and output digest before status can return `local_patch_ready`. Malformed state returns one metadata-only repair action instead of a traceback, while a failure queue bound to another inventory returns a stale-queue reconciliation action rather than blocking the current inventory.
