@@ -125,7 +125,7 @@ def apply_user_corrections(
     if output_path.suffix.casefold() not in {".json", ".jsonl"}:
         raise CorrectionError("Correction output must use JSON or JSONL to retain audit metadata")
 
-    checkpoint, _ = canonical_checkpoint_bytes(checkpoint_path)
+    checkpoint, checkpoint_bytes = canonical_checkpoint_bytes(checkpoint_path)
     if checkpoint["source_inventory"]["fingerprint"] != expected_inventory_fingerprint:
         raise CorrectionError("Release checkpoint does not match the verified source inventory")
 
@@ -246,6 +246,19 @@ def apply_user_corrections(
         "model_calls": 0,
         "context_analysis_runs": 0,
         "base_source": base_source,
+        "bindings": {
+            "inventory_fingerprint": expected_inventory_fingerprint,
+            "checkpoint_sha256": hashlib.sha256(checkpoint_bytes).hexdigest(),
+            "request_sha256": hashlib.sha256(request_path.read_bytes()).hexdigest(),
+            "base_results_sha256": (
+                hashlib.sha256(base_results_path.read_bytes()).hexdigest()
+                if base_results_path is not None
+                else None
+            ),
+            "changed_candidate_digests": {
+                target_id: stable_hash(changes[target_id]) for target_id in sorted(changes)
+            },
+        },
         "output": str(output_path),
         "output_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
     }
