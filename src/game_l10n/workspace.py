@@ -148,6 +148,8 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "native_shard_material_tokens": 24000,
         "native_worker_history": "none",
         "native_worker_reuse": False,
+        "native_task_payload_schema": "parr0t.native-task-payload.v1",
+        "native_full_source_access": "validation_only",
         "native_agent_max_depth": 1,
         "model_controller_allowed": False,
         "worker_delegation_allowed": False,
@@ -242,6 +244,7 @@ This private workspace contains game data and localization artifacts. Resolve th
 - Retryable failures stay in the metadata-only failure queue. Terminal source-preserved outcomes are recorded separately and are not retried as pending work; `metadata.blocking_on_failure=true` holds the entire patch.
 - Keep publication dormant and unmentioned until the user requests it. SDK promotion also requires confirmed patch success and the original exact target identity. Its separate engine-only commit must pass `game-l10n verify-sdk-promotion`; never mix a `main`-owned path into that commit.
 - Native orchestration is root-direct for the entire pass with no controller or worker delegation. After `prepare-native-pass`, use `game-l10n native-pass-step` as the only scheduler. Dispatch only its returned wave, wait once, then call it again; the core imports complete results and returns one next action. Never select waves or recovery from the manifest yourself; reload prose only when `status.contract_set.digest` or the control generation changes.
+- Each v6 task embeds its bound segments. Read it once; never open the validation-only full source.
 - Use proportional checks, keep small coupled work in the current agent, and stop after the required layer passes. Once a pass leaves no more than `execution.residual_direct_records`, use one fresh worker on one cached residual task; do not create a job-local scheduler, controller, lease/owner system, liveness proof, memoization layer, or supplemental evidence pack. A native capacity failure ends that worker attempt and enters resumable state; it must not auto-restart the root turn. Aggregate once per wave, report progress only at a wave boundary or blocker, and stop after one unchanged progress observation or two control actions without measurable progress.
 
 ## Status routes

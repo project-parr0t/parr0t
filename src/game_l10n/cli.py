@@ -1795,7 +1795,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     native_prepare = sub.add_parser(
         "prepare-native-pass",
-        help="Create cached exclusive target-ID task files for native workers",
+        help="Create cached exclusive bound-segment task payloads for native workers",
     )
     native_prepare.add_argument("--workspace", required=True)
     native_prepare.add_argument("--input", required=True, help="Ordered source segment file")

@@ -92,6 +92,18 @@ class InstructionSurfaceTests(unittest.TestCase):
         self.assertIn("E_BULK_EXECUTION_BUDGET_REQUIRED", detail)
         self.assertIn("one semantic model/API batch call", execution)
         self.assertIn("must not create or submit one prompt per candidate", review)
+        self.assertIn("must not open the full ordered `source_artifact`", detail)
+        self.assertIn("must not make another full game-tree copy", execution)
+        self.assertIn("must not reopen the complete ordered source", review)
+
+    def test_runtime_and_worker_cost_claims_stay_evidence_bound(self) -> None:
+        coverage = (ROOT / "docs/coverage-gates.md").read_text(encoding="utf-8")
+        deepseek = (ROOT / "docs/codex-app-deepseek.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("must not be reported as “working in game”", coverage)
+        self.assertIn("must not open the full ordered source", deepseek)
 
     def test_status_contract_set_is_stable_and_generation_aware(self) -> None:
         first = _status_contract_set(

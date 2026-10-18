@@ -117,7 +117,7 @@ def _write_fixture(root: Path, *, readme_replacement: bool = False) -> tuple[Pat
     }
     spec_path = private / "package.json"
     spec_path.write_text(json.dumps(spec), encoding="utf-8")
-    package = private / "fixture-patch-v1.2.0.zip"
+    package = private / "Fixture-Game-Korean-r2.zip"
     build_steam_package(payload, spec_path, package)
     with zipfile.ZipFile(package, "r") as archive:
         manifest_bytes = archive.read(MANIFEST_NAME)
@@ -134,12 +134,17 @@ def _write_fixture(root: Path, *, readme_replacement: bool = False) -> tuple[Pat
         "patch_id": "fixture-localization",
         "release_id": "r2",
         "display_name": "Fixture Game",
-        "patch_version": "v1.2.0",
-        "tag": "v1.2.0",
-        "release_title": "Fixture Game Patch v1.2.0 (Game Version 1.0.0)",
+        "language": "Korean",
+        "patch_version": "r2",
+        "tag": "r2",
+        "release_title": "Fixture Game-Korean-r2 (Game Version 1.0.0)",
         "target": {"os": "windows", "architecture": "x64", "prerequisites": []},
         "supported_game_builds": [
-            {"id": "fixture-build-1", "display_version": "1.0.0"}
+            {
+                "id": "fixture-build-1",
+                "display_version": "1.0.0",
+                "display_type": "version",
+            }
         ],
         "commits": {"sdk": "a" * 40, "translation_source": None},
         "asset": {
@@ -178,7 +183,12 @@ class InstanceReleaseTests(unittest.TestCase):
             )
 
         self.assertEqual(result["status"], "ready")
-        self.assertEqual(result["release_title"], "Fixture Game Patch v1.2.0 (Game Version 1.0.0)")
+        self.assertEqual(
+            result["release_title"],
+            "Fixture Game-Korean-r2 (Game Version 1.0.0)",
+        )
+        self.assertEqual(result["patch_version"], "r2")
+        self.assertEqual(result["language"], "Korean")
         self.assertEqual(
             result["tracked_files"],
             ["parr0t-instance-release.json", "parr0t-release-checkpoint.json", "README.md"],
@@ -243,6 +253,66 @@ class InstanceReleaseTests(unittest.TestCase):
                     user_confirmed_success=True,
                     user_approved_publication=False,
                 )
+
+    def test_gate_rejects_semver_patch_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance, package = _write_fixture(Path(directory))
+            metadata_path = instance / INSTANCE_RELEASE_NAME
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["patch_version"] = "v1.2.0"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            _git(instance, "add", INSTANCE_RELEASE_NAME)
+            _git(instance, "commit", "-m", "Use invalid semantic version")
+
+            with self.assertRaisesRegex(InstanceReleaseError, "positive revision"):
+                validate_instance_release(
+                    instance,
+                    package,
+                    user_confirmed_success=True,
+                    user_approved_publication=True,
+                )
+
+    def test_gate_rejects_title_without_language_revision_pattern(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance, package = _write_fixture(Path(directory))
+            metadata_path = instance / INSTANCE_RELEASE_NAME
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["release_title"] = "Fixture Game Patch r2 (Game Version 1.0.0)"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            _git(instance, "add", INSTANCE_RELEASE_NAME)
+            _git(instance, "commit", "-m", "Use invalid release title")
+
+            with self.assertRaisesRegex(InstanceReleaseError, "release_title must be exactly"):
+                validate_instance_release(
+                    instance,
+                    package,
+                    user_confirmed_success=True,
+                    user_approved_publication=True,
+                )
+
+    def test_gate_accepts_game_build_title_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance, package = _write_fixture(Path(directory))
+            metadata_path = instance / INSTANCE_RELEASE_NAME
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["supported_game_builds"][0]["display_type"] = "build"
+            metadata["supported_game_builds"][0]["display_version"] = "3340"
+            metadata["release_title"] = "Fixture Game-Korean-r2 (Game Build 3340)"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            _git(instance, "add", INSTANCE_RELEASE_NAME)
+            _git(instance, "commit", "-m", "Use game build title")
+
+            result = validate_instance_release(
+                instance,
+                package,
+                user_confirmed_success=True,
+                user_approved_publication=True,
+            )
+
+        self.assertEqual(
+            result["release_title"],
+            "Fixture Game-Korean-r2 (Game Build 3340)",
+        )
 
 
 if __name__ == "__main__":
