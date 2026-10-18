@@ -154,10 +154,12 @@ class WorkspaceTests(unittest.TestCase):
             )
             upgraded = load_config(work)["execution"]
 
-        self.assertEqual(upgraded["native_shard_policy_version"], 3)
+        self.assertEqual(upgraded["native_shard_policy_version"], 4)
         self.assertEqual(upgraded["native_shard_records"], 64)
         self.assertEqual(upgraded["native_shard_min_records"], 8)
         self.assertEqual(upgraded["native_shard_material_tokens"], 24_000)
+        self.assertEqual(upgraded["native_review_shard_records"], 2048)
+        self.assertEqual(upgraded["native_review_shard_material_tokens"], 262_144)
         self.assertFalse(upgraded["model_controller_allowed"])
         self.assertFalse(upgraded["worker_delegation_allowed"])
         self.assertEqual(upgraded["max_root_model_calls_per_turn"], 64)
@@ -284,10 +286,18 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(config["execution"]["validation_profile"], "proportional")
         self.assertEqual(config["execution"]["same_failure_limit"], 2)
         self.assertFalse(config["execution"]["delegate_simple_tasks"])
-        self.assertEqual(config["execution"]["native_shard_policy_version"], 3)
+        self.assertEqual(config["execution"]["native_shard_policy_version"], 4)
         self.assertEqual(config["execution"]["native_shard_records"], 64)
         self.assertEqual(config["execution"]["native_shard_min_records"], 8)
         self.assertEqual(config["execution"]["native_shard_material_tokens"], 24000)
+        self.assertEqual(config["execution"]["native_review_shard_records"], 2048)
+        self.assertEqual(config["execution"]["native_review_shard_min_records"], 64)
+        self.assertEqual(
+            config["execution"]["native_review_shard_material_tokens"], 262144
+        )
+        self.assertEqual(config["execution"]["large_inventory_threshold_records"], 10000)
+        self.assertEqual(config["execution"]["startup_full_inventory_scan_limit"], 2)
+        self.assertFalse(config["execution"]["startup_per_record_artifacts_allowed"])
         self.assertEqual(config["execution"]["native_worker_history"], "none")
         self.assertFalse(config["execution"]["native_worker_reuse"])
         self.assertEqual(config["execution"]["native_agent_max_depth"], 1)
