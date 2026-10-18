@@ -1207,6 +1207,7 @@ class LocalizationOrchestrator:
             cached = self.store.get(cache_keys[index]) if not force else None
             if cached:
                 results[index] = cached
+                self._remember_result(segment, cached)
                 continue
             saved_result = saved_results.get(str(index))
             if isinstance(saved_result, dict):
@@ -1214,6 +1215,7 @@ class LocalizationOrchestrator:
                     partial = self._result_from_state(saved_result)
                     if partial.segment_id == segment.id and partial.source == segment.source:
                         results[index] = partial
+                        self._remember_result(segment, partial)
                 except (TypeError, ValueError):
                     results[index] = None
             if results[index] is None:
@@ -1384,10 +1386,6 @@ class LocalizationOrchestrator:
                     result = results[index]
                     assert result is not None
                     segment = items[index]
-                    for prior_index in range(index):
-                        prior_result = results[prior_index]
-                        if prior_result is not None:
-                            self._remember_result(items[prior_index], prior_result)
                     review_anchors = (
                         self._anchors(segment.speaker)
                         if self.config.use_style_memory

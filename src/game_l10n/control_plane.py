@@ -17,6 +17,8 @@ REVIEW_CONTROL_ALLOWED_ACTIONS = (
     "read_status",
     "prepare_validated_manifest",
     "dispatch_authorized_task",
+    "dispatch_authorized_wave",
+    "wait_for_active_wave",
     "validate_control_envelope",
     "import_completed_wave",
     "aggregate_completed_pass",
@@ -50,6 +52,9 @@ def review_control_contract() -> dict[str, Any]:
         "budget_inference_allowed": False,
         "reprocess_unchanged_success_allowed": False,
         "status_action_match_required": True,
+        "native_step_command_required": True,
+        "native_step_command": "game-l10n native-pass-step",
+        "model_selected_wave_or_recovery_allowed": False,
         "halted_state_allowed_actions": [
             "read_status",
             "record_aggregate_usage",
