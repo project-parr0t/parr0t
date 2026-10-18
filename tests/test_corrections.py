@@ -117,6 +117,7 @@ class CorrectionTests(unittest.TestCase):
             output = root / "corrected.jsonl"
             inventory_fingerprint = _digest("fixture-inventory")
             write_results(base, results)
+            base_digest = hashlib.sha256(base.read_bytes()).hexdigest()
             checkpoint.write_text(
                 json.dumps(_checkpoint(segments, results, inventory_fingerprint)),
                 encoding="utf-8",
@@ -146,6 +147,12 @@ class CorrectionTests(unittest.TestCase):
         self.assertEqual(summary["unchanged_count"], 1)
         self.assertEqual(summary["model_calls"], 0)
         self.assertEqual(summary["context_analysis_runs"], 0)
+        self.assertEqual(summary["bindings"]["inventory_fingerprint"], inventory_fingerprint)
+        self.assertEqual(summary["bindings"]["base_results_sha256"], base_digest)
+        self.assertEqual(
+            summary["bindings"]["changed_candidate_digests"]["fixture-a"],
+            stable_hash("TARGET_A_NEW"),
+        )
         self.assertEqual(new_rows[0]["text"], "TARGET_A_NEW")
         self.assertEqual(new_rows[0]["acceptance_authority"], "user")
         self.assertEqual(new_rows[0]["attempts"][-1]["stage"], "user-correction")
@@ -191,6 +198,7 @@ class CorrectionTests(unittest.TestCase):
             rows = [json.loads(line) for line in output.read_text().splitlines()]
 
         self.assertEqual(summary["base_source"], "release_checkpoint")
+        self.assertIsNone(summary["bindings"]["base_results_sha256"])
         self.assertEqual(summary["model_calls"], 0)
         self.assertEqual(rows[0]["text"], "TARGET_A_NEW")
         self.assertEqual(rows[0]["acceptance_authority"], "user")

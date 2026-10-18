@@ -60,7 +60,7 @@ class InstructionSurfaceTests(unittest.TestCase):
             "docs/filesystem-packaging.md",
             "docs/instance-release.md",
             "no model controllers or worker delegation",
-            "one semantic batch call",
+            "binary-splits only failures",
         ):
             self.assertIn(required, agents)
 
@@ -96,6 +96,10 @@ class InstructionSurfaceTests(unittest.TestCase):
         self.assertIn("must not open the full ordered `source_artifact`", detail)
         self.assertIn("must not make another full game-tree copy", execution)
         self.assertIn("must not reopen the complete ordered source", review)
+        self.assertIn("up to 2,048 candidates", review)
+        self.assertIn("half the prior bound", detail)
+        self.assertIn("Large-inventory startup budget", execution)
+        self.assertIn("validates only tasks in the wave", execution)
 
     def test_runtime_and_worker_cost_claims_stay_evidence_bound(self) -> None:
         coverage = (ROOT / "docs/coverage-gates.md").read_text(encoding="utf-8")
@@ -127,6 +131,22 @@ class InstructionSurfaceTests(unittest.TestCase):
             first["reload_policy"],
             "digest_change_or_new_control_generation_only",
         )
+
+    def test_small_correction_and_work_lane_contracts_are_bounded(self) -> None:
+        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        minimal = (ROOT / "docs" / "minimal-corrections.md").read_text(
+            encoding="utf-8"
+        )
+        execution = (ROOT / "docs" / "execution-budget.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("Bind every write to the current work lane", agents)
+        self.assertIn("combined set must remain at or below 32", minimal)
+        self.assertIn("one ordered semantic batch", minimal)
+        self.assertIn("normal ceiling is two semantic calls", minimal)
+        self.assertIn("A supervision or analysis lane", execution)
+        self.assertIn("enumerate the outgoing commits", execution)
 
 
 if __name__ == "__main__":

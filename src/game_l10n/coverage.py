@@ -37,6 +37,11 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _file_binding(path: Path) -> dict[str, int]:
+    stat = path.stat()
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
 def _inventory_document(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(payload, dict) or payload.get("schema") != INVENTORY_SCHEMA:
@@ -229,6 +234,10 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
         "user_visible_exclusion_count": len(visible_exclusions),
         "static_complete": complete,
         "issue_codes": issue_codes,
+        "file_bindings": {
+            "primary": _file_binding(primary_path),
+            "independent": _file_binding(independent_path),
+        },
     }
 
 
@@ -251,9 +260,23 @@ def require_inventory_attestation(work_dir: Path, primary_path: Path) -> dict[st
         raise ConfigurationError("Independent source inventory is incomplete")
     if state.get("primary_path") != str(primary_path.resolve()):
         raise ConfigurationError("Verified primary inventory does not match this context input")
+    bindings = state.get("file_bindings")
+    if (
+        isinstance(bindings, dict)
+        and bindings.get("primary") == _file_binding(primary_path)
+    ):
+        return state
     payload = _inventory_document(primary_path)
     if state.get("primary_fingerprint") != inventory_fingerprint(payload):
         raise ConfigurationError("Primary inventory changed after independent verification")
+    independent_path = Path(str(state.get("independent_path", "")))
+    state["file_bindings"] = {
+        "primary": _file_binding(primary_path),
+        "independent": (
+            _file_binding(independent_path) if independent_path.is_file() else None
+        ),
+    }
+    _atomic_json(state_path, state)
     return state
 
 
