@@ -4,7 +4,7 @@ Parr0t separates four claims that must not be collapsed into one “complete” 
 
 1. **Static inventory coverage** — two independent extraction methods found the same ordered targets and neither excluded user-visible scope.
 2. **Result alignment** — the current result artifact has exactly one matching row for every target in its declared scope.
-3. **Semantic review coverage** — every non-preserved candidate, including reused and previously unflagged candidates, received a fresh independent verdict for this context and candidate digest.
+3. **Semantic review coverage** — every non-preserved candidate, including reused and previously unflagged candidates, received a fresh independent low-cost triage or selected strong verdict for this context and candidate digest.
 4. **Runtime coverage** — an authorized or user-executed observation found no unmatched, untranslated, unvisited, or unobservable user-visible state.
 
 Only the fourth claim can establish runtime completeness. Static checks must report `REAL_RUNTIME_NOT_EXECUTED` when no runtime report exists. `manifest_missing_count=0` is never evidence that the running game has zero omissions.
@@ -62,7 +62,7 @@ Use a dedicated full pass when an earlier translation is being improved:
 game-l10n review-existing --workspace <workspace> --input <primary.json> --existing <old-results.json> --output <new-results.json>
 ```
 
-Every existing target is re-judged. Integrity checks can trigger a focused repair first, but a matching ID, source hash, or candidate digest cannot substitute for semantic judgment. Review completion records both the reused-candidate count and the freshly reviewed reused-candidate count.
+Every existing target is re-triaged; selected flags/risk/sample targets also receive strong review. Integrity checks can trigger a focused repair first, but a matching ID, source hash, or candidate digest cannot substitute for the current verdict. Review completion records both the reused-candidate count and the freshly reviewed reused-candidate count.
 
 ## Failure queue and held patches
 

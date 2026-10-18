@@ -57,14 +57,14 @@ Do not skip or reorder barriers. One refusal, timeout, malformed result, capacit
 - Translation is faithful transformation, not content generation. Independent review checks meaning, omission, voice, tone, function, conditions, units, terminology, allusions, placeholders, markup, control codes, ordering, and material layout risk.
 - Build new outputs in the workspace. Automated checks use synthetic targets and never install or launch the real game.
 - Apply proportional verification and stop after the changed layer passes. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.
-- Native passes are root-direct: no model controllers or worker delegation. Obey manifest budgets, checkpoint on any ceiling, and reread contracts only when their digest or control generation changes.
+- Native passes are root-direct with no delegation. The v5 manifest is authoritative; each task uses one semantic batch call. Obey its bulk gate, checkpoint on limits, and reload only on digest/generation change.
 
 ## Status-driven routes
 
 Use the routing table in repository `AGENTS.md`. Common short paths are:
 
 - full job: `sdk-selection.md` → `coverage-gates.md` → `review-pipeline.md`;
-- native worker/control-plane work: `control-plane-contract.md` and `execution-budget.md`;
+- native worker/control-plane work: `control-plane-contract.md`, `execution-budget.md`, and `detail-contract.md`;
 - manual/API fallback exchange: `translation-exchange.md`;
 - exact user-approved wording correction: `minimal-corrections.md` without model or context calls;
 - prior release, game update, or selective continuation: `release-checkpoint.md`;
