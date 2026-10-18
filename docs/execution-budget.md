@@ -29,6 +29,8 @@ Run the broad core/adapter suites and privacy/FAQ gates once after the final cod
 
 Measure implementation, final validation/packaging, user wait, and external publication separately. Use actual command elapsed times for network or signing claims. Parallel review overlaps implementation and must not be added again to wall-clock totals. A readiness check must not expand into a new scheduler, duplicate verifier, credential probe, or speculative deployment system.
 
+For all-branch maintenance, use the content-bound audit in `docs/sdk-branch-contract.md`. Refresh refs once, pin them, and reuse unchanged validation evidence. A validated `up_to_date_compatible` branch requires no merge solely to change its ancestry. Do not rerun the common core suite on every unchanged branch, or treat an unvalidated old branch as compatible merely because it has no merge conflict.
+
 ## Exact correction budget
 
 When the user supplies the final replacement wording for a typo or small translation fix, use `docs/minimal-corrections.md`. Resolve its stable IDs, run `game-l10n apply-user-correction`, repack the owning payload once, and verify the package once. The expected model-call and context-analysis budget is zero. Do not delegate the correction, reopen full source discovery, re-read every translation, rehash the game tree, or create a job-specific apply/validation script. If reverse dependencies exist, review only those IDs; if mapping is ambiguous, perform one narrow static lookup before changing anything.
