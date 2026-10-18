@@ -11,6 +11,93 @@ from .privacy import is_within
 
 
 CONTROL_ENVELOPE_SCHEMA = "parr0t.control-envelope.v2"
+REVIEW_CONTROL_CONTRACT_SCHEMA = "parr0t.review-control-contract.v1"
+REVIEW_CONTROL_MODE = "deterministic_review_router"
+REVIEW_CONTROL_ALLOWED_ACTIONS = (
+    "read_status",
+    "prepare_validated_manifest",
+    "dispatch_authorized_task",
+    "validate_control_envelope",
+    "import_completed_wave",
+    "aggregate_completed_pass",
+    "route_categorical_status",
+    "record_aggregate_usage",
+    "checkpoint_and_stop",
+)
+
+
+def review_control_contract() -> dict[str, Any]:
+    """Return the immutable, text-free contract for review orchestration."""
+
+    return {
+        "schema": REVIEW_CONTROL_CONTRACT_SCHEMA,
+        "mode": REVIEW_CONTROL_MODE,
+        "allowed_actions": list(REVIEW_CONTROL_ALLOWED_ACTIONS),
+        "allowed_decision_inputs": [
+            "validated_status.next_actions",
+            "validated_native_manifest",
+            "validated_control_envelope",
+            "aggregate_usage_counters",
+            "explicit_user_approval",
+        ],
+        "semantic_access_allowed": False,
+        "free_form_planning_allowed": False,
+        "ad_hoc_contracts_allowed": False,
+        "autonomous_resume_allowed": False,
+        "autonomous_sdk_or_tool_changes_allowed": False,
+        "model_choice_allowed": False,
+        "batch_shape_change_allowed": False,
+        "budget_inference_allowed": False,
+        "reprocess_unchanged_success_allowed": False,
+        "status_action_match_required": True,
+        "halted_state_allowed_actions": [
+            "read_status",
+            "record_aggregate_usage",
+            "checkpoint_and_stop",
+        ],
+        "resume_requirements": [
+            "explicit_user_approval",
+            "complete_budget_contract",
+            "regenerated_validated_manifest",
+        ],
+        "unknown_state_action": "checkpoint_and_stop",
+        "next_action_source": "validated_status_or_manifest_only",
+        "review_plan_source": "validated_manifest_only",
+        "review_stage_order": [
+            "deterministic_validation",
+            "complete_low_cost_triage",
+            "selective_strong_review",
+            "flagged_only_rewrite",
+            "review_fallback_for_failures_only",
+        ],
+        "strong_review_selection_inputs": [
+            "triage_status",
+            "manifest_high_risk_flag",
+            "deterministic_sample",
+        ],
+        "unselected_candidate_requirement": "current_generation_triage_ok",
+        "universal_strong_review_required": False,
+    }
+
+
+def validate_review_control_action(action: str) -> dict[str, Any]:
+    """Authorize only a fixed review-router action; never invent a recovery step."""
+
+    normalized = str(action).strip()
+    if normalized not in REVIEW_CONTROL_ALLOWED_ACTIONS:
+        raise ConfigurationError(
+            "E_REVIEW_CONTROL_ACTION_DENIED: review control plane actions must be "
+            "selected from the immutable allowlist; checkpoint and stop instead"
+        )
+    return {
+        "schema": "parr0t.review-control-permit.v1",
+        "mode": REVIEW_CONTROL_MODE,
+        "action": normalized,
+        "authorized": True,
+        "unknown_state_action": "checkpoint_and_stop",
+    }
+
+
 LEGACY_CONTROL_ENVELOPE_SCHEMA = "parr0t.control-envelope.v1"
 ROUTE_EVIDENCE_SCHEMA = "parr0t.route-evidence.v1"
 CONTROL_STATE_SCHEMA = "parr0t.control-plane-state.v1"

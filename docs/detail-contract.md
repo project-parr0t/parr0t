@@ -1,0 +1,37 @@
+# Task-detail contract governance
+
+This contract governs every job-, stage-, coordinator-, wave-, task-, or worker-specific instruction created during a Parr0t run. A detail contract is supplemental-only: it supplies bindings, never a new policy layer.
+
+## Authority order
+
+Apply instructions in this order: the user's current request and explicit approvals, repository `AGENTS.md` and routed core contracts, selected SDK contract, workspace `AGENTS.md`, generated `parr0t.detail-contract.v1`, then task prose. A lower layer may narrow its assigned targets, paths, outputs, checks, deadline, or budget. It must not weaken, replace, reinterpret, or postpone a higher layer.
+
+The native v5 task manifest is the only executable detail contract. Its `worker_contract`, `detail_contract`, `execution_contract`, and `contract_fingerprint` are one immutable unit. Reject a changed or conflicting unit before dispatch with `E_DETAIL_CONTRACT_CONFLICT`. Free-form Markdown may be a short operator note, but it is not passed to a worker and has no execution authority.
+
+## Permitted detail
+
+A task may define only:
+
+- exclusive target IDs and existing private input/context paths;
+- one exclusive output path and its fixed response schema;
+- stage-specific acceptance checks and categorical failure codes;
+- limits equal to or stricter than the parent manifest;
+- the checkpoint to reuse and the exact stop condition.
+
+Do not copy core contracts into a job file. Resolve the manifest fingerprint and routed contract digest instead. Historical incidents, previous model arguments, provider refusal prose, game text, speculative recovery designs, and title-specific analysis stay in private audit data; generally reusable failure guidance belongs in the neutral FAQ.
+
+## Batched semantic execution
+
+One prepared task is one semantic batch. Load its shared context once, evaluate all bound targets in one model request/worker response, and write one status per target in the same ordered result. Do not create a prompt file or model/API call per record inside that task. Partial refusal, malformed output, timeout, or other failure is recorded only for the affected target in that batched result; it does not cancel successful neighbors.
+
+If a provider protocol can accept only one target, `prepare-native-pass` must create one-target tasks before dispatch. A worker must not silently turn a multi-target task back into a serial loop. Repartitioning requires a newly generated manifest, not a job-local exception.
+
+## Bulk budget gate
+
+At or above `execution.bulk_budget_gate_records` (default 4,096 records), the first wave is a measurement pilot. Before importing a later wave, regenerate or validate the manifest with user-approved ceilings for elapsed minutes and aggregate input tokens, plus either a provider-cost ceiling or an explicit declaration that the selected route is unmetered. Without them, checkpoint and return `E_BULK_EXECUTION_BUDGET_REQUIRED`; do not infer a budget, continue because work is already underway, or ask for a broader authorization.
+
+The limits cover the whole pass, not each worker. Reaching one stops new dispatch, preserves completed shards and the unchanged pending queue, and returns the smallest required decision. It never authorizes dropping targets or accepting unreviewed candidates.
+
+## Conflict examples
+
+Reject a detail contract that introduces per-record semantic calls within a batch, raises call/token/time/cost limits, reopens unchanged successes, adds duplicate verification, changes provider roles or pipeline order, exposes text to the control plane, grants runtime/publication effects, or converts a refusal into exclusion. Keep the valid checkpoint and regenerate only the conflicting detail contract.

@@ -53,6 +53,7 @@ from .filesystem_package import build_filesystem_package, validate_filesystem_pa
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext
 from .instance_release import validate_instance_release
 from .native_pass import (
+    DEFAULT_BULK_BUDGET_GATE_RECORDS,
     DEFAULT_MAX_MATERIAL_TOKENS,
     DEFAULT_MAX_RECORDS,
     DEFAULT_MAX_WORKERS,
@@ -143,6 +144,7 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
         "docs/provider-protocol.md",
         "docs/control-plane-contract.md",
         "docs/execution-budget.md",
+        "docs/detail-contract.md",
     ),
     "resolve_translation_review_gaps": (
         "docs/coverage-gates.md",
@@ -151,6 +153,7 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
         "docs/provider-protocol.md",
         "docs/control-plane-contract.md",
         "docs/execution-budget.md",
+        "docs/detail-contract.md",
     ),
     "rebuild_current_inventory_translation_attestation": (
         "docs/coverage-gates.md",
@@ -392,6 +395,7 @@ def _orchestrator(work_dir: Path, context_pack: ContextPack) -> LocalizationOrch
     orchestrator_config = OrchestratorConfig(
         translator_chain=list(routing["translators"]),
         reviewer_chain=list(routing.get("reviewers", [])),
+        review_triager_chain=list(routing.get("review_triagers", [])),
         rewriter_chain=list(routing.get("rewriters", [])),
         require_review=bool(routing.get("require_review", True)),
         review_max_rounds=int(routing.get("review_max_rounds", 2)),
@@ -419,6 +423,22 @@ def _orchestrator(work_dir: Path, context_pack: ContextPack) -> LocalizationOrch
         ),
         preserve_source_on_failure=bool(routing.get("preserve_source_on_failure", False)),
         review_refusal_policy=str(routing.get("review_refusal_policy", "fallback")),
+        strong_review_sample_percent=float(
+            routing.get("strong_review_sample_percent", 5.0)
+        ),
+        strong_review_high_risk_categories=list(
+            routing.get(
+                "strong_review_high_risk_categories",
+                [
+                    "allusion",
+                    "critical_logic",
+                    "parody",
+                    "quest_title",
+                    "script_sensitive",
+                    "wordplay",
+                ],
+            )
+        ),
     )
     file_config = config.get("files", {})
     glossary = _load_dataclass_list(
@@ -982,6 +1002,32 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
         if args.max_workers is not None
         else int(config.get("routing", {}).get("max_workers", DEFAULT_MAX_WORKERS))
     )
+    bulk_budget_gate_records = int(
+        execution.get("bulk_budget_gate_records", DEFAULT_BULK_BUDGET_GATE_RECORDS)
+    )
+    max_elapsed_minutes = (
+        args.max_elapsed_minutes
+        if args.max_elapsed_minutes is not None
+        else execution.get("bulk_max_elapsed_minutes")
+    )
+    max_input_tokens = (
+        args.max_input_tokens
+        if args.max_input_tokens is not None
+        else execution.get("bulk_max_input_tokens")
+    )
+    max_provider_cost_usd = (
+        args.max_provider_cost_usd
+        if args.max_provider_cost_usd is not None
+        else execution.get("bulk_max_provider_cost_usd")
+    )
+    provider_cost_unmetered = bool(
+        args.provider_cost_unmetered
+        or execution.get("bulk_provider_cost_unmetered", False)
+    )
+    user_approved_budget = bool(
+        args.user_approved_budget
+        or execution.get("bulk_budget_user_approved", False)
+    )
     result = prepare_native_tasks(
         work_dir,
         source,
@@ -991,6 +1037,12 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
         min_records=min_records,
         max_material_tokens=max_material_tokens,
         max_workers=max_workers,
+        bulk_budget_gate_records=bulk_budget_gate_records,
+        max_elapsed_minutes=max_elapsed_minutes,
+        max_input_tokens=max_input_tokens,
+        max_provider_cost_usd=max_provider_cost_usd,
+        provider_cost_unmetered=provider_cost_unmetered,
+        user_approved_budget=user_approved_budget,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -1625,7 +1677,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     review_existing = sub.add_parser(
         "review-existing",
-        help="Independently re-review every reused candidate against the current full context",
+        help="Triage every reused candidate and selectively strong-review it in current context",
     )
     review_existing.add_argument("--workspace", required=True)
     review_existing.add_argument("--input", required=True, help="Current ordered source targets")
@@ -1747,6 +1799,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-workers",
         type=int,
         help="Maximum direct root-to-worker dispatches active in one wave",
+    )
+    native_prepare.add_argument(
+        "--max-elapsed-minutes",
+        type=int,
+        help="User-approved elapsed-time ceiling for a gated bulk pass",
+    )
+    native_prepare.add_argument(
+        "--max-input-tokens",
+        type=int,
+        help="User-approved aggregate input-token ceiling for a gated bulk pass",
+    )
+    cost_group = native_prepare.add_mutually_exclusive_group()
+    cost_group.add_argument(
+        "--max-provider-cost-usd",
+        type=float,
+        help="User-approved provider-cost ceiling for a metered bulk pass",
+    )
+    cost_group.add_argument(
+        "--provider-cost-unmetered",
+        action="store_true",
+        help="Declare that the selected route has no measurable provider charge",
+    )
+    native_prepare.add_argument(
+        "--user-approved-budget",
+        action="store_true",
+        help="Assert that the user supplied the bound bulk time, token, and cost policy",
     )
     native_prepare.set_defaults(func=cmd_prepare_native_pass)
 

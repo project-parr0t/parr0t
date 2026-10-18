@@ -87,10 +87,18 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 ## Review cost is high even when most candidates are already correct
 
 - **Symptom:** The reviewer returns a full copy of every translation and consumes nearly as many output tokens as translation itself.
-- **General cause:** Quality classification and correction were combined into one response contract.
-- **Diagnosis:** Check whether accepted candidates are echoed by the reviewer and whether a correction model runs for every target.
-- **Resolution:** Use a compact judge that returns only `ok` or `rewrite` plus categorical issue codes. Invoke a rewriter only for `rewrite`, validate the correction, and confirm it with another compact judgment.
-- **Prevention:** Set per-task output limits, retain focused scene/character evidence, record provider usage metadata, and compare quality and cost on synthetic representative evaluations before changing the configured roles.
+- **General cause:** Quality classification, strong judgment, and correction were combined, or the strongest judge ran universally despite a low defect rate.
+- **Diagnosis:** Check whether accepted candidates are echoed, whether every target reaches the strong model, and whether a correction model runs for every target.
+- **Resolution:** Run deterministic checks and complete low-cost compact triage first. Send only triage flags/failures, evidence-backed high-risk targets, and the deterministic sample to the strong judge; rewrite only its `rewrite` targets and confirm corrections.
+- **Prevention:** Bind the triage route, sample rate, risk metadata, and per-task output limits in configuration; retain focused context and compare quality/cost on representative evaluations before changing roles.
+
+## A bounded review task still makes one model call per record
+
+- **Symptom:** Task files contain many IDs, yet prompt count and model/API calls grow almost one-for-one with records; input greatly exceeds output and elapsed time scales serially.
+- **General cause:** Target-level failure isolation was misread as a requirement for target-level requests, or a job-local coordinator contract overrode the batch intent.
+- **Diagnosis:** Compare task count, record count, prompt artifacts, and semantic call count. More than one semantic request for a multi-target native task violates its v5 detail contract.
+- **Resolution:** Preserve completed shards, discard only the conflicting local execution instructions, and regenerate the remaining v5 manifest. Load shared context once, produce one ordered batched verdict set, and retain failures per target. If the provider truly accepts one target, repartition before dispatch.
+- **Prevention:** Treat `parr0t.detail-contract.v1` as supplemental-only, reject free-form execution contracts, and enforce the bulk pilot/budget gate before later waves.
 
 ## A semantically accurate title or short line still reads like a literal translation
 
