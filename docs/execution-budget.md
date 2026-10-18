@@ -29,7 +29,7 @@ Run the broad core/adapter suites and privacy/FAQ gates once after the final cod
 
 Measure implementation, final validation/packaging, user wait, and external publication separately. Use actual command elapsed times for network or signing claims. Parallel review overlaps implementation and must not be added again to wall-clock totals. A readiness check must not expand into a new scheduler, duplicate verifier, credential probe, or speculative deployment system.
 
-For all-branch maintenance, use the content-bound audit in `docs/sdk-branch-contract.md`. Refresh refs once, pin them, and reuse unchanged validation evidence. A validated `up_to_date_compatible` branch requires no merge solely to change its ancestry. Do not rerun the common core suite on every unchanged branch, or treat an unvalidated old branch as compatible merely because it has no merge conflict.
+For all-branch maintenance, follow `docs/branch-update-contract.md`. Refresh refs once and reuse one pinned inventory. Skip merge preparation and broad validation for already synchronized targets, hold known core overrides early, and reuse unchanged evidence for remaining candidates. Equivalent current core content may skip a history-only merge; a successful future-core simulation does not mean missing core changes are already installed. Do not rerun suites after an applied merge whose tree exactly matches the validated tree.
 
 ## Exact correction budget
 

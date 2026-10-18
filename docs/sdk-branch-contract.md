@@ -18,7 +18,7 @@ The reverse direction is forbidden. `main` must not contain an engine name, engi
 
 Distribution-layer packaging that does not inspect or interpret engine assets may live on `main`. It must consume an already prepared payload, remain independent of the payload's engine, and keep every title-specific identifier and file in the private workspace. Steam discovery and receipt-based installation are distribution concerns; text extraction, runtime hooks, asset rebuilding, and engine payload construction remain SDK-branch concerns.
 
-Engine SDK branches may use every public interface from `main`. When `main` changes, check compatibility before changing each branch. A content-bound `up_to_date_compatible` result permits leaving that branch unchanged; otherwise reconcile the core and run both suites. A core change must not import the adapter package or special-case its paths.
+Engine SDK branches may use every public interface from `main`. When `main` changes, check compatibility before changing each branch. Follow `docs/branch-update-contract.md`: equivalent core content may skip a history-only update, while missing core changes require a validated update. Reconcile divergent core ownership separately. A core change must not import the adapter package or special-case its paths.
 
 ## Ownership
 
@@ -62,21 +62,9 @@ A promotion commit owns engine-specific implementation only. It must be a separa
 
 An exact engine build observed in a private workspace may be reduced to its declared public compatibility line for the branch name, but the line must be derived from that observed build before evaluation begins. After it is recorded, the exact `sdk-<engine>-<version>` identity controls ownership; an older, newer, or merely similar branch cannot absorb the result.
 
-## All-branch compatibility audit
+## Branch audit and update route
 
-After one authorized remote-ref refresh, run the deterministic checker with external state:
-
-```text
-python scripts/check_branches.py --repo <repository> --main-ref origin/main --state-dir <external-audit-directory>
-```
-
-It inventories all `origin` tracking branches once and pins their commit IDs. `--ref` limits an explicitly requested subset; repeat it to include local branches. It never fetches, merges, rebases, stages, commits, or pushes an audited branch, and never installs or launches a game. Tests execute only against separate repository snapshots, with synthetic local Git metadata so activation tests can bind a clean runtime. The current privacy and FAQ validators are authoritative even when an older branch changed its own validator.
-
-An SDK containing only additions is tested as latest core plus its SDK-owned additions. The report names this `latest_core_with_sdk`; it does not claim that the older branch itself was updated or that a real game was exercised. A passing full suite with no skips, privacy scan, and engine FAQ check yields `up_to_date_compatible` and `skip_update` even when the commit ancestry is older. Core overrides differing from current main remain `core_diverged`: test that original branch tree and require manual reconciliation instead of silently replacing those edits. Byte-identical core changes are compatible regardless of ancestry.
-
-Validation is keyed by effective file identities, the checker and validator contents, Python/platform/package metadata, relevant environment paths, and `--environment-key`. Unchanged content, including empty commits, reuses passing checks. Changed SDK content invalidates only that SDK; changed core invalidates affected combined snapshots. Failed, malformed, or zero-test results never qualify for reuse. Passing runs with skipped tests may reuse their partial result, but cannot authorize `skip_update`. Explicitly change `--environment-key` when editable dependency files, native tools, or other unversioned prerequisites change; use `--force` for a deliberately fresh measurement. Cache state is local validation evidence, not a publication approval or signature.
-
-Independent snapshots use at most two concurrent check processes by default (`--jobs`). Keep cache, logs, snapshots, and reports outside the repository. A nonzero exit means at least one failed check, incomplete proof, or unresolved core divergence; inspect each branch row rather than labeling the entire audit successful.
+Use `docs/branch-update-contract.md` for all-branch health checks, content-bound validation reuse, update decisions, and explicit local application. Its separate states distinguish current core content from a successful simulation of a future update. A simulation alone cannot skip a core update. SDK selection, ownership, and the promotion acceptance gate below remain mandatory.
 
 ## Promotion preparation and fixed base
 

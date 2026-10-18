@@ -70,7 +70,7 @@ class BranchAuditTests(unittest.TestCase):
         with patch("scripts.check_branches.run_checks", side_effect=check) as runner:
             result = self.audit()
             self.assertEqual(runner.call_count, 2)
-        self.assertEqual(result["branches"][1]["compatibility"], "up_to_date_compatible")
+        self.assertEqual(result["branches"][1]["compatibility"], "update_ready")
         self.assertEqual(before, (self.git("show-ref"), self.git("status", "--porcelain")))
 
     def test_identical_validated_content_skips_even_after_empty_commit(self) -> None:

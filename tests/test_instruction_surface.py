@@ -52,6 +52,7 @@ class InstructionSurfaceTests(unittest.TestCase):
             "fallback_required",
             "parr0t.control-envelope.v2",
             "docs/sdk-selection.md",
+            "docs/branch-update-contract.md",
             "docs/control-plane-contract.md",
             "docs/detail-contract.md",
             "docs/translation-exchange.md",

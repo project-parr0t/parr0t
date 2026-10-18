@@ -67,6 +67,7 @@ def plan_branches(repo: Path, main_ref: str, refs: list[str] | None = None) -> l
         files = read_tree(commit)
         if commit == main_commit:
             base, overrides, additions = main_commit, [], []
+            owned = main_files.keys()
         else:
             base = git(repo, "merge-base", main_commit, commit).decode().strip()
             base_files = read_tree(base)
@@ -81,6 +82,7 @@ def plan_branches(repo: Path, main_ref: str, refs: list[str] | None = None) -> l
         plans.append({
             "ref": ref, "commit": commit, "main_commit": main_commit, "merge_base": base,
             "sdk": sdk, "core_overrides": overrides,
+            "core_current": all(files.get(path) == main_files.get(path) for path in owned),
             "snapshot_kind": "latest_core_with_sdk" if overlay else "branch_tree",
             "source_commit": main_commit if overlay else commit,
             "additions": additions if overlay else [],
@@ -167,7 +169,8 @@ def run_checks(snapshot: Path, python: str, sdk: bool, log: Path) -> dict:
 
 
 def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", refs: list[str] | None = None,
-                   python: str = sys.executable, environment_key: str = "", jobs: int = 2, force: bool = False) -> dict:
+                   python: str = sys.executable, environment_key: str = "", jobs: int = 2, force: bool = False,
+                   pinned_plans: list[dict] | None = None) -> dict:
     repo, state = repo.resolve(), state.resolve()
     if state.is_relative_to(repo):
         raise ValueError("Audit state must be outside the repository")
@@ -181,7 +184,7 @@ def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", re
         cache = {}
     cached = cache.get("results", {})
     validators, environment = validator_digest(), environment_digest(python, environment_key)
-    plans = plan_branches(repo, main_ref, refs)
+    plans = plan_branches(repo, main_ref, refs) if pinned_plans is None else pinned_plans
     pending, results = {}, {}
     for plan in plans:
         key = digest([SCHEMA, plan["content_digest"], plan["sdk"], validators, environment])
@@ -229,10 +232,13 @@ def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", re
             compatibility = "unverified"
         elif plan["merge_base"] == plan["main_commit"]:
             compatibility = "up_to_date"
-        else:
+        elif plan["core_current"]:
             compatibility = "up_to_date_compatible"
-        rows.append({**plan, **result, "compatibility": compatibility,
-                     "update_action": "skip_update" if compatibility in {"up_to_date", "up_to_date_compatible"} else "manual_review"})
+        else:
+            compatibility = "update_ready"
+        action = ("skip_update" if compatibility in {"up_to_date", "up_to_date_compatible"}
+                  else "update_required" if compatibility == "update_ready" else "manual_review")
+        rows.append({**plan, **result, "compatibility": compatibility, "update_action": action})
     cache_path.write_text(json.dumps({"schema": SCHEMA, "results": {**cached, **{key: {k: v for k, v in value.items() if k != "cached"} for key, value in results.items()}}}, indent=2) + "\n", encoding="utf-8")
     report = {"schema": SCHEMA, "main_commit": plans[0]["main_commit"], "branches": rows,
               "executed": len(pending), "reused": sum(row["cached"] for row in rows),
