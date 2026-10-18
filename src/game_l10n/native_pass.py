@@ -16,6 +16,7 @@ from .control_plane import (
 )
 from .models import Segment
 from .store import stable_hash
+from .validators import validate_integrity
 
 
 ALLOWED_STATUSES = {"success", "refused", "error", "invalid"}
@@ -695,7 +696,7 @@ def prepare_native_tasks(
     }
 
 
-def _validate_row(row: dict[str, Any]) -> dict[str, Any]:
+def _validate_row(row: dict[str, Any], *, segment: Segment | None = None) -> dict[str, Any]:
     target_id = row.get("target_id")
     status = row.get("status")
     text = row.get("text", "")
@@ -706,7 +707,11 @@ def _validate_row(row: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(text, str):
         raise ValueError(f"Native shard {target_id!r} text must be a string")
     if status == "success" and not text.strip():
-        raise ValueError(f"Native shard {target_id!r} reports success without text")
+        if (
+            segment is None or segment.id != target_id or text != ""
+            or validate_integrity(segment, text, [])
+        ):
+            raise ValueError(f"Native shard {target_id!r} reports success without text")
     issues = row.get("issues", [])
     if not isinstance(issues, list) or not all(isinstance(item, str) for item in issues):
         raise ValueError(f"Native shard {target_id!r} issues must be strings")
@@ -717,6 +722,60 @@ def _validate_row(row: dict[str, Any]) -> dict[str, Any]:
         "provider": str(row.get("provider", "native-worker")),
         "issues": issues,
     }
+
+
+def _validate_manifest_rows(
+    work_dir: Path,
+    manifest: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    bound_segments: dict[str, Segment],
+) -> list[dict[str, Any]]:
+    # Ordinary results keep the existing fast path. Optional empty results must
+    # join the exact prepared source, including its immutable adapter metadata.
+    if not bound_segments and any(
+        row.get("status") == "success" and row.get("text") == "" for row in rows
+    ):
+        from .formats import read_segments
+
+        artifact = manifest.get("source_artifact")
+        if not isinstance(artifact, str) or not artifact.strip():
+            raise ValueError("Optional-slot source artifact is invalid")
+        try:
+            if Path(artifact).is_absolute():
+                raise ValueError("Optional-slot source artifact must be relative")
+            source = (work_dir / artifact).resolve()
+            source.relative_to(work_dir.resolve())
+            if not source.is_file():
+                raise ValueError("Optional-slot source artifact must be a file")
+            ordered = read_segments(source)
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+            raise ValueError("Optional-slot source artifact is invalid") from None
+        if (
+            len(ordered) != manifest.get("records")
+            or stable_hash([asdict(segment) for segment in ordered])
+            != manifest.get("source_fingerprint")
+        ):
+            raise ValueError("Optional-slot source no longer matches its task manifest")
+        source_ids = {segment.id for segment in ordered}
+        for segment in ordered:
+            if segment.metadata.get("ui_empty_target") is not None:
+                related = segment.metadata.get("ui_composed_with_ids")
+                if not isinstance(related, list) or not all(
+                    isinstance(target_id, str) and target_id in source_ids
+                    for target_id in related
+                ):
+                    raise ValueError("Optional-slot composition references an unbound target")
+        # Cache only a fully validated source; reuse once per wave/import scan.
+        bound_segments.update((segment.id, segment) for segment in ordered)
+    return [
+        _validate_row(
+            row,
+            segment=bound_segments.get(row["target_id"])
+            if isinstance(row.get("target_id"), str) else None,
+        )
+        for row in rows
+    ]
 
 
 def import_native_shard(work_dir: Path, source: Path, shard_name: str) -> dict[str, Any]:
@@ -776,6 +835,7 @@ def import_native_wave(
 
     planned: list[tuple[Path, list[dict[str, Any]]]] = []
     wave_ids: set[str] = set()
+    bound_segments: dict[str, Segment] = {}
     for task in tasks:
         expected_ids = _task_target_ids(manifest_path.parent / task["file"])
         if len(expected_ids) != task["records"]:
@@ -784,9 +844,11 @@ def import_native_wave(
         if not result_path.is_file():
             raise ValueError("Native wave result is incomplete")
         try:
-            rows = [_validate_row(row) for row in _read_jsonl(result_path)]
+            rows = _validate_manifest_rows(
+                work_dir, manifest, _read_jsonl(result_path), bound_segments=bound_segments
+            )
         except (ValueError, json.JSONDecodeError):
-            raise ValueError("Native wave result is invalid") from None
+            raise ValueError("E_NATIVE_WAVE_RESULT_INVALID: Native wave result is invalid") from None
         result_ids = [row["target_id"] for row in rows]
         if result_ids != expected_ids:
             raise ValueError("Native wave result does not match its exclusive task binding")
@@ -965,6 +1027,7 @@ def _imported_native_waves(
     imported_waves: list[int] = []
     imported_tasks = 0
     gap_seen = False
+    bound_segments: dict[str, Segment] = {}
     for wave in sorted({task["wave"] for task in manifest["tasks"]}):
         tasks = [task for task in manifest["tasks"] if task["wave"] == wave]
         receipt_path = _wave_receipt_path(work_dir, manifest, tasks, wave)
@@ -1035,7 +1098,9 @@ def _imported_native_waves(
                 present.append(False)
                 continue
             try:
-                rows = [_validate_row(row) for row in _read_jsonl(shard)]
+                rows = _validate_manifest_rows(
+                    work_dir, manifest, _read_jsonl(shard), bound_segments=bound_segments
+                )
             except (ValueError, json.JSONDecodeError):
                 raise ValueError(
                     "E_NATIVE_CONTROL_IMPORTED_SHARD_INVALID: imported shard is invalid"
@@ -1337,6 +1402,7 @@ def merge_native_pass(
         expected_shards = len(shard_bindings)
 
     imported_shards = 0
+    bound_segments: dict[str, Segment] = {}
     for shard, expected_ids in shard_bindings:
         if not shard.is_file():
             continue
@@ -1344,7 +1410,9 @@ def merge_native_pass(
             rows = [_validate_row(raw) for raw in _read_jsonl(shard)]
         else:
             try:
-                rows = [_validate_row(raw) for raw in _read_jsonl(shard)]
+                rows = _validate_manifest_rows(
+                    work_dir, manifest, _read_jsonl(shard), bound_segments=bound_segments
+                )
             except (ValueError, json.JSONDecodeError):
                 raise ValueError("Imported native shard is invalid") from None
         if expected_ids is not None and [row["target_id"] for row in rows] != expected_ids:

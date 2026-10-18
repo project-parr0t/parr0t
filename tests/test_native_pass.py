@@ -3,19 +3,157 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
+from game_l10n.formats import read_segments
 from game_l10n.models import Segment
 from game_l10n.native_pass import (
+    _imported_native_waves,
+    _validate_manifest_rows,
     import_native_shard,
     import_native_wave,
     merge_native_pass,
     native_control_step,
     prepare_native_tasks,
 )
+from tests.test_validators import optional_slot_fixture
 
 
 class NativePassTests(unittest.TestCase):
+    def _prepare_optional_wave(self, root: Path, *, slots: int = 1):
+        source = root / "source.jsonl"
+        self._write_rows(source, [
+            asdict(Segment("fixture-label", "SYNTHETIC_LABEL")),
+            *(asdict(optional_slot_fixture(target_id=f"fixture-slot-{index}"))
+              for index in range(slots)),
+        ])
+        segments = read_segments(source)
+        tasks = root / "tasks"
+        prepare_native_tasks(
+            root, source, segments, tasks, max_records=1, max_workers=slots + 1
+        )
+        results = root / "results"
+        results.mkdir()
+        for task in tasks.glob("task-*.jsonl"):
+            rows = [json.loads(line) for line in task.read_text().splitlines()]
+            self._write_rows(results / task.name, [{
+                "target_id": row["target_id"], "status": "success",
+                "text": "TARGET_LABEL" if row["target_id"] == "fixture-label" else "",
+            } for row in rows])
+        return source, segments, tasks, results
+
+    def test_unbound_manual_shard_merge_rejects_empty_even_with_slot_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shard = root / ".game-l10n/native/shards/manual.jsonl"
+            shard.parent.mkdir(parents=True)
+            segment = optional_slot_fixture()
+            self._write_rows(shard, [{
+                "target_id": segment.id, "status": "success", "text": "",
+            }])
+            output = root / "merged.jsonl"
+            with self.assertRaisesRegex(ValueError, "without text"):
+                merge_native_pass(root, [segment], output)
+            self.assertFalse(output.exists())
+
+    def test_optional_wave_rejects_malformed_source_paths_with_fixed_error(self) -> None:
+        missing = object()
+        for value in (missing, None, 1, [], {}, "", ".", "missing.jsonl", "../outside.jsonl", "/outside.jsonl", "bad\0path"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _, _, tasks, results = self._prepare_optional_wave(root)
+                manifest_path = tasks / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                if value is missing:
+                    del manifest["source_artifact"]
+                else:
+                    manifest["source_artifact"] = value
+                manifest_path.write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(ValueError, "^E_NATIVE_WAVE_RESULT_INVALID:"):
+                    import_native_wave(root, manifest_path, results, 1)
+                self.assertFalse((root / ".game-l10n/native/shards").exists())
+
+    def test_multiple_empty_tasks_read_bound_source_once_per_wave_and_legacy_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, _, tasks, results = self._prepare_optional_wave(root, slots=2)
+            manifest_path = tasks / "manifest.json"
+            with patch("game_l10n.formats.read_segments", wraps=read_segments) as reader:
+                summary = import_native_wave(root, manifest_path, results, 1)
+                reader.assert_called_once_with(source.resolve())
+            self.assertEqual(summary["tasks"], 3)
+            self.assertEqual(summary["success"], 3)
+            # Simulate only the missing legacy receipt; retain imported shards.
+            (root / summary["receipt"]).unlink()
+            manifest = json.loads(manifest_path.read_text())
+            with patch("game_l10n.formats.read_segments", wraps=read_segments) as reader:
+                imported, count = _imported_native_waves(root, manifest_path, manifest)
+                reader.assert_called_once_with(source.resolve())
+            self.assertEqual(imported, [1])
+            self.assertEqual(count, 3)
+            self.assertTrue((root / summary["receipt"]).exists())
+
+    def test_optional_wave_rejects_related_ids_absent_from_bound_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, segments, _, results = self._prepare_optional_wave(root)
+            slot = segments[1]
+            source.write_text(json.dumps(asdict(slot)) + "\n")
+            tasks = root / "unbound-related-tasks"
+            prepare_native_tasks(root, source, [slot], tasks)
+            self._write_rows(results / "task-0001.jsonl", [{
+                "target_id": slot.id, "status": "success", "text": "",
+            }])
+            manifest = json.loads((tasks / "manifest.json").read_text())
+            with self.assertRaisesRegex(ValueError, "references an unbound target"):
+                _validate_manifest_rows(root, manifest, [{
+                    "target_id": slot.id, "status": "success", "text": "",
+                }], bound_segments={})
+            with self.assertRaisesRegex(ValueError, "^E_NATIVE_WAVE_RESULT_INVALID:"):
+                import_native_wave(root, tasks / "manifest.json", results, 1)
+            self.assertFalse((root / ".game-l10n/native/shards").exists())
+
+    def test_result_owned_empty_authority_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = root / "result.jsonl"
+            self._write_rows(result, [{
+                "target_id": "fixture-slot", "status": "success", "text": "",
+                "allow_empty": True,
+                "ui_empty_target": optional_slot_fixture().metadata["ui_empty_target"],
+            }])
+            with self.assertRaisesRegex(ValueError, "without text"):
+                import_native_shard(root, result, "fixture")
+
+    def test_optional_empty_wave_joins_bound_source_and_merges_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, segments, tasks, results = self._prepare_optional_wave(root)
+            summary = import_native_wave(root, tasks / "manifest.json", results, 1)
+            self.assertEqual(summary["success"], 2)
+            output = root / "merged.jsonl"
+            merge_native_pass(root, segments, output, manifest_path=tasks / "manifest.json")
+            row = json.loads(output.read_text().splitlines()[1])
+            self.assertEqual(row["text"], "")
+            self.assertEqual(row["candidate_generation"], 1)
+            self.assertTrue(row["candidate_digest"])
+            # Import and merge retain candidate state; neither claims review.
+            self.assertNotIn("reviewer", row)
+            self.assertNotEqual(row["status"], "reviewed")
+
+    def test_optional_empty_wave_rejects_changed_inventory_before_any_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, segments, tasks, results = self._prepare_optional_wave(root)
+            changed = asdict(segments[1])
+            changed["source"] = "SOURCE_CHANGED"
+            self._write_rows(source, [asdict(segments[0]), changed])
+            with self.assertRaisesRegex(ValueError, "invalid"):
+                import_native_wave(root, tasks / "manifest.json", results, 1)
+            self.assertFalse((root / ".game-l10n/native/shards").exists())
+
     def _write_rows(self, path: Path, rows: list[dict]) -> None:
         path.write_text(
             "".join(json.dumps(row) + "\n" for row in rows),
