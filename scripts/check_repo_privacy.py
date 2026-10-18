@@ -15,7 +15,6 @@ DENIED_PARTS = {
     "localized",
     "batches",
     "audit",
-    "wolf-json",
     "logs",
     "sdk-export",
 }

@@ -22,8 +22,8 @@ Parr0t is engine-neutral. Keep game data, translations, prompts, caches, logs, c
 7. **Translate, do not invent.** Preserve target-scoped narrative, functional, or knowledge context for every item in the prepared batch; target isolation does not require separate model calls. Preserve meaning, character voice, formality, scene state, UI function, conditions, units, order, terminology, placeholders, markup, control codes, supported allusions, and natural target-language effect.
 8. **Keep source and runtime immutable by default.** Build new artifacts in the workspace. Inspection, building, testing, log reading, or access to a game directory does not authorize install, update, restore/remove, launch, cleanup, or execution. Each real runtime action requires its own explicit approval under `docs/runtime-approval.md`.
 9. **Select and activate before implementing.** Follow `docs/sdk-selection.md` before format or data-plane work. Reuse or extend only an exact engine/version match and execute it from the bound SDK checkout. Code from another identity is reference evidence for `derive-new`, not permission to widen that SDK. Generated pass-through tools are not an adapter. `main` never imports engine-specific data from an SDK branch.
-10. **Publication is dormant.** Do not propose, prepare, mention, commit, push, tag, publish, deploy, or create a release unless the user first requests that exact external action. SDK promotion additionally requires confirmed patch success. Its engine-only commit must not touch a path present on `main`; verify it with `game-l10n verify-sdk-promotion`. Per-game publication additionally requires `docs/instance-release.md` and its release gate.
-11. **Keep review control deterministic.** After `prepare-native-pass`, only `game-l10n native-pass-step` selects or advances waves. Dispatch its exact returned wave after one bounded wait; each task keeps one semantic batch call. Root reads metadata only; no model controllers or worker delegation. Never choose recovery, models, batches, budgets, or resume. Unknown state means checkpoint and stop.
+10. **Publication is dormant.** Do not propose, prepare, mention, commit, push, tag, publish, deploy, or create a release unless the user first requests that exact external action. SDK promotion requires confirmed patch success. Its engine-only commit must not touch `main` paths; check paths with `game-l10n verify-sdk-promotion --working-tree`, pin its base, and verify the final commit before packaging. Per-game publication requires `docs/instance-release.md` and its release gate.
+11. **Keep review control deterministic.** After `prepare-native-pass`, only `game-l10n native-pass-step` selects or advances waves. Dispatch its exact returned wave after one bounded wait; each task keeps one semantic batch call. V6 tasks embed bound segments; workers never open the validation-only full source. Root reads metadata only; no model controllers or worker delegation. Never choose recovery, models, batches, budgets, or resume. Unknown state means checkpoint and stop.
 12. **Keep provider mode fixed.** A selected preset defines the authorized providers and roles. A key does not change mode or promote a fallback. Native App workers and API providers are distinct; never emulate a native worker with another Codex process or silently replace the locked route.
 
 ## Standard job sequence
@@ -53,11 +53,12 @@ Parr0t is engine-neutral. Keep game data, translations, prompts, caches, logs, c
 | Windows package | `docs/installer-contract.md` plus `docs/filesystem-packaging.md` or `docs/steam-packaging.md` |
 | Steam discovery or Play-button integration | `docs/steam-faq.md`, `docs/wrapper-executable.md` |
 | User-requested per-game publication | `docs/instance-release.md` |
+| SDK branch maintenance/update | `docs/branch-update-contract.md` |
 | Confirmed SDK promotion/publication | `docs/sdk-branch-contract.md`, `docs/engine-faq-contract.md` |
 | Framework troubleshooting | `docs/faq.md` |
 | Triggered engine exception | selected SDK branch `docs/engine-faq.md` under `docs/engine-faq-contract.md` |
 
-For launcher-neutral Windows packages, `-GameRoot` accepts absolute paths and paths relative to the startup current directory; when omitted, the validated startup current directory is tried before prompting.
+Launcher-neutral packages accept absolute or startup-relative `-GameRoot`; omission uses the validated startup directory before prompting.
 
 ## Repository acceptance
 
@@ -66,5 +67,3 @@ For launcher-neutral Windows packages, `-GameRoot` accepts absolute paths and pa
 - A deterministic engine problem belongs in code plus a regression test. Use an engine runbook only when safe continuation needs external tooling, user material, runtime evidence, authorization, or an uninferable decision.
 - Before committing repository changes, run `python scripts/check_repo_privacy.py` and `python -m unittest discover -s tests -t . -v`.
 - API keys belong only in environment variables and must never be printed or persisted.
-
-See `docs/wolf-rpg-pro.md`.

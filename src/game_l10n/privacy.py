@@ -13,9 +13,6 @@ DENIED_PARTS = {
     "outputs",
     "translations",
     "localized",
-    "batches",
-    "audit",
-    "wolf-json",
     "cache",
     "logs",
 }

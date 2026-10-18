@@ -30,7 +30,7 @@ Initialize the workspace and record the user's Git choice as described in the ma
 ## Translation batches
 
 ```powershell
-game-l10n wolf prepare-batches `
+python -m game_l10n.wolf prepare-batches `
   --workspace <agent-workspace> `
   --source wolf-json `
   --copy-to translations\wolf-json `
@@ -50,12 +50,12 @@ The context-first translation/review orchestrator remains authoritative. Batch v
 Import the complete reviewed output into the batches, then apply it:
 
 ```powershell
-game-l10n wolf import-reviewed `
+python -m game_l10n.wolf import-reviewed `
   --workspace <agent-workspace> `
   --reviewed translations\reviewed.json `
   --batches batches
 
-game-l10n wolf apply-batches `
+python -m game_l10n.wolf apply-batches `
   --workspace <agent-workspace> `
   --batches batches `
   --translated-json translations\wolf-json
@@ -68,7 +68,7 @@ The importer requires every current target to be `reviewed` or exact `source_pre
 Mark deferred batch items with `"manual": true`, then export the queue and a harmless same-format example:
 
 ```powershell
-game-l10n wolf manual-export `
+python -m game_l10n.wolf manual-export `
   --workspace <agent-workspace> `
   --batches batches `
   --output translations\manual_translation_queue.json `
@@ -78,7 +78,7 @@ game-l10n wolf manual-export `
 Merge a completed queue only after its IDs, sources, control codes, and newline counts validate:
 
 ```powershell
-game-l10n wolf manual-merge `
+python -m game_l10n.wolf manual-merge `
   --workspace <agent-workspace> `
   --queue translations\manual_translation_queue.json `
   --batches batches
@@ -87,7 +87,7 @@ game-l10n wolf manual-merge `
 ## Protect and audit runtime identifiers
 
 ```powershell
-game-l10n wolf protect-runtime `
+python -m game_l10n.wolf protect-runtime `
   --workspace <agent-workspace> `
   --wolfdawn <wolfdawn-executable> `
   --original-data <game-root>\Data `
@@ -95,7 +95,7 @@ game-l10n wolf protect-runtime `
 
 # Inject the protected JSON into build\Data with the reviewed WolfDawn workflow.
 
-game-l10n wolf audit-runtime `
+python -m game_l10n.wolf audit-runtime `
   --workspace <agent-workspace> `
   --wolfdawn <wolfdawn-executable> `
   --original-data <game-root>\Data `
@@ -109,7 +109,7 @@ An audit failure is a build failure. Do not dismiss a reported key change merely
 WOLF Pro refuses to mix archive encryption versions. The adapter invokes an external packer with the contract `pack <directory> <output.wolf> <Game.wolf>` and always produces the three replacement archives together:
 
 ```powershell
-game-l10n wolf pack-pro `
+python -m game_l10n.wolf pack-pro `
   --workspace <agent-workspace> `
   --packer <pro-packer-executable> `
   --built-data build\Data `
@@ -120,3 +120,9 @@ game-l10n wolf pack-pro `
 Review the output before installing it. Keep a recoverable copy of the original archives and never copy packer binaries or game-derived data into this SDK repository.
 
 `pack-pro` rechecks the current inventory and blocking-failure gate before invoking the external packer. Runtime coverage remains a separate claim: packing and a clean static audit do not prove that every screen or state was observed in a real execution.
+
+## Core update compatibility
+
+Use the standalone engine module commands above. The framework CLI and root package remain identical to main. Import engine APIs from the engine subpackage.
+
+The engine-owned public-tree regression gate rejects wolf-json, batches, and audit artifacts. Keep these directories external and exclude wolf-json from any workspace Git configuration. The core package version is not an engine SDK version.
