@@ -1,10 +1,10 @@
 # Parr0t agent operation guide
 
-Operating entry point for coding agents. `AGENTS.md` defines invariants; dedicated documents define stage details. Do not load unrelated contracts in advance.
+Agent entry point. `AGENTS.md` defines invariants; load stage documents on demand.
 
 ## Supported control paths
 
-Parr0t supports Codex App/CLI directly and Codex routed through an OpenCodex-compatible proxy. A proxy changes provider routing only. It does not relax repository instructions, workspace isolation, control-plane separation, provider locks, or authorization boundaries.
+Parr0t supports Codex App/CLI and OpenCodex-compatible proxies. A proxy changes routing only, never repository, isolation, provider, or authorization contracts.
 
 ## Start or resume
 
@@ -23,7 +23,7 @@ For a new job:
 3. Ask once whether Git may be used for this game task and record the choice. Disabled means no `git init`, commit, branch, remote, or push for that job.
 4. Follow the single later `next_actions`. Resolve only its `required_contracts`; load another contract only for a new user route. Isolated workers perform locale/engine discovery, inventory, and classification, update private state, and return validated envelope paths. Only `local_patch_ready` is terminal.
 
-For an existing job, start with status and reuse valid checkpoints. Do not repeat extraction, context work, translation, or validation whose input fingerprint is unchanged.
+For an existing job, start with status and reuse valid checkpoints. Do not repeat work with unchanged fingerprints.
 
 ## State machine
 
@@ -50,6 +50,7 @@ Do not skip or reorder barriers. One refusal, timeout, malformed result, capacit
 
 - Select and activate the SDK before data-plane work. Exact engine/version matches run from the bound branch checkout. A different identity may be a bound read-only code reference for `derive-new`, never a compatibility or promotion destination. Generated pass-through workspace tools are placeholders, not an active adapter.
 - Inventory completeness requires two independently implemented ordered manifests. Result alignment, semantic review coverage, and runtime observation are separate claims.
+- At 10,000+ records, each inventory method scans once and reconciliation runs once. Reuse unchanged attestations; never create per-record startup files or repeat discovery before context.
 - Context is target-scoped, not absent. Use narrative/voice, functional/UI, knowledge/prerequisite, adjacent, glossary, and immutable evidence relevant to that target.
 - The top-level agent is a text-free control plane. It handles IDs, counts, categorical status, queue movement, artifact paths, and deterministic codes. Workers access private text and return only validated metadata envelopes.
 - The top-level agent never inspects game-root files, including preliminary discovery; it passes paths to isolated workers. A missing SDK does not relax this boundary.
@@ -57,7 +58,7 @@ Do not skip or reorder barriers. One refusal, timeout, malformed result, capacit
 - Translation is faithful transformation, not content generation. Independent review checks meaning, omission, voice, tone, function, conditions, units, terminology, allusions, placeholders, markup, control codes, ordering, and material layout risk.
 - Build new outputs in the workspace. Automated checks use synthetic targets and never install or launch the real game.
 - Apply proportional verification and stop after the changed layer passes. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.
-- Native passes are root-direct without delegation. After `prepare-native-pass`, only `native-pass-step` may select or advance waves; dispatch its returned tasks and wait once.
+- Native passes are root-direct without delegation. Only `native-pass-step` advances waves. Use `prepare-native-pass --pass-kind review` for up to 2,048 initial candidates and failed-only binary splitting; translation keeps its own bounds.
 
 ## Status-driven routes
 

@@ -15,7 +15,7 @@ from .control_plane import (
     review_control_contract,
 )
 from .models import Segment
-from .store import stable_hash
+from .store import stable_hash, stable_hash_sequence
 from .validators import validate_integrity
 
 
@@ -27,16 +27,55 @@ TASK_PAYLOAD_SCHEMA = "parr0t.native-task-payload.v1"
 DEFAULT_MAX_RECORDS = 64
 DEFAULT_MIN_RECORDS = 8
 DEFAULT_MAX_MATERIAL_TOKENS = 24_000
+DEFAULT_REVIEW_MAX_RECORDS = 2_048
+DEFAULT_REVIEW_MIN_RECORDS = 64
+DEFAULT_REVIEW_MAX_MATERIAL_TOKENS = 262_144
+DEFAULT_REVIEW_SPLIT_MAX_DEPTH = 11
+DEFAULT_REVIEW_SPLIT_MAX_ATTEMPTS = DEFAULT_REVIEW_SPLIT_MAX_DEPTH + 1
 DEFAULT_MAX_WORKERS = 8
 DEFAULT_BULK_BUDGET_GATE_RECORDS = 4_096
-NATIVE_CONTROL_STATE_SCHEMA = "parr0t.native-control-state.v1"
+PASS_KINDS = {"translation", "review", "rewrite"}
+NATIVE_CONTROL_STATE_SCHEMA = "parr0t.native-control-state.v2"
+LEGACY_NATIVE_CONTROL_STATE_SCHEMA = "parr0t.native-control-state.v1"
 NATIVE_CONTROL_STEP_SCHEMA = "parr0t.native-control-step.v1"
 NATIVE_WAVE_RECEIPT_SCHEMA = "parr0t.native-wave-receipt.v1"
 USAGE_EVENT = re.compile(r"^[a-zA-Z0-9._-]{1,128}$")
 
 
-def _worker_contract() -> dict[str, Any]:
+def _failure_split_contract(pass_kind: str) -> dict[str, Any]:
+    enabled = pass_kind == "review"
     return {
+        "enabled": enabled,
+        "strategy": "failed_subset_binary" if enabled else "none",
+        "triggers": (
+            [
+                "batch_refused",
+                "batch_error",
+                "malformed_or_incomplete_result",
+                "target_refused_or_error",
+            ]
+            if enabled
+            else []
+        ),
+        "successful_rows_locked": enabled,
+        "retry_successful_rows": False,
+        "max_depth": DEFAULT_REVIEW_SPLIT_MAX_DEPTH if enabled else 0,
+        "max_attempts_per_target": (
+            DEFAULT_REVIEW_SPLIT_MAX_ATTEMPTS if enabled else 1
+        ),
+        "owner": "native_pass_step" if enabled else "none",
+        "terminal_action": (
+            "emit_failed_rows_for_configured_review_fallback"
+            if enabled
+            else "emit_failed_rows"
+        ),
+    }
+
+
+def _worker_contract(pass_kind: str = "translation") -> dict[str, Any]:
+    split_contract = _failure_split_contract(pass_kind)
+    return {
+        "pass_kind": pass_kind,
         "history_mode": "none",
         "fresh_worker_per_task": True,
         "max_followup_tasks": 0,
@@ -57,10 +96,13 @@ def _worker_contract() -> dict[str, Any]:
         "control_envelope_schema": CONTROL_ENVELOPE_SCHEMA,
         "worker_final_response": "workspace_relative_envelope_path_only",
         "free_form_parent_response_allowed": False,
+        "failure_split": split_contract,
+        "failure_result_proof_fields": [],
     }
 
 
-def _detail_contract() -> dict[str, Any]:
+def _detail_contract(pass_kind: str = "translation") -> dict[str, Any]:
+    split_contract = _failure_split_contract(pass_kind)
     return {
         "review_control": review_control_contract(),
         "schema": "parr0t.detail-contract.v1",
@@ -86,13 +128,22 @@ def _detail_contract() -> dict[str, Any]:
             "checkpoint_reuse",
         ],
         "conflict_action": "reject_before_dispatch",
-        "one_semantic_batch_per_task": True,
+        "pass_kind": pass_kind,
+        "one_initial_semantic_batch_per_task": True,
+        "additional_semantic_calls": (
+            "new_core_prepared_tasks_only" if split_contract["enabled"] else "none"
+        ),
         "per_record_semantic_call_loop_allowed": False,
         "shared_context_loads_per_task": 1,
         "task_input": "bound_segment_payload_only",
         "full_source_artifact_access": "validation_only",
         "result_cardinality": "one_status_per_bound_target",
-        "partial_failure_isolation": "per_target_status_in_same_batched_result",
+        "partial_failure_isolation": (
+            "lock_successes_then_binary_split_failed_subset"
+            if split_contract["enabled"]
+            else "per_target_status_in_same_batched_result"
+        ),
+        "failure_split": split_contract,
         "unchanged_success_reprocessing_allowed": False,
         "budget_exhaustion_action": "checkpoint_and_return_control",
     }
@@ -103,6 +154,7 @@ def _execution_contract(
     max_workers: int,
     record_count: int,
     *,
+    pass_kind: str,
     bulk_budget_gate_records: int,
     max_elapsed_minutes: int | None,
     max_input_tokens: int | None,
@@ -127,6 +179,7 @@ def _execution_contract(
     )
     budget_approved = bool(user_approved_budget and budget_complete)
     return {
+        "pass_kind": pass_kind,
         "strategy": "direct_single_task" if task_count == 1 else "bounded_slot_queue",
         "orchestration_owner": "root_control_plane",
         "model_controller_allowed": False,
@@ -276,6 +329,9 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
         )
     if not isinstance(payload.get("source_fingerprint"), str) or not payload["source_fingerprint"]:
         raise ValueError("Native task manifest source fingerprint is missing")
+    pass_kind = payload.get("pass_kind", "translation")
+    if pass_kind not in PASS_KINDS:
+        raise ValueError("Native task manifest pass_kind is invalid")
     if version == TASK_MANIFEST_VERSION:
         if payload.get("task_payload_schema") != TASK_PAYLOAD_SCHEMA:
             raise ValueError("E_DETAIL_CONTRACT_CONFLICT: task payload schema is missing")
@@ -290,7 +346,7 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
                 "execution_contract": execution_contract,
             }
         )
-        if worker_contract != _worker_contract() or detail_contract != _detail_contract():
+        if worker_contract != _worker_contract(pass_kind) or detail_contract != _detail_contract(pass_kind):
             raise ValueError("E_DETAIL_CONTRACT_CONFLICT: native task contract was changed")
         if not isinstance(execution_contract, dict) or (
             execution_contract.get("detail_contract_schema")
@@ -334,17 +390,27 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
             )
         ):
             raise ValueError("Native task manifest contains an invalid task binding")
-        task_path = manifest_path.parent / name
-        if not task_path.is_file() or _file_sha256(task_path) != digest:
-            raise ValueError("Native task manifest references a missing or changed task")
-        target_ids = _task_target_ids(
-            task_path,
-            require_payload=version == TASK_MANIFEST_VERSION,
-        )
-        if len(target_ids) != records:
-            raise ValueError("Native task record count does not match its manifest binding")
         seen_files.add(name)
     return payload
+
+
+def _validate_manifest_task_file(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    task: dict[str, Any],
+) -> list[str]:
+    """Validate only a task that is about to be dispatched or imported."""
+
+    task_path = manifest_path.parent / task["file"]
+    if not task_path.is_file() or _file_sha256(task_path) != task["sha256"]:
+        raise ValueError("Native task manifest references a missing or changed task")
+    target_ids = _task_target_ids(
+        task_path,
+        require_payload=manifest.get("version") == TASK_MANIFEST_VERSION,
+    )
+    if len(target_ids) != task["records"]:
+        raise ValueError("Native task record count does not match its manifest binding")
+    return target_ids
 
 
 def _manifest_shard_path(
@@ -461,9 +527,10 @@ def prepare_native_tasks(
     segments: list[Segment],
     output_dir: Path,
     *,
-    max_records: int = DEFAULT_MAX_RECORDS,
+    pass_kind: str = "translation",
+    max_records: int | None = None,
     min_records: int | None = None,
-    max_material_tokens: int = DEFAULT_MAX_MATERIAL_TOKENS,
+    max_material_tokens: int | None = None,
     max_workers: int = DEFAULT_MAX_WORKERS,
     bulk_budget_gate_records: int = DEFAULT_BULK_BUDGET_GATE_RECORDS,
     max_elapsed_minutes: int | None = None,
@@ -473,10 +540,27 @@ def prepare_native_tasks(
     user_approved_budget: bool = False,
 ) -> dict[str, Any]:
     require_control_plane_ready(work_dir)
-    if not 1 <= max_records <= 2000:
-        raise ValueError("max_records must be between 1 and 2000")
+    if pass_kind not in PASS_KINDS:
+        raise ValueError(f"pass_kind must be one of: {', '.join(sorted(PASS_KINDS))}")
+    if max_records is None:
+        max_records = (
+            DEFAULT_REVIEW_MAX_RECORDS
+            if pass_kind == "review"
+            else DEFAULT_MAX_RECORDS
+        )
+    if max_material_tokens is None:
+        max_material_tokens = (
+            DEFAULT_REVIEW_MAX_MATERIAL_TOKENS
+            if pass_kind == "review"
+            else DEFAULT_MAX_MATERIAL_TOKENS
+        )
+    if not 1 <= max_records <= DEFAULT_REVIEW_MAX_RECORDS:
+        raise ValueError("max_records must be between 1 and 2048")
     if min_records is None:
-        min_records = min(DEFAULT_MIN_RECORDS, max_records)
+        min_records = min(
+            DEFAULT_REVIEW_MIN_RECORDS if pass_kind == "review" else DEFAULT_MIN_RECORDS,
+            max_records,
+        )
     if not 1 <= min_records <= max_records:
         raise ValueError("min_records must be between 1 and max_records")
     if not 256 <= max_material_tokens <= 1_000_000:
@@ -518,13 +602,14 @@ def prepare_native_tasks(
     except ValueError as exc:
         raise ValueError("Native task source and output must stay inside the private workspace") from exc
 
-    fingerprint = stable_hash([asdict(segment) for segment in segments])
+    fingerprint = stable_hash_sequence(asdict(segment) for segment in segments)
     manifest_path = output_dir / "manifest.json"
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if (
             manifest.get("version") == TASK_MANIFEST_VERSION
             and manifest.get("source_fingerprint") == fingerprint
+            and manifest.get("pass_kind", "translation") == pass_kind
             and manifest.get("max_records") == max_records
             and manifest.get("min_records") == min_records
             and manifest.get("max_material_tokens") == max_material_tokens
@@ -536,6 +621,7 @@ def prepare_native_tasks(
                 len(task_rows),
                 max_workers,
                 len(segments),
+                pass_kind=pass_kind,
                 bulk_budget_gate_records=bulk_budget_gate_records,
                 max_elapsed_minutes=max_elapsed_minutes,
                 max_input_tokens=max_input_tokens,
@@ -545,15 +631,15 @@ def prepare_native_tasks(
             )
             expected_contract_fingerprint = stable_hash(
                 {
-                    "worker_contract": _worker_contract(),
-                    "detail_contract": _detail_contract(),
+                    "worker_contract": _worker_contract(pass_kind),
+                    "detail_contract": _detail_contract(pass_kind),
                     "execution_contract": expected_execution_contract,
                 }
             )
             valid = (
                 bool(task_rows)
-                and manifest.get("worker_contract") == _worker_contract()
-                and manifest.get("detail_contract") == _detail_contract()
+                and manifest.get("worker_contract") == _worker_contract(pass_kind)
+                and manifest.get("detail_contract") == _detail_contract(pass_kind)
                 and manifest.get("execution_contract") == expected_execution_contract
                 and manifest.get("contract_fingerprint")
                 == expected_contract_fingerprint
@@ -573,7 +659,8 @@ def prepare_native_tasks(
                 )
                 and all(
                     (output_dir / item["file"]).is_file()
-                    and _file_sha256(output_dir / item["file"]) == item["sha256"]
+                    and isinstance(item.get("size"), int)
+                    and (output_dir / item["file"]).stat().st_size == item["size"]
                     for item in task_rows
                 )
             )
@@ -583,6 +670,7 @@ def prepare_native_tasks(
                     "cached": True,
                     "records": len(segments),
                     "tasks": len(task_rows),
+                    "pass_kind": pass_kind,
                     "max_records": max_records,
                     "min_records": min_records,
                     "max_material_tokens": max_material_tokens,
@@ -654,6 +742,7 @@ def prepare_native_tasks(
                     item[2] > max_material_tokens for item in batch
                 ),
                 "sha256": _file_sha256(path),
+                "size": path.stat().st_size,
             }
         )
     for stale in output_dir.glob("task-*.jsonl"):
@@ -663,6 +752,7 @@ def prepare_native_tasks(
         len(tasks),
         max_workers,
         len(segments),
+        pass_kind=pass_kind,
         bulk_budget_gate_records=bulk_budget_gate_records,
         max_elapsed_minutes=max_elapsed_minutes,
         max_input_tokens=max_input_tokens,
@@ -677,8 +767,8 @@ def prepare_native_tasks(
             or budget_gate["user_approved"] is True
             or task["wave"] <= budget_gate["pilot_waves_without_approved_budget"]
         )
-    worker_contract = _worker_contract()
-    detail_contract = _detail_contract()
+    worker_contract = _worker_contract(pass_kind)
+    detail_contract = _detail_contract(pass_kind)
     contract_fingerprint = stable_hash(
         {
             "worker_contract": worker_contract,
@@ -689,6 +779,7 @@ def prepare_native_tasks(
     manifest = {
         "version": TASK_MANIFEST_VERSION,
         "task_payload_schema": TASK_PAYLOAD_SCHEMA,
+        "pass_kind": pass_kind,
         "source_artifact": source_artifact,
         "source_fingerprint": fingerprint,
         "max_records": max_records,
@@ -709,6 +800,7 @@ def prepare_native_tasks(
         "cached": False,
         "records": len(segments),
         "tasks": len(tasks),
+        "pass_kind": pass_kind,
         "max_records": max_records,
         "min_records": min_records,
         "max_material_tokens": max_material_tokens,
@@ -747,13 +839,20 @@ def _validate_row(row: dict[str, Any], *, segment: Segment | None = None) -> dic
     issues = row.get("issues", [])
     if not isinstance(issues, list) or not all(isinstance(item, str) for item in issues):
         raise ValueError(f"Native shard {target_id!r} issues must be strings")
-    return {
+    result = {
         "target_id": target_id,
         "status": status,
         "text": text if status == "success" else "",
         "provider": str(row.get("provider", "native-worker")),
         "issues": issues,
     }
+    for field in ("split_depth", "semantic_attempts"):
+        if field in row:
+            value = row[field]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"Native shard {target_id!r} {field} must be non-negative")
+            result[field] = value
+    return result
 
 
 def _validate_manifest_rows(
@@ -785,7 +884,7 @@ def _validate_manifest_rows(
             raise ValueError("Optional-slot source artifact is invalid") from None
         if (
             len(ordered) != manifest.get("records")
-            or stable_hash([asdict(segment) for segment in ordered])
+            or stable_hash_sequence(asdict(segment) for segment in ordered)
             != manifest.get("source_fingerprint")
         ):
             raise ValueError("Optional-slot source no longer matches its task manifest")
@@ -800,7 +899,7 @@ def _validate_manifest_rows(
                     raise ValueError("Optional-slot composition references an unbound target")
         # Cache only a fully validated source; reuse once per wave/import scan.
         bound_segments.update((segment.id, segment) for segment in ordered)
-    return [
+    validated = [
         _validate_row(
             row,
             segment=bound_segments.get(row["target_id"])
@@ -808,6 +907,7 @@ def _validate_manifest_rows(
         )
         for row in rows
     ]
+    return validated
 
 
 def import_native_shard(work_dir: Path, source: Path, shard_name: str) -> dict[str, Any]:
@@ -869,12 +969,7 @@ def import_native_wave(
     wave_ids: set[str] = set()
     bound_segments: dict[str, Segment] = {}
     for task in tasks:
-        expected_ids = _task_target_ids(
-            manifest_path.parent / task["file"],
-            require_payload=manifest.get("version") == TASK_MANIFEST_VERSION,
-        )
-        if len(expected_ids) != task["records"]:
-            raise ValueError("Native task record count does not match its manifest binding")
+        expected_ids = _validate_manifest_task_file(manifest_path, manifest, task)
         result_path = source_dir / task["file"]
         if not result_path.is_file():
             raise ValueError("Native wave result is incomplete")
@@ -914,18 +1009,167 @@ def import_native_wave(
 
 
 def _native_control_plan_fingerprint(manifest: dict[str, Any]) -> str:
-    return stable_hash(
-        [
-            {
+    def bindings() -> Iterable[dict[str, Any]]:
+        yield {"pass_kind": manifest.get("pass_kind", "translation")}
+        for task in manifest["tasks"]:
+            yield {
                 "file": task["file"],
                 "wave": task["wave"],
                 "slot": task["slot"],
                 "records": task["records"],
                 "sha256": task["sha256"],
             }
-            for task in manifest["tasks"]
-        ]
+
+    return stable_hash_sequence(bindings())
+
+
+def _relative_to_work_dir(work_dir: Path, path: Path) -> str:
+    try:
+        return path.resolve().relative_to(work_dir.resolve()).as_posix()
+    except ValueError as exc:
+        raise ValueError("Native review split artifact escaped the private workspace") from exc
+
+
+def _prepare_review_split_pass(
+    work_dir: Path,
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    results_dir: Path,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Create the next failed-only review pass without model-side scheduling."""
+
+    parent_meta = manifest.get("review_split")
+    if parent_meta is not None and not isinstance(parent_meta, dict):
+        raise ValueError("E_NATIVE_REVIEW_SPLIT_INVALID: split metadata is invalid")
+    parent_depth = int(parent_meta.get("depth", 0)) if parent_meta else 0
+    root_manifest = (
+        str(parent_meta.get("root_manifest"))
+        if parent_meta
+        else _relative_to_work_dir(work_dir, manifest_path)
     )
+    root_results = (
+        work_dir / str(parent_meta.get("root_results_dir"))
+        if parent_meta
+        else results_dir
+    )
+    chain = (
+        list(parent_meta.get("chain", []))
+        if parent_meta
+        else [_relative_to_work_dir(work_dir, manifest_path)]
+    )
+    if not chain or chain[-1] != _relative_to_work_dir(work_dir, manifest_path):
+        raise ValueError("E_NATIVE_REVIEW_SPLIT_INVALID: split chain is invalid")
+
+    failed_groups: list[list[Segment]] = []
+    failed_records = 0
+    terminal_records = 0
+    bound_segments: dict[str, Segment] = {}
+    for task in manifest["tasks"]:
+        expected_ids = _validate_manifest_task_file(manifest_path, manifest, task)
+        shard_path = _manifest_shard_path(work_dir, manifest, task)
+        if not shard_path.is_file():
+            raise ValueError("E_NATIVE_REVIEW_SPLIT_INVALID: review pass is incomplete")
+        rows = _validate_manifest_rows(
+            work_dir,
+            manifest,
+            _read_jsonl(shard_path),
+            bound_segments=bound_segments,
+        )
+        if [row["target_id"] for row in rows] != expected_ids:
+            raise ValueError("E_NATIVE_REVIEW_SPLIT_INVALID: imported shard binding changed")
+        payload_rows = _read_jsonl(manifest_path.parent / task["file"])
+        payload_by_id: dict[str, Segment] = {}
+        for payload in payload_rows:
+            segment_payload = payload.get("segment")
+            try:
+                segment = Segment(**segment_payload)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "E_NATIVE_REVIEW_SPLIT_INVALID: task payload is invalid"
+                ) from None
+            payload_by_id[segment.id] = segment
+        group = [
+            payload_by_id[row["target_id"]]
+            for row in rows
+            if row["status"] != "success"
+        ]
+        failed_records += len(group)
+        if len(group) > 1:
+            failed_groups.append(group)
+        else:
+            terminal_records += len(group)
+
+    splittable_records = sum(len(group) for group in failed_groups)
+    split_contract = manifest["worker_contract"]["failure_split"]
+    max_depth = int(split_contract["max_depth"])
+    base = {
+        "prepared": False,
+        "failed_records": failed_records,
+        "splittable_records": splittable_records,
+        "terminal_records": terminal_records,
+        "depth": parent_depth,
+        "chain": chain,
+        "terminal_action": split_contract["terminal_action"],
+    }
+    if not failed_groups or parent_depth >= max_depth:
+        return base
+
+    next_depth = parent_depth + 1
+    retry_segments = [segment for group in failed_groups for segment in group]
+    next_max_records = max(1, max((len(group) + 1) // 2 for group in failed_groups))
+    root_manifest_path = work_dir / root_manifest
+    task_dir = root_manifest_path.parent / f"review-split-{next_depth:02d}"
+    source_path = root_manifest_path.parent / f"review-split-{next_depth:02d}-source.jsonl"
+    child_results = root_results / f"split-{next_depth:02d}"
+    _atomic_jsonl(source_path, (asdict(segment) for segment in retry_segments))
+
+    gate = manifest["execution_contract"]["bulk_budget_gate"]
+    prepare_native_tasks(
+        work_dir,
+        source_path,
+        retry_segments,
+        task_dir,
+        pass_kind="review",
+        max_records=next_max_records,
+        min_records=min(DEFAULT_REVIEW_MIN_RECORDS, next_max_records),
+        max_material_tokens=manifest["max_material_tokens"],
+        max_workers=manifest["max_workers"],
+        bulk_budget_gate_records=(1 if gate.get("active") is True else DEFAULT_BULK_BUDGET_GATE_RECORDS),
+        max_elapsed_minutes=gate.get("max_elapsed_minutes"),
+        max_input_tokens=gate.get("max_input_tokens"),
+        max_provider_cost_usd=gate.get("max_provider_cost_usd"),
+        provider_cost_unmetered=gate.get("provider_cost_unmetered") is True,
+        user_approved_budget=gate.get("user_approved") is True,
+    )
+    child_manifest_path = task_dir / "manifest.json"
+    child_manifest = json.loads(child_manifest_path.read_text(encoding="utf-8"))
+    child_relative = _relative_to_work_dir(work_dir, child_manifest_path)
+    chain = [*chain, child_relative]
+    child_manifest["review_split"] = {
+        "depth": next_depth,
+        "root_manifest": root_manifest,
+        "parent_manifest": _relative_to_work_dir(work_dir, manifest_path),
+        "root_results_dir": _relative_to_work_dir(work_dir, root_results),
+        "results_dir": _relative_to_work_dir(work_dir, child_results),
+        "chain": chain,
+        "inherited_usage": {
+            "created_at_epoch": state["created_at_epoch"],
+            "input_tokens": state["input_tokens"],
+            "provider_cost_usd": state["provider_cost_usd"],
+            "usage_event_ids": list(state["usage_event_ids"]),
+        },
+    }
+    _atomic_json(child_manifest_path, child_manifest)
+    return {
+        **base,
+        "prepared": True,
+        "depth": next_depth,
+        "next_max_records": next_max_records,
+        "manifest": child_relative,
+        "results_dir": _relative_to_work_dir(work_dir, child_results),
+        "chain": chain,
+    }
 
 
 def _native_control_state_path(
@@ -943,20 +1187,53 @@ def _native_control_state_path(
 def _new_native_control_state(
     manifest: dict[str, Any], plan_fingerprint: str
 ) -> dict[str, Any]:
+    inherited = manifest.get("review_split", {}).get("inherited_usage", {})
+    if inherited:
+        created_at = inherited.get("created_at_epoch")
+        input_tokens = inherited.get("input_tokens")
+        provider_cost = inherited.get("provider_cost_usd")
+        usage_ids = inherited.get("usage_event_ids")
+        if (
+            not isinstance(created_at, (int, float))
+            or isinstance(created_at, bool)
+            or not isinstance(input_tokens, int)
+            or isinstance(input_tokens, bool)
+            or input_tokens < 0
+            or not isinstance(provider_cost, (int, float))
+            or isinstance(provider_cost, bool)
+            or not math.isfinite(provider_cost)
+            or provider_cost < 0
+            or not isinstance(usage_ids, list)
+            or len(usage_ids) > 10000
+            or not all(
+                isinstance(item, str) and USAGE_EVENT.fullmatch(item)
+                for item in usage_ids
+            )
+            or len(usage_ids) != len(set(usage_ids))
+        ):
+            raise ValueError("E_NATIVE_REVIEW_SPLIT_INVALID: inherited usage is invalid")
+    else:
+        created_at = time.time()
+        input_tokens = 0
+        provider_cost = 0.0
+        usage_ids = []
     return {
         "schema": NATIVE_CONTROL_STATE_SCHEMA,
         "source_fingerprint": manifest["source_fingerprint"],
         "plan_fingerprint": plan_fingerprint,
         "contract_fingerprint": manifest["contract_fingerprint"],
-        "created_at_epoch": time.time(),
+        "created_at_epoch": created_at,
         "active_wave": 0,
         "control_steps_in_wave": 0,
         "last_progress_marker": "",
         "unchanged_observations": 0,
         "last_action": "",
-        "input_tokens": 0,
-        "provider_cost_usd": 0.0,
-        "usage_event_ids": [],
+        "input_tokens": input_tokens,
+        "provider_cost_usd": provider_cost,
+        "usage_event_ids": list(usage_ids),
+        "checkpoint_initialized": False,
+        "imported_wave_count": 0,
+        "imported_tasks": 0,
     }
 
 
@@ -969,7 +1246,7 @@ def _load_native_control_state(
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("E_NATIVE_CONTROL_STATE_INVALID: state is unreadable") from exc
-    required = {
+    legacy_required = {
         "schema",
         "source_fingerprint",
         "plan_fingerprint",
@@ -984,6 +1261,20 @@ def _load_native_control_state(
         "provider_cost_usd",
         "usage_event_ids",
     }
+    required = legacy_required | {
+        "checkpoint_initialized",
+        "imported_wave_count",
+        "imported_tasks",
+    }
+    if (
+        isinstance(state, dict)
+        and state.get("schema") == LEGACY_NATIVE_CONTROL_STATE_SCHEMA
+        and set(state) == legacy_required
+    ):
+        state["schema"] = NATIVE_CONTROL_STATE_SCHEMA
+        state["checkpoint_initialized"] = False
+        state["imported_wave_count"] = 0
+        state["imported_tasks"] = 0
     if not isinstance(state, dict) or set(state) != required:
         raise ValueError("E_NATIVE_CONTROL_STATE_INVALID: state shape is invalid")
     if (
@@ -1016,6 +1307,13 @@ def _load_native_control_state(
             for item in state["usage_event_ids"]
         )
         or len(state["usage_event_ids"]) != len(set(state["usage_event_ids"]))
+        or not isinstance(state.get("checkpoint_initialized"), bool)
+        or not isinstance(state.get("imported_wave_count"), int)
+        or isinstance(state.get("imported_wave_count"), bool)
+        or state["imported_wave_count"] < 0
+        or not isinstance(state.get("imported_tasks"), int)
+        or isinstance(state.get("imported_tasks"), bool)
+        or state["imported_tasks"] < 0
     ):
         raise ValueError("E_NATIVE_CONTROL_STATE_INVALID: state values are invalid")
     # A regenerated manifest may bind an approved budget without changing the task plan.
@@ -1061,7 +1359,6 @@ def _imported_native_waves(
 ) -> tuple[list[int], int]:
     imported_waves: list[int] = []
     imported_tasks = 0
-    gap_seen = False
     bound_segments: dict[str, Segment] = {}
     for wave in sorted({task["wave"] for task in manifest["tasks"]}):
         tasks = [task for task in manifest["tasks"] if task["wave"] == wave]
@@ -1116,10 +1413,6 @@ def _imported_native_waves(
                     raise ValueError(
                         "E_NATIVE_CONTROL_STATE_INVALID: wave receipt no longer matches"
                     )
-            if gap_seen:
-                raise ValueError(
-                    "E_NATIVE_CONTROL_STATE_INVALID: imported waves are not contiguous"
-                )
             imported_waves.append(wave)
             imported_tasks += len(tasks)
             continue
@@ -1154,15 +1447,11 @@ def _imported_native_waves(
                 "E_NATIVE_CONTROL_STATE_INVALID: a wave is only partially imported"
             )
         if all(present):
-            if gap_seen:
-                raise ValueError(
-                    "E_NATIVE_CONTROL_STATE_INVALID: imported waves are not contiguous"
-                )
             _write_wave_receipt(work_dir, manifest, tasks, wave)
             imported_waves.append(wave)
             imported_tasks += len(tasks)
         else:
-            gap_seen = True
+            break
     return imported_waves, imported_tasks
 
 
@@ -1228,15 +1517,34 @@ def native_control_step(
         provider_cost_usd=provider_cost_usd,
     )
 
-    imported_waves, imported_tasks = _imported_native_waves(
-        work_dir, manifest_path, manifest
-    )
-    waves = sorted({task["wave"] for task in manifest["tasks"]})
+    wave_tasks: dict[int, list[dict[str, Any]]] = {}
+    for task in manifest["tasks"]:
+        wave_tasks.setdefault(task["wave"], []).append(task)
+    waves = sorted(wave_tasks)
+    if state["checkpoint_initialized"] is not True:
+        imported_waves, imported_tasks = _imported_native_waves(
+            work_dir, manifest_path, manifest
+        )
+        state["checkpoint_initialized"] = True
+        state["imported_wave_count"] = len(imported_waves)
+        state["imported_tasks"] = imported_tasks
+    else:
+        imported_wave_count = state["imported_wave_count"]
+        if imported_wave_count > len(waves):
+            raise ValueError("E_NATIVE_CONTROL_STATE_INVALID: imported wave count is invalid")
+        imported_waves = waves[:imported_wave_count]
+        imported_tasks = sum(len(wave_tasks[wave]) for wave in imported_waves)
+        if imported_tasks != state["imported_tasks"]:
+            raise ValueError("E_NATIVE_CONTROL_STATE_INVALID: imported task count is invalid")
     import_summary: dict[str, Any] | None = None
-    next_wave = next((wave for wave in waves if wave not in imported_waves), None)
+    next_wave = (
+        waves[state["imported_wave_count"]]
+        if state["imported_wave_count"] < len(waves)
+        else None
+    )
 
     if next_wave is not None:
-        tasks = [task for task in manifest["tasks"] if task["wave"] == next_wave]
+        tasks = wave_tasks[next_wave]
         ready_paths = [
             results_dir / task["file"]
             for task in tasks
@@ -1295,11 +1603,14 @@ def native_control_step(
                 action = "checkpoint_and_stop"
                 issue_codes = ["E_NATIVE_WAVE_RESULT_INVALID"]
             else:
-                imported_waves, imported_tasks = _imported_native_waves(
-                    work_dir, manifest_path, manifest
-                )
-                next_wave = next(
-                    (wave for wave in waves if wave not in imported_waves), None
+                state["imported_wave_count"] += 1
+                state["imported_tasks"] += len(tasks)
+                imported_waves = waves[: state["imported_wave_count"]]
+                imported_tasks = state["imported_tasks"]
+                next_wave = (
+                    waves[state["imported_wave_count"]]
+                    if state["imported_wave_count"] < len(waves)
+                    else None
                 )
                 state["last_progress_marker"] = f"{imported_tasks}:{next_wave or 0}:0"
                 state["unchanged_observations"] = 0
@@ -1314,11 +1625,7 @@ def native_control_step(
                     budget_issue = _native_budget_issue(
                         manifest["execution_contract"], state, next_wave
                     )
-                    next_tasks = [
-                        task
-                        for task in manifest["tasks"]
-                        if task["wave"] == next_wave
-                    ]
+                    next_tasks = wave_tasks[next_wave]
                     if budget_issue:
                         action = "checkpoint_and_stop"
                         issue_codes = [budget_issue]
@@ -1348,13 +1655,16 @@ def native_control_step(
     state["last_action"] = action
     _atomic_json(state_path, state)
     selected_tasks = (
-        [task for task in manifest["tasks"] if task["wave"] == next_wave]
+        wave_tasks[next_wave]
         if action == "dispatch_authorized_wave" and next_wave is not None
         else []
     )
-    return {
+    for task in selected_tasks:
+        _validate_manifest_task_file(manifest_path, manifest, task)
+    response = {
         "schema": NATIVE_CONTROL_STEP_SCHEMA,
         "action": action,
+        "manifest": _relative_to_work_dir(work_dir, manifest_path),
         "wave": next_wave or 0,
         "counts": {
             "total_waves": len(waves),
@@ -1401,6 +1711,22 @@ def native_control_step(
         ),
         "state": state_path.resolve().relative_to(work_dir.resolve()).as_posix(),
     }
+    if action == "aggregate_completed_pass" and manifest["pass_kind"] == "review":
+        split = _prepare_review_split_pass(
+            work_dir, manifest_path, manifest, results_dir, state
+        )
+        response["review_split"] = split
+        if split["prepared"]:
+            child_manifest = work_dir / split["manifest"]
+            child_results = work_dir / split["results_dir"]
+            child_response = native_control_step(
+                work_dir, child_manifest, child_results
+            )
+            child_response["review_split"] = split
+            if child_response["action"] == "dispatch_authorized_wave":
+                child_response["action"] = "dispatch_review_split_wave"
+            return child_response
+    return response
 
 
 def merge_native_pass(
@@ -1418,33 +1744,87 @@ def merge_native_pass(
     shard_root = work_dir / ".game-l10n" / "native" / "shards"
     manifest_bound = manifest_path is not None
     expected_shards = 0
-    shard_bindings: list[tuple[Path, list[str] | None]] = []
+    shard_bindings: list[
+        tuple[Path, list[str] | None, dict[str, Any] | None, int]
+    ] = []
+    review_split_manifests = 0
     if manifest_path is not None:
-        manifest = _load_task_manifest(work_dir, manifest_path)
-        fingerprint = stable_hash([asdict(segment) for segment in segments])
+        leaf_manifest = _load_task_manifest(work_dir, manifest_path)
+        leaf_relative = _relative_to_work_dir(work_dir, manifest_path)
+        split_meta = leaf_manifest.get("review_split")
+        manifest_chain: list[tuple[Path, dict[str, Any]]]
+        if split_meta is None:
+            manifest_chain = [(manifest_path, leaf_manifest)]
+        else:
+            if not isinstance(split_meta, dict) or not isinstance(
+                split_meta.get("chain"), list
+            ):
+                raise ValueError("E_NATIVE_REVIEW_SPLIT_INVALID: split chain is invalid")
+            chain = split_meta["chain"]
+            if not chain or chain[-1] != leaf_relative:
+                raise ValueError("E_NATIVE_REVIEW_SPLIT_INVALID: split chain is invalid")
+            manifest_chain = []
+            for index, relative in enumerate(chain):
+                if not isinstance(relative, str) or Path(relative).is_absolute():
+                    raise ValueError(
+                        "E_NATIVE_REVIEW_SPLIT_INVALID: split manifest path is invalid"
+                    )
+                candidate = (work_dir / relative).resolve()
+                try:
+                    candidate.relative_to(work_dir.resolve())
+                except ValueError as exc:
+                    raise ValueError(
+                        "E_NATIVE_REVIEW_SPLIT_INVALID: split manifest escaped workspace"
+                    ) from exc
+                chained_manifest = _load_task_manifest(work_dir, candidate)
+                if index:
+                    metadata = chained_manifest.get("review_split")
+                    if (
+                        not isinstance(metadata, dict)
+                        or metadata.get("depth") != index
+                        or metadata.get("root_manifest") != chain[0]
+                        or metadata.get("parent_manifest") != chain[index - 1]
+                        or metadata.get("chain") != chain[: index + 1]
+                    ):
+                        raise ValueError(
+                            "E_NATIVE_REVIEW_SPLIT_INVALID: split lineage is invalid"
+                        )
+                manifest_chain.append((candidate, chained_manifest))
+            review_split_manifests = len(manifest_chain)
+
+        root_manifest = manifest_chain[0][1]
+        fingerprint = stable_hash_sequence(asdict(segment) for segment in segments)
         if (
-            manifest.get("source_fingerprint") != fingerprint
-            or manifest.get("records") != len(segments)
+            root_manifest.get("source_fingerprint") != fingerprint
+            or root_manifest.get("records") != len(segments)
         ):
             raise ValueError("Native task manifest targets a different ordered source")
-        expected_shards = len(manifest["tasks"])
-        shard_bindings = [
-            (
-                _manifest_shard_path(work_dir, manifest, task),
-                _task_target_ids(
-                    manifest_path.parent / task["file"],
-                    require_payload=manifest.get("version") == TASK_MANIFEST_VERSION,
-                ),
+        for generation, (bound_path, bound_manifest) in enumerate(manifest_chain):
+            expected_shards += len(bound_manifest["tasks"])
+            shard_bindings.extend(
+                (
+                    _manifest_shard_path(work_dir, bound_manifest, task),
+                    _task_target_ids(
+                        bound_path.parent / task["file"],
+                        require_payload=(
+                            bound_manifest.get("version") == TASK_MANIFEST_VERSION
+                        ),
+                    ),
+                    bound_manifest,
+                    generation,
+                )
+                for task in bound_manifest["tasks"]
             )
-            for task in manifest["tasks"]
-        ]
     else:
-        shard_bindings = [(path, None) for path in sorted(shard_root.glob("*.jsonl"))]
+        shard_bindings = [
+            (path, None, None, 0) for path in sorted(shard_root.glob("*.jsonl"))
+        ]
         expected_shards = len(shard_bindings)
 
     imported_shards = 0
     bound_segments: dict[str, Segment] = {}
-    for shard, expected_ids in shard_bindings:
+    collected_generation: dict[str, int] = {}
+    for shard, expected_ids, bound_manifest, generation in shard_bindings:
         if not shard.is_file():
             continue
         if expected_ids is None:
@@ -1452,7 +1832,10 @@ def merge_native_pass(
         else:
             try:
                 rows = _validate_manifest_rows(
-                    work_dir, manifest, _read_jsonl(shard), bound_segments=bound_segments
+                    work_dir,
+                    bound_manifest,
+                    _read_jsonl(shard),
+                    bound_segments=bound_segments,
                 )
             except (ValueError, json.JSONDecodeError):
                 raise ValueError("Imported native shard is invalid") from None
@@ -1468,13 +1851,23 @@ def merge_native_pass(
                     f"Native shard target ID is absent from ordered source: {target_id}"
                 )
             if target_id in collected:
-                if manifest_bound:
+                if not review_split_manifests:
                     raise ValueError("Imported native shards overlap")
-                raise ValueError(f"Native shards overlap on target ID: {target_id}")
+                if collected_generation[target_id] == generation:
+                    raise ValueError("Imported native split shards overlap within a pass")
+                if collected[target_id]["status"] == "success":
+                    raise ValueError(
+                        "E_NATIVE_REVIEW_SPLIT_INVALID: a successful row was reprocessed"
+                    )
+            elif generation:
+                raise ValueError(
+                    "E_NATIVE_REVIEW_SPLIT_INVALID: split row has no failed parent"
+                )
             if row["status"] == "success":
                 row["candidate_generation"] = 1
                 row["candidate_digest"] = stable_hash(row["text"])
             collected[target_id] = row
+            collected_generation[target_id] = generation
     merged = [collected[target_id] for target_id in order if target_id in collected]
     _atomic_jsonl(destination, merged)
     missing = len(segments) - len(merged)
@@ -1487,5 +1880,6 @@ def merge_native_pass(
         "manifest_bound": manifest_bound,
         "expected_shards": expected_shards,
         "imported_shards": imported_shards,
+        "review_split_manifests": review_split_manifests,
         "artifact": str(destination),
     }

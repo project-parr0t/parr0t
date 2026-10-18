@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from game_l10n.coverage import (
     completion_attestation,
@@ -46,6 +47,24 @@ def write_inventory(
 
 
 class CoverageTests(unittest.TestCase):
+    def test_verified_inventory_uses_unchanged_file_binding_fast_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            rows = [{"id": "fixture-1", "source": "SOURCE"}]
+            write_inventory(primary, "primary", rows)
+            write_inventory(independent, "independent", rows)
+            saved = save_inventory_attestation(root, primary, independent)
+
+            with patch(
+                "game_l10n.coverage._inventory_document",
+                side_effect=AssertionError("unchanged inventory was reparsed"),
+            ):
+                loaded = require_inventory_attestation(root, primary)
+
+        self.assertEqual(loaded["primary_fingerprint"], saved["primary_fingerprint"])
+
     def test_retry_approval_requires_current_generation_and_approved_status(self) -> None:
         segment = Segment("synthetic-retry", "SOURCE")
         for stage in ("review-grace-retry", "review-refusal-retry"):

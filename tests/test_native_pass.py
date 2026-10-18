@@ -23,6 +23,139 @@ from tests.test_validators import optional_slot_fixture
 
 
 class NativePassTests(unittest.TestCase):
+    def test_review_pass_uses_large_batch_and_bounded_failure_split_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            summary = prepare_native_tasks(
+                root,
+                source,
+                [Segment(f"fixture-{index}", "S") for index in range(4096)],
+                tasks,
+                pass_kind="review",
+                max_material_tokens=1_000_000,
+            )
+            manifest = json.loads((tasks / "manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(summary["pass_kind"], "review")
+        self.assertEqual(summary["max_records"], 2048)
+        self.assertEqual([item["records"] for item in manifest["tasks"]], [2048, 2048])
+        split = manifest["worker_contract"]["failure_split"]
+        self.assertTrue(split["enabled"])
+        self.assertEqual(split["strategy"], "failed_subset_binary")
+        self.assertTrue(split["successful_rows_locked"])
+        self.assertEqual(split["max_depth"], 11)
+        self.assertEqual(split["max_attempts_per_target"], 12)
+        self.assertEqual(split["owner"], "native_pass_step")
+        self.assertEqual(
+            manifest["worker_contract"]["max_semantic_model_calls_per_task"], 1
+        )
+        self.assertFalse(manifest["worker_contract"]["per_record_semantic_call_loop_allowed"])
+
+    def test_review_failures_create_core_owned_split_chain_and_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            segments = [Segment(f"fixture-{index}", "S") for index in range(4)]
+            prepare_native_tasks(
+                root,
+                source,
+                segments,
+                tasks,
+                pass_kind="review",
+                max_records=4,
+                max_workers=1,
+            )
+            first = native_control_step(root, tasks / "manifest.json", results)
+            self.assertEqual(first["action"], "dispatch_authorized_wave")
+            task_rows = [
+                json.loads(line)
+                for line in (tasks / "task-0001.jsonl").read_text().splitlines()
+            ]
+            self._write_rows(
+                results / "task-0001.jsonl",
+                [
+                    {
+                        "target_id": row["target_id"],
+                        "status": "success" if index < 2 else "refused",
+                        "text": "T" if index < 2 else "",
+                    }
+                    for index, row in enumerate(task_rows)
+                ],
+            )
+            split = native_control_step(root, tasks / "manifest.json", results)
+            self.assertEqual(
+                split["action"], "dispatch_review_split_wave", msg=split
+            )
+            self.assertEqual(split["review_split"]["splittable_records"], 2)
+            self.assertEqual(split["review_split"]["next_max_records"], 1)
+            self.assertEqual(len(split["review_split"]["chain"]), 2)
+
+            child_manifest = root / split["manifest"]
+            child_results = root / split["review_split"]["results_dir"]
+            while split["action"] in {
+                "dispatch_review_split_wave",
+                "dispatch_authorized_wave",
+            }:
+                for binding in split["tasks"]:
+                    child_task = root / binding["task"]
+                    rows = [json.loads(line) for line in child_task.read_text().splitlines()]
+                    self._write_rows(
+                        root / binding["result"],
+                        [
+                            {
+                                "target_id": row["target_id"],
+                                "status": "success",
+                                "text": "T2",
+                            }
+                            for row in rows
+                        ],
+                    )
+                split = native_control_step(root, child_manifest, child_results)
+
+            merged = merge_native_pass(
+                root,
+                segments,
+                root / "merged.jsonl",
+                manifest_path=child_manifest,
+            )
+
+        self.assertEqual(split["action"], "aggregate_completed_pass")
+        self.assertEqual(merged["success"], 4)
+        self.assertEqual(merged["review_split_manifests"], 2)
+
+    def test_native_step_hashes_only_the_selected_wave_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            prepare_native_tasks(
+                root,
+                source,
+                [Segment(f"fixture-{index}", "S") for index in range(20)],
+                tasks,
+                max_records=1,
+                max_workers=1,
+            )
+            from game_l10n import native_pass as native_module
+
+            with patch.object(
+                native_module,
+                "_file_sha256",
+                wraps=native_module._file_sha256,
+            ) as digest:
+                step = native_control_step(root, tasks / "manifest.json", root / "results")
+
+        self.assertEqual(step["action"], "dispatch_authorized_wave")
+        self.assertEqual(digest.call_count, 1)
+
+
     def _prepare_optional_wave(self, root: Path, *, slots: int = 1):
         source = root / "source.jsonl"
         self._write_rows(source, [
