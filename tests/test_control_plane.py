@@ -7,7 +7,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from game_l10n.cli import main
+from game_l10n.cli import build_parser, main
 from game_l10n.control_plane import (
     REVIEW_CONTROL_ALLOWED_ACTIONS,
     REVIEW_CONTROL_CONTRACT_SCHEMA,
@@ -29,6 +29,20 @@ from game_l10n.native_pass import _detail_contract, prepare_native_tasks
 
 
 class ControlPlaneContractTests(unittest.TestCase):
+    def test_native_pass_step_cli_is_registered(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "native-pass-step",
+                "--workspace",
+                "fixture-workspace",
+                "--manifest",
+                "tasks/manifest.json",
+                "--results-dir",
+                "results",
+            ]
+        )
+        self.assertEqual(args.func.__name__, "cmd_native_pass_step")
+
     def test_review_control_contract_is_deterministic_and_text_free(self) -> None:
         contract = review_control_contract()
 
@@ -43,6 +57,11 @@ class ControlPlaneContractTests(unittest.TestCase):
         self.assertFalse(contract["autonomous_resume_allowed"])
         self.assertFalse(contract["autonomous_sdk_or_tool_changes_allowed"])
         self.assertTrue(contract["status_action_match_required"])
+        self.assertTrue(contract["native_step_command_required"])
+        self.assertEqual(
+            contract["native_step_command"], "game-l10n native-pass-step"
+        )
+        self.assertFalse(contract["model_selected_wave_or_recovery_allowed"])
         self.assertEqual(
             contract["halted_state_allowed_actions"],
             ["read_status", "record_aggregate_usage", "checkpoint_and_stop"],

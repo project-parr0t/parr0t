@@ -57,7 +57,7 @@ Do not skip or reorder barriers. One refusal, timeout, malformed result, capacit
 - Translation is faithful transformation, not content generation. Independent review checks meaning, omission, voice, tone, function, conditions, units, terminology, allusions, placeholders, markup, control codes, ordering, and material layout risk.
 - Build new outputs in the workspace. Automated checks use synthetic targets and never install or launch the real game.
 - Apply proportional verification and stop after the changed layer passes. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.
-- Native passes are root-direct with no delegation. The v5 manifest is authoritative; each task uses one semantic batch call. Obey its bulk gate, checkpoint on limits, and reload only on digest/generation change.
+- Native passes are root-direct without delegation. After `prepare-native-pass`, only `native-pass-step` may select or advance waves; dispatch its returned tasks and wait once.
 
 ## Status-driven routes
 
@@ -89,6 +89,7 @@ game-l10n sdk-inventory --workspace <external-workspace> --refresh-remote
 game-l10n sdk-evaluate --workspace <external-workspace> --target-engine <engine> --target-version <version-line> --branch <sdk-branch> --result <compatible|partial|reference|incompatible> --reason <reason-code> --evidence-path <public-contract-path>
 game-l10n sdk-select --workspace <external-workspace> --target-engine <engine> --target-version <version-line> --mode <reuse|extend|derive-new|private-new> [--branch <sdk-branch>]
 game-l10n sdk-activate --workspace <external-workspace> [--reference-checkout <reference-worktree>]
+game-l10n native-pass-step --workspace <external-workspace> --manifest <private-manifest> --results-dir <private-wave-results>
 ```
 
 These are agent execution boundaries, not a human command cookbook. With an OpenCodex-compatible proxy, configure the proxy separately and run Codex against the Parr0t checkout; keep proxy credentials and configuration outside this repository.
