@@ -235,7 +235,7 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(summary["tasks"], 3)
         self.assertTrue(summary["fresh_worker_per_task"])
         self.assertEqual(summary["history_mode"], "none")
-        self.assertEqual(manifest["version"], 4)
+        self.assertEqual(manifest["version"], 5)
         self.assertEqual(manifest["min_records"], 8)
         self.assertEqual(manifest["max_material_tokens"], 300)
         self.assertEqual(manifest["max_workers"], 8)
@@ -253,6 +253,15 @@ class NativePassTests(unittest.TestCase):
             manifest["worker_contract"]["max_model_calls_per_task"], 16
         )
         self.assertEqual(
+            manifest["worker_contract"]["max_semantic_model_calls_per_task"], 1
+        )
+        self.assertFalse(
+            manifest["worker_contract"]["per_record_semantic_call_loop_allowed"]
+        )
+        self.assertTrue(
+            manifest["worker_contract"]["single_batched_result_required"]
+        )
+        self.assertEqual(
             manifest["worker_contract"]["max_parent_progress_messages"], 0
         )
         self.assertEqual(manifest["worker_contract"]["parent_result"], "metadata_only")
@@ -265,6 +274,17 @@ class NativePassTests(unittest.TestCase):
             "workspace_relative_envelope_path_only",
         )
         self.assertFalse(manifest["worker_contract"]["free_form_parent_response_allowed"])
+        self.assertEqual(
+            manifest["detail_contract"]["schema"],
+            "parr0t.detail-contract.v1",
+        )
+        self.assertEqual(
+            manifest["detail_contract"]["authority"], "supplemental_only"
+        )
+        self.assertFalse(
+            manifest["detail_contract"]["free_form_execution_contract_allowed"]
+        )
+        self.assertTrue(manifest["contract_fingerprint"])
         self.assertEqual(
             manifest["execution_contract"]["strategy"],
             "bounded_slot_queue",
@@ -317,6 +337,103 @@ class NativePassTests(unittest.TestCase):
         self.assertTrue(
             all(task["records"] == 1 for task in manifest["tasks"])
         )
+
+    def test_bulk_pass_stops_after_pilot_until_user_budget_is_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "fixture-source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            segments = [Segment(f"fixture-{index}", "SOURCE") for index in range(4)]
+            tasks = root / "tasks"
+            prepare_native_tasks(
+                root,
+                source,
+                segments,
+                tasks,
+                max_records=2,
+                max_workers=1,
+                bulk_budget_gate_records=4,
+            )
+            results = root / "results"
+            results.mkdir()
+            second_rows = [
+                json.loads(line)
+                for line in (tasks / "task-0002.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self._write_rows(
+                results / "task-0002.jsonl",
+                [
+                    {
+                        "target_id": row["target_id"],
+                        "status": "success",
+                        "text": "TARGET",
+                    }
+                    for row in second_rows
+                ],
+            )
+
+            with self.assertRaisesRegex(ValueError, "E_BULK_EXECUTION_BUDGET_REQUIRED"):
+                import_native_wave(root, tasks / "manifest.json", results, 2)
+
+            prepare_native_tasks(
+                root,
+                source,
+                segments,
+                tasks,
+                max_records=2,
+                max_workers=1,
+                bulk_budget_gate_records=4,
+                max_elapsed_minutes=60,
+                max_input_tokens=1_000_000,
+                provider_cost_unmetered=True,
+                user_approved_budget=True,
+            )
+            summary = import_native_wave(root, tasks / "manifest.json", results, 2)
+
+        self.assertEqual(summary["wave"], 2)
+        self.assertEqual(summary["records"], 2)
+
+    def test_changed_v5_detail_contract_is_rejected_before_import(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "fixture-source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            prepare_native_tasks(
+                root,
+                source,
+                [Segment("fixture-1", "SOURCE")],
+                tasks,
+            )
+            manifest_path = tasks / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["detail_contract"]["per_record_semantic_call_loop_allowed"] = True
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            results = root / "results"
+            results.mkdir()
+
+            with self.assertRaisesRegex(ValueError, "E_DETAIL_CONTRACT_CONFLICT"):
+                import_native_wave(root, manifest_path, results, 1)
+
+    def test_detail_policy_may_tighten_but_not_disable_bulk_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "fixture-source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "cannot exceed the core default"):
+                prepare_native_tasks(
+                    root,
+                    source,
+                    [Segment("fixture-1", "SOURCE")],
+                    root / "tasks",
+                    bulk_budget_gate_records=4097,
+                )
 
     def test_small_residual_pass_uses_one_direct_task_without_controller(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

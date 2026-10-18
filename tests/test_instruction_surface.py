@@ -10,6 +10,24 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class InstructionSurfaceTests(unittest.TestCase):
+    def test_review_control_is_documented_as_a_deterministic_router(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        contract = (root / "docs" / "control-plane-contract.md").read_text(
+            encoding="utf-8"
+        )
+        agents = (root / "AGENTS.md").read_text(encoding="utf-8")
+        skill = (root / "skills" / "game-localization" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("Deterministic review router", contract)
+        self.assertIn("checkpoint_and_stop", contract)
+        self.assertIn("must not create an\nad-hoc manifest", contract)
+        self.assertIn("Keep review control deterministic", agents)
+        self.assertIn("complete low-cost triage", agents)
+        self.assertIn("selective strong review", agents)
+        self.assertIn("Review control is a deterministic router", skill)
+
     def test_always_loaded_instructions_stay_compact(self) -> None:
         limits = {
             "AGENTS.md": 1200,
@@ -35,11 +53,13 @@ class InstructionSurfaceTests(unittest.TestCase):
             "parr0t.control-envelope.v2",
             "docs/sdk-selection.md",
             "docs/control-plane-contract.md",
+            "docs/detail-contract.md",
             "docs/translation-exchange.md",
             "docs/runtime-approval.md",
             "docs/filesystem-packaging.md",
             "docs/instance-release.md",
             "no model controllers or worker delegation",
+            "one semantic batch call",
         ):
             self.assertIn(required, agents)
 
@@ -60,6 +80,18 @@ class InstructionSurfaceTests(unittest.TestCase):
             for relative in contracts:
                 with self.subTest(action=action, relative=relative):
                     self.assertTrue((ROOT / relative).is_file())
+
+    def test_detail_contract_cannot_override_core_or_serialize_a_batch(self) -> None:
+        detail = (ROOT / "docs/detail-contract.md").read_text(encoding="utf-8")
+        execution = (ROOT / "docs/execution-budget.md").read_text(encoding="utf-8")
+        review = (ROOT / "docs/review-pipeline.md").read_text(encoding="utf-8")
+
+        self.assertIn("supplemental-only", detail)
+        self.assertIn("only executable detail contract", detail)
+        self.assertIn("one semantic batch", detail)
+        self.assertIn("E_BULK_EXECUTION_BUDGET_REQUIRED", detail)
+        self.assertIn("one semantic model/API batch call", execution)
+        self.assertIn("must not create or submit one prompt per candidate", review)
 
     def test_status_contract_set_is_stable_and_generation_aware(self) -> None:
         first = _status_contract_set(

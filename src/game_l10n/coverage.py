@@ -376,7 +376,7 @@ def completion_attestation(
     )
     reviewed = []
     for item in rows:
-        final_verdict = any(
+        strong_verdict = any(
             attempt.stage
             in {
                 "review",
@@ -387,6 +387,24 @@ def completion_attestation(
             and attempt.status == "approved"
             and attempt.candidate_generation == item.candidate_generation
             for attempt in item.attempts
+        )
+        triage_verdict = any(
+            attempt.stage
+            in {
+                "review-triage",
+                "review-triage-confirm",
+                "review-triage-grace-retry",
+                "review-triage-refusal-retry",
+            }
+            and attempt.status == "approved"
+            and attempt.candidate_generation == item.candidate_generation
+            for attempt in item.attempts
+        )
+        review_tier = item.metadata.get("review_tier")
+        final_verdict = (
+            strong_verdict
+            if review_tier in {"strong", "strong_pending"}
+            else strong_verdict or triage_verdict
         )
         if (
             item.status == "reviewed"

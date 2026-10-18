@@ -41,3 +41,7 @@ The translator returns only the value for this segment. It must not repeat `TARG
 3. Keep labels and values as separate targets when the runtime does; do not merge them merely to make translation easier.
 4. Do not add fixed target affixes until their target-locale form is known and stable. Without explicit affixes, semantic review still checks the render pattern but deterministic duplicate detection cannot claim certainty.
 5. Treat `ui_state_semantics` as meaning evidence, not as target text. The target wording still follows locale, style, glossary, and space constraints.
+
+## Strong-review selection fields
+
+Extraction or context analysis may add `review_category` and `requires_strong_review=true` from structural evidence. Supported default high-risk categories are `allusion`, `critical_logic`, `parody`, `quest_title`, `script_sensitive`, and `wordplay`. Boolean evidence flags such as `reference_cue`, `parody`, `allusion`, `wordplay`, or `logic_facing` also select strong review. Do not infer these fields in the text-free control plane or mark ordinary dialogue high-risk merely because of its wording; uncertainty is handled by complete low-cost triage and deterministic sampling.
