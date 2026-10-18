@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from scripts.check_branches import audit_branches, plan_branches, run_checks
+from scripts.check_branches import audit_branches, environment_digest, run_checks
 
 
 class BranchAuditTests(unittest.TestCase):
@@ -181,6 +181,14 @@ class BranchAuditTests(unittest.TestCase):
         result = run_checks(snapshot, sys.executable, False, self.root / "run.log")
         self.assertTrue(result["passed"])
         self.assertEqual(result["checks"]["tests"]["skipped"], 1)
+
+    def test_native_tool_configuration_changes_invalidate_environment(self) -> None:
+        with patch("scripts.check_branches.subprocess.run", return_value=type("Probe", (), {"stdout": "fixture"})()):
+            with patch.dict("os.environ", {"GAME_L10N_CSC": "fixture-compiler-a"}):
+                first = environment_digest(sys.executable, "")
+            with patch.dict("os.environ", {"GAME_L10N_CSC": "fixture-compiler-b"}):
+                second = environment_digest(sys.executable, "")
+        self.assertNotEqual(first, second)
 
     def test_audit_state_cannot_pollute_the_repository(self) -> None:
         with self.assertRaisesRegex(ValueError, "outside"):

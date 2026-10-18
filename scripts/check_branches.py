@@ -98,7 +98,7 @@ def environment_digest(python: str, environment_key: str) -> str:
 print(json.dumps([sys.version,sys.executable,platform.platform(),sorted((d.metadata.get('Name',''),d.version,str(d.locate_file(''))) for d in m.distributions())]))"""
     result = subprocess.run([python, "-c", probe], capture_output=True, check=True, text=True)
     return digest([result.stdout, environment_key, {key: os.environ.get(key, "") for key in
-                  ("PATH", "PYTHONPATH", "CSC", "CECIL")}])
+                  ("PATH", "PYTHONPATH", "CSC", "CECIL", "GAME_L10N_CSC", "GAME_L10N_CECIL")}])
 
 
 def validator_digest() -> str:
