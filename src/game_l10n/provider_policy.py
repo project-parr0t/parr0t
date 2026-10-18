@@ -117,9 +117,24 @@ def validate_provider_policy(
         _mode_drift("the DeepSeek adapter must remain scoped to fallback roles")
 
     routing = config.get("routing", {})
+    sample_percent = routing.get("strong_review_sample_percent")
+    if (
+        not isinstance(sample_percent, (int, float))
+        or isinstance(sample_percent, bool)
+        or not 0 <= sample_percent <= 100
+    ):
+        _mode_drift("strong_review_sample_percent must be between 0 and 100")
+    high_risk_categories = routing.get("strong_review_high_risk_categories")
+    if (
+        not isinstance(high_risk_categories, list)
+        or not all(isinstance(item, str) and item.strip() for item in high_risk_categories)
+        or len(high_risk_categories) != len(set(high_risk_categories))
+    ):
+        _mode_drift("strong-review categories must be unique non-empty strings")
     required_routes = {
         "context_analyzers": ["native-sol"],
         "translators": ["native-luna", "deepseek"],
+        "review_triagers": ["native-luna"],
         "reviewers": ["native-sol", "deepseek"],
         "rewriters": ["deepseek"],
     }

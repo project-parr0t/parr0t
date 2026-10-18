@@ -7,21 +7,112 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
 
-from .control_plane import CONTROL_ENVELOPE_SCHEMA, require_control_plane_ready
+from .control_plane import (
+    CONTROL_ENVELOPE_SCHEMA,
+    require_control_plane_ready,
+    review_control_contract,
+)
 from .models import Segment
 from .store import stable_hash
 
 
 ALLOWED_STATUSES = {"success", "refused", "error", "invalid"}
 SAFE_NAME = re.compile(r"[^a-z0-9._-]+")
-TASK_MANIFEST_VERSION = 4
+TASK_MANIFEST_VERSION = 5
+SUPPORTED_TASK_MANIFEST_VERSIONS = {4, TASK_MANIFEST_VERSION}
 DEFAULT_MAX_RECORDS = 64
 DEFAULT_MIN_RECORDS = 8
 DEFAULT_MAX_MATERIAL_TOKENS = 24_000
 DEFAULT_MAX_WORKERS = 8
+DEFAULT_BULK_BUDGET_GATE_RECORDS = 4_096
 
 
-def _execution_contract(task_count: int, max_workers: int) -> dict[str, Any]:
+def _worker_contract() -> dict[str, Any]:
+    return {
+        "history_mode": "none",
+        "fresh_worker_per_task": True,
+        "max_followup_tasks": 0,
+        "max_agent_depth": 1,
+        "delegation_allowed": False,
+        "model_controller_role_allowed": False,
+        "max_model_calls_per_task": 16,
+        "max_semantic_model_calls_per_task": 1,
+        "per_record_semantic_call_loop_allowed": False,
+        "max_prompt_artifacts_per_task": 1,
+        "single_batched_result_required": True,
+        "max_parent_progress_messages": 0,
+        "task_message_contains_game_text": False,
+        "parent_result": "metadata_only",
+        "control_envelope_schema": CONTROL_ENVELOPE_SCHEMA,
+        "worker_final_response": "workspace_relative_envelope_path_only",
+        "free_form_parent_response_allowed": False,
+    }
+
+
+def _detail_contract() -> dict[str, Any]:
+    return {
+        "review_control": review_control_contract(),
+        "schema": "parr0t.detail-contract.v1",
+        "authority": "supplemental_only",
+        "canonical_source": "native_task_manifest",
+        "free_form_execution_contract_allowed": False,
+        "incident_history_allowed": False,
+        "may_narrow": [
+            "bound_target_ids",
+            "input_paths",
+            "output_paths",
+            "acceptance_checks",
+            "limits_within_parent_budget",
+        ],
+        "must_not_override": [
+            "user_scope",
+            "core_contracts",
+            "control_plane_boundary",
+            "provider_mode",
+            "pipeline_order",
+            "manifest_budgets",
+            "authorization_boundaries",
+            "checkpoint_reuse",
+        ],
+        "conflict_action": "reject_before_dispatch",
+        "one_semantic_batch_per_task": True,
+        "per_record_semantic_call_loop_allowed": False,
+        "shared_context_loads_per_task": 1,
+        "result_cardinality": "one_status_per_bound_target",
+        "partial_failure_isolation": "per_target_status_in_same_batched_result",
+        "unchanged_success_reprocessing_allowed": False,
+        "budget_exhaustion_action": "checkpoint_and_return_control",
+    }
+
+
+def _execution_contract(
+    task_count: int,
+    max_workers: int,
+    record_count: int,
+    *,
+    bulk_budget_gate_records: int,
+    max_elapsed_minutes: int | None,
+    max_input_tokens: int | None,
+    max_provider_cost_usd: float | None,
+    provider_cost_unmetered: bool,
+    user_approved_budget: bool,
+) -> dict[str, Any]:
+    bulk_gate_active = record_count >= bulk_budget_gate_records
+    budget_complete = (
+        isinstance(max_elapsed_minutes, int)
+        and max_elapsed_minutes > 0
+        and isinstance(max_input_tokens, int)
+        and max_input_tokens > 0
+        and (
+            provider_cost_unmetered
+            or (
+                isinstance(max_provider_cost_usd, (int, float))
+                and not isinstance(max_provider_cost_usd, bool)
+                and max_provider_cost_usd > 0
+            )
+        )
+    )
+    budget_approved = bool(user_approved_budget and budget_complete)
     return {
         "strategy": "direct_single_task" if task_count == 1 else "bounded_slot_queue",
         "orchestration_owner": "root_control_plane",
@@ -47,6 +138,18 @@ def _execution_contract(task_count: int, max_workers: int) -> dict[str, Any]:
         "max_control_actions_without_progress": 2,
         "capacity_failure_action": "defer_task_and_end_worker_attempt",
         "automatic_root_turn_restart_allowed": False,
+        "detail_contract_schema": "parr0t.detail-contract.v1",
+        "bulk_budget_gate": {
+            "active": bulk_gate_active,
+            "activation_records": bulk_budget_gate_records,
+            "pilot_waves_without_approved_budget": 1,
+            "user_approved": budget_approved,
+            "max_elapsed_minutes": max_elapsed_minutes,
+            "max_input_tokens": max_input_tokens,
+            "max_provider_cost_usd": max_provider_cost_usd,
+            "provider_cost_unmetered": provider_cost_unmetered,
+            "missing_budget_action": "checkpoint_and_request_user_limit",
+        },
     }
 
 
@@ -139,12 +242,40 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
         raise ValueError("Native task manifest does not exist")
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
-        raise ValueError(f"Native task manifest must be version {TASK_MANIFEST_VERSION}")
+        raise ValueError(
+            f"Native task manifest must be a supported version: {sorted(SUPPORTED_TASK_MANIFEST_VERSIONS)}"
+        )
     tasks = payload.get("tasks")
-    if payload.get("version") != TASK_MANIFEST_VERSION or not isinstance(tasks, list) or not tasks:
-        raise ValueError(f"Native task manifest must be version {TASK_MANIFEST_VERSION}")
+    version = payload.get("version")
+    if version not in SUPPORTED_TASK_MANIFEST_VERSIONS or not isinstance(tasks, list) or not tasks:
+        raise ValueError(
+            f"Native task manifest must be a supported version: {sorted(SUPPORTED_TASK_MANIFEST_VERSIONS)}"
+        )
     if not isinstance(payload.get("source_fingerprint"), str) or not payload["source_fingerprint"]:
         raise ValueError("Native task manifest source fingerprint is missing")
+    if version == TASK_MANIFEST_VERSION:
+        worker_contract = payload.get("worker_contract")
+        detail_contract = payload.get("detail_contract")
+        execution_contract = payload.get("execution_contract")
+        contract_fingerprint = payload.get("contract_fingerprint")
+        expected_fingerprint = stable_hash(
+            {
+                "worker_contract": worker_contract,
+                "detail_contract": detail_contract,
+                "execution_contract": execution_contract,
+            }
+        )
+        if worker_contract != _worker_contract() or detail_contract != _detail_contract():
+            raise ValueError("E_DETAIL_CONTRACT_CONFLICT: native task contract was changed")
+        if not isinstance(execution_contract, dict) or (
+            execution_contract.get("detail_contract_schema")
+            != "parr0t.detail-contract.v1"
+        ):
+            raise ValueError("E_DETAIL_CONTRACT_CONFLICT: execution contract is missing")
+        if contract_fingerprint != expected_fingerprint:
+            raise ValueError("E_DETAIL_CONTRACT_CONFLICT: contract fingerprint is invalid")
+        budget_gate = execution_contract.get("bulk_budget_gate", {})
+        pilot_waves = budget_gate.get("pilot_waves_without_approved_budget", 0)
     seen_files: set[str] = set()
     for task in tasks:
         if not isinstance(task, dict):
@@ -153,6 +284,7 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
         wave = task.get("wave")
         records = task.get("records")
         digest = task.get("sha256")
+        dispatch_authorized = task.get("dispatch_authorized")
         if (
             not isinstance(name, str)
             or not name
@@ -166,6 +298,15 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
             or records < 1
             or not isinstance(digest, str)
             or not digest
+            or (
+                version == TASK_MANIFEST_VERSION
+                and dispatch_authorized
+                != (
+                    budget_gate.get("active") is not True
+                    or budget_gate.get("user_approved") is True
+                    or wave <= pilot_waves
+                )
+            )
         ):
             raise ValueError("Native task manifest contains an invalid task binding")
         task_path = manifest_path.parent / name
@@ -230,6 +371,12 @@ def prepare_native_tasks(
     min_records: int | None = None,
     max_material_tokens: int = DEFAULT_MAX_MATERIAL_TOKENS,
     max_workers: int = DEFAULT_MAX_WORKERS,
+    bulk_budget_gate_records: int = DEFAULT_BULK_BUDGET_GATE_RECORDS,
+    max_elapsed_minutes: int | None = None,
+    max_input_tokens: int | None = None,
+    max_provider_cost_usd: float | None = None,
+    provider_cost_unmetered: bool = False,
+    user_approved_budget: bool = False,
 ) -> dict[str, Any]:
     require_control_plane_ready(work_dir)
     if not 1 <= max_records <= 2000:
@@ -242,6 +389,28 @@ def prepare_native_tasks(
         raise ValueError("max_material_tokens must be between 256 and 1000000")
     if not 1 <= max_workers <= 64:
         raise ValueError("max_workers must be between 1 and 64")
+    if not 1 <= bulk_budget_gate_records <= DEFAULT_BULK_BUDGET_GATE_RECORDS:
+        raise ValueError(
+            "bulk_budget_gate_records may be lowered but cannot exceed the core default"
+        )
+    if max_elapsed_minutes is not None and max_elapsed_minutes < 1:
+        raise ValueError("max_elapsed_minutes must be positive")
+    if max_input_tokens is not None and max_input_tokens < 1:
+        raise ValueError("max_input_tokens must be positive")
+    if max_provider_cost_usd is not None and max_provider_cost_usd <= 0:
+        raise ValueError("max_provider_cost_usd must be positive")
+    if provider_cost_unmetered and max_provider_cost_usd is not None:
+        raise ValueError(
+            "provider_cost_unmetered and max_provider_cost_usd are mutually exclusive"
+        )
+    if user_approved_budget and (
+        max_elapsed_minutes is None
+        or max_input_tokens is None
+        or (not provider_cost_unmetered and max_provider_cost_usd is None)
+    ):
+        raise ValueError(
+            "A user-approved bulk budget requires elapsed, input-token, and cost-or-unmetered limits"
+        )
     if not segments:
         raise ValueError("Ordered source contains no segments")
     ids = [segment.id for segment in segments]
@@ -266,10 +435,45 @@ def prepare_native_tasks(
             and manifest.get("max_workers") == max_workers
         ):
             task_rows = manifest.get("tasks", [])
-            expected_execution_contract = _execution_contract(len(task_rows), max_workers)
+            expected_execution_contract = _execution_contract(
+                len(task_rows),
+                max_workers,
+                len(segments),
+                bulk_budget_gate_records=bulk_budget_gate_records,
+                max_elapsed_minutes=max_elapsed_minutes,
+                max_input_tokens=max_input_tokens,
+                max_provider_cost_usd=max_provider_cost_usd,
+                provider_cost_unmetered=provider_cost_unmetered,
+                user_approved_budget=user_approved_budget,
+            )
+            expected_contract_fingerprint = stable_hash(
+                {
+                    "worker_contract": _worker_contract(),
+                    "detail_contract": _detail_contract(),
+                    "execution_contract": expected_execution_contract,
+                }
+            )
             valid = (
                 bool(task_rows)
+                and manifest.get("worker_contract") == _worker_contract()
+                and manifest.get("detail_contract") == _detail_contract()
                 and manifest.get("execution_contract") == expected_execution_contract
+                and manifest.get("contract_fingerprint")
+                == expected_contract_fingerprint
+                and all(
+                    item.get("dispatch_authorized")
+                    == (
+                        expected_execution_contract["bulk_budget_gate"]["active"]
+                        is not True
+                        or expected_execution_contract["bulk_budget_gate"]["user_approved"]
+                        is True
+                        or item["wave"]
+                        <= expected_execution_contract["bulk_budget_gate"][
+                            "pilot_waves_without_approved_budget"
+                        ]
+                    )
+                    for item in task_rows
+                )
                 and all(
                     (output_dir / item["file"]).is_file()
                     and _file_sha256(output_dir / item["file"]) == item["sha256"]
@@ -288,9 +492,17 @@ def prepare_native_tasks(
                     "max_workers": max_workers,
                     "fresh_worker_per_task": True,
                     "history_mode": "none",
+                    "contract_fingerprint": expected_contract_fingerprint,
                     "execution_contract": execution_contract,
                     "manifest": str(manifest_path),
-                    "artifacts": [str(output_dir / item["file"]) for item in task_rows],
+                    "artifacts": [
+                        str(output_dir / item["file"])
+                        for item in task_rows
+                        if item["dispatch_authorized"]
+                    ],
+                    "deferred_tasks": sum(
+                        not item["dispatch_authorized"] for item in task_rows
+                    ),
                 }
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -345,7 +557,33 @@ def prepare_native_tasks(
     for stale in output_dir.glob("task-*.jsonl"):
         if stale.name not in expected:
             stale.unlink()
-    execution_contract = _execution_contract(len(tasks), max_workers)
+    execution_contract = _execution_contract(
+        len(tasks),
+        max_workers,
+        len(segments),
+        bulk_budget_gate_records=bulk_budget_gate_records,
+        max_elapsed_minutes=max_elapsed_minutes,
+        max_input_tokens=max_input_tokens,
+        max_provider_cost_usd=max_provider_cost_usd,
+        provider_cost_unmetered=provider_cost_unmetered,
+        user_approved_budget=user_approved_budget,
+    )
+    budget_gate = execution_contract["bulk_budget_gate"]
+    for task in tasks:
+        task["dispatch_authorized"] = (
+            budget_gate["active"] is not True
+            or budget_gate["user_approved"] is True
+            or task["wave"] <= budget_gate["pilot_waves_without_approved_budget"]
+        )
+    worker_contract = _worker_contract()
+    detail_contract = _detail_contract()
+    contract_fingerprint = stable_hash(
+        {
+            "worker_contract": worker_contract,
+            "detail_contract": detail_contract,
+            "execution_contract": execution_contract,
+        }
+    )
     manifest = {
         "version": TASK_MANIFEST_VERSION,
         "source_artifact": source_artifact,
@@ -355,22 +593,10 @@ def prepare_native_tasks(
         "max_material_tokens": max_material_tokens,
         "max_workers": max_workers,
         "records": len(segments),
-        "worker_contract": {
-            "history_mode": "none",
-            "fresh_worker_per_task": True,
-            "max_followup_tasks": 0,
-            "max_agent_depth": 1,
-            "delegation_allowed": False,
-            "model_controller_role_allowed": False,
-            "max_model_calls_per_task": 16,
-            "max_parent_progress_messages": 0,
-            "task_message_contains_game_text": False,
-            "parent_result": "metadata_only",
-            "control_envelope_schema": CONTROL_ENVELOPE_SCHEMA,
-            "worker_final_response": "workspace_relative_envelope_path_only",
-            "free_form_parent_response_allowed": False,
-        },
+        "worker_contract": worker_contract,
+        "detail_contract": detail_contract,
         "execution_contract": execution_contract,
+        "contract_fingerprint": contract_fingerprint,
         "tasks": tasks,
     }
     temporary = manifest_path.with_name(f"{manifest_path.name}.tmp")
@@ -386,9 +612,15 @@ def prepare_native_tasks(
         "max_workers": max_workers,
         "fresh_worker_per_task": True,
         "history_mode": "none",
+        "contract_fingerprint": contract_fingerprint,
         "execution_contract": execution_contract,
         "manifest": str(manifest_path),
-        "artifacts": [str(output_dir / item["file"]) for item in tasks],
+        "artifacts": [
+            str(output_dir / item["file"])
+            for item in tasks
+            if item["dispatch_authorized"]
+        ],
+        "deferred_tasks": sum(not item["dispatch_authorized"] for item in tasks),
     }
 
 
@@ -455,6 +687,18 @@ def import_native_wave(
         raise ValueError("Native wave result directory does not exist")
 
     manifest = _load_task_manifest(work_dir, manifest_path)
+    if manifest.get("version") == TASK_MANIFEST_VERSION:
+        budget_gate = manifest["execution_contract"].get("bulk_budget_gate", {})
+        pilot_waves = budget_gate.get("pilot_waves_without_approved_budget", 0)
+        if (
+            budget_gate.get("active") is True
+            and budget_gate.get("user_approved") is not True
+            and wave > pilot_waves
+        ):
+            raise ValueError(
+                "E_BULK_EXECUTION_BUDGET_REQUIRED: checkpoint after the pilot wave and "
+                "bind user-approved elapsed, input-token, and cost-or-unmetered limits"
+            )
     tasks = [task for task in manifest["tasks"] if task["wave"] == wave]
     if not tasks:
         raise ValueError("Native task manifest does not contain the requested wave")

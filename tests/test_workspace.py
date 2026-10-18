@@ -134,6 +134,16 @@ class WorkspaceTests(unittest.TestCase):
                 "max_root_input_tokens_per_turn",
                 "max_root_progress_messages_per_wave",
                 "max_worker_model_calls_per_task",
+                "max_semantic_model_calls_per_task",
+                "per_record_semantic_call_loop_allowed",
+                "detail_contract_schema",
+                "free_form_execution_contract_allowed",
+                "bulk_budget_gate_records",
+                "bulk_max_elapsed_minutes",
+                "bulk_max_input_tokens",
+                "bulk_max_provider_cost_usd",
+                "bulk_provider_cost_unmetered",
+                "bulk_budget_user_approved",
                 "budget_exhaustion_action",
                 "contract_reload_policy",
             ):
@@ -144,13 +154,39 @@ class WorkspaceTests(unittest.TestCase):
             )
             upgraded = load_config(work)["execution"]
 
-        self.assertEqual(upgraded["native_shard_policy_version"], 2)
+        self.assertEqual(upgraded["native_shard_policy_version"], 3)
         self.assertEqual(upgraded["native_shard_records"], 64)
         self.assertEqual(upgraded["native_shard_min_records"], 8)
         self.assertEqual(upgraded["native_shard_material_tokens"], 24_000)
         self.assertFalse(upgraded["model_controller_allowed"])
         self.assertFalse(upgraded["worker_delegation_allowed"])
         self.assertEqual(upgraded["max_root_model_calls_per_turn"], 64)
+        self.assertEqual(upgraded["max_semantic_model_calls_per_task"], 1)
+        self.assertFalse(upgraded["per_record_semantic_call_loop_allowed"])
+        self.assertEqual(upgraded["bulk_budget_gate_records"], 4096)
+
+    def test_legacy_workspace_gains_selective_review_defaults_in_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            initialize_workspace(work, sdk, git_choice="disabled")
+            config_path = work / "game-l10n.json"
+            legacy = json.loads(config_path.read_text(encoding="utf-8"))
+            legacy["routing"].pop("review_triagers")
+            legacy["routing"].pop("strong_review_sample_percent")
+            legacy["routing"].pop("strong_review_high_risk_categories")
+            config_path.write_text(
+                json.dumps(legacy, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            routing = load_config(work)["routing"]
+
+        self.assertEqual(routing["review_triagers"], ["native-luna"])
+        self.assertEqual(routing["strong_review_sample_percent"], 5.0)
+        self.assertIn("wordplay", routing["strong_review_high_risk_categories"])
 
     def test_completion_state_rejects_contradictory_semantic_claims(self) -> None:
         state = {
@@ -221,11 +257,19 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(legacy_input_caps, providers["deepseek"]["task_max_input_chars"])
         self.assertEqual(providers["openai-sol"]["model"], "gpt-6.1-sol")
         self.assertEqual(providers["openai-luna"]["reasoning_effort"], "none")
+        self.assertEqual(
+            providers["openai-luna"]["task_max_output_tokens"][
+                "game_translation_review_judge"
+            ],
+            256,
+        )
         self.assertEqual(providers["openai-sol"]["reasoning_effort"], "low")
         self.assertEqual(config["routing"]["translators"], ["openai-luna", "deepseek"])
+        self.assertEqual(config["routing"]["review_triagers"], ["openai-luna"])
         self.assertEqual(config["routing"]["reviewers"], ["openai-sol", "deepseek"])
         self.assertEqual(config["routing"]["rewriters"], ["deepseek", "openai-sol"])
         self.assertEqual(config["routing"]["review_max_rounds"], 2)
+        self.assertEqual(config["routing"]["strong_review_sample_percent"], 5.0)
         self.assertEqual(
             providers["openai-sol"]["task_max_output_tokens"][
                 "game_translation_review_judge"
@@ -240,7 +284,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(config["execution"]["validation_profile"], "proportional")
         self.assertEqual(config["execution"]["same_failure_limit"], 2)
         self.assertFalse(config["execution"]["delegate_simple_tasks"])
-        self.assertEqual(config["execution"]["native_shard_policy_version"], 2)
+        self.assertEqual(config["execution"]["native_shard_policy_version"], 3)
         self.assertEqual(config["execution"]["native_shard_records"], 64)
         self.assertEqual(config["execution"]["native_shard_min_records"], 8)
         self.assertEqual(config["execution"]["native_shard_material_tokens"], 24000)
@@ -249,6 +293,16 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(config["execution"]["native_agent_max_depth"], 1)
         self.assertFalse(config["execution"]["model_controller_allowed"])
         self.assertFalse(config["execution"]["worker_delegation_allowed"])
+        self.assertEqual(config["execution"]["max_semantic_model_calls_per_task"], 1)
+        self.assertFalse(
+            config["execution"]["per_record_semantic_call_loop_allowed"]
+        )
+        self.assertEqual(
+            config["execution"]["detail_contract_schema"],
+            "parr0t.detail-contract.v1",
+        )
+        self.assertFalse(config["execution"]["free_form_execution_contract_allowed"])
+        self.assertEqual(config["execution"]["bulk_budget_gate_records"], 4096)
         self.assertEqual(config["execution"]["max_root_model_calls_per_wave"], 12)
         self.assertEqual(config["execution"]["max_root_model_calls_per_turn"], 64)
         self.assertEqual(
@@ -308,7 +362,8 @@ class WorkspaceTests(unittest.TestCase):
             "two independent complete ordered inventories",
             "primary translation",
             "translation fallback for failures only",
-            "complete independent review",
+            "complete low-cost triage",
+            "selective strong review",
             "review fallback for failures only",
             "parr0t.control-envelope.v2",
             "game-l10n validate-control-envelope",
@@ -343,10 +398,14 @@ class WorkspaceTests(unittest.TestCase):
         )
         self.assertLess(
             generated_agents.index("translation fallback for failures only"),
-            generated_agents.index("complete independent review"),
+            generated_agents.index("complete low-cost triage"),
         )
         self.assertLess(
-            generated_agents.index("complete independent review"),
+            generated_agents.index("complete low-cost triage"),
+            generated_agents.index("selective strong review"),
+        )
+        self.assertLess(
+            generated_agents.index("selective strong review"),
             generated_agents.index("review fallback for failures only"),
         )
         self.assertEqual(config["sdk_selection"]["status"], "pending")
@@ -404,6 +463,7 @@ class WorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(config["routing"]["context_analyzers"], ["native-sol"])
         self.assertEqual(config["routing"]["translators"], ["native-luna", "deepseek"])
+        self.assertEqual(config["routing"]["review_triagers"], ["native-luna"])
         self.assertEqual(config["routing"]["reviewers"], ["native-sol", "deepseek"])
         self.assertEqual(config["routing"]["rewriters"], ["deepseek"])
 
