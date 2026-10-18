@@ -96,33 +96,9 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 
 - **Symptom:** Task files contain many IDs, yet prompt count and model/API calls grow almost one-for-one with records; input greatly exceeds output and elapsed time scales serially.
 - **General cause:** Target-level failure isolation was misread as a requirement for target-level requests, or a job-local coordinator contract overrode the batch intent.
-- **Diagnosis:** Compare task count, record count, prompt artifacts, and semantic call count. More than one semantic request for a multi-target native task violates its v5 detail contract.
-- **Resolution:** Preserve completed shards, discard only the conflicting local execution instructions, and regenerate the remaining v5 manifest. Load shared context once, produce one ordered batched verdict set, and retain failures per target. If the provider truly accepts one target, repartition before dispatch.
+- **Diagnosis:** Compare task count, record count, prompt artifacts, and semantic call count. More than one semantic request for a multi-target native task violates its v6 detail contract.
+- **Resolution:** Preserve completed shards, discard only the conflicting local execution instructions, and regenerate the remaining v6 manifest. Load shared context once, produce one ordered batched verdict set, and retain failures per target. If the provider truly accepts one target, repartition before dispatch.
 - **Prevention:** Treat `parr0t.detail-contract.v1` as supplemental-only, reject free-form execution contracts, and enforce the bulk pilot/budget gate before later waves.
-
-## An MV plugin or script command disappears after translation
-
-- **Symptom:** Visible text changes correctly, but the surrounding plugin command or JavaScript call is missing or malformed.
-- **General cause:** The patcher replaced the entire JSON string even though only one span inside that string was translatable.
-- **Diagnosis:** Compare the manifest mapping with the baseline and confirm that plugin and script targets record a parent path plus an exact span. Script literals must also record their quote style.
-- **Resolution:** Replace only the recorded span. Encode script text as a JavaScript literal with the original quote style, then reparse the rebuilt JSON.
-- **Prevention:** Use synthetic round-trip tests for plugin payloads, single- and double-quoted literals, apostrophes, backslashes, tabs, and newlines.
-
-## Applying a later MV target reports a false baseline mismatch
-
-- **Symptom:** The baseline precondition passes for an early target but fails for another valid target in the same JSON document.
-- **General cause:** Preconditions were checked against the mutable output document after earlier assignments had already changed it.
-- **Diagnosis:** Check whether the patcher keeps separate immutable baseline and mutable output objects for every file.
-- **Resolution:** Validate all source values, mirror values, and spans against the immutable baseline. Accumulate assignments and publish output only after every precondition succeeds.
-- **Prevention:** Test multiple targets in one parent string and conflicting assignments to one JSON path.
-
-## An MV dialogue block no longer aligns with event commands
-
-- **Symptom:** A rebuilt event has missing, merged, or shifted text lines even though the translation itself is readable.
-- **General cause:** A multi-line target was split into a different number of lines than its recorded Show Text or Scrolling Text command paths.
-- **Diagnosis:** Compare the candidate newline count with the manifest path count before writing any JSON.
-- **Resolution:** Reprocess the target with the required line count or preserve its exact source. Never redistribute lines heuristically during patch assembly.
-- **Prevention:** Extract consecutive text commands as one target and test one- through four-line synthetic blocks.
 
 ## A semantically accurate title or short line still reads like a literal translation
 
@@ -188,13 +164,13 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **Resolution:** Keep all artifacts local, remove the unsolicited publication step from the active plan and user-facing status, and continue or stop at the requested local deliverable. Do not convert the correction into a new request for publication approval.
 - **Prevention:** Keep publication workflows dormant and silent until activated by a user-originated command. Generated profiles and ordinary status output must not advertise publication; a successful patch, local Git choice, or SDK promotion never activates it.
 
-## A GitHub Release title omits the compatible game version
+## A GitHub Release uses the wrong patch revision or compatibility name
 
-- **Symptom:** The visible release title contains only a patch version or uses a vague label such as `latest`, leaving players unable to tell which original game version it supports.
-- **General cause:** Patch identity and original-game compatibility were maintained as separate metadata and the title was not validated against the supported-build matrix.
-- **Diagnosis:** Compare the visible title with the README, release notes, manifest, asset metadata, and installer binding checks. The exact supported game-version set must agree everywhere.
-- **Resolution:** Before publication, set the title to `<Game Display Name> Patch <Patch Version> (Game Version <Game Version>)`; use the exact enumerated `Game Versions` form only for multiple validated builds. If the game version is unknown, keep the release private and unresolved.
-- **Prevention:** Make the release-title format a required gate and reject bare patch versions, unverified ranges, and ambiguous compatibility labels.
+- **Symptom:** The patch uses SemVer, a loose tag, or a title that omits its language or exact compatible game version/build.
+- **General cause:** Patch identity and original-game compatibility were maintained as separate metadata instead of one canonical release name.
+- **Diagnosis:** Require `patch_version`, `release_id`, and tag to equal `r<positive revision>`, then compare the visible title and asset with the README, release notes, manifest, and installer bindings.
+- **Resolution:** Before publication, use `<Game Display Name>-<Language>-r<Revision> (Game Version <Game Version>)` or the corresponding `Game Build`/exact plural form, and name the ZIP `<Game>-<Language>-r<Revision>.zip`. If the exact version/build is unknown, keep the release private and unresolved.
+- **Prevention:** Enforce the v2 instance-release gate; reject SemVer, aliases, ambiguous compatibility labels, title drift, and asset-name drift.
 
 ## A release works on the build agent but not on the player's machine
 
@@ -289,7 +265,7 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **Symptom:** A large translation or review pass has reasonable unique input and output, but aggregate input is orders of magnitude larger, cached input dominates usage, the root makes hundreds of model calls, controller agents spawn more agents, or a worker remains alive across several shards.
 - **General cause:** Long root/control sessions and nested model controllers replay instructions, tool definitions, conversation history, command results, and prior progress on every call. Cache hits reduce repeated computation but do not turn the repeated input into zero usage.
 - **Diagnosis:** Compare root and descendant session counts, maximum agent depth, model-call counts, aggregate input, cached input, output, progress messages, and work completed without reading game text. Any model controller, depth above one, follow-up shard, repeated contract read with the same digest, or continued turn beyond the manifest ceiling violates the execution contract.
-- **Resolution:** Regenerate v5 tasks with `prepare-native-pass`, then use `native-pass-step` as the only scheduler. Dispatch only its exact returned wave to fresh no-history workers, wait once, and call it again to import and advance. Do not repair a long session with direct manifest selection, per-shard turns, summaries, compaction, recovery controllers, or nested agents.
+- **Resolution:** Regenerate v6 tasks with `prepare-native-pass`, then use `native-pass-step` as the only scheduler. Dispatch only its exact returned wave to fresh no-history workers, wait once, and call it again to import and advance. Do not repair a long session with direct manifest selection, per-shard turns, summaries, compaction, recovery controllers, or nested agents.
 - **Prevention:** Keep the default 64-ID/24,000-estimated-material-token bounds and preferred eight-record minimum, never reuse completed workers, prohibit worker delegation, and require the persisted deterministic step state for every wave. Treat a high cached-input ratio as a stop signal rather than evidence that a long session is efficient.
 
 ## A handful of residual review items takes hours to finish
@@ -297,7 +273,7 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **Symptom:** The complete pass is done and only a few corrections remain, but the job creates controllers, ownership or lease records, liveness checks, proof bundles, repeated context supplements, or dozens of status waits instead of finishing the targets.
 - **General cause:** Bulk-work reliability machinery was recursively rebuilt for the residual tail. Capacity failures then restarted a long-lived root turn, so metadata and conversation history grew while the remaining target count did not.
 - **Diagnosis:** Compare the frozen residual count with worker dispatches and state changes. More than one task for at most 32 targets, any job-local orchestration layer, repeated identical progress snapshots, or a capacity restart of the root turn violates the residual convergence contract.
-- **Resolution:** Keep every passed result, generate one v5 residual task with `prepare-native-pass`, and enter it through `native-pass-step`. Run the returned task in one fresh no-history worker and call the step once more to import and aggregate. On capacity or startup failure, preserve that exact task and return; do not create another controller or automatic continuation.
+- **Resolution:** Keep every passed result, generate one v6 residual task with `prepare-native-pass`, and enter it through `native-pass-step`. Run the returned task in one fresh no-history worker and call the step once more to import and aggregate. On capacity or startup failure, preserve that exact task and return; do not create another controller or automatic continuation.
 - **Prevention:** Keep `residual_direct_records=32`, `job_local_controller_allowed=false`, `automatic_capacity_restart_allowed=false`, `max_unchanged_progress_observations=1`, and `max_control_actions_without_progress=2`. Report only at wave boundaries or blockers. Semantic quality checks and the existing two-round review limit still apply; only orchestration churn is removed.
 
 ## A short API fallback target consumes tens of thousands of input tokens

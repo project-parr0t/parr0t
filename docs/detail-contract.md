@@ -6,7 +6,9 @@ This contract governs every job-, stage-, coordinator-, wave-, task-, or worker-
 
 Apply instructions in this order: the user's current request and explicit approvals, repository `AGENTS.md` and routed core contracts, selected SDK contract, workspace `AGENTS.md`, generated `parr0t.detail-contract.v1`, then task prose. A lower layer may narrow its assigned targets, paths, outputs, checks, deadline, or budget. It must not weaken, replace, reinterpret, or postpone a higher layer.
 
-The native v5 task manifest is the only executable detail contract. Its `worker_contract`, `detail_contract`, `execution_contract`, and `contract_fingerprint` are one immutable unit. Reject a changed or conflicting unit before dispatch with `E_DETAIL_CONTRACT_CONFLICT`. Free-form Markdown may be a short operator note, but it is not passed to a worker and has no execution authority.
+The native v6 task manifest is the only executable detail contract. Its `worker_contract`, `detail_contract`, `execution_contract`, and `contract_fingerprint` are one immutable unit. Reject a changed or conflicting unit before dispatch with `E_DETAIL_CONTRACT_CONFLICT`. Free-form Markdown may be a short operator note, but it is not passed to a worker and has no execution authority.
+
+Each v6 task row binds the complete segment payload under `parr0t.native-task-payload.v1`. A data-plane worker reads that task once and must not open the full ordered `source_artifact`. The full source exists only for framework-side fingerprint, alignment, and merge validation.
 
 ## Permitted detail
 

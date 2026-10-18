@@ -16,12 +16,14 @@ from .control_plane import (
 )
 from .models import Segment
 from .store import stable_hash
+from .validators import validate_integrity
 
 
 ALLOWED_STATUSES = {"success", "refused", "error", "invalid"}
 SAFE_NAME = re.compile(r"[^a-z0-9._-]+")
-TASK_MANIFEST_VERSION = 5
-SUPPORTED_TASK_MANIFEST_VERSIONS = {4, TASK_MANIFEST_VERSION}
+TASK_MANIFEST_VERSION = 6
+SUPPORTED_TASK_MANIFEST_VERSIONS = {4, 5, TASK_MANIFEST_VERSION}
+TASK_PAYLOAD_SCHEMA = "parr0t.native-task-payload.v1"
 DEFAULT_MAX_RECORDS = 64
 DEFAULT_MIN_RECORDS = 8
 DEFAULT_MAX_MATERIAL_TOKENS = 24_000
@@ -45,6 +47,9 @@ def _worker_contract() -> dict[str, Any]:
         "max_semantic_model_calls_per_task": 1,
         "per_record_semantic_call_loop_allowed": False,
         "max_prompt_artifacts_per_task": 1,
+        "task_payload_schema": TASK_PAYLOAD_SCHEMA,
+        "task_payload_contains_bound_segments": True,
+        "full_source_artifact_access": "validation_only",
         "single_batched_result_required": True,
         "max_parent_progress_messages": 0,
         "task_message_contains_game_text": False,
@@ -84,6 +89,8 @@ def _detail_contract() -> dict[str, Any]:
         "one_semantic_batch_per_task": True,
         "per_record_semantic_call_loop_allowed": False,
         "shared_context_loads_per_task": 1,
+        "task_input": "bound_segment_payload_only",
+        "full_source_artifact_access": "validation_only",
         "result_cardinality": "one_status_per_bound_target",
         "partial_failure_isolation": "per_target_status_in_same_batched_result",
         "unchanged_success_reprocessing_allowed": False,
@@ -270,6 +277,8 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
     if not isinstance(payload.get("source_fingerprint"), str) or not payload["source_fingerprint"]:
         raise ValueError("Native task manifest source fingerprint is missing")
     if version == TASK_MANIFEST_VERSION:
+        if payload.get("task_payload_schema") != TASK_PAYLOAD_SCHEMA:
+            raise ValueError("E_DETAIL_CONTRACT_CONFLICT: task payload schema is missing")
         worker_contract = payload.get("worker_contract")
         detail_contract = payload.get("detail_contract")
         execution_contract = payload.get("execution_contract")
@@ -328,6 +337,12 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
         task_path = manifest_path.parent / name
         if not task_path.is_file() or _file_sha256(task_path) != digest:
             raise ValueError("Native task manifest references a missing or changed task")
+        target_ids = _task_target_ids(
+            task_path,
+            require_payload=version == TASK_MANIFEST_VERSION,
+        )
+        if len(target_ids) != records:
+            raise ValueError("Native task record count does not match its manifest binding")
         seen_files.add(name)
     return payload
 
@@ -398,7 +413,7 @@ def _write_wave_receipt(
     return path
 
 
-def _task_target_ids(task_path: Path) -> list[str]:
+def _task_target_ids(task_path: Path, *, require_payload: bool = False) -> list[str]:
     rows = _read_jsonl(task_path)
     ids: list[str] = []
     for row in rows:
@@ -412,6 +427,16 @@ def _task_target_ids(task_path: Path) -> list[str]:
             or ordinal < 0
         ):
             raise ValueError("Native task file contains an invalid target binding")
+        if require_payload:
+            segment_payload = row.get("segment")
+            if not isinstance(segment_payload, dict):
+                raise ValueError("Native task file is missing its bound segment payload")
+            try:
+                segment = Segment(**segment_payload)
+            except (TypeError, ValueError):
+                raise ValueError("Native task file contains an invalid segment payload") from None
+            if segment.id != target_id:
+                raise ValueError("Native task segment payload does not match its target binding")
         ids.append(target_id)
     if len(ids) != len(set(ids)):
         raise ValueError("Native task file contains duplicate target bindings")
@@ -504,6 +529,7 @@ def prepare_native_tasks(
             and manifest.get("min_records") == min_records
             and manifest.get("max_material_tokens") == max_material_tokens
             and manifest.get("max_workers") == max_workers
+            and manifest.get("task_payload_schema") == TASK_PAYLOAD_SCHEMA
         ):
             task_rows = manifest.get("tasks", [])
             expected_execution_contract = _execution_contract(
@@ -563,6 +589,7 @@ def prepare_native_tasks(
                     "max_workers": max_workers,
                     "fresh_worker_per_task": True,
                     "history_mode": "none",
+                    "task_payload_schema": TASK_PAYLOAD_SCHEMA,
                     "contract_fingerprint": expected_contract_fingerprint,
                     "execution_contract": execution_contract,
                     "manifest": str(manifest_path),
@@ -607,7 +634,11 @@ def prepare_native_tasks(
         name = f"task-{number:04d}.jsonl"
         path = output_dir / name
         rows = [
-            {"target_id": segment.id, "ordinal": ordinal}
+            {
+                "target_id": segment.id,
+                "ordinal": ordinal,
+                "segment": asdict(segment),
+            }
             for ordinal, segment, _ in batch
         ]
         _atomic_jsonl(path, rows)
@@ -657,6 +688,7 @@ def prepare_native_tasks(
     )
     manifest = {
         "version": TASK_MANIFEST_VERSION,
+        "task_payload_schema": TASK_PAYLOAD_SCHEMA,
         "source_artifact": source_artifact,
         "source_fingerprint": fingerprint,
         "max_records": max_records,
@@ -683,6 +715,7 @@ def prepare_native_tasks(
         "max_workers": max_workers,
         "fresh_worker_per_task": True,
         "history_mode": "none",
+        "task_payload_schema": TASK_PAYLOAD_SCHEMA,
         "contract_fingerprint": contract_fingerprint,
         "execution_contract": execution_contract,
         "manifest": str(manifest_path),
@@ -695,7 +728,7 @@ def prepare_native_tasks(
     }
 
 
-def _validate_row(row: dict[str, Any]) -> dict[str, Any]:
+def _validate_row(row: dict[str, Any], *, segment: Segment | None = None) -> dict[str, Any]:
     target_id = row.get("target_id")
     status = row.get("status")
     text = row.get("text", "")
@@ -706,7 +739,11 @@ def _validate_row(row: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(text, str):
         raise ValueError(f"Native shard {target_id!r} text must be a string")
     if status == "success" and not text.strip():
-        raise ValueError(f"Native shard {target_id!r} reports success without text")
+        if (
+            segment is None or segment.id != target_id or text != ""
+            or validate_integrity(segment, text, [])
+        ):
+            raise ValueError(f"Native shard {target_id!r} reports success without text")
     issues = row.get("issues", [])
     if not isinstance(issues, list) or not all(isinstance(item, str) for item in issues):
         raise ValueError(f"Native shard {target_id!r} issues must be strings")
@@ -717,6 +754,60 @@ def _validate_row(row: dict[str, Any]) -> dict[str, Any]:
         "provider": str(row.get("provider", "native-worker")),
         "issues": issues,
     }
+
+
+def _validate_manifest_rows(
+    work_dir: Path,
+    manifest: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    bound_segments: dict[str, Segment],
+) -> list[dict[str, Any]]:
+    # Ordinary results keep the existing fast path. Optional empty results must
+    # join the exact prepared source, including its immutable adapter metadata.
+    if not bound_segments and any(
+        row.get("status") == "success" and row.get("text") == "" for row in rows
+    ):
+        from .formats import read_segments
+
+        artifact = manifest.get("source_artifact")
+        if not isinstance(artifact, str) or not artifact.strip():
+            raise ValueError("Optional-slot source artifact is invalid")
+        try:
+            if Path(artifact).is_absolute():
+                raise ValueError("Optional-slot source artifact must be relative")
+            source = (work_dir / artifact).resolve()
+            source.relative_to(work_dir.resolve())
+            if not source.is_file():
+                raise ValueError("Optional-slot source artifact must be a file")
+            ordered = read_segments(source)
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+            raise ValueError("Optional-slot source artifact is invalid") from None
+        if (
+            len(ordered) != manifest.get("records")
+            or stable_hash([asdict(segment) for segment in ordered])
+            != manifest.get("source_fingerprint")
+        ):
+            raise ValueError("Optional-slot source no longer matches its task manifest")
+        source_ids = {segment.id for segment in ordered}
+        for segment in ordered:
+            if segment.metadata.get("ui_empty_target") is not None:
+                related = segment.metadata.get("ui_composed_with_ids")
+                if not isinstance(related, list) or not all(
+                    isinstance(target_id, str) and target_id in source_ids
+                    for target_id in related
+                ):
+                    raise ValueError("Optional-slot composition references an unbound target")
+        # Cache only a fully validated source; reuse once per wave/import scan.
+        bound_segments.update((segment.id, segment) for segment in ordered)
+    return [
+        _validate_row(
+            row,
+            segment=bound_segments.get(row["target_id"])
+            if isinstance(row.get("target_id"), str) else None,
+        )
+        for row in rows
+    ]
 
 
 def import_native_shard(work_dir: Path, source: Path, shard_name: str) -> dict[str, Any]:
@@ -776,17 +867,23 @@ def import_native_wave(
 
     planned: list[tuple[Path, list[dict[str, Any]]]] = []
     wave_ids: set[str] = set()
+    bound_segments: dict[str, Segment] = {}
     for task in tasks:
-        expected_ids = _task_target_ids(manifest_path.parent / task["file"])
+        expected_ids = _task_target_ids(
+            manifest_path.parent / task["file"],
+            require_payload=manifest.get("version") == TASK_MANIFEST_VERSION,
+        )
         if len(expected_ids) != task["records"]:
             raise ValueError("Native task record count does not match its manifest binding")
         result_path = source_dir / task["file"]
         if not result_path.is_file():
             raise ValueError("Native wave result is incomplete")
         try:
-            rows = [_validate_row(row) for row in _read_jsonl(result_path)]
+            rows = _validate_manifest_rows(
+                work_dir, manifest, _read_jsonl(result_path), bound_segments=bound_segments
+            )
         except (ValueError, json.JSONDecodeError):
-            raise ValueError("Native wave result is invalid") from None
+            raise ValueError("E_NATIVE_WAVE_RESULT_INVALID: Native wave result is invalid") from None
         result_ids = [row["target_id"] for row in rows]
         if result_ids != expected_ids:
             raise ValueError("Native wave result does not match its exclusive task binding")
@@ -965,6 +1062,7 @@ def _imported_native_waves(
     imported_waves: list[int] = []
     imported_tasks = 0
     gap_seen = False
+    bound_segments: dict[str, Segment] = {}
     for wave in sorted({task["wave"] for task in manifest["tasks"]}):
         tasks = [task for task in manifest["tasks"] if task["wave"] == wave]
         receipt_path = _wave_receipt_path(work_dir, manifest, tasks, wave)
@@ -1035,12 +1133,17 @@ def _imported_native_waves(
                 present.append(False)
                 continue
             try:
-                rows = [_validate_row(row) for row in _read_jsonl(shard)]
+                rows = _validate_manifest_rows(
+                    work_dir, manifest, _read_jsonl(shard), bound_segments=bound_segments
+                )
             except (ValueError, json.JSONDecodeError):
                 raise ValueError(
                     "E_NATIVE_CONTROL_IMPORTED_SHARD_INVALID: imported shard is invalid"
                 ) from None
-            expected_ids = _task_target_ids(manifest_path.parent / task["file"])
+            expected_ids = _task_target_ids(
+                manifest_path.parent / task["file"],
+                require_payload=manifest.get("version") == TASK_MANIFEST_VERSION,
+            )
             if [row["target_id"] for row in rows] != expected_ids:
                 raise ValueError(
                     "E_NATIVE_CONTROL_IMPORTED_SHARD_INVALID: imported shard binding changed"
@@ -1113,7 +1216,7 @@ def native_control_step(
     manifest = _load_task_manifest(work_dir, manifest_path)
     if manifest.get("version") != TASK_MANIFEST_VERSION:
         raise ValueError(
-            "E_NATIVE_CONTROL_MANIFEST_UPGRADE_REQUIRED: deterministic stepping requires v5"
+            "E_NATIVE_CONTROL_MANIFEST_UPGRADE_REQUIRED: deterministic stepping requires v6"
         )
     plan_fingerprint = _native_control_plan_fingerprint(manifest)
     state_path = _native_control_state_path(work_dir, manifest, plan_fingerprint)
@@ -1328,7 +1431,10 @@ def merge_native_pass(
         shard_bindings = [
             (
                 _manifest_shard_path(work_dir, manifest, task),
-                _task_target_ids(manifest_path.parent / task["file"]),
+                _task_target_ids(
+                    manifest_path.parent / task["file"],
+                    require_payload=manifest.get("version") == TASK_MANIFEST_VERSION,
+                ),
             )
             for task in manifest["tasks"]
         ]
@@ -1337,6 +1443,7 @@ def merge_native_pass(
         expected_shards = len(shard_bindings)
 
     imported_shards = 0
+    bound_segments: dict[str, Segment] = {}
     for shard, expected_ids in shard_bindings:
         if not shard.is_file():
             continue
@@ -1344,7 +1451,9 @@ def merge_native_pass(
             rows = [_validate_row(raw) for raw in _read_jsonl(shard)]
         else:
             try:
-                rows = [_validate_row(raw) for raw in _read_jsonl(shard)]
+                rows = _validate_manifest_rows(
+                    work_dir, manifest, _read_jsonl(shard), bound_segments=bound_segments
+                )
             except (ValueError, json.JSONDecodeError):
                 raise ValueError("Imported native shard is invalid") from None
         if expected_ids is not None and [row["target_id"] for row in rows] != expected_ids:

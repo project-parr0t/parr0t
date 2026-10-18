@@ -24,7 +24,7 @@ If an upstream candidate changes after review, discard that review and judge the
 Initialize an external workspace and register the source game as a read-only root using the core workflow. Then extract:
 
 ```powershell
-game-l10n rpg-maker-mv extract `
+python -m game_l10n.rpg_maker_mv extract `
   --workspace <agent-workspace> `
   --game-root <configured-game-root> `
   --output engine-extract
@@ -40,7 +40,7 @@ The output contains:
 After the core translation and review pipeline produces its result file, build a separate patch tree:
 
 ```powershell
-game-l10n rpg-maker-mv build `
+python -m game_l10n.rpg_maker_mv build `
   --workspace <agent-workspace> `
   --game-root <configured-game-root> `
   --manifest engine-extract\apply-manifest.json `
@@ -54,13 +54,13 @@ By default, missing or unsuccessful results and translations with deterministic 
 Verify and package:
 
 ```powershell
-game-l10n rpg-maker-mv verify `
+python -m game_l10n.rpg_maker_mv verify `
   --workspace <agent-workspace> `
   --game-root <configured-game-root> `
   --manifest engine-extract\apply-manifest.json `
   --patch patch-tree
 
-game-l10n rpg-maker-mv pack `
+python -m game_l10n.rpg_maker_mv pack `
   --workspace <agent-workspace> `
   --game-root <configured-game-root> `
   --manifest engine-extract\apply-manifest.json `
@@ -81,3 +81,7 @@ The pack command repeats verification before writing the ZIP. The archive preser
 - Verification reparses every JSON output, compares its structure with the baseline, rejects changes outside manifest-owned paths, and rechecks source hashes.
 
 All committed tests use synthetic identifiers and text. Do not add extracted files, manifests, reports, hashes, target counts, real paths, or runtime observations from a localization job to this branch.
+
+## Core update compatibility
+
+Use the standalone engine module commands above. The framework CLI and root package remain identical to main. Import engine APIs from the engine subpackage.
