@@ -10,6 +10,7 @@ from game_l10n.native_pass import (
     import_native_shard,
     import_native_wave,
     merge_native_pass,
+    native_control_step,
     prepare_native_tasks,
 )
 
@@ -105,6 +106,8 @@ class NativePassTests(unittest.TestCase):
                 )
 
             summary = import_native_wave(root, tasks / "manifest.json", results, 1)
+            receipt = root / summary["receipt"]
+            receipt_exists = receipt.is_file()
             stale = root / ".game-l10n" / "native" / "shards" / "stale.jsonl"
             self._write_rows(
                 stale,
@@ -126,6 +129,7 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(summary["records"], 4)
         self.assertEqual(summary["success"], 4)
         self.assertEqual(summary["failed"], 0)
+        self.assertTrue(receipt_exists)
         self.assertNotIn("fixture-", json.dumps(summary))
         self.assertNotIn("TARGET_", json.dumps(summary))
         self.assertTrue(merged["manifest_bound"])
@@ -484,6 +488,235 @@ class NativePassTests(unittest.TestCase):
             [task["records"] for task in manifest["tasks"]],
             [32, 33],
         )
+
+    def test_native_control_step_dispatches_imports_and_advances_one_wave(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            segments = [Segment(f"fixture-{index}", "SOURCE") for index in range(4)]
+            tasks = root / "tasks"
+            results = root / "results"
+            prepare_native_tasks(
+                root,
+                source,
+                segments,
+                tasks,
+                max_records=2,
+                max_workers=1,
+            )
+
+            first = native_control_step(root, tasks / "manifest.json", results)
+            self.assertEqual(first["action"], "dispatch_authorized_wave")
+            self.assertEqual(first["wave"], 1)
+            self.assertEqual(len(first["tasks"]), 1)
+
+            for number in (1, 2):
+                task_path = tasks / f"task-{number:04d}.jsonl"
+                rows = [
+                    json.loads(line)
+                    for line in task_path.read_text(encoding="utf-8").splitlines()
+                ]
+                self._write_rows(
+                    results / task_path.name,
+                    [
+                        {
+                            "target_id": row["target_id"],
+                            "status": "success",
+                            "text": "TARGET",
+                        }
+                        for row in rows
+                    ],
+                )
+                step = native_control_step(
+                    root,
+                    tasks / "manifest.json",
+                    results,
+                    usage_event_id=f"wave-{number}",
+                    input_tokens=100,
+                )
+                if number == 1:
+                    self.assertEqual(step["action"], "dispatch_authorized_wave")
+                    self.assertEqual(step["wave"], 2)
+                    self.assertEqual(step["imported_wave"]["wave"], 1)
+                else:
+                    self.assertEqual(step["action"], "aggregate_completed_pass")
+                    self.assertEqual(step["wave"], 0)
+                    self.assertEqual(step["imported_wave"]["wave"], 2)
+
+        self.assertEqual(step["counts"]["imported_waves"], 2)
+        self.assertEqual(step["usage"]["events"], 2)
+        self.assertEqual(step["usage"]["input_tokens"], 200)
+        self.assertNotIn("SOURCE", json.dumps(step))
+        self.assertNotIn("TARGET", json.dumps(step))
+
+    def test_native_control_step_stops_repeated_unchanged_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            prepare_native_tasks(
+                root,
+                source,
+                [Segment("fixture-1", "SOURCE")],
+                tasks,
+            )
+            results = root / "results"
+
+            first = native_control_step(root, tasks / "manifest.json", results)
+            second = native_control_step(root, tasks / "manifest.json", results)
+
+        self.assertEqual(first["action"], "dispatch_authorized_wave")
+        self.assertEqual(second["action"], "checkpoint_and_stop")
+        self.assertEqual(second["issue_codes"], ["E_NATIVE_NO_MEASURABLE_PROGRESS"])
+
+    def test_native_control_step_normalizes_invalid_wave_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            prepare_native_tasks(
+                root,
+                source,
+                [Segment("fixture-1", "SOURCE")],
+                tasks,
+            )
+            native_control_step(root, tasks / "manifest.json", results)
+            self._write_rows(
+                results / "task-0001.jsonl",
+                [{"target_id": "wrong-target", "status": "success", "text": "TARGET"}],
+            )
+            stopped = native_control_step(root, tasks / "manifest.json", results)
+            self._write_rows(
+                results / "task-0001.jsonl",
+                [{"target_id": "fixture-1", "status": "success", "text": "TARGET"}],
+            )
+            recovered = native_control_step(root, tasks / "manifest.json", results)
+
+        self.assertEqual(stopped["action"], "checkpoint_and_stop")
+        self.assertEqual(stopped["issue_codes"], ["E_NATIVE_WAVE_RESULT_INVALID"])
+        self.assertNotIn("wrong-target", json.dumps(stopped))
+        self.assertEqual(recovered["action"], "aggregate_completed_pass")
+
+    def test_native_control_step_preserves_pilot_across_budget_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            segments = [Segment(f"fixture-{index}", "SOURCE") for index in range(4)]
+            tasks = root / "tasks"
+            results = root / "results"
+            prepare_native_tasks(
+                root,
+                source,
+                segments,
+                tasks,
+                max_records=2,
+                max_workers=1,
+                bulk_budget_gate_records=4,
+            )
+            native_control_step(root, tasks / "manifest.json", results)
+            task_path = tasks / "task-0001.jsonl"
+            rows = [
+                json.loads(line)
+                for line in task_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self._write_rows(
+                results / task_path.name,
+                [
+                    {
+                        "target_id": row["target_id"],
+                        "status": "success",
+                        "text": "TARGET",
+                    }
+                    for row in rows
+                ],
+            )
+            stopped = native_control_step(
+                root,
+                tasks / "manifest.json",
+                results,
+                usage_event_id="pilot",
+                input_tokens=100,
+            )
+            prepare_native_tasks(
+                root,
+                source,
+                segments,
+                tasks,
+                max_records=2,
+                max_workers=1,
+                bulk_budget_gate_records=4,
+                max_elapsed_minutes=60,
+                max_input_tokens=1_000,
+                provider_cost_unmetered=True,
+                user_approved_budget=True,
+            )
+            resumed = native_control_step(root, tasks / "manifest.json", results)
+
+        self.assertEqual(stopped["action"], "checkpoint_and_stop")
+        self.assertEqual(
+            stopped["issue_codes"], ["E_BULK_EXECUTION_BUDGET_REQUIRED"]
+        )
+        self.assertEqual(resumed["action"], "dispatch_authorized_wave")
+        self.assertEqual(resumed["wave"], 2)
+        self.assertEqual(resumed["counts"]["imported_waves"], 1)
+        self.assertEqual(resumed["usage"]["input_tokens"], 100)
+
+    def test_native_control_step_imports_completed_wave_before_budget_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            prepare_native_tasks(
+                root,
+                source,
+                [Segment(f"fixture-{index}", "SOURCE") for index in range(4)],
+                tasks,
+                max_records=2,
+                max_workers=1,
+                bulk_budget_gate_records=4,
+                max_elapsed_minutes=60,
+                max_input_tokens=100,
+                provider_cost_unmetered=True,
+                user_approved_budget=True,
+            )
+            native_control_step(root, tasks / "manifest.json", results)
+            task_path = tasks / "task-0001.jsonl"
+            rows = [
+                json.loads(line)
+                for line in task_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self._write_rows(
+                results / task_path.name,
+                [
+                    {
+                        "target_id": row["target_id"],
+                        "status": "success",
+                        "text": "TARGET",
+                    }
+                    for row in rows
+                ],
+            )
+            stopped = native_control_step(
+                root,
+                tasks / "manifest.json",
+                results,
+                usage_event_id="wave-1",
+                input_tokens=100,
+            )
+
+        self.assertEqual(stopped["action"], "checkpoint_and_stop")
+        self.assertEqual(
+            stopped["issue_codes"], ["E_NATIVE_INPUT_BUDGET_EXHAUSTED"]
+        )
+        self.assertEqual(stopped["counts"]["imported_waves"], 1)
+        self.assertEqual(stopped["imported_wave"]["wave"], 1)
 
 
 if __name__ == "__main__":
