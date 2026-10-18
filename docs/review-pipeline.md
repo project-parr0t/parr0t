@@ -25,7 +25,9 @@ A rewriter runs only when a judge reports a material `meaning`, `omission`, `add
 
 For native App review, compact output alone is not enough: each bounded review task runs in a fresh no-history worker and that worker ends after the task. Reusing a judge session for later tasks replays prior candidates and tool output, increases input superlinearly, and risks cross-target contamination without improving the current target's evidence.
 
-Within that fresh worker, the prepared task is still one batch. The judge loads shared rules/context once and produces all bound `ok | rewrite | refused | error` verdicts in one semantic response. It must not create or submit one prompt per candidate. A per-target verdict isolates the outcome, not the request: one failed target remains failed while successful neighbors remain usable in the same batch result.
+Prepare native judging with `prepare-native-pass --pass-kind review`. The initial task may contain up to 2,048 candidates, subject to the 262,144 estimated-material-token cap. The judge loads shared rules/context once and produces all bound `ok | rewrite | refused | error` verdicts in one semantic response. It must not create or submit one prompt per candidate.
+
+After a refused/errored result is imported, `native-pass-step` locks successful verdicts and creates a new manifest containing only the failed subset at half the prior record bound. Every retry uses a new no-history worker and one semantic call. The chain stops at depth 11 or a one-row subset; remaining failures enter the configured review fallback. The control plane follows the returned `dispatch_review_split_wave` and manifest path without reading candidates or choosing the split.
 
 The worker reads only its bound v6 task payload plus the referenced focused context. It must not reopen the complete ordered source or prior result set for every batch. The full artifacts remain framework validation inputs; repeating them in each worker turns a linear pass into superlinear input cost without improving verdict evidence.
 

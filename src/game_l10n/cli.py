@@ -58,6 +58,9 @@ from .native_pass import (
     DEFAULT_MAX_RECORDS,
     DEFAULT_MAX_WORKERS,
     DEFAULT_MIN_RECORDS,
+    DEFAULT_REVIEW_MAX_MATERIAL_TOKENS,
+    DEFAULT_REVIEW_MAX_RECORDS,
+    DEFAULT_REVIEW_MIN_RECORDS,
     import_native_shard,
     import_native_wave,
     merge_native_pass,
@@ -69,7 +72,7 @@ from .privacy import is_within, require_external_workdir
 from .providers import ProviderRegistry
 from .provider_policy import require_direct_provider_pipeline
 from .runtime_approval import create_runtime_approval
-from .store import stable_hash
+from .store import stable_hash, stable_hash_sequence
 from .steam import build_steam_package, inspect_installed_state, validate_steam_package
 from .translation_exchange import prepare_translation_exchange, seal_translation_exchange
 from .tooling import cached_tool_state, run_cached_tool
@@ -619,7 +622,9 @@ def cmd_translate(args: argparse.Namespace) -> int:
     if destination == context_source:
         raise ValueError("Translation output must not overwrite the verified context inventory")
     inventory_state = require_inventory_attestation(work_dir, context_source)
-    inventory_segments = read_segments(context_source)
+    inventory_segments = (
+        segments if context_source == source else read_segments(context_source)
+    )
     context_pack, context_cached = _analyze_context(
         work_dir,
         inventory_segments,
@@ -666,7 +671,9 @@ def cmd_review_existing(args: argparse.Namespace) -> int:
     if destination == context_source:
         raise ValueError("Full re-review output must not overwrite the verified context inventory")
     inventory_state = require_inventory_attestation(work_dir, context_source)
-    inventory_segments = read_segments(context_source)
+    inventory_segments = (
+        segments if context_source == source else read_segments(context_source)
+    )
     context_pack, context_cached = _analyze_context(
         work_dir,
         inventory_segments,
@@ -727,7 +734,9 @@ def cmd_resume_failures(args: argparse.Namespace) -> int:
     previous = {item.segment_id: item for item in read_translation_results(checkpoint)}
     if set(previous) != set(segment_by_id):
         raise ValueError("Held result checkpoint does not match the current target set")
-    inventory_segments = read_segments(context_source)
+    inventory_segments = (
+        segments if context_source == source else read_segments(context_source)
+    )
     context_pack, context_cached = _analyze_context(
         work_dir,
         inventory_segments,
@@ -981,35 +990,56 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     output = _path_in_workspace(work_dir, args.output)
     execution = config.get("execution", {})
+    pass_kind = args.pass_kind
     stored_records = execution.get("native_shard_records")
     stored_material = execution.get("native_shard_material_tokens")
     legacy_default = int(execution.get("native_shard_policy_version", 1)) < 2 and (
         (stored_records == 256 and stored_material is None)
         or (stored_records == 32 and stored_material == 12_000)
     )
+    configured_records = (
+        execution.get("native_review_shard_records", DEFAULT_REVIEW_MAX_RECORDS)
+        if pass_kind == "review"
+        else execution.get("native_shard_records", DEFAULT_MAX_RECORDS)
+    )
     max_records = (
         args.max_records
         if args.max_records is not None
-        else DEFAULT_MAX_RECORDS
-        if legacy_default
-        else int(execution.get("native_shard_records", DEFAULT_MAX_RECORDS))
+        else (
+            DEFAULT_MAX_RECORDS
+            if legacy_default and pass_kind != "review"
+            else int(configured_records)
+        )
+    )
+    configured_material = (
+        execution.get(
+            "native_review_shard_material_tokens",
+            DEFAULT_REVIEW_MAX_MATERIAL_TOKENS,
+        )
+        if pass_kind == "review"
+        else execution.get(
+            "native_shard_material_tokens", DEFAULT_MAX_MATERIAL_TOKENS
+        )
     )
     max_material_tokens = (
         args.max_material_tokens
         if args.max_material_tokens is not None
-        else DEFAULT_MAX_MATERIAL_TOKENS
-        if legacy_default
-        else int(
-            execution.get(
-                "native_shard_material_tokens", DEFAULT_MAX_MATERIAL_TOKENS
-            )
+        else (
+            DEFAULT_MAX_MATERIAL_TOKENS
+            if legacy_default and pass_kind != "review"
+            else int(configured_material)
         )
+    )
+    configured_min_records = (
+        execution.get("native_review_shard_min_records", DEFAULT_REVIEW_MIN_RECORDS)
+        if pass_kind == "review"
+        else execution.get("native_shard_min_records", DEFAULT_MIN_RECORDS)
     )
     min_records = (
         args.min_records
         if args.min_records is not None
         else min(
-            int(execution.get("native_shard_min_records", DEFAULT_MIN_RECORDS)),
+            int(configured_min_records),
             max_records,
         )
     )
@@ -1049,6 +1079,7 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
         source,
         read_segments(source),
         output,
+        pass_kind=pass_kind,
         max_records=max_records,
         min_records=min_records,
         max_material_tokens=max_material_tokens,
@@ -1296,13 +1327,11 @@ def cmd_status(args: argparse.Namespace) -> int:
                             context_state.get("source_inventory_fingerprint"), str
                         )
                     ):
-                        source_segments_digest = stable_hash(
-                            [
-                                asdict(item)
-                                for item in read_segments(
-                                    Path(inventory_state["primary_path"])
-                                )
-                            ]
+                        source_segments_digest = stable_hash_sequence(
+                            asdict(item)
+                            for item in read_segments(
+                                Path(inventory_state["primary_path"])
+                            )
                         )
                     if context_issue:
                         state_issue_codes.append(context_issue)
@@ -1803,6 +1832,12 @@ def build_parser() -> argparse.ArgumentParser:
     native_prepare.add_argument("--workspace", required=True)
     native_prepare.add_argument("--input", required=True, help="Ordered source segment file")
     native_prepare.add_argument("--output", required=True, help="Private task directory")
+    native_prepare.add_argument(
+        "--pass-kind",
+        choices=["translation", "review", "rewrite"],
+        default="translation",
+        help="Use review to enable 2048-record batches and bounded failed-subset splitting",
+    )
     native_prepare.add_argument("--max-records", type=int)
     native_prepare.add_argument(
         "--min-records",
