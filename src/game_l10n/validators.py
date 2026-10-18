@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import Counter
 
 from .models import GlossaryEntry, Segment, ValidationIssue
+from .store import stable_hash
 
 # Game/format tokens that must survive byte-for-byte. More patterns can be configured per project.
 DEFAULT_PROTECTED_PATTERNS = (
@@ -31,6 +33,53 @@ def protected_tokens(text: str, extra_patterns: list[str] | None = None) -> Coun
     return Counter(tokens)
 
 
+def empty_target_allowed(segment: Segment) -> bool:
+    """Read optional-slot authority only from the bound inventory, never a result row."""
+    metadata = segment.metadata
+    contract = metadata.get("ui_empty_target")
+    if not isinstance(contract, dict) or set(contract) != {
+        "schema", "reason_code", "source_sha256", "composition_sha256", "evidence_sha256"
+    }:
+        return False
+    if (
+        contract["schema"] != "parr0t.ui-empty-target/v1"
+        or contract["reason_code"] != "optional_grammatical_slot"
+        or metadata.get("ui_slot_role") != "template_fragment"
+    ):
+        return False
+    related = metadata.get("ui_composed_with_ids")
+    pattern = metadata.get("ui_render_pattern")
+    prefix = metadata.get("ui_fixed_target_prefix", "")
+    suffix = metadata.get("ui_fixed_target_suffix", "")
+    if (
+        not isinstance(related, list) or not related
+        or not all(isinstance(item, str) and item and item != segment.id for item in related)
+        or len(set(related)) != len(related)
+        or not isinstance(pattern, str) or "{value}" not in pattern
+        or not isinstance(prefix, str) or not isinstance(suffix, str)
+        or not (prefix.strip() or suffix.strip())
+    ):
+        return False
+    if not all(
+        isinstance(contract[key], str) and re.fullmatch(r"[0-9a-f]{64}", contract[key])
+        for key in ("source_sha256", "composition_sha256", "evidence_sha256")
+    ):
+        return False
+    composition = {
+        "target_id": segment.id,
+        "source_sha256": hashlib.sha256(segment.source.encode("utf-8")).hexdigest(),
+        "ui_slot_role": metadata["ui_slot_role"],
+        "ui_composed_with_ids": related,
+        "ui_render_pattern": pattern,
+        "ui_fixed_target_prefix": prefix,
+        "ui_fixed_target_suffix": suffix,
+    }
+    return (
+        contract["source_sha256"] == composition["source_sha256"]
+        and contract["composition_sha256"] == stable_hash(composition)
+    )
+
+
 def validate_integrity(
     segment: Segment,
     candidate: str,
@@ -40,7 +89,7 @@ def validate_integrity(
     max_length_ratio: float = 4.0,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
-    if not candidate.strip():
+    if not candidate.strip() and not (candidate == "" and empty_target_allowed(segment)):
         return [ValidationIssue("empty", "Translation is empty")]
 
     source_tokens = protected_tokens(segment.source, extra_patterns)

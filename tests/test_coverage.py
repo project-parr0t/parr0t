@@ -88,6 +88,44 @@ class CoverageTests(unittest.TestCase):
                     self.assertEqual(state["semantic_review"]["complete"], expected)
                     self.assertEqual(state["static_completion"], expected)
 
+    def test_selected_strong_target_cannot_complete_with_triage_verdict_only(self) -> None:
+        segment = Segment("synthetic-selected", "SOURCE")
+        result = TranslationResult(
+            segment_id=segment.id,
+            source=segment.source,
+            text="TARGET",
+            status="reviewed",
+            acceptance_authority="reviewer",
+            candidate_generation=1,
+            candidate_digest=stable_hash("TARGET"),
+            metadata={"review_tier": "strong_pending"},
+            attempts=[
+                AttemptRecord(
+                    "review-triage",
+                    "synthetic-triager",
+                    "approved",
+                    candidate_generation=1,
+                )
+            ],
+        )
+
+        state = completion_attestation(
+            [segment],
+            [result],
+            inventory_segments=[segment],
+            inventory={
+                "status": "static_verified",
+                "static_complete": True,
+                "primary_segments": 1,
+                "primary_fingerprint": "synthetic",
+            },
+            runtime={"runtime_complete": False},
+            review_required=True,
+        )
+
+        self.assertFalse(state["semantic_review"]["complete"])
+        self.assertFalse(state["static_completion"])
+
     def test_independent_inventory_gate_is_bound_to_primary_fingerprint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

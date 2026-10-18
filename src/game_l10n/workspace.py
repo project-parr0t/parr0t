@@ -51,6 +51,9 @@ CONFIG_TEMPLATE: dict[str, Any] = {
             "api_key_env": "OPENAI_API_KEY",
             "reasoning_effort": "none",
             "max_output_tokens": 2048,
+            "task_max_output_tokens": {
+                "game_translation_review_judge": 256
+            },
         },
         {
             "name": "deepseek",
@@ -88,8 +91,18 @@ CONFIG_TEMPLATE: dict[str, Any] = {
     "routing": {
         "context_analyzers": ["openai-sol", "deepseek"],
         "translators": ["openai-luna", "deepseek"],
+        "review_triagers": ["openai-luna"],
         "reviewers": ["openai-sol", "deepseek"],
         "rewriters": ["deepseek", "openai-sol"],
+        "strong_review_sample_percent": 5.0,
+        "strong_review_high_risk_categories": [
+            "allusion",
+            "critical_logic",
+            "parody",
+            "quest_title",
+            "script_sensitive",
+            "wordplay"
+        ],
         "require_review": True,
         "review_max_rounds": 2,
         "max_workers": 8,
@@ -129,7 +142,7 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "same_failure_limit": 2,
         "reuse_unchanged_checks": True,
         "delegate_simple_tasks": False,
-        "native_shard_policy_version": 2,
+        "native_shard_policy_version": 3,
         "native_shard_records": 64,
         "native_shard_min_records": 8,
         "native_shard_material_tokens": 24000,
@@ -143,6 +156,16 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "max_root_input_tokens_per_turn": 5000000,
         "max_root_progress_messages_per_wave": 1,
         "max_worker_model_calls_per_task": 16,
+        "max_semantic_model_calls_per_task": 1,
+        "per_record_semantic_call_loop_allowed": False,
+        "detail_contract_schema": "parr0t.detail-contract.v1",
+        "free_form_execution_contract_allowed": False,
+        "bulk_budget_gate_records": 4096,
+        "bulk_max_elapsed_minutes": None,
+        "bulk_max_input_tokens": None,
+        "bulk_max_provider_cost_usd": None,
+        "bulk_provider_cost_unmetered": False,
+        "bulk_budget_user_approved": False,
         "budget_exhaustion_action": "checkpoint_and_return_control",
         "contract_reload_policy": "digest_change_or_new_control_generation_only",
         "residual_direct_records": 32,
@@ -207,7 +230,7 @@ This private workspace contains game data and localization artifacts. Resolve th
 - Apply the repository `skills/request-scope-guard/SKILL.md` after every scope-changing user message and before optional or external effects. Git, provider, installation, launch, and publication permissions are separate; never infer one from access or another approval.
 - This is a text-localization workspace. Do not inspect images for text, run OCR, plan image translation, or create image tooling unless the user specifically requests image translation.
 - Select and activate the exact engine/version SDK before data-plane work. A different SDK may be a bound `reference` for `derive-new`; generated pass-through tools are not an adapter.
-- Require two independent complete ordered inventories, typed context analysis, primary translation, translation fallback for failures only, complete independent review, selective rewrite, review fallback for failures only, deterministic validation, then packing. Do not shrink scope or reorder barriers.
+- Require two independent complete ordered inventories, typed context analysis, primary translation, translation fallback for failures only, complete low-cost triage, selective strong review for flags/risk/sample, flagged-only rewrite, review fallback for failures only, deterministic validation, then packing. Do not shrink scope or reorder barriers.
 - The top-level agent is a text-free control plane. It sees hashed control IDs, counts, categorical states, queue transitions, artifact paths, and deterministic codes only. Data-plane workers return a `parr0t.control-envelope.v2` path; validate it with `game-l10n validate-control-envelope`.
 - Existing-locale detection, engine/version discovery, source inventory, and content classification are data-plane work. The parent may pass the configured path to an isolated worker, but must not open the game README, manifest, configuration, script, asset, or extracted text itself. The worker records SDK-selection metadata inside the workspace and returns only a validated control envelope path.
 - If private text, provider refusal prose, content classification, or semantic judgment reaches the parent, run `game-l10n record-control-plane-leak` and stop. The contaminated agent must not run or confirm resume; only a fresh control plane with no inherited content history may use `resume-control-plane --fresh-session-confirmed`.
@@ -218,14 +241,14 @@ This private workspace contains game data and localization artifacts. Resolve th
 - Build and validate a new recoverable output here. Never mutate or launch the real game during automated validation. Real install, update, remove/restore, and launch each require their own explicit one-shot authorization.
 - Retryable failures stay in the metadata-only failure queue. Terminal source-preserved outcomes are recorded separately and are not retried as pending work; `metadata.blocking_on_failure=true` holds the entire patch.
 - Keep publication dormant and unmentioned until the user requests it. SDK promotion also requires confirmed patch success and the original exact target identity. Its separate engine-only commit must pass `game-l10n verify-sdk-promotion`; never mix a `main`-owned path into that commit.
-- Native orchestration is root-direct for the entire pass: the root dispatches prepared tasks straight to fresh workers, and neither a controller agent nor worker delegation is permitted. Obey the manifest's depth, per-wave, root-call, worker-call, and input-token ceilings. On any ceiling, checkpoint and return control instead of compacting, summarizing, or spawning another controller. Do not reread an unchanged contract set; `status.contract_set.digest` changes when reloading is required.
+- Native orchestration is root-direct for the entire pass with no controller or worker delegation. After `prepare-native-pass`, use `game-l10n native-pass-step` as the only scheduler. Dispatch only its returned wave, wait once, then call it again; the core imports complete results and returns one next action. Never select waves or recovery from the manifest yourself; reload prose only when `status.contract_set.digest` or the control generation changes.
 - Use proportional checks, keep small coupled work in the current agent, and stop after the required layer passes. Once a pass leaves no more than `execution.residual_direct_records`, use one fresh worker on one cached residual task; do not create a job-local scheduler, controller, lease/owner system, liveness proof, memoization layer, or supplemental evidence pack. A native capacity failure ends that worker attempt and enters resumable state; it must not auto-restart the root turn. Aggregate once per wave, report progress only at a wave boundary or blocker, and stop after one unchanged progress observation or two control actions without measurable progress.
 
 ## Status routes
 
 - SDK choice: `docs/sdk-selection.md`; SDK promotion: `docs/sdk-branch-contract.md` and `docs/engine-faq-contract.md`.
 - Inventory/review: `docs/coverage-gates.md` and `docs/review-pipeline.md`.
-- Control plane/native workers: `docs/control-plane-contract.md` and `docs/execution-budget.md`.
+- Control plane/native workers: `docs/control-plane-contract.md`, `docs/execution-budget.md`, and `docs/detail-contract.md`.
 - Manual/API handoff: `docs/translation-exchange.md`.
 - Existing release or game update: `docs/release-checkpoint.md`; exact approved wording fix: `docs/minimal-corrections.md`; composed UI: `docs/segment-metadata.md`.
 - Runtime mutation: `docs/runtime-approval.md` only after the exact user request.
@@ -846,7 +869,32 @@ def _apply_execution_defaults(config: dict[str, Any]) -> None:
         execution["native_shard_material_tokens"] = 24_000
     for key, value in CONFIG_TEMPLATE["execution"].items():
         execution.setdefault(key, value)
-    execution["native_shard_policy_version"] = 2
+    execution["native_shard_policy_version"] = 3
+
+
+def _apply_review_routing_defaults(config: dict[str, Any]) -> None:
+    routing = config.setdefault("routing", {})
+    if not isinstance(routing, dict):
+        raise ConfigurationError("Workspace routing policy must be an object")
+    preset = str(config.get("provider_preset", ""))
+    if preset == CODEX_APP_PRESET:
+        routing.setdefault("review_triagers", ["native-luna"])
+    elif preset == "openai-deepseek":
+        routing.setdefault("review_triagers", ["openai-luna"])
+    else:
+        routing.setdefault("review_triagers", [])
+    routing.setdefault("strong_review_sample_percent", 5.0)
+    routing.setdefault(
+        "strong_review_high_risk_categories",
+        [
+            "allusion",
+            "critical_logic",
+            "parody",
+            "quest_title",
+            "script_sensitive",
+            "wordplay",
+        ],
+    )
 
 
 def initialize_workspace(
@@ -888,8 +936,18 @@ def initialize_workspace(
         config["routing"] = {
             "context_analyzers": ["native-sol"],
             "translators": ["native-luna", "deepseek"],
+            "review_triagers": ["native-luna"],
             "reviewers": ["native-sol", "deepseek"],
             "rewriters": ["deepseek"],
+            "strong_review_sample_percent": 5.0,
+            "strong_review_high_risk_categories": [
+                "allusion",
+                "critical_logic",
+                "parody",
+                "quest_title",
+                "script_sensitive",
+                "wordplay",
+            ],
             "require_review": True,
             "review_max_rounds": 2,
             "max_workers": 8,
@@ -925,6 +983,7 @@ def initialize_workspace(
         config["routing"] = {
             "context_analyzers": ["translator-primary"],
             "translators": ["translator-primary"],
+            "review_triagers": [],
             "reviewers": ["reviewer-primary"],
             "rewriters": ["reviewer-primary"],
             "require_review": True,
@@ -985,6 +1044,7 @@ def load_config(work_dir: Path) -> dict[str, Any]:
         raise ConfigurationError(f"Workspace config not found: {path}")
     config = json.loads(path.read_text(encoding="utf-8"))
     _apply_execution_defaults(config)
+    _apply_review_routing_defaults(config)
     lock_path = work_dir / MODE_LOCK_PATH
     mode_lock = (
         json.loads(lock_path.read_text(encoding="utf-8"))

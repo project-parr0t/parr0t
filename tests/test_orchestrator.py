@@ -13,6 +13,163 @@ from game_l10n.providers import ProviderRegistry, ScriptedProvider
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_low_cost_triage_approval_skips_strong_reviewer(self) -> None:
+        translator = ScriptedProvider(
+            "fixture-translator",
+            lambda **_: {"status": "success", "text": "TARGET", "reason": ""},
+        )
+        triager = ScriptedProvider(
+            "fixture-triager", lambda **_: {"verdict": "ok", "issues": []}
+        )
+        strong = ScriptedProvider(
+            "fixture-strong", lambda **_: {"verdict": "ok", "issues": []}
+        )
+        registry = ProviderRegistry(
+            {item.name: item for item in (translator, triager, strong)}
+        )
+        segment = Segment("triage-only", "SOURCE")
+        with tempfile.TemporaryDirectory() as directory:
+            result = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(
+                    [translator.name],
+                    [strong.name],
+                    review_triager_chain=[triager.name],
+                    strong_review_sample_percent=0,
+                    strong_review_high_risk_categories=[],
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                context_pack=ContextPack(story_summary="STORY"),
+                work_dir=Path(directory),
+            ).translate_one(segment)
+
+        self.assertEqual(result.status, "reviewed")
+        self.assertEqual(result.metadata["review_tier"], "triage")
+        self.assertEqual(triager.call_count, 1)
+        self.assertEqual(strong.call_count, 0)
+        state = completion_attestation(
+            [segment],
+            [result],
+            inventory_segments=[segment],
+            inventory={
+                "status": "static_verified",
+                "static_complete": True,
+                "primary_segments": 1,
+                "primary_fingerprint": "fixture",
+            },
+            runtime={"runtime_complete": False},
+            review_required=True,
+        )
+        self.assertTrue(state["semantic_review"]["complete"])
+
+    def test_triage_flag_routes_candidate_to_strong_reviewer(self) -> None:
+        translator = ScriptedProvider(
+            "fixture-translator",
+            lambda **_: {"status": "success", "text": "TARGET", "reason": ""},
+        )
+        triager = ScriptedProvider(
+            "fixture-triager",
+            lambda **_: {"verdict": "rewrite", "issues": ["literalism"]},
+        )
+        strong = ScriptedProvider(
+            "fixture-strong", lambda **_: {"verdict": "ok", "issues": []}
+        )
+        registry = ProviderRegistry(
+            {item.name: item for item in (translator, triager, strong)}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(
+                    [translator.name],
+                    [strong.name],
+                    review_triager_chain=[triager.name],
+                    strong_review_sample_percent=0,
+                    strong_review_high_risk_categories=[],
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                context_pack=ContextPack(story_summary="STORY"),
+                work_dir=Path(directory),
+            ).translate_one(Segment("triage-flag", "SOURCE"))
+
+        self.assertEqual(result.status, "reviewed")
+        self.assertEqual(result.metadata["review_tier"], "strong")
+        self.assertIn("triage_flagged", result.metadata["strong_review_reasons"])
+        self.assertEqual(triager.call_count, 1)
+        self.assertEqual(strong.call_count, 1)
+
+    def test_deterministic_sample_routes_candidate_to_strong_reviewer(self) -> None:
+        translator = ScriptedProvider(
+            "fixture-translator",
+            lambda **_: {"status": "success", "text": "TARGET", "reason": ""},
+        )
+        triager = ScriptedProvider(
+            "fixture-triager", lambda **_: {"verdict": "ok", "issues": []}
+        )
+        strong = ScriptedProvider(
+            "fixture-strong", lambda **_: {"verdict": "ok", "issues": []}
+        )
+        registry = ProviderRegistry(
+            {item.name: item for item in (translator, triager, strong)}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(
+                    [translator.name],
+                    [strong.name],
+                    review_triager_chain=[triager.name],
+                    strong_review_sample_percent=100,
+                    strong_review_high_risk_categories=[],
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                context_pack=ContextPack(story_summary="STORY"),
+                work_dir=Path(directory),
+            ).translate_one(Segment("sampled", "SOURCE"))
+
+        self.assertEqual(result.metadata["review_tier"], "strong")
+        self.assertIn("deterministic_sample", result.metadata["strong_review_reasons"])
+        self.assertEqual(strong.call_count, 1)
+
+    def test_deferred_batch_triages_all_candidates_without_strong_calls(self) -> None:
+        translator = ScriptedProvider(
+            "fixture-translator",
+            lambda **_: {"status": "success", "text": "TARGET", "reason": ""},
+        )
+        triager = ScriptedProvider(
+            "fixture-triager", lambda **_: {"verdict": "ok", "issues": []}
+        )
+        strong = ScriptedProvider(
+            "fixture-strong", lambda **_: {"verdict": "ok", "issues": []}
+        )
+        registry = ProviderRegistry(
+            {item.name: item for item in (translator, triager, strong)}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            results = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(
+                    [translator.name],
+                    [strong.name],
+                    review_triager_chain=[triager.name],
+                    strong_review_sample_percent=0,
+                    strong_review_high_risk_categories=[],
+                    defer_fallbacks_until_primary_complete=True,
+                    use_style_memory=False,
+                    max_workers=2,
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                context_pack=ContextPack(story_summary="STORY"),
+                work_dir=Path(directory),
+            ).translate_many(
+                [Segment("batch-1", "SOURCE_1"), Segment("batch-2", "SOURCE_2")]
+            )
+
+        self.assertEqual([item.status for item in results], ["reviewed", "reviewed"])
+        self.assertEqual([item.metadata["review_tier"] for item in results], ["triage", "triage"])
+        self.assertEqual(triager.call_count, 2)
+        self.assertEqual(strong.call_count, 0)
+
     def test_successful_review_retry_completes_initial_and_corrected_candidates(self) -> None:
         for confirmation in (False, True):
             with self.subTest(confirmation=confirmation):

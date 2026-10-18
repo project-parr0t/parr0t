@@ -1,8 +1,43 @@
 # Control-plane isolation contract
 
+## Deterministic review router (normative)
+
+Review orchestration is a finite-state router, not a semantic reviewer or an
+autonomous recovery agent. The control plane may use only validated status,
+native manifests, control envelopes, aggregate usage counters, and explicit
+user approval. It must not inspect source or translated text, infer meaning,
+choose a model, invent a review plan, or reinterpret a worker result.
+
+The only review-control actions are: read validated status; prepare the
+repository-defined manifest; run `game-l10n native-pass-step`; dispatch the
+single exact wave it returns; wait once for that active wave; validate a
+text-free control envelope; aggregate a completed pass; route an exact
+categorical status; record aggregate usage; or checkpoint and stop.
+
+Anything else is denied. In particular, the control plane must not create an
+ad-hoc manifest, receipt, queue, or result format; clone or rebind the SDK;
+move files to repair tools; change batch shape or model; repeat an unchanged
+success; or clear a halted/cost-audit state on its own. User approval is an
+input to the repository contract, not permission to improvise missing budget
+or execution fields. Resuming additionally requires a regenerated, validated
+manifest. If a required state is missing, contradictory, or not
+recognized, the sole transition is `checkpoint_and_stop`.
+
+Every native review manifest embeds `parr0t.review-control-contract.v1` inside
+its immutable detail contract. Changing or removing it invalidates the
+manifest, so lower-priority notes cannot silently restore control-plane
+discretion.
+
+The fixed review order is deterministic validation, complete low-cost triage,
+selective strong review, flagged-only rewrite, then failure-only fallback.
+Strong-review membership comes only from private triage status, a manifest
+high-risk flag, or the stable deterministic sample. The parent receives IDs
+and counts only; it cannot inspect text, waive triage, or promote strong review
+to an unbudgeted universal pass.
+
 The top-level Parr0t agent schedules work and advances queues. It does not inspect or judge game text. This boundary applies from preliminary discovery through final validation; it is not limited to translation and review providers. Arbitrary subprocess output remains in private workspace logs; a parent-facing tool failure is categorical only.
 
-Deterministic native-wave collection is part of the private data plane. `import-native-wave` may parse result text locally, but its stdout is limited to wave/task/record counts and workspace-relative artifact paths. It validates the complete wave before writing shards. The parent must not open those shards; it uses the same task manifest for the final aggregate merge so unrelated files cannot enter the pass.
+Deterministic native-wave collection is part of the private data plane. `native-pass-step` is the normative scheduler: it persists text-free progress and aggregate usage, enforces unchanged-observation and budget stops, imports a complete active wave atomically, and emits exactly one next action. Its dispatch response contains only task/result paths and counts. The parent must not select another wave, call legacy `import-native-wave` as a recovery path, or open imported shards. The same manifest binds the final aggregate merge.
 
 ## Entry gate
 

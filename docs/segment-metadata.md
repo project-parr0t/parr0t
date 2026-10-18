@@ -36,8 +36,43 @@ The translator returns only the value for this segment. It must not repeat `TARG
 
 ## Extraction and review rules
 
+### Optional empty grammatical slots
+
+An adapter may declare `ui_empty_target` for an optional `template_fragment`
+only after static format or call-site evidence establishes its composition and
+the nonempty fixed target affix rendered outside it. This is inventory authority;
+candidate/provider output and an `allow_empty` flag cannot grant it. A digest
+records evidence identity, not proof that the evidence was inspected. The adapter
+must verify that evidence and retain it privately before preparing the inventory.
+
+The object has exactly `schema: parr0t.ui-empty-target/v1`,
+`reason_code: optional_grammatical_slot`, and lowercase SHA-256 fields
+`source_sha256`, `composition_sha256`, `evidence_sha256`. The source digest hashes
+UTF-8 source bytes. The composition digest uses `store.stable_hash` on an object
+with `target_id`, `source_sha256`, `ui_slot_role`, `ui_composed_with_ids`,
+`ui_render_pattern`, `ui_fixed_target_prefix`, and `ui_fixed_target_suffix`.
+Absent affixes are empty strings. Related IDs must be nonempty, unique, and omit
+the slot itself; the render pattern must contain `{value}`.
+
+Only the exact empty string is eligible. Whitespace and ordinary empty targets
+remain invalid. Token, glossary, and other integrity checks still run. Native
+wave import reads this authority from the prepared source and verifies its full
+manifest fingerprint; changed metadata invalidates the join. Legacy unbound
+shard import and unbound shard merge still reject empty success. Related IDs
+must exist in that bound source. Missing, malformed, external, or nonfile source
+paths fail closed; a wave import reports `E_NATIVE_WAVE_RESULT_INVALID`. The
+validated source map is loaded once per wave import, merge, or legacy receipt
+upgrade scan and reused across its tasks. Import is candidate transport only:
+independent current-candidate review remains mandatory before checkpoint
+acceptance. This contract does not relax provider envelopes or mark any candidate
+reviewed, source-preserved, complete, or releasable.
+
 1. Inspect resource bindings or render call sites when the selected SDK can do so without executing the game.
 2. Use stable related IDs so a checkpoint can invalidate the affected composition dependencies after a correction.
 3. Keep labels and values as separate targets when the runtime does; do not merge them merely to make translation easier.
 4. Do not add fixed target affixes until their target-locale form is known and stable. Without explicit affixes, semantic review still checks the render pattern but deterministic duplicate detection cannot claim certainty.
 5. Treat `ui_state_semantics` as meaning evidence, not as target text. The target wording still follows locale, style, glossary, and space constraints.
+
+## Strong-review selection fields
+
+Extraction or context analysis may add `review_category` and `requires_strong_review=true` from structural evidence. Supported default high-risk categories are `allusion`, `critical_logic`, `parody`, `quest_title`, `script_sensitive`, and `wordplay`. Boolean evidence flags such as `reference_cue`, `parody`, `allusion`, `wordplay`, or `logic_facing` also select strong review. Do not infer these fields in the text-free control plane or mark ordinary dialogue high-risk merely because of its wording; uncertainty is handled by complete low-cost triage and deterministic sampling.
