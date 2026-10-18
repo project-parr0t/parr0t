@@ -32,6 +32,8 @@ At or above `execution.bulk_budget_gate_records` (default 4,096 records), the fi
 
 The limits cover the whole pass, not each worker. Reaching one stops new dispatch, preserves completed shards and the unchanged pending queue, and returns the smallest required decision. It never authorizes dropping targets or accepting unreviewed candidates.
 
+`game-l10n native-pass-step` is the only authority that selects or advances a wave. A job note, model plan, or direct manifest reading cannot substitute for its returned action. It imports a complete active wave before returning the next dispatch, preserves pilot checkpoints across an approved budget regeneration, and checkpoints repeated unchanged observations instead of inventing recovery.
+
 ## Conflict examples
 
 Reject a detail contract that introduces per-record semantic calls within a batch, raises call/token/time/cost limits, reopens unchanged successes, adds duplicate verification, changes provider roles or pipeline order, exposes text to the control plane, grants runtime/publication effects, or converts a refusal into exclusion. Keep the valid checkpoint and regenerate only the conflicting detail contract.
