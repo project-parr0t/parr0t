@@ -1186,9 +1186,19 @@ def publish_sdk_profile(
 
 
 def verify_sdk_promotion_commit(
-    sdk_root: Path, branch: str, commit: str = "HEAD"
+    sdk_root: Path,
+    branch: str,
+    commit: str = "HEAD",
+    *,
+    working_tree: bool = False,
+    planned_paths: list[str] | None = None,
+    expected_main: str | None = None,
 ) -> dict[str, Any]:
-    """Prove that one SDK promotion commit does not modify main-owned paths."""
+    """Check SDK path ownership before implementation or on a final commit.
+
+    Preflight is read-only and does not attest tests, privacy, or publication approval.
+    Pass its base hash as expected_main on subsequent checks to detect base drift.
+    """
 
     sdk_root = sdk_root.resolve()
     if not (sdk_root / ".git").exists():
@@ -1211,6 +1221,14 @@ def verify_sdk_promotion_commit(
     ):
         raise ConfigurationError("E_SDK_PROMOTION_COMMIT: commit reference is unsafe")
 
+    if planned_paths and not working_tree:
+        raise ConfigurationError("E_SDK_PROMOTION_PATH: planned paths require working-tree preflight")
+    if expected_main is not None and (
+        len(expected_main) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in expected_main)
+    ):
+        raise ConfigurationError("E_SDK_PROMOTION_BASE: expected main must be a full commit hash")
+
     def git(*args: str) -> str:
         completed = subprocess.run(
             ["git", *args],
@@ -1224,7 +1242,7 @@ def verify_sdk_promotion_commit(
             raise ConfigurationError(
                 f"E_SDK_PROMOTION_GIT: git {' '.join(args)} failed"
             )
-        return completed.stdout.strip()
+        return completed.stdout.rstrip("\r\n")
 
     def is_ancestor(ancestor: str, descendant: str) -> bool:
         completed = subprocess.run(
@@ -1239,50 +1257,70 @@ def verify_sdk_promotion_commit(
             raise ConfigurationError("E_SDK_PROMOTION_GIT: ancestry check failed")
         return completed.returncode == 0
 
-    git("rev-parse", "--verify", "main^{commit}")
+    base = git("rev-parse", "--verify", "main^{commit}")
+    if expected_main is not None and base != expected_main:
+        raise ConfigurationError("E_SDK_PROMOTION_BASE: main changed since preflight; reconcile explicitly")
     git("rev-parse", "--verify", f"{branch}^{{commit}}")
-    resolved = git("rev-parse", "--verify", f"{commit}^{{commit}}")
-    if not is_ancestor(resolved, branch):
-        raise ConfigurationError(
-            "E_SDK_PROMOTION_COMMIT: commit is not reachable from the target SDK branch"
-        )
-    ancestry = git("rev-list", "--parents", "-n", "1", resolved).split()
-    if len(ancestry) != 2:
-        raise ConfigurationError(
-            "E_SDK_PROMOTION_COMMIT: promotion must be one non-merge engine commit"
-        )
-    parent = ancestry[1]
-    if not is_ancestor("main", parent):
-        raise ConfigurationError(
-            "E_SDK_PROMOTION_BASE: merge the intended main revision before promotion"
-        )
-    changed_paths = sorted(
-        set(
-            git(
-                "diff-tree",
-                "--no-commit-id",
-                "--name-only",
-                "--no-renames",
-                "-r",
-                resolved,
-            ).splitlines()
-        )
-    )
-    if not changed_paths:
+    if working_tree:
+        if commit != "HEAD":
+            raise ConfigurationError("E_SDK_PROMOTION_COMMIT: preflight checks HEAD and the working tree")
+        if git("symbolic-ref", "--quiet", "--short", "HEAD") != branch:
+            raise ConfigurationError("E_SDK_PROMOTION_BRANCH: preflight requires the target branch checkout")
+        resolved = git("rev-parse", "--verify", "HEAD^{commit}")
+        if not is_ancestor(base, resolved):
+            raise ConfigurationError("E_SDK_PROMOTION_BASE: merge the intended main revision before preflight")
+        paths = set()
+        # Include committed, staged and unstaged changes separately: a worktree
+        # reversal must not conceal a staged or already committed core edit.
+        for revisions in ((base, "HEAD"), ("--cached", base), (base,)):
+            paths.update(git("diff", "--name-only", "--no-renames", "-z", *revisions, "--").split("\0"))
+        paths.update(git("ls-files", "--others", "--exclude-standard", "-z").split("\0"))
+        for path in planned_paths or []:
+            normalized = path.replace("\\", "/")
+            if (
+                not normalized
+                or normalized.startswith("/")
+                or ":" in normalized
+                or "\0" in normalized
+                or any(part in {"", ".", ".."} for part in normalized.split("/"))
+            ):
+                raise ConfigurationError("E_SDK_PROMOTION_PATH: planned paths must be repository-relative files")
+            paths.add(normalized)
+        changed_paths = sorted(paths - {""})
+    else:
+        resolved = git("rev-parse", "--verify", f"{commit}^{{commit}}")
+        if not is_ancestor(resolved, branch):
+            raise ConfigurationError(
+                "E_SDK_PROMOTION_COMMIT: commit is not reachable from the target SDK branch"
+            )
+        ancestry = git("rev-list", "--parents", "-n", "1", resolved).split()
+        if len(ancestry) != 2:
+            raise ConfigurationError(
+                "E_SDK_PROMOTION_COMMIT: promotion must be one non-merge engine commit"
+            )
+        if not is_ancestor(base, ancestry[1]):
+            raise ConfigurationError(
+                "E_SDK_PROMOTION_BASE: merge the intended main revision before promotion"
+            )
+        changed_paths = sorted(set(git(
+            "diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-z", "-r", resolved,
+        ).split("\0")) - {""})
+    if not changed_paths and not working_tree:
         raise ConfigurationError("E_SDK_PROMOTION_COMMIT: promotion commit is empty")
-    main_paths = set(git("ls-tree", "-r", "--name-only", "main").splitlines())
+    main_paths = set(git("ls-tree", "-r", "--name-only", "-z", base).split("\0")) - {""}
     core_paths = sorted(set(changed_paths) & main_paths)
     if core_paths:
         raise ConfigurationError(
-            "E_SDK_PROMOTION_CORE_PATH: promotion commit modifies main-owned paths: "
+            "E_SDK_PROMOTION_CORE_PATH: promotion changes main-owned paths: "
             + ", ".join(core_paths)
         )
     return {
         "schema": "parr0t.sdk-promotion-scope/v1",
-        "status": "ready",
+        "status": "scope_ready" if working_tree else "ready",
+        "mode": "working-tree" if working_tree else "commit",
         "branch": branch,
         "commit": resolved,
-        "base": git("rev-parse", "--verify", "main^{commit}"),
+        "base": base,
         "changed_paths": changed_paths,
         "main_owned_paths": [],
     }

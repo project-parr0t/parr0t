@@ -62,17 +62,35 @@ A promotion commit owns engine-specific implementation only. It must be a separa
 
 An exact engine build observed in a private workspace may be reduced to its declared public compatibility line for the branch name, but the line must be derived from that observed build before evaluation begins. After it is recorded, the exact `sdk-<engine>-<version>` identity controls ownership; an older, newer, or merely similar branch cannot absorb the result.
 
+## Promotion preparation and fixed base
+
+Treat generalizing private tooling, adding synthetic fixtures, and fixing adapter behavior as SDK implementation. Promotion preparation begins after those capabilities and their acceptance criteria are known. Read this contract and the engine FAQ contract together, and consolidate required fixes before implementation rather than distributing new requirements over repeated review rounds.
+
+Before implementation, resolve the intended local `main` commit and target SDK branch once. Record that full base hash and the planned file list outside the repository. Run the existing scope checker early, before creating files or running broad regression:
+
+```text
+game-l10n verify-sdk-promotion --sdk-root <repository> --branch <sdk-branch> --working-tree --planned-path <new-sdk-file>
+```
+
+Repeat `--planned-path` for each intended file. Preflight requires the target branch checkout and checks committed, staged, unstaged, untracked, and planned paths against `main`. It does not create files, stage, commit, fetch, or change branches. Its `scope_ready` result attests path ownership only; it is not test, privacy, or publication approval. Split a rejected core path into a separately authorized core change immediately.
+
+Use the returned `base` hash as `--expected-main <full-hash>` in subsequent preflight and final commit checks. This pins the local reference; it neither refreshes nor attests the remote. Do not silently adopt a moving upstream during finalization. When an intended base update is necessary, explicitly reconcile its contract/code changes, record the new hash, and invalidate only validation evidence affected by changed inputs.
+
+Check local Git identity, signing configuration/tool availability, and configured destination early without exposing credentials or creating trial commits. Authentication, signing, or network failures have separate causes: preserve the working tree, diagnose the failed prerequisite once, and use the retry limits in `docs/execution-budget.md`. Network publication and other external actions still require their own exact user request.
+
 ## Branch acceptance gate
 
 Before an engine SDK branch is published:
 
 1. Merge or rebase the intended `main` revision.
 2. Confirm the branch name equals the recorded promotion target and that every promoted capability was exercised on that target compatibility line.
-3. Confirm the diff from `main` contains only that engine adapter and its engine-owned support files. For `derive-new`, inspect the diff rather than merging the reference branch. Run `game-l10n verify-sdk-promotion --sdk-root <repository> --branch <sdk-branch> --commit <promotion-commit>`; any `main`-owned path is a hard failure and must be split into a separate core change.
+3. Confirm the diff from `main` contains only that engine adapter and its engine-owned support files. For `derive-new`, inspect the diff rather than merging the reference branch. Run `game-l10n verify-sdk-promotion --sdk-root <repository> --branch <sdk-branch> --commit <promotion-commit> --expected-main <full-hash>`; any `main`-owned path is a hard failure and must be split into a separate core change.
 4. Run the core test suite, the adapter test suite, and the privacy scan.
 5. Confirm no private game data, names, paths, text, hashes, counts, logs, or run history appears in the tree or branch-only commits.
 6. Classify every material problem observed during adapter work under `docs/engine-faq-contract.md`. Put deterministic fixes in code and regression tests, keep title-specific or unresolved material private, and place only SDK-external manual exceptions in the branch's `docs/engine-faq.md`. Run `python scripts/check_engine_faq.py docs/engine-faq.md`; zero entries is valid.
 7. Keep framework-level troubleshooting in `main`'s `docs/faq.md`. Never merge an engine runbook into `main`.
 8. Call the core runtime approval guard immediately before any real installation write or process launch. Do not add an unguarded direct execution path in an SDK branch.
+
+Complete the acceptance gate on the fixed code and base before creating the final archive, patch export, or report. Produce those delivery artifacts once from that validated tree. If an input changes, rerun the affected checks and rebuild only affected artifacts. A successful scope check does not replace the other acceptance checks. Keep a reviewable local result until the user requests the exact commit, push, or other external action; request no publication approval while implementation remains unfinished.
 
 The framework may be installed without an engine adapter, but it cannot unpack or patch an engine by itself. Once an engine SDK branch supplies its adapter, the same central context, translation, fallback, review, and source-preservation flow becomes executable without duplicating orchestration logic.

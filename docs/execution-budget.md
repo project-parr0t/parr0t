@@ -21,6 +21,14 @@ Use the lowest sufficient level:
 
 Stop when the required level passes. Broaden or repeat validation only after input changes, a failed check, or an unresolved concrete risk.
 
+## SDK promotion budget
+
+Follow the preparation and fixed-base sequence in `docs/sdk-branch-contract.md`: consolidate acceptance criteria, check planned path ownership, freeze the intended `main` hash, implement, run focused checks, then run final acceptance on fixed inputs. Generalization and missing synthetic fixtures are implementation work, not deployment overhead. Keep small coupled changes in the current agent.
+
+Run the broad core/adapter suites and privacy/FAQ gates once after the final code and base are settled. Reuse passing evidence for unchanged inputs; changes to relevant code, contracts, fixtures, or dependencies require the affected checks again. Do not weaken a gate to meet the time budget. Create the final delivery archive, export, and report after acceptance, once. Never package midway through a review loop merely to report progress.
+
+Measure implementation, final validation/packaging, user wait, and external publication separately. Use actual command elapsed times for network or signing claims. Parallel review overlaps implementation and must not be added again to wall-clock totals. A readiness check must not expand into a new scheduler, duplicate verifier, credential probe, or speculative deployment system.
+
 ## Exact correction budget
 
 When the user supplies the final replacement wording for a typo or small translation fix, use `docs/minimal-corrections.md`. Resolve its stable IDs, run `game-l10n apply-user-correction`, repack the owning payload once, and verify the package once. The expected model-call and context-analysis budget is zero. Do not delegate the correction, reopen full source discovery, re-read every translation, rehash the game tree, or create a job-specific apply/validation script. If reverse dependencies exist, review only those IDs; if mapping is ambiguous, perform one narrow static lookup before changing anything.
