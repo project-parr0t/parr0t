@@ -58,7 +58,7 @@ Do not skip or reorder barriers. One refusal, timeout, malformed result, capacit
 - Translation is faithful transformation, not content generation. Independent review checks meaning, omission, voice, tone, function, conditions, units, terminology, allusions, placeholders, markup, control codes, ordering, and material layout risk.
 - Build new outputs in the workspace. Automated checks use synthetic targets and never install or launch the real game.
 - Apply proportional verification and stop after the changed layer passes. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.
-- Native passes are root-direct without delegation. Only `native-pass-step` advances waves. Use `prepare-native-pass --pass-kind review` for up to 2,048 initial candidates and failed-only binary splitting; translation keeps its own bounds.
+- Native passes are root-to-relay only. Give the `native-pass-step` artifact to a fresh relay, never semantic workers. Only it advances waves. Review starts at 2,048 candidates and uses bounded failed-only splitting.
 
 ## Status-driven routes
 

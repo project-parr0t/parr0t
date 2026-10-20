@@ -8,6 +8,8 @@ Apply instructions in this order: the user's current request and explicit approv
 
 The native v6 task manifest is the only executable detail contract. Its `worker_contract`, `detail_contract`, `execution_contract`, and `contract_fingerprint` are one immutable unit. Reject a changed or conflicting unit before dispatch with `E_DETAIL_CONTRACT_CONFLICT`. Free-form Markdown may be a short operator note, but it is not passed to a worker and has no execution authority.
 
+The root may pass only the core-generated `parr0t.native-wave-relay.v1` path to a fresh isolated relay. It must not copy the bound task paths into direct semantic-worker prompts. The relay is restricted to exact dispatch and categorical collection; it cannot add instructions, inspect semantic payloads, retry, split, select a provider, or create a replacement format. A semantic worker's free-form response contaminates only that disposable relay unless the relay forwards it; forwarding is a control-plane incident.
+
 Each v6 task row binds the complete segment payload under `parr0t.native-task-payload.v1`. A data-plane worker reads that task once and must not open the full ordered `source_artifact`. The full source exists only for framework-side fingerprint, alignment, and merge validation.
 
 ## Permitted detail
