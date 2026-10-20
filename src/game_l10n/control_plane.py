@@ -16,9 +16,7 @@ REVIEW_CONTROL_MODE = "deterministic_review_router"
 REVIEW_CONTROL_ALLOWED_ACTIONS = (
     "read_status",
     "prepare_validated_manifest",
-    "dispatch_authorized_task",
-    "dispatch_authorized_wave",
-    "dispatch_review_split_wave",
+    "dispatch_isolated_wave_relay",
     "wait_for_active_wave",
     "validate_control_envelope",
     "import_completed_wave",
@@ -58,6 +56,9 @@ def review_control_contract() -> dict[str, Any]:
         "status_action_match_required": True,
         "native_step_command_required": True,
         "native_step_command": "game-l10n native-pass-step",
+        "root_direct_semantic_worker_allowed": False,
+        "semantic_worker_parent": "isolated_wave_relay",
+        "relay_authority": "exact_dispatch_only",
         "model_selected_wave_or_recovery_allowed": False,
         "halted_state_allowed_actions": [
             "read_status",
@@ -113,6 +114,8 @@ CONTROL_STATE_SCHEMA = "parr0t.control-plane-state.v1"
 CONTROL_STATE_PATH = ".game-l10n/control-plane-state.json"
 CONTROL_ENTRY_SCHEMA = "parr0t.control-plane-entry.v1"
 CONTROL_ENTRY_PATH = ".game-l10n/control-plane-entry.json"
+CONTROL_HANDOFF_SCHEMA = "parr0t.control-plane-handoff.v1"
+CONTROL_HANDOFF_PATH = ".game-l10n/control-plane-handoff.json"
 
 _CONTROL_STATE_FIELDS = {
     "schema",
@@ -453,6 +456,8 @@ def record_control_plane_leak(work_dir: Path, incident_code: str) -> dict[str, A
         raise ConfigurationError("E_CONTROL_PLANE_LEAK: unsupported incident code")
     state = control_plane_state(work_dir)
     if state["status"] == "rotation_required":
+        if not (work_dir / CONTROL_HANDOFF_PATH).is_file():
+            _write_control_plane_handoff(work_dir, state)
         return state
     contaminated = {
         "schema": CONTROL_STATE_SCHEMA,
@@ -464,15 +469,133 @@ def record_control_plane_leak(work_dir: Path, incident_code: str) -> dict[str, A
     }
     _atomic_json(work_dir / CONTROL_STATE_PATH, contaminated)
     _atomic_json(work_dir / CONTROL_ENTRY_PATH, initial_control_plane_entry_state())
+    _write_control_plane_handoff(work_dir, contaminated)
     return contaminated
 
 
-def acknowledge_control_plane_rotation(work_dir: Path, incident_id: str) -> dict[str, Any]:
+def _control_handoff_digest(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _write_control_plane_handoff(
+    work_dir: Path, state: dict[str, Any]
+) -> dict[str, Any]:
+    payload = {
+        "schema": CONTROL_HANDOFF_SCHEMA,
+        "status": "rotation_required",
+        "from_generation": state["generation"],
+        "to_generation": state["generation"] + 1,
+        "incident_id": state["incident_id"],
+        "issue_code": "control_plane_leak",
+    }
+    receipt = {**payload, "digest": _control_handoff_digest(payload)}
+    _atomic_json(work_dir / CONTROL_HANDOFF_PATH, receipt)
+    return receipt
+
+
+def _validated_control_plane_handoff(
+    work_dir: Path, handoff_path: Path
+) -> dict[str, Any]:
+    expected = (work_dir / CONTROL_HANDOFF_PATH).resolve()
+    if handoff_path.resolve() != expected:
+        raise ConfigurationError(
+            "E_CONTROL_PLANE_HANDOFF_REQUIRED: resume accepts only the canonical "
+            "core-generated metadata receipt"
+        )
+    try:
+        receipt = json.loads(expected.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigurationError(
+            "E_CONTROL_PLANE_HANDOFF_REQUIRED: canonical handoff receipt is unavailable"
+        ) from exc
+    fields = {
+        "schema",
+        "status",
+        "from_generation",
+        "to_generation",
+        "incident_id",
+        "issue_code",
+        "digest",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != fields:
+        raise ConfigurationError(
+            "E_CONTROL_PLANE_HANDOFF_INVALID: handoff receipt shape is invalid"
+        )
+    unsigned = {key: receipt[key] for key in fields if key != "digest"}
+    if (
+        receipt.get("schema") != CONTROL_HANDOFF_SCHEMA
+        or receipt.get("status") != "rotation_required"
+        or receipt.get("issue_code") != "control_plane_leak"
+        or not isinstance(receipt.get("from_generation"), int)
+        or isinstance(receipt.get("from_generation"), bool)
+        or receipt["from_generation"] < 1
+        or receipt.get("to_generation") != receipt["from_generation"] + 1
+        or not isinstance(receipt.get("incident_id"), str)
+        or len(receipt["incident_id"]) != 32
+        or any(
+            character not in "0123456789abcdef"
+            for character in receipt["incident_id"]
+        )
+        or receipt.get("digest") != _control_handoff_digest(unsigned)
+    ):
+        raise ConfigurationError(
+            "E_CONTROL_PLANE_HANDOFF_INVALID: handoff receipt binding is invalid"
+        )
+    return receipt
+
+
+def _reset_native_control_observations(work_dir: Path) -> None:
+    """Reset only generation-local polling state after a validated rotation."""
+
+    control_dir = work_dir / ".game-l10n" / "native" / "control"
+    if not control_dir.is_dir():
+        return
+    for path in control_dir.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("schema") not in {
+            "parr0t.native-control-state.v1",
+            "parr0t.native-control-state.v2",
+        }:
+            continue
+        required = {
+            "control_steps_in_wave",
+            "last_progress_marker",
+            "unchanged_observations",
+            "last_action",
+        }
+        if not required.issubset(payload):
+            continue
+        payload["control_steps_in_wave"] = 0
+        payload["last_progress_marker"] = ""
+        payload["unchanged_observations"] = 0
+        payload["last_action"] = ""
+        _atomic_json(path, payload)
+
+
+def acknowledge_control_plane_rotation(
+    work_dir: Path, handoff_path: Path
+) -> dict[str, Any]:
     state = control_plane_state(work_dir)
     if state["status"] != "rotation_required":
         raise ConfigurationError("E_CONTROL_PLANE_STATE: no rotation is pending")
-    if not incident_id or state["incident_id"] != incident_id:
-        raise ConfigurationError("E_CONTROL_PLANE_STATE: incident ID does not match")
+    if not (work_dir / CONTROL_HANDOFF_PATH).is_file():
+        _write_control_plane_handoff(work_dir, state)
+    receipt = _validated_control_plane_handoff(work_dir, handoff_path)
+    if (
+        receipt["incident_id"] != state["incident_id"]
+        or receipt["from_generation"] != state["generation"]
+        or receipt["to_generation"] != state["generation"] + 1
+    ):
+        raise ConfigurationError(
+            "E_CONTROL_PLANE_HANDOFF_INVALID: receipt does not match pending rotation"
+        )
+    incident_id = receipt["incident_id"]
     resumed = {
         "schema": CONTROL_STATE_SCHEMA,
         "status": "ready",
@@ -484,6 +607,7 @@ def acknowledge_control_plane_rotation(work_dir: Path, incident_id: str) -> dict
     }
     _atomic_json(work_dir / CONTROL_STATE_PATH, resumed)
     _atomic_json(work_dir / CONTROL_ENTRY_PATH, initial_control_plane_entry_state())
+    _reset_native_control_observations(work_dir)
     return resumed
 
 
