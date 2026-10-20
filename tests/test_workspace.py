@@ -396,7 +396,7 @@ class WorkspaceTests(unittest.TestCase):
             "docs/instance-release.md",
             "startup-current-directory-relative paths",
             "one cached residual task",
-            "root-direct for the entire pass",
+            "disposable isolated relay per authorized wave",
             "status.contract_set.digest",
             "must not auto-restart the root turn",
             "report progress only at a wave boundary or blocker",
