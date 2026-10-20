@@ -18,6 +18,7 @@ from game_l10n.native_pass import (
     merge_native_pass,
     native_control_step,
     prepare_native_tasks,
+    seal_native_wave_relay,
 )
 from tests.test_validators import optional_slot_fixture
 
@@ -47,14 +48,14 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(split["strategy"], "failed_subset_binary")
         self.assertTrue(split["successful_rows_locked"])
         self.assertEqual(split["max_depth"], 11)
-        self.assertEqual(split["max_attempts_per_target"], 12)
-        self.assertEqual(split["owner"], "native_pass_step")
+        self.assertEqual(split["max_semantic_calls"], 16)
         self.assertEqual(
-            manifest["worker_contract"]["max_semantic_model_calls_per_task"], 1
+            manifest["worker_contract"]["max_semantic_model_calls_per_task"], 16
         )
+        self.assertEqual(manifest["worker_contract"]["max_model_calls_per_task"], 24)
         self.assertFalse(manifest["worker_contract"]["per_record_semantic_call_loop_allowed"])
 
-    def test_review_failures_create_core_owned_split_chain_and_merge(self) -> None:
+    def test_review_worker_proves_bounded_failed_subset_split_and_merges_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source.jsonl"
@@ -72,7 +73,7 @@ class NativePassTests(unittest.TestCase):
                 max_workers=1,
             )
             first = native_control_step(root, tasks / "manifest.json", results)
-            self.assertEqual(first["action"], "dispatch_authorized_wave")
+            self.assertEqual(first["action"], "dispatch_isolated_wave_relay")
             task_rows = [
                 json.loads(line)
                 for line in (tasks / "task-0001.jsonl").read_text().splitlines()
@@ -84,50 +85,30 @@ class NativePassTests(unittest.TestCase):
                         "target_id": row["target_id"],
                         "status": "success" if index < 2 else "refused",
                         "text": "T" if index < 2 else "",
+                        **(
+                            {"split_depth": 1, "semantic_attempts": 2}
+                            if index >= 2
+                            else {}
+                        ),
                     }
                     for index, row in enumerate(task_rows)
                 ],
             )
-            split = native_control_step(root, tasks / "manifest.json", results)
-            self.assertEqual(
-                split["action"], "dispatch_review_split_wave", msg=split
-            )
-            self.assertEqual(split["review_split"]["splittable_records"], 2)
-            self.assertEqual(split["review_split"]["next_max_records"], 1)
-            self.assertEqual(len(split["review_split"]["chain"]), 2)
-
-            child_manifest = root / split["manifest"]
-            child_results = root / split["review_split"]["results_dir"]
-            while split["action"] in {
-                "dispatch_review_split_wave",
-                "dispatch_authorized_wave",
-            }:
-                for binding in split["tasks"]:
-                    child_task = root / binding["task"]
-                    rows = [json.loads(line) for line in child_task.read_text().splitlines()]
-                    self._write_rows(
-                        root / binding["result"],
-                        [
-                            {
-                                "target_id": row["target_id"],
-                                "status": "success",
-                                "text": "T2",
-                            }
-                            for row in rows
-                        ],
-                    )
-                split = native_control_step(root, child_manifest, child_results)
+            completed = native_control_step(root, tasks / "manifest.json", results)
 
             merged = merge_native_pass(
                 root,
                 segments,
                 root / "merged.jsonl",
-                manifest_path=child_manifest,
+                manifest_path=tasks / "manifest.json",
             )
 
-        self.assertEqual(split["action"], "aggregate_completed_pass")
-        self.assertEqual(merged["success"], 4)
-        self.assertEqual(merged["review_split_manifests"], 2)
+        self.assertEqual(completed["action"], "aggregate_completed_pass")
+        self.assertEqual(completed["imported_wave"]["success"], 2)
+        self.assertEqual(completed["imported_wave"]["failed"], 2)
+        self.assertEqual(merged["success"], 2)
+        self.assertEqual(merged["failed"], 2)
+        self.assertEqual(merged["imported_shards"], 1)
 
     def test_native_step_hashes_only_the_selected_wave_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -152,7 +133,7 @@ class NativePassTests(unittest.TestCase):
             ) as digest:
                 step = native_control_step(root, tasks / "manifest.json", root / "results")
 
-        self.assertEqual(step["action"], "dispatch_authorized_wave")
+        self.assertEqual(step["action"], "dispatch_isolated_wave_relay")
         self.assertEqual(digest.call_count, 1)
 
 
@@ -634,10 +615,23 @@ class NativePassTests(unittest.TestCase):
         self.assertFalse(
             manifest["execution_contract"]["worker_delegation_allowed"]
         )
-        self.assertEqual(manifest["execution_contract"]["max_agent_depth"], 1)
+        self.assertEqual(manifest["execution_contract"]["max_agent_depth"], 2)
+        self.assertFalse(
+            manifest["execution_contract"]["root_direct_semantic_worker_allowed"]
+        )
+        self.assertEqual(
+            manifest["execution_contract"]["root_dispatch_role"],
+            "isolated_wave_relay",
+        )
+        self.assertTrue(
+            manifest["execution_contract"]["relay_delegation_allowed"]
+        )
+        self.assertFalse(
+            manifest["execution_contract"]["relay_model_controller_allowed"]
+        )
         self.assertEqual(
             manifest["execution_contract"]["orchestration_owner"],
-            "root_control_plane",
+            "deterministic_core_via_isolated_wave_relay",
         )
         self.assertEqual(
             manifest["execution_contract"]["max_root_model_calls_per_wave"],
@@ -839,9 +833,18 @@ class NativePassTests(unittest.TestCase):
             )
 
             first = native_control_step(root, tasks / "manifest.json", results)
-            self.assertEqual(first["action"], "dispatch_authorized_wave")
+            self.assertEqual(first["action"], "dispatch_isolated_wave_relay")
             self.assertEqual(first["wave"], 1)
-            self.assertEqual(len(first["tasks"]), 1)
+            self.assertNotIn("tasks", first)
+            self.assertEqual(first["relay"]["role"], "isolated_wave_relay")
+            self.assertEqual(first["relay"]["tasks"], 1)
+            relay_path = root / first["relay"]["dispatch"]
+            relay = json.loads(relay_path.read_text(encoding="utf-8"))
+            self.assertEqual(relay["schema"], "parr0t.native-wave-relay.v1")
+            self.assertEqual(len(relay["task_bindings"]), 1)
+            self.assertFalse(
+                relay["relay_contract"]["raw_child_response_forwarding_allowed"]
+            )
 
             for number in (1, 2):
                 task_path = tasks / f"task-{number:04d}.jsonl"
@@ -868,7 +871,7 @@ class NativePassTests(unittest.TestCase):
                     input_tokens=100,
                 )
                 if number == 1:
-                    self.assertEqual(step["action"], "dispatch_authorized_wave")
+                    self.assertEqual(step["action"], "dispatch_isolated_wave_relay")
                     self.assertEqual(step["wave"], 2)
                     self.assertEqual(step["imported_wave"]["wave"], 1)
                 else:
@@ -881,6 +884,94 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(step["usage"]["input_tokens"], 200)
         self.assertNotIn("SOURCE", json.dumps(step))
         self.assertNotIn("TARGET", json.dumps(step))
+
+    def test_native_wave_relay_receipt_is_categorical_and_digest_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            prepare_native_tasks(
+                root, source, [Segment("fixture-1", "SOURCE")], tasks
+            )
+            step = native_control_step(root, tasks / "manifest.json", results)
+            dispatch = root / step["relay"]["dispatch"]
+            incomplete = seal_native_wave_relay(root, dispatch)
+            task_row = json.loads(
+                (tasks / "task-0001.jsonl").read_text(encoding="utf-8").splitlines()[0]
+            )
+            self._write_rows(
+                results / "task-0001.jsonl",
+                [
+                    {
+                        "target_id": task_row["target_id"],
+                        "status": "success",
+                        "text": "TARGET",
+                    }
+                ],
+            )
+            complete = seal_native_wave_relay(root, dispatch)
+            receipt = json.loads(
+                (root / complete["receipt"]).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(incomplete["issue_codes"], ["E_NATIVE_WAVE_INCOMPLETE"])
+        self.assertEqual(complete["issue_codes"], [])
+        self.assertEqual(complete["counts"]["ready_tasks"], 1)
+        self.assertEqual(
+            receipt["schema"], "parr0t.native-wave-relay-receipt.v1"
+        )
+        self.assertNotIn("SOURCE", json.dumps(receipt))
+        self.assertNotIn("TARGET", json.dumps(receipt))
+
+    def test_cli_mode_requires_relay_receipt_before_wave_import(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            prepare_native_tasks(
+                root, source, [Segment("fixture-1", "SOURCE")], tasks
+            )
+            first = native_control_step(
+                root,
+                tasks / "manifest.json",
+                results,
+                require_relay_receipt=True,
+            )
+            task_row = json.loads(
+                (tasks / "task-0001.jsonl").read_text(encoding="utf-8").splitlines()[0]
+            )
+            self._write_rows(
+                results / "task-0001.jsonl",
+                [
+                    {
+                        "target_id": task_row["target_id"],
+                        "status": "success",
+                        "text": "TARGET",
+                    }
+                ],
+            )
+            blocked = native_control_step(
+                root,
+                tasks / "manifest.json",
+                results,
+                require_relay_receipt=True,
+            )
+            seal_native_wave_relay(root, root / first["relay"]["dispatch"])
+            resumed = native_control_step(
+                root,
+                tasks / "manifest.json",
+                results,
+                require_relay_receipt=True,
+            )
+
+        self.assertEqual(
+            blocked["issue_codes"], ["E_NATIVE_RELAY_RECEIPT_REQUIRED"]
+        )
+        self.assertEqual(resumed["action"], "aggregate_completed_pass")
 
     def test_native_control_step_stops_repeated_unchanged_observation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -899,7 +990,7 @@ class NativePassTests(unittest.TestCase):
             first = native_control_step(root, tasks / "manifest.json", results)
             second = native_control_step(root, tasks / "manifest.json", results)
 
-        self.assertEqual(first["action"], "dispatch_authorized_wave")
+        self.assertEqual(first["action"], "dispatch_isolated_wave_relay")
         self.assertEqual(second["action"], "checkpoint_and_stop")
         self.assertEqual(second["issue_codes"], ["E_NATIVE_NO_MEASURABLE_PROGRESS"])
 
@@ -993,7 +1084,7 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(
             stopped["issue_codes"], ["E_BULK_EXECUTION_BUDGET_REQUIRED"]
         )
-        self.assertEqual(resumed["action"], "dispatch_authorized_wave")
+        self.assertEqual(resumed["action"], "dispatch_isolated_wave_relay")
         self.assertEqual(resumed["wave"], 2)
         self.assertEqual(resumed["counts"]["imported_waves"], 1)
         self.assertEqual(resumed["usage"]["input_tokens"], 100)
