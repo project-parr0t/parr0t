@@ -12,6 +12,7 @@ from typing import Any
 
 from .control_plane import (
     LEAK_INCIDENT_CODES,
+    CONTROL_HANDOFF_PATH,
     ROLE_STAGES,
     WORKER_ROLES,
     acknowledge_control_plane_rotation,
@@ -66,6 +67,7 @@ from .native_pass import (
     merge_native_pass,
     native_control_step,
     prepare_native_tasks,
+    seal_native_wave_relay,
 )
 from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from .privacy import is_within, require_external_workdir
@@ -917,6 +919,18 @@ def cmd_native_pass_step(args: argparse.Namespace) -> int:
         usage_event_id=args.usage_event_id,
         input_tokens=args.input_tokens,
         provider_cost_usd=args.provider_cost_usd,
+        require_relay_receipt=True,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_seal_native_wave_relay(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    require_sdk_activation(work_dir, load_config(work_dir))
+    result = seal_native_wave_relay(
+        work_dir,
+        _path_in_workspace(work_dir, args.dispatch, must_exist=True),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -972,14 +986,29 @@ def cmd_record_control_plane_leak(args: argparse.Namespace) -> int:
 
 def cmd_resume_control_plane(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
-    if not args.fresh_session_confirmed:
+    if (
+        not args.fresh_session_confirmed
+        or not args.contracts_read
+        or not args.source_unopened
+    ):
         raise ConfigurationError(
-            "E_CONTROL_PLANE_FRESH_SESSION_REQUIRED: only a newly started metadata-only "
-            "control plane may acknowledge rotation"
+            "E_CONTROL_PLANE_FRESH_SESSION_REQUIRED: resume requires a newly started "
+            "metadata-only control plane that has read the contracts and not opened source"
         )
-    state = control_plane_state(work_dir)
-    result = acknowledge_control_plane_rotation(work_dir, state["incident_id"])
-    print(json.dumps(public_control_plane_state(result), ensure_ascii=False))
+    handoff = Path(args.handoff_receipt)
+    if not handoff.is_absolute():
+        handoff = work_dir / handoff
+    result = acknowledge_control_plane_rotation(work_dir, handoff)
+    entry = establish_control_plane_entry(work_dir)
+    print(
+        json.dumps(
+            {
+                "control_plane": public_control_plane_state(result),
+                "entry_gate": public_control_plane_entry_state(entry),
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 
@@ -1901,6 +1930,14 @@ def build_parser() -> argparse.ArgumentParser:
     native_step.add_argument("--provider-cost-usd", type=float, default=0.0)
     native_step.set_defaults(func=cmd_native_pass_step)
 
+    native_relay = sub.add_parser(
+        "seal-native-wave-relay",
+        help="Seal categorical completion for one exact isolated native wave relay",
+    )
+    native_relay.add_argument("--workspace", required=True)
+    native_relay.add_argument("--dispatch", required=True)
+    native_relay.set_defaults(func=cmd_seal_native_wave_relay)
+
     native_import = sub.add_parser(
         "import-native-shard",
         help="Import one exclusive native-agent result shard into the private workspace",
@@ -2018,6 +2055,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Assert this is a newly started metadata-only control plane",
     )
+    control_resume.add_argument(
+        "--handoff-receipt",
+        default=CONTROL_HANDOFF_PATH,
+        help="Canonical core-generated metadata receipt; arbitrary handoff files are rejected",
+    )
+    control_resume.add_argument("--contracts-read", action="store_true")
+    control_resume.add_argument("--source-unopened", action="store_true")
     control_resume.set_defaults(func=cmd_resume_control_plane)
 
     sdk_inventory = sub.add_parser(
