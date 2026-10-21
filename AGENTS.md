@@ -41,7 +41,7 @@ Parr0t is engine-neutral. Keep game data, translations, prompts, caches, logs, c
 | --- | --- |
 | Start/resume or SDK choice | `docs/agent-usage.md`, `docs/sdk-selection.md`, `docs/sdk-branch-contract.md` |
 | Construct a user-facing task prompt | `docs/prompt-examples.md` |
-| Inventory, context, translation, or review | `docs/coverage-gates.md`, `docs/review-pipeline.md`, `docs/fallback-routing.md`, `docs/provider-protocol.md` |
+| Inventory, context, translation, or review | `docs/coverage-gates.md`, `docs/engine-static-scope.md`, `docs/review-pipeline.md`, `docs/fallback-routing.md`, `docs/provider-protocol.md` |
 | Control-plane worker or native pass | `docs/control-plane-contract.md`, `docs/execution-budget.md`, `docs/detail-contract.md` |
 | Codex App + DeepSeek preset | `docs/codex-app-deepseek.md` |
 | Manual or external fallback exchange | `docs/translation-exchange.md` |

@@ -28,6 +28,7 @@ def write_inventory(
     *,
     declared_complete: bool = True,
     exclusions: list[dict] | None = None,
+    static_scope: dict | None = None,
 ) -> None:
     path.write_text(
         json.dumps(
@@ -38,6 +39,7 @@ def write_inventory(
                 "coverage": {
                     "declared_complete": declared_complete,
                     "exclusions": exclusions or [],
+                    **({"static_scope": static_scope} if static_scope is not None else {}),
                 },
                 "segments": segments,
             }
@@ -47,6 +49,72 @@ def write_inventory(
 
 
 class CoverageTests(unittest.TestCase):
+    @staticmethod
+    def _static_scope(*, unused: int = 1) -> dict:
+        return {
+            "schema": "parr0t.static-scope.v1",
+            "claim": "static_reachability_only",
+            "engine_capability": "synthetic-fixed-path-graph-v1",
+            "candidate_count": 2,
+            "included_count": 2 - unused,
+            "proven_unused_count": unused,
+            "conservative_retained_count": 0,
+            "unresolved_dynamic_reference_count": 0,
+            "methods": [
+                {"name": "synthetic-bfs", "implementation_fingerprint": "bfs-v1"},
+                {"name": "synthetic-fixed-point", "implementation_fingerprint": "fixed-point-v1"},
+            ],
+            "methods_agree": True,
+            "evidence_fingerprint": "fixture-scope-evidence",
+        }
+
+    def test_independent_static_scope_can_account_for_proven_unused_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            rows = [{"id": "synthetic-active", "source": "SOURCE_ACTIVE"}]
+            scope = self._static_scope()
+            exclusions = [{
+                "reason_code": "SYNTHETIC_STATIC_UNREACHABLE",
+                "affects_user_visible_text": False,
+                "scope": "static_reachability",
+                "target_count": 1,
+                "evidence_fingerprint": "fixture-exclusion-evidence",
+            }]
+            write_inventory(primary, "synthetic-bfs", rows, exclusions=exclusions, static_scope=scope)
+            write_inventory(independent, "synthetic-fixed-point", rows, exclusions=exclusions, static_scope=scope)
+
+            state = verify_inventory_pair(primary, independent)
+
+        self.assertTrue(state["static_complete"])
+        self.assertEqual(state["static_scope"]["proven_unused_count"], 1)
+        self.assertFalse(state["static_scope_tracking_mismatch"])
+
+    def test_static_scope_disagreement_cannot_silently_filter_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            rows = [{"id": "synthetic-active", "source": "SOURCE_ACTIVE"}]
+            exclusions = [{
+                "reason_code": "SYNTHETIC_STATIC_UNREACHABLE",
+                "affects_user_visible_text": False,
+                "scope": "static_reachability",
+                "target_count": 1,
+                "evidence_fingerprint": "fixture-exclusion-evidence",
+            }]
+            first = self._static_scope()
+            second = {**first, "evidence_fingerprint": "different-evidence"}
+            write_inventory(primary, "synthetic-bfs", rows, exclusions=exclusions, static_scope=first)
+            write_inventory(independent, "synthetic-fixed-point", rows, exclusions=exclusions, static_scope=second)
+
+            state = verify_inventory_pair(primary, independent)
+
+        self.assertFalse(state["static_complete"])
+        self.assertTrue(state["static_scope_tracking_mismatch"])
+        self.assertIn("STATIC_SCOPE_TRACKING_MISMATCH", state["issue_codes"])
+
     def test_verified_inventory_uses_unchanged_file_binding_fast_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -40,6 +40,8 @@ The selected engine SDK produces two JSON documents in the private workspace. Th
 
 The two documents must name different methods and carry different implementation fingerprints; copying one manifest and changing its label is not an independent check. An exclusion has `reason_code` and `affects_user_visible_text`. If the latter is true, the inventory cannot pass. Inventory workers classify structure and player visibility only: subject matter, an anticipated safeguard response, or a content-policy guess is never an extraction exclusion. Overcapture is resolved inside the engine SDK; it is not a reason to silently omit an entire source class.
 
+An engine SDK may reduce overcapture through the capability contract in `docs/engine-static-scope.md`. The inventory then records candidate, included, conservatively retained, and proven-unused counts in `coverage.static_scope`. Two differently implemented graph analyses must agree before an SDK removes a target. Dynamic or indirect references retain the affected targets; absence of a direct reference is not proof of non-display. Static reachability is not runtime observation and never satisfies the runtime coverage gate.
+
 When a target is one part of a composed UI string, both inventories must agree on the evidence-backed fields defined by `docs/segment-metadata.md`. A stable source ID without its slot role or composition dependencies is insufficient for safe reuse and review.
 
 Run the gate before context analysis:
