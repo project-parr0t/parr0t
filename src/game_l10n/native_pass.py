@@ -15,7 +15,8 @@ from .control_plane import (
     review_control_contract,
 )
 from .models import Segment
-from .store import stable_hash
+from .native_followup import CANDIDATE_METADATA_KEY
+from .store import stable_hash, stable_hash_sequence
 from .validators import validate_integrity
 
 
@@ -26,25 +27,64 @@ SUPPORTED_TASK_MANIFEST_VERSIONS = {4, 5, TASK_MANIFEST_VERSION}
 TASK_PAYLOAD_SCHEMA = "parr0t.native-task-payload.v1"
 DEFAULT_MAX_RECORDS = 64
 DEFAULT_MIN_RECORDS = 8
-DEFAULT_MAX_MATERIAL_TOKENS = 24_000
+DEFAULT_MAX_MATERIAL_TOKENS = 8_000
+DEFAULT_REVIEW_MAX_RECORDS = 2_048
+DEFAULT_REVIEW_MIN_RECORDS = 64
+DEFAULT_REVIEW_MAX_MATERIAL_TOKENS = 262_144
+DEFAULT_REVIEW_SPLIT_MAX_DEPTH = 11
+DEFAULT_REVIEW_SPLIT_MAX_CALLS = 16
 DEFAULT_MAX_WORKERS = 8
 DEFAULT_BULK_BUDGET_GATE_RECORDS = 4_096
-NATIVE_CONTROL_STATE_SCHEMA = "parr0t.native-control-state.v1"
+PASS_KINDS = {"translation", "review", "rewrite"}
+NATIVE_CONTROL_STATE_SCHEMA = "parr0t.native-control-state.v2"
+LEGACY_NATIVE_CONTROL_STATE_SCHEMA = "parr0t.native-control-state.v1"
 NATIVE_CONTROL_STEP_SCHEMA = "parr0t.native-control-step.v1"
 NATIVE_WAVE_RECEIPT_SCHEMA = "parr0t.native-wave-receipt.v1"
+NATIVE_WAVE_RELAY_SCHEMA = "parr0t.native-wave-relay.v1"
+NATIVE_WAVE_RELAY_RECEIPT_SCHEMA = "parr0t.native-wave-relay-receipt.v1"
 USAGE_EVENT = re.compile(r"^[a-zA-Z0-9._-]{1,128}$")
+RESULT_VALIDATION_REVISION = 2
 
 
-def _worker_contract() -> dict[str, Any]:
+def _failure_split_contract(pass_kind: str) -> dict[str, Any]:
+    enabled = pass_kind == "review"
     return {
+        "enabled": enabled,
+        "strategy": "failed_subset_binary" if enabled else "none",
+        "triggers": (
+            [
+                "batch_refused",
+                "batch_error",
+                "malformed_or_incomplete_result",
+                "target_refused_or_error",
+            ]
+            if enabled
+            else []
+        ),
+        "successful_rows_locked": enabled,
+        "retry_successful_rows": False,
+        "max_depth": DEFAULT_REVIEW_SPLIT_MAX_DEPTH if enabled else 0,
+        "max_semantic_calls": DEFAULT_REVIEW_SPLIT_MAX_CALLS if enabled else 1,
+        "terminal_action": (
+            "emit_failed_rows_for_configured_review_fallback"
+            if enabled
+            else "emit_failed_rows"
+        ),
+    }
+
+
+def _worker_contract(pass_kind: str = "translation") -> dict[str, Any]:
+    split_contract = _failure_split_contract(pass_kind)
+    return {
+        "pass_kind": pass_kind,
         "history_mode": "none",
         "fresh_worker_per_task": True,
         "max_followup_tasks": 0,
         "max_agent_depth": 1,
         "delegation_allowed": False,
         "model_controller_role_allowed": False,
-        "max_model_calls_per_task": 16,
-        "max_semantic_model_calls_per_task": 1,
+        "max_model_calls_per_task": 24 if split_contract["enabled"] else 16,
+        "max_semantic_model_calls_per_task": split_contract["max_semantic_calls"],
         "per_record_semantic_call_loop_allowed": False,
         "max_prompt_artifacts_per_task": 1,
         "task_payload_schema": TASK_PAYLOAD_SCHEMA,
@@ -57,10 +97,17 @@ def _worker_contract() -> dict[str, Any]:
         "control_envelope_schema": CONTROL_ENVELOPE_SCHEMA,
         "worker_final_response": "workspace_relative_envelope_path_only",
         "free_form_parent_response_allowed": False,
+        "direct_parent_role": "isolated_wave_relay",
+        "root_direct_parent_allowed": False,
+        "failure_split": split_contract,
+        "failure_result_proof_fields": (
+            ["split_depth", "semantic_attempts"] if split_contract["enabled"] else []
+        ),
     }
 
 
-def _detail_contract() -> dict[str, Any]:
+def _detail_contract(pass_kind: str = "translation") -> dict[str, Any]:
+    split_contract = _failure_split_contract(pass_kind)
     return {
         "review_control": review_control_contract(),
         "schema": "parr0t.detail-contract.v1",
@@ -86,13 +133,39 @@ def _detail_contract() -> dict[str, Any]:
             "checkpoint_reuse",
         ],
         "conflict_action": "reject_before_dispatch",
-        "one_semantic_batch_per_task": True,
+        "pass_kind": pass_kind,
+        "one_initial_semantic_batch_per_task": True,
+        "additional_semantic_calls": (
+            "failed_subset_binary_split_only" if split_contract["enabled"] else "none"
+        ),
         "per_record_semantic_call_loop_allowed": False,
         "shared_context_loads_per_task": 1,
         "task_input": "bound_segment_payload_only",
+        "candidate_binding": {
+            "required": pass_kind in {"review", "rewrite"},
+            "metadata_key": (
+                CANDIDATE_METADATA_KEY
+                if pass_kind in {"review", "rewrite"}
+                else ""
+            ),
+            "text_field": "text",
+            "generation_field": "generation",
+            "digest_field": "digest",
+            "source_role": "semantic_reference",
+            "candidate_role": (
+                "review_subject"
+                if pass_kind == "review"
+                else "rewrite_subject" if pass_kind == "rewrite" else "none"
+            ),
+        },
         "full_source_artifact_access": "validation_only",
         "result_cardinality": "one_status_per_bound_target",
-        "partial_failure_isolation": "per_target_status_in_same_batched_result",
+        "partial_failure_isolation": (
+            "lock_successes_then_binary_split_failed_subset"
+            if split_contract["enabled"]
+            else "per_target_status_in_same_batched_result"
+        ),
+        "failure_split": split_contract,
         "unchanged_success_reprocessing_allowed": False,
         "budget_exhaustion_action": "checkpoint_and_return_control",
     }
@@ -103,6 +176,7 @@ def _execution_contract(
     max_workers: int,
     record_count: int,
     *,
+    pass_kind: str,
     bulk_budget_gate_records: int,
     max_elapsed_minutes: int | None,
     max_input_tokens: int | None,
@@ -127,11 +201,22 @@ def _execution_contract(
     )
     budget_approved = bool(user_approved_budget and budget_complete)
     return {
+        "pass_kind": pass_kind,
         "strategy": "direct_single_task" if task_count == 1 else "bounded_slot_queue",
-        "orchestration_owner": "root_control_plane",
+        "orchestration_owner": "deterministic_core_via_isolated_wave_relay",
         "model_controller_allowed": False,
-        "max_agent_depth": 1,
+        "max_agent_depth": 2,
         "worker_delegation_allowed": False,
+        "root_direct_semantic_worker_allowed": False,
+        "root_dispatch_role": "isolated_wave_relay",
+        "semantic_worker_parent": "isolated_wave_relay",
+        "relay_history_mode": "none",
+        "relay_delegation_allowed": True,
+        "relay_model_controller_allowed": False,
+        "relay_planning_allowed": False,
+        "relay_retry_allowed": False,
+        "relay_route_change_allowed": False,
+        "relay_final_response": "workspace_relative_relay_receipt_path_only",
         "max_parallel_workers": max_workers,
         "max_tasks_per_wave": max_workers,
         "estimated_waves": (task_count + max_workers - 1) // max_workers,
@@ -139,7 +224,9 @@ def _execution_contract(
         "max_root_model_calls_per_turn": 64,
         "max_root_input_tokens_per_turn": 5_000_000,
         "max_root_progress_messages_per_wave": 1,
-        "max_worker_model_calls_per_task": 16,
+        "max_worker_model_calls_per_task": (
+            24 if pass_kind == "review" else 16
+        ),
         "budget_exhaustion_action": "checkpoint_and_return_control",
         "contract_reload_policy": "digest_change_or_new_control_generation_only",
         "job_local_controller_allowed": False,
@@ -276,6 +363,9 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
         )
     if not isinstance(payload.get("source_fingerprint"), str) or not payload["source_fingerprint"]:
         raise ValueError("Native task manifest source fingerprint is missing")
+    pass_kind = payload.get("pass_kind", "translation")
+    if pass_kind not in PASS_KINDS:
+        raise ValueError("Native task manifest pass_kind is invalid")
     if version == TASK_MANIFEST_VERSION:
         if payload.get("task_payload_schema") != TASK_PAYLOAD_SCHEMA:
             raise ValueError("E_DETAIL_CONTRACT_CONFLICT: task payload schema is missing")
@@ -290,7 +380,7 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
                 "execution_contract": execution_contract,
             }
         )
-        if worker_contract != _worker_contract() or detail_contract != _detail_contract():
+        if worker_contract != _worker_contract(pass_kind) or detail_contract != _detail_contract(pass_kind):
             raise ValueError("E_DETAIL_CONTRACT_CONFLICT: native task contract was changed")
         if not isinstance(execution_contract, dict) or (
             execution_contract.get("detail_contract_schema")
@@ -334,17 +424,27 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
             )
         ):
             raise ValueError("Native task manifest contains an invalid task binding")
-        task_path = manifest_path.parent / name
-        if not task_path.is_file() or _file_sha256(task_path) != digest:
-            raise ValueError("Native task manifest references a missing or changed task")
-        target_ids = _task_target_ids(
-            task_path,
-            require_payload=version == TASK_MANIFEST_VERSION,
-        )
-        if len(target_ids) != records:
-            raise ValueError("Native task record count does not match its manifest binding")
         seen_files.add(name)
     return payload
+
+
+def _validate_manifest_task_file(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    task: dict[str, Any],
+) -> list[str]:
+    """Validate only a task that is about to be dispatched or imported."""
+
+    task_path = manifest_path.parent / task["file"]
+    if not task_path.is_file() or _file_sha256(task_path) != task["sha256"]:
+        raise ValueError("Native task manifest references a missing or changed task")
+    target_ids = _task_target_ids(
+        task_path,
+        require_payload=manifest.get("version") == TASK_MANIFEST_VERSION,
+    )
+    if len(target_ids) != task["records"]:
+        raise ValueError("Native task record count does not match its manifest binding")
+    return target_ids
 
 
 def _manifest_shard_path(
@@ -455,15 +555,47 @@ def _estimated_material_tokens(segment: Segment) -> int:
     return max(1, (len(payload) + 2) // 3)
 
 
+def _require_candidate_bindings(segments: list[Segment], pass_kind: str) -> None:
+    if pass_kind not in {"review", "rewrite"}:
+        return
+    for segment in segments:
+        candidate = segment.metadata.get(CANDIDATE_METADATA_KEY)
+        if not isinstance(candidate, dict):
+            raise ValueError(
+                f"{pass_kind} target {segment.id!r} is missing its candidate binding"
+            )
+        text = candidate.get("text")
+        generation = candidate.get("generation")
+        digest = candidate.get("digest")
+        valid_empty = (
+            isinstance(text, str)
+            and text == ""
+            and segment.metadata.get("ui_empty_target") is not None
+            and not validate_integrity(segment, text, [])
+        )
+        if (
+            not isinstance(text, str)
+            or (not text.strip() and not valid_empty)
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 1
+            or digest != stable_hash(text)
+        ):
+            raise ValueError(
+                f"{pass_kind} target {segment.id!r} has an invalid candidate binding"
+            )
+
+
 def prepare_native_tasks(
     work_dir: Path,
     source_path: Path,
     segments: list[Segment],
     output_dir: Path,
     *,
-    max_records: int = DEFAULT_MAX_RECORDS,
+    pass_kind: str = "translation",
+    max_records: int | None = None,
     min_records: int | None = None,
-    max_material_tokens: int = DEFAULT_MAX_MATERIAL_TOKENS,
+    max_material_tokens: int | None = None,
     max_workers: int = DEFAULT_MAX_WORKERS,
     bulk_budget_gate_records: int = DEFAULT_BULK_BUDGET_GATE_RECORDS,
     max_elapsed_minutes: int | None = None,
@@ -473,10 +605,27 @@ def prepare_native_tasks(
     user_approved_budget: bool = False,
 ) -> dict[str, Any]:
     require_control_plane_ready(work_dir)
-    if not 1 <= max_records <= 2000:
-        raise ValueError("max_records must be between 1 and 2000")
+    if pass_kind not in PASS_KINDS:
+        raise ValueError(f"pass_kind must be one of: {', '.join(sorted(PASS_KINDS))}")
+    if max_records is None:
+        max_records = (
+            DEFAULT_REVIEW_MAX_RECORDS
+            if pass_kind == "review"
+            else DEFAULT_MAX_RECORDS
+        )
+    if max_material_tokens is None:
+        max_material_tokens = (
+            DEFAULT_REVIEW_MAX_MATERIAL_TOKENS
+            if pass_kind == "review"
+            else DEFAULT_MAX_MATERIAL_TOKENS
+        )
+    if not 1 <= max_records <= DEFAULT_REVIEW_MAX_RECORDS:
+        raise ValueError("max_records must be between 1 and 2048")
     if min_records is None:
-        min_records = min(DEFAULT_MIN_RECORDS, max_records)
+        min_records = min(
+            DEFAULT_REVIEW_MIN_RECORDS if pass_kind == "review" else DEFAULT_MIN_RECORDS,
+            max_records,
+        )
     if not 1 <= min_records <= max_records:
         raise ValueError("min_records must be between 1 and max_records")
     if not 256 <= max_material_tokens <= 1_000_000:
@@ -509,6 +658,7 @@ def prepare_native_tasks(
         )
     if not segments:
         raise ValueError("Ordered source contains no segments")
+    _require_candidate_bindings(segments, pass_kind)
     ids = [segment.id for segment in segments]
     if len(ids) != len(set(ids)):
         raise ValueError("Ordered source contains duplicate target IDs")
@@ -518,13 +668,14 @@ def prepare_native_tasks(
     except ValueError as exc:
         raise ValueError("Native task source and output must stay inside the private workspace") from exc
 
-    fingerprint = stable_hash([asdict(segment) for segment in segments])
+    fingerprint = stable_hash_sequence(asdict(segment) for segment in segments)
     manifest_path = output_dir / "manifest.json"
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if (
             manifest.get("version") == TASK_MANIFEST_VERSION
             and manifest.get("source_fingerprint") == fingerprint
+            and manifest.get("pass_kind", "translation") == pass_kind
             and manifest.get("max_records") == max_records
             and manifest.get("min_records") == min_records
             and manifest.get("max_material_tokens") == max_material_tokens
@@ -536,6 +687,7 @@ def prepare_native_tasks(
                 len(task_rows),
                 max_workers,
                 len(segments),
+                pass_kind=pass_kind,
                 bulk_budget_gate_records=bulk_budget_gate_records,
                 max_elapsed_minutes=max_elapsed_minutes,
                 max_input_tokens=max_input_tokens,
@@ -545,15 +697,15 @@ def prepare_native_tasks(
             )
             expected_contract_fingerprint = stable_hash(
                 {
-                    "worker_contract": _worker_contract(),
-                    "detail_contract": _detail_contract(),
+                    "worker_contract": _worker_contract(pass_kind),
+                    "detail_contract": _detail_contract(pass_kind),
                     "execution_contract": expected_execution_contract,
                 }
             )
             valid = (
                 bool(task_rows)
-                and manifest.get("worker_contract") == _worker_contract()
-                and manifest.get("detail_contract") == _detail_contract()
+                and manifest.get("worker_contract") == _worker_contract(pass_kind)
+                and manifest.get("detail_contract") == _detail_contract(pass_kind)
                 and manifest.get("execution_contract") == expected_execution_contract
                 and manifest.get("contract_fingerprint")
                 == expected_contract_fingerprint
@@ -573,7 +725,8 @@ def prepare_native_tasks(
                 )
                 and all(
                     (output_dir / item["file"]).is_file()
-                    and _file_sha256(output_dir / item["file"]) == item["sha256"]
+                    and isinstance(item.get("size"), int)
+                    and (output_dir / item["file"]).stat().st_size == item["size"]
                     for item in task_rows
                 )
             )
@@ -583,6 +736,7 @@ def prepare_native_tasks(
                     "cached": True,
                     "records": len(segments),
                     "tasks": len(task_rows),
+                    "pass_kind": pass_kind,
                     "max_records": max_records,
                     "min_records": min_records,
                     "max_material_tokens": max_material_tokens,
@@ -654,6 +808,7 @@ def prepare_native_tasks(
                     item[2] > max_material_tokens for item in batch
                 ),
                 "sha256": _file_sha256(path),
+                "size": path.stat().st_size,
             }
         )
     for stale in output_dir.glob("task-*.jsonl"):
@@ -663,6 +818,7 @@ def prepare_native_tasks(
         len(tasks),
         max_workers,
         len(segments),
+        pass_kind=pass_kind,
         bulk_budget_gate_records=bulk_budget_gate_records,
         max_elapsed_minutes=max_elapsed_minutes,
         max_input_tokens=max_input_tokens,
@@ -677,8 +833,8 @@ def prepare_native_tasks(
             or budget_gate["user_approved"] is True
             or task["wave"] <= budget_gate["pilot_waves_without_approved_budget"]
         )
-    worker_contract = _worker_contract()
-    detail_contract = _detail_contract()
+    worker_contract = _worker_contract(pass_kind)
+    detail_contract = _detail_contract(pass_kind)
     contract_fingerprint = stable_hash(
         {
             "worker_contract": worker_contract,
@@ -689,6 +845,7 @@ def prepare_native_tasks(
     manifest = {
         "version": TASK_MANIFEST_VERSION,
         "task_payload_schema": TASK_PAYLOAD_SCHEMA,
+        "pass_kind": pass_kind,
         "source_artifact": source_artifact,
         "source_fingerprint": fingerprint,
         "max_records": max_records,
@@ -709,6 +866,7 @@ def prepare_native_tasks(
         "cached": False,
         "records": len(segments),
         "tasks": len(tasks),
+        "pass_kind": pass_kind,
         "max_records": max_records,
         "min_records": min_records,
         "max_material_tokens": max_material_tokens,
@@ -747,12 +905,56 @@ def _validate_row(row: dict[str, Any], *, segment: Segment | None = None) -> dic
     issues = row.get("issues", [])
     if not isinstance(issues, list) or not all(isinstance(item, str) for item in issues):
         raise ValueError(f"Native shard {target_id!r} issues must be strings")
-    return {
+    result = {
         "target_id": target_id,
         "status": status,
         "text": text if status == "success" else "",
         "provider": str(row.get("provider", "native-worker")),
         "issues": issues,
+    }
+    for field in ("split_depth", "semantic_attempts"):
+        if field in row:
+            value = row[field]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"Native shard {target_id!r} {field} must be non-negative")
+            result[field] = value
+    return result
+
+
+def _review_failure_has_split_proof(
+    row: dict[str, Any], *, max_depth: int, max_calls: int
+) -> bool:
+    split_depth = row.get("split_depth")
+    semantic_attempts = row.get("semantic_attempts")
+    return bool(
+        isinstance(split_depth, int)
+        and not isinstance(split_depth, bool)
+        and 1 <= split_depth <= max_depth
+        and isinstance(semantic_attempts, int)
+        and not isinstance(semantic_attempts, bool)
+        and 2 <= semantic_attempts <= max_calls
+    )
+
+
+def _normalize_review_failure(
+    row: dict[str, Any], *, max_depth: int, max_calls: int
+) -> dict[str, Any]:
+    """Keep valid review failures while isolating worker/relay contract failures."""
+
+    if row["status"] == "success":
+        return row
+    if row.get("issues") == ["worker_ended_without_result"]:
+        return row
+    if _review_failure_has_split_proof(
+        row, max_depth=max_depth, max_calls=max_calls
+    ):
+        return row
+    return {
+        "target_id": row["target_id"],
+        "status": "error",
+        "text": "",
+        "provider": "native-control",
+        "issues": ["review_split_proof_missing"],
     }
 
 
@@ -785,7 +987,7 @@ def _validate_manifest_rows(
             raise ValueError("Optional-slot source artifact is invalid") from None
         if (
             len(ordered) != manifest.get("records")
-            or stable_hash([asdict(segment) for segment in ordered])
+            or stable_hash_sequence(asdict(segment) for segment in ordered)
             != manifest.get("source_fingerprint")
         ):
             raise ValueError("Optional-slot source no longer matches its task manifest")
@@ -800,7 +1002,7 @@ def _validate_manifest_rows(
                     raise ValueError("Optional-slot composition references an unbound target")
         # Cache only a fully validated source; reuse once per wave/import scan.
         bound_segments.update((segment.id, segment) for segment in ordered)
-    return [
+    validated = [
         _validate_row(
             row,
             segment=bound_segments.get(row["target_id"])
@@ -808,6 +1010,17 @@ def _validate_manifest_rows(
         )
         for row in rows
     ]
+    if manifest.get("pass_kind", "translation") == "review" and len(validated) > 1:
+        split_contract = manifest.get("worker_contract", {}).get("failure_split", {})
+        max_depth = int(split_contract.get("max_depth", 0))
+        max_calls = int(split_contract.get("max_semantic_calls", 1))
+        validated = [
+            _normalize_review_failure(
+                row, max_depth=max_depth, max_calls=max_calls
+            )
+            for row in validated
+        ]
+    return validated
 
 
 def import_native_shard(work_dir: Path, source: Path, shard_name: str) -> dict[str, Any]:
@@ -869,12 +1082,7 @@ def import_native_wave(
     wave_ids: set[str] = set()
     bound_segments: dict[str, Segment] = {}
     for task in tasks:
-        expected_ids = _task_target_ids(
-            manifest_path.parent / task["file"],
-            require_payload=manifest.get("version") == TASK_MANIFEST_VERSION,
-        )
-        if len(expected_ids) != task["records"]:
-            raise ValueError("Native task record count does not match its manifest binding")
+        expected_ids = _validate_manifest_task_file(manifest_path, manifest, task)
         result_path = source_dir / task["file"]
         if not result_path.is_file():
             raise ValueError("Native wave result is incomplete")
@@ -914,18 +1122,381 @@ def import_native_wave(
 
 
 def _native_control_plan_fingerprint(manifest: dict[str, Any]) -> str:
-    return stable_hash(
-        [
-            {
+    def bindings() -> Iterable[dict[str, Any]]:
+        yield {"pass_kind": manifest.get("pass_kind", "translation")}
+        for task in manifest["tasks"]:
+            yield {
                 "file": task["file"],
                 "wave": task["wave"],
                 "slot": task["slot"],
                 "records": task["records"],
                 "sha256": task["sha256"],
             }
-            for task in manifest["tasks"]
-        ]
+
+    return stable_hash_sequence(bindings())
+
+
+def _write_wave_relay_dispatch(
+    work_dir: Path,
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    results_dir: Path,
+    wave: int,
+    tasks: list[dict[str, Any]],
+    plan_fingerprint: str,
+) -> str:
+    """Write the only dispatch artifact the root may give to a wave relay."""
+
+    bindings = [
+        {
+            "task": (manifest_path.parent / task["file"])
+            .resolve()
+            .relative_to(work_dir.resolve())
+            .as_posix(),
+            "result": (results_dir / task["file"])
+            .resolve()
+            .relative_to(work_dir.resolve())
+            .as_posix(),
+            "records": task["records"],
+            "estimated_material_tokens": task["estimated_material_tokens"],
+        }
+        for task in tasks
+    ]
+    unsigned = {
+        "schema": NATIVE_WAVE_RELAY_SCHEMA,
+        "pass_kind": manifest["pass_kind"],
+        "manifest": manifest_path.resolve().relative_to(work_dir.resolve()).as_posix(),
+        "manifest_contract_fingerprint": manifest["contract_fingerprint"],
+        "plan_fingerprint": plan_fingerprint,
+        "wave": wave,
+        "task_bindings": bindings,
+        "relay_contract": {
+            "role": "isolated_wave_relay",
+            "history_mode": "none",
+            "authority": "dispatch_exact_bindings_only",
+            "semantic_task_files_may_be_opened_by_relay": False,
+            "semantic_worker_history_mode": "none",
+            "semantic_worker_delegation_allowed": False,
+            "planning_allowed": False,
+            "retry_allowed": False,
+            "route_change_allowed": False,
+            "raw_child_response_forwarding_allowed": False,
+            "child_leak_action": "quarantine_relay_and_return_categorical_receipt",
+            "final_response": "workspace_relative_relay_receipt_path_only",
+        },
+    }
+    payload = {**unsigned, "dispatch_fingerprint": stable_hash(unsigned)}
+    path = _wave_relay_dispatch_path(work_dir, plan_fingerprint, wave)
+    _atomic_json(path, payload)
+    return path.resolve().relative_to(work_dir.resolve()).as_posix()
+
+
+def _wave_relay_dispatch_path(
+    work_dir: Path, plan_fingerprint: str, wave: int
+) -> Path:
+    return (
+        work_dir
+        / ".game-l10n"
+        / "native"
+        / "relay"
+        / f"{plan_fingerprint[:24]}-wave-{wave:04d}.json"
     )
+
+
+def _read_structurally_bound_result(
+    task: Path,
+    result: Path,
+) -> tuple[list[str], list[dict[str, Any]]] | None:
+    """Return a complete ordered result without exposing semantic fields."""
+
+    if not result.is_file():
+        return None
+    try:
+        expected_ids = _task_target_ids(task, require_payload=True)
+        rows = [_validate_row(row) for row in _read_jsonl(result)]
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return None
+    if [row["target_id"] for row in rows] != expected_ids:
+        return None
+    return expected_ids, rows
+
+
+def _complete_ended_task_result(
+    task: Path,
+    result: Path,
+    *,
+    expected_records: int,
+) -> bool:
+    """Preserve an ordered partial result and fill only its missing targets."""
+
+    if _read_structurally_bound_result(task, result) is not None:
+        return False
+    if result.exists() and not result.is_file():
+        raise ValueError("E_NATIVE_RELAY_INVALID: result path is not a file")
+
+    expected_ids = _task_target_ids(task, require_payload=True)
+    if len(expected_ids) != expected_records:
+        raise ValueError("E_NATIVE_RELAY_INVALID: ended task record count changed")
+
+    preserved: dict[str, dict[str, Any]] = {}
+    if result.is_file():
+        original = result.read_bytes()
+        partial_rows: list[dict[str, Any]] = []
+        malformed = False
+        for line in original.splitlines():
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line.decode("utf-8-sig"))
+                if not isinstance(raw, dict):
+                    raise ValueError("Result row must be an object")
+                partial_rows.append(_validate_row(raw))
+            except (UnicodeError, ValueError, TypeError):
+                malformed = True
+        expected_positions = {target_id: index for index, target_id in enumerate(expected_ids)}
+        partial_ids = [row["target_id"] for row in partial_rows]
+        if (
+            len(partial_ids) != len(set(partial_ids))
+            or any(target_id not in expected_positions for target_id in partial_ids)
+            or [expected_positions[target_id] for target_id in partial_ids]
+            != sorted(expected_positions[target_id] for target_id in partial_ids)
+        ):
+            raise ValueError(
+                "E_NATIVE_RELAY_INVALID: ended task result is not an ordered subset"
+            )
+        if malformed:
+            digest = hashlib.sha256(original).hexdigest()
+            archive = result.with_name(f"{result.name}.ended-original-{digest}")
+            if archive.exists():
+                if archive.read_bytes() != original:
+                    raise ValueError("E_NATIVE_RELAY_INVALID: original archive changed")
+            else:
+                archive.write_bytes(original)
+        preserved = {row["target_id"]: row for row in partial_rows}
+
+    completed_rows = [
+        preserved.get(
+            target_id,
+            {
+                "target_id": target_id,
+                "status": "error",
+                "text": "",
+                "provider": "native-worker",
+                "issues": ["worker_ended_without_result"],
+            },
+        )
+        for target_id in expected_ids
+    ]
+    _atomic_jsonl(result, completed_rows)
+    return True
+
+
+def seal_native_wave_relay(
+    work_dir: Path,
+    dispatch_path: Path,
+    *,
+    ended_tasks: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Seal one relay and deterministically queue workers that ended without output."""
+
+    require_control_plane_ready(work_dir)
+    resolved = dispatch_path.resolve()
+    relay_root = (work_dir / ".game-l10n" / "native" / "relay").resolve()
+    try:
+        resolved.relative_to(relay_root)
+    except ValueError as exc:
+        raise ValueError("E_NATIVE_RELAY_INVALID: dispatch escaped relay directory") from exc
+    try:
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("E_NATIVE_RELAY_INVALID: dispatch is unreadable") from exc
+    fields = {
+        "schema",
+        "pass_kind",
+        "manifest",
+        "manifest_contract_fingerprint",
+        "plan_fingerprint",
+        "wave",
+        "task_bindings",
+        "relay_contract",
+        "dispatch_fingerprint",
+    }
+    if not isinstance(payload, dict) or set(payload) != fields:
+        raise ValueError("E_NATIVE_RELAY_INVALID: dispatch shape is invalid")
+    unsigned = {key: payload[key] for key in fields if key != "dispatch_fingerprint"}
+    if (
+        payload.get("schema") != NATIVE_WAVE_RELAY_SCHEMA
+        or payload.get("pass_kind") not in PASS_KINDS
+        or not isinstance(payload.get("wave"), int)
+        or isinstance(payload.get("wave"), bool)
+        or payload["wave"] < 1
+        or payload.get("dispatch_fingerprint") != stable_hash(unsigned)
+        or not isinstance(payload.get("task_bindings"), list)
+        or not payload["task_bindings"]
+        or len(payload["task_bindings"]) > DEFAULT_MAX_WORKERS
+        or not isinstance(payload.get("relay_contract"), dict)
+        or payload["relay_contract"].get("role") != "isolated_wave_relay"
+        or payload["relay_contract"].get("authority")
+        != "dispatch_exact_bindings_only"
+        or payload["relay_contract"].get("raw_child_response_forwarding_allowed")
+        is not False
+    ):
+        raise ValueError("E_NATIVE_RELAY_INVALID: dispatch binding is invalid")
+
+    if len(set(ended_tasks)) != len(ended_tasks):
+        raise ValueError("E_NATIVE_RELAY_INVALID: ended tasks must be unique")
+
+    bindings_by_name: dict[str, tuple[Path, Path, int]] = {}
+    for binding in payload["task_bindings"]:
+        if not isinstance(binding, dict) or set(binding) != {
+            "task",
+            "result",
+            "records",
+            "estimated_material_tokens",
+        }:
+            raise ValueError("E_NATIVE_RELAY_INVALID: task binding is invalid")
+        if (
+            not isinstance(binding["task"], str)
+            or not isinstance(binding["result"], str)
+            or not isinstance(binding["records"], int)
+            or isinstance(binding["records"], bool)
+            or binding["records"] < 1
+            or not isinstance(binding["estimated_material_tokens"], int)
+            or isinstance(binding["estimated_material_tokens"], bool)
+            or binding["estimated_material_tokens"] < 1
+        ):
+            raise ValueError("E_NATIVE_RELAY_INVALID: task binding values are invalid")
+        task = (work_dir / binding["task"]).resolve()
+        result = (work_dir / binding["result"]).resolve()
+        try:
+            task.relative_to(work_dir.resolve())
+            result.relative_to(work_dir.resolve())
+        except ValueError as exc:
+            raise ValueError("E_NATIVE_RELAY_INVALID: task binding escaped workspace") from exc
+        if not task.is_file():
+            raise ValueError("E_NATIVE_RELAY_INVALID: bound task is unavailable")
+        task_name = task.name
+        if task_name in bindings_by_name:
+            raise ValueError("E_NATIVE_RELAY_INVALID: task names must be unique")
+        bindings_by_name[task_name] = (task, result, binding["records"])
+
+    unknown_ended = [name for name in ended_tasks if name not in bindings_by_name]
+    if unknown_ended:
+        raise ValueError("E_NATIVE_RELAY_INVALID: ended task is not bound to this wave")
+
+    ended_tasks_recorded = 0
+    for name in ended_tasks:
+        task, result, expected_records = bindings_by_name[name]
+        ended_tasks_recorded += int(
+            _complete_ended_task_result(
+                task,
+                result,
+                expected_records=expected_records,
+            )
+        )
+
+    ready = sum(
+        _read_structurally_bound_result(task, result) is not None
+        for task, result, _ in bindings_by_name.values()
+    )
+
+    total = len(payload["task_bindings"])
+    issue_codes = [] if ready == total else ["E_NATIVE_WAVE_INCOMPLETE"]
+    dispatch_relative = resolved.relative_to(work_dir.resolve()).as_posix()
+    receipt_unsigned = {
+        "schema": NATIVE_WAVE_RELAY_RECEIPT_SCHEMA,
+        "dispatch": dispatch_relative,
+        "dispatch_fingerprint": payload["dispatch_fingerprint"],
+        "wave": payload["wave"],
+        "counts": {
+            "expected_tasks": total,
+            "ready_tasks": ready,
+            "pending_tasks": total - ready,
+        },
+        "issue_codes": issue_codes,
+    }
+    receipt = {
+        **receipt_unsigned,
+        "receipt_fingerprint": stable_hash(receipt_unsigned),
+    }
+    receipt_path = resolved.with_name(f"{resolved.stem}-receipt.json")
+    _atomic_json(receipt_path, receipt)
+    return {
+        "schema": NATIVE_WAVE_RELAY_RECEIPT_SCHEMA,
+        "receipt": receipt_path.relative_to(work_dir.resolve()).as_posix(),
+        "wave": payload["wave"],
+        "counts": receipt_unsigned["counts"],
+        "issue_codes": issue_codes,
+        "ended_tasks_recorded": ended_tasks_recorded,
+    }
+
+
+def _validated_native_wave_relay_receipt(
+    work_dir: Path,
+    plan_fingerprint: str,
+    wave: int,
+) -> dict[str, Any]:
+    dispatch_path = _wave_relay_dispatch_path(work_dir, plan_fingerprint, wave).resolve()
+    receipt_path = dispatch_path.with_name(f"{dispatch_path.stem}-receipt.json")
+    if not receipt_path.is_file():
+        raise ValueError("E_NATIVE_RELAY_RECEIPT_REQUIRED")
+    try:
+        dispatch = json.loads(dispatch_path.read_text(encoding="utf-8"))
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID") from exc
+    receipt_fields = {
+        "schema",
+        "dispatch",
+        "dispatch_fingerprint",
+        "wave",
+        "counts",
+        "issue_codes",
+        "receipt_fingerprint",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != receipt_fields:
+        raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
+    unsigned = {
+        key: receipt[key] for key in receipt_fields if key != "receipt_fingerprint"
+    }
+    dispatch_relative = dispatch_path.relative_to(work_dir.resolve()).as_posix()
+    bindings = dispatch.get("task_bindings") if isinstance(dispatch, dict) else None
+    if not isinstance(bindings, list):
+        raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
+    ready = 0
+    for binding in bindings:
+        if (
+            not isinstance(binding, dict)
+            or not isinstance(binding.get("task"), str)
+            or not isinstance(binding.get("result"), str)
+        ):
+            raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
+        task = (work_dir / binding["task"]).resolve()
+        result = (work_dir / binding["result"]).resolve()
+        try:
+            task.relative_to(work_dir.resolve())
+            result.relative_to(work_dir.resolve())
+        except ValueError as exc:
+            raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID") from exc
+        ready += int(_read_structurally_bound_result(task, result) is not None)
+    total = len(bindings)
+    expected_counts = {
+        "expected_tasks": total,
+        "ready_tasks": ready,
+        "pending_tasks": total - ready,
+    }
+    expected_issues = [] if ready == total else ["E_NATIVE_WAVE_INCOMPLETE"]
+    if (
+        receipt.get("schema") != NATIVE_WAVE_RELAY_RECEIPT_SCHEMA
+        or receipt.get("dispatch") != dispatch_relative
+        or receipt.get("dispatch_fingerprint") != dispatch.get("dispatch_fingerprint")
+        or receipt.get("wave") != wave
+        or receipt.get("counts") != expected_counts
+        or receipt.get("issue_codes") != expected_issues
+        or receipt.get("receipt_fingerprint") != stable_hash(unsigned)
+    ):
+        raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
+    return receipt
 
 
 def _native_control_state_path(
@@ -957,6 +1528,9 @@ def _new_native_control_state(
         "input_tokens": 0,
         "provider_cost_usd": 0.0,
         "usage_event_ids": [],
+        "checkpoint_initialized": False,
+        "imported_wave_count": 0,
+        "imported_tasks": 0,
     }
 
 
@@ -969,7 +1543,7 @@ def _load_native_control_state(
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("E_NATIVE_CONTROL_STATE_INVALID: state is unreadable") from exc
-    required = {
+    legacy_required = {
         "schema",
         "source_fingerprint",
         "plan_fingerprint",
@@ -984,6 +1558,20 @@ def _load_native_control_state(
         "provider_cost_usd",
         "usage_event_ids",
     }
+    required = legacy_required | {
+        "checkpoint_initialized",
+        "imported_wave_count",
+        "imported_tasks",
+    }
+    if (
+        isinstance(state, dict)
+        and state.get("schema") == LEGACY_NATIVE_CONTROL_STATE_SCHEMA
+        and set(state) == legacy_required
+    ):
+        state["schema"] = NATIVE_CONTROL_STATE_SCHEMA
+        state["checkpoint_initialized"] = False
+        state["imported_wave_count"] = 0
+        state["imported_tasks"] = 0
     if not isinstance(state, dict) or set(state) != required:
         raise ValueError("E_NATIVE_CONTROL_STATE_INVALID: state shape is invalid")
     if (
@@ -1016,6 +1604,13 @@ def _load_native_control_state(
             for item in state["usage_event_ids"]
         )
         or len(state["usage_event_ids"]) != len(set(state["usage_event_ids"]))
+        or not isinstance(state.get("checkpoint_initialized"), bool)
+        or not isinstance(state.get("imported_wave_count"), int)
+        or isinstance(state.get("imported_wave_count"), bool)
+        or state["imported_wave_count"] < 0
+        or not isinstance(state.get("imported_tasks"), int)
+        or isinstance(state.get("imported_tasks"), bool)
+        or state["imported_tasks"] < 0
     ):
         raise ValueError("E_NATIVE_CONTROL_STATE_INVALID: state values are invalid")
     # A regenerated manifest may bind an approved budget without changing the task plan.
@@ -1061,7 +1656,6 @@ def _imported_native_waves(
 ) -> tuple[list[int], int]:
     imported_waves: list[int] = []
     imported_tasks = 0
-    gap_seen = False
     bound_segments: dict[str, Segment] = {}
     for wave in sorted({task["wave"] for task in manifest["tasks"]}):
         tasks = [task for task in manifest["tasks"] if task["wave"] == wave]
@@ -1116,10 +1710,6 @@ def _imported_native_waves(
                     raise ValueError(
                         "E_NATIVE_CONTROL_STATE_INVALID: wave receipt no longer matches"
                     )
-            if gap_seen:
-                raise ValueError(
-                    "E_NATIVE_CONTROL_STATE_INVALID: imported waves are not contiguous"
-                )
             imported_waves.append(wave)
             imported_tasks += len(tasks)
             continue
@@ -1154,15 +1744,11 @@ def _imported_native_waves(
                 "E_NATIVE_CONTROL_STATE_INVALID: a wave is only partially imported"
             )
         if all(present):
-            if gap_seen:
-                raise ValueError(
-                    "E_NATIVE_CONTROL_STATE_INVALID: imported waves are not contiguous"
-                )
             _write_wave_receipt(work_dir, manifest, tasks, wave)
             imported_waves.append(wave)
             imported_tasks += len(tasks)
         else:
-            gap_seen = True
+            break
     return imported_waves, imported_tasks
 
 
@@ -1204,6 +1790,7 @@ def native_control_step(
     usage_event_id: str | None = None,
     input_tokens: int = 0,
     provider_cost_usd: float = 0.0,
+    require_relay_receipt: bool = False,
 ) -> dict[str, Any]:
     """Advance one manifest pass without asking a model to schedule or recover it."""
 
@@ -1228,15 +1815,34 @@ def native_control_step(
         provider_cost_usd=provider_cost_usd,
     )
 
-    imported_waves, imported_tasks = _imported_native_waves(
-        work_dir, manifest_path, manifest
-    )
-    waves = sorted({task["wave"] for task in manifest["tasks"]})
+    wave_tasks: dict[int, list[dict[str, Any]]] = {}
+    for task in manifest["tasks"]:
+        wave_tasks.setdefault(task["wave"], []).append(task)
+    waves = sorted(wave_tasks)
+    if state["checkpoint_initialized"] is not True:
+        imported_waves, imported_tasks = _imported_native_waves(
+            work_dir, manifest_path, manifest
+        )
+        state["checkpoint_initialized"] = True
+        state["imported_wave_count"] = len(imported_waves)
+        state["imported_tasks"] = imported_tasks
+    else:
+        imported_wave_count = state["imported_wave_count"]
+        if imported_wave_count > len(waves):
+            raise ValueError("E_NATIVE_CONTROL_STATE_INVALID: imported wave count is invalid")
+        imported_waves = waves[:imported_wave_count]
+        imported_tasks = sum(len(wave_tasks[wave]) for wave in imported_waves)
+        if imported_tasks != state["imported_tasks"]:
+            raise ValueError("E_NATIVE_CONTROL_STATE_INVALID: imported task count is invalid")
     import_summary: dict[str, Any] | None = None
-    next_wave = next((wave for wave in waves if wave not in imported_waves), None)
+    next_wave = (
+        waves[state["imported_wave_count"]]
+        if state["imported_wave_count"] < len(waves)
+        else None
+    )
 
     if next_wave is not None:
-        tasks = [task for task in manifest["tasks"] if task["wave"] == next_wave]
+        tasks = wave_tasks[next_wave]
         ready_paths = [
             results_dir / task["file"]
             for task in tasks
@@ -1249,8 +1855,21 @@ def native_control_step(
                 for path in ready_paths
             ]
         )
+        relay_dispatch_path = _wave_relay_dispatch_path(
+            work_dir, plan_fingerprint, next_wave
+        )
+        relay_receipt_path = relay_dispatch_path.with_name(
+            f"{relay_dispatch_path.stem}-receipt.json"
+        )
+        relay_receipt_fingerprint = (
+            _file_sha256(relay_receipt_path)
+            if relay_receipt_path.is_file()
+            else "missing"
+        )
         progress_marker = (
-            f"{imported_tasks}:{next_wave}:{ready_results}:{result_fingerprint}"
+            f"{imported_tasks}:{next_wave}:{ready_results}:"
+            f"{result_fingerprint}:{relay_receipt_fingerprint}:"
+            f"validation-{RESULT_VALIDATION_REVISION}"
         )
         if state["active_wave"] == next_wave:
             state["control_steps_in_wave"] += 1
@@ -1271,16 +1890,48 @@ def native_control_step(
                 "max_unchanged_progress_observations", 1
             )
         )
+        relay_issue = ""
+        if (
+            require_relay_receipt
+            and state["active_wave"] == next_wave
+            and (
+                state["last_action"] == "dispatch_isolated_wave_relay"
+                or _wave_relay_dispatch_path(
+                    work_dir, plan_fingerprint, next_wave
+                ).is_file()
+            )
+        ):
+            try:
+                relay_receipt = _validated_native_wave_relay_receipt(
+                    work_dir, plan_fingerprint, next_wave
+                )
+            except ValueError as exc:
+                code = str(exc)
+                relay_issue = (
+                    code
+                    if code
+                    in {
+                        "E_NATIVE_RELAY_RECEIPT_REQUIRED",
+                        "E_NATIVE_RELAY_RECEIPT_INVALID",
+                    }
+                    else "E_NATIVE_RELAY_RECEIPT_INVALID"
+                )
+            else:
+                if relay_receipt["issue_codes"]:
+                    relay_issue = "E_NATIVE_WAVE_INCOMPLETE"
         budget_issue = _native_budget_issue(
             manifest["execution_contract"], state, next_wave
         )
-        if budget_issue == "E_BULK_EXECUTION_BUDGET_REQUIRED":
+        if relay_issue:
+            action = "checkpoint_and_stop"
+            issue_codes = [relay_issue]
+        elif budget_issue == "E_BULK_EXECUTION_BUDGET_REQUIRED":
             action = "checkpoint_and_stop"
             issue_codes = [budget_issue]
         elif budget_issue and ready_results != len(tasks):
             action = "checkpoint_and_stop"
             issue_codes = [budget_issue]
-        elif state["control_steps_in_wave"] > max_root_calls:
+        elif state["control_steps_in_wave"] > max_root_calls and ready_results != len(tasks):
             action = "checkpoint_and_stop"
             issue_codes = ["E_NATIVE_WAVE_CONTROL_LIMIT"]
         elif state["unchanged_observations"] >= max_unchanged:
@@ -1295,11 +1946,14 @@ def native_control_step(
                 action = "checkpoint_and_stop"
                 issue_codes = ["E_NATIVE_WAVE_RESULT_INVALID"]
             else:
-                imported_waves, imported_tasks = _imported_native_waves(
-                    work_dir, manifest_path, manifest
-                )
-                next_wave = next(
-                    (wave for wave in waves if wave not in imported_waves), None
+                state["imported_wave_count"] += 1
+                state["imported_tasks"] += len(tasks)
+                imported_waves = waves[: state["imported_wave_count"]]
+                imported_tasks = state["imported_tasks"]
+                next_wave = (
+                    waves[state["imported_wave_count"]]
+                    if state["imported_wave_count"] < len(waves)
+                    else None
                 )
                 state["last_progress_marker"] = f"{imported_tasks}:{next_wave or 0}:0"
                 state["unchanged_observations"] = 0
@@ -1314,11 +1968,7 @@ def native_control_step(
                     budget_issue = _native_budget_issue(
                         manifest["execution_contract"], state, next_wave
                     )
-                    next_tasks = [
-                        task
-                        for task in manifest["tasks"]
-                        if task["wave"] == next_wave
-                    ]
+                    next_tasks = wave_tasks[next_wave]
                     if budget_issue:
                         action = "checkpoint_and_stop"
                         issue_codes = [budget_issue]
@@ -1328,7 +1978,7 @@ def native_control_step(
                         action = "checkpoint_and_stop"
                         issue_codes = ["E_NATIVE_DISPATCH_NOT_AUTHORIZED"]
                     else:
-                        action = "dispatch_authorized_wave"
+                        action = "dispatch_isolated_wave_relay"
                         issue_codes = []
         elif ready_results:
             action = "wait_for_active_wave"
@@ -1337,7 +1987,7 @@ def native_control_step(
             action = "checkpoint_and_stop"
             issue_codes = ["E_NATIVE_DISPATCH_NOT_AUTHORIZED"]
         else:
-            action = "dispatch_authorized_wave"
+            action = "dispatch_isolated_wave_relay"
             issue_codes = []
     else:
         action = "aggregate_completed_pass"
@@ -1348,9 +1998,24 @@ def native_control_step(
     state["last_action"] = action
     _atomic_json(state_path, state)
     selected_tasks = (
-        [task for task in manifest["tasks"] if task["wave"] == next_wave]
-        if action == "dispatch_authorized_wave" and next_wave is not None
+        wave_tasks[next_wave]
+        if action == "dispatch_isolated_wave_relay" and next_wave is not None
         else []
+    )
+    for task in selected_tasks:
+        _validate_manifest_task_file(manifest_path, manifest, task)
+    relay_dispatch = (
+        _write_wave_relay_dispatch(
+            work_dir,
+            manifest_path,
+            manifest,
+            results_dir,
+            next_wave,
+            selected_tasks,
+            plan_fingerprint,
+        )
+        if selected_tasks and next_wave is not None
+        else ""
     )
     return {
         "schema": NATIVE_CONTROL_STEP_SCHEMA,
@@ -1364,21 +2029,18 @@ def native_control_step(
             "pending_tasks": len(manifest["tasks"]) - imported_tasks,
         },
         "issue_codes": issue_codes,
-        "tasks": [
+        "relay": (
             {
-                "task": (manifest_path.parent / task["file"])
-                .resolve()
-                .relative_to(work_dir.resolve())
-                .as_posix(),
-                "result": (results_dir / task["file"])
-                .resolve()
-                .relative_to(work_dir.resolve())
-                .as_posix(),
-                "records": task["records"],
-                "estimated_material_tokens": task["estimated_material_tokens"],
+                "dispatch": relay_dispatch,
+                "role": "isolated_wave_relay",
+                "history_mode": "none",
+                "tasks": len(selected_tasks),
+                "records": sum(task["records"] for task in selected_tasks),
+                "final_response": "workspace_relative_relay_receipt_path_only",
             }
-            for task in selected_tasks
-        ],
+            if relay_dispatch
+            else None
+        ),
         "usage": {
             "events": len(state["usage_event_ids"]),
             "input_tokens": state["input_tokens"],
@@ -1421,7 +2083,7 @@ def merge_native_pass(
     shard_bindings: list[tuple[Path, list[str] | None]] = []
     if manifest_path is not None:
         manifest = _load_task_manifest(work_dir, manifest_path)
-        fingerprint = stable_hash([asdict(segment) for segment in segments])
+        fingerprint = stable_hash_sequence(asdict(segment) for segment in segments)
         if (
             manifest.get("source_fingerprint") != fingerprint
             or manifest.get("records") != len(segments)

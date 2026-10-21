@@ -96,7 +96,7 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 
 - **Symptom:** Task files contain many IDs, yet prompt count and model/API calls grow almost one-for-one with records; input greatly exceeds output and elapsed time scales serially.
 - **General cause:** Target-level failure isolation was misread as a requirement for target-level requests, or a job-local coordinator contract overrode the batch intent.
-- **Diagnosis:** Compare task count, record count, prompt artifacts, and semantic call count. More than one semantic request for a multi-target native task violates its v6 detail contract.
+- **Diagnosis:** Compare pass kind, task count, record count, prompt artifacts, and semantic call count. Translation/rewrite permits one semantic request. Review permits only its manifest-declared failed-subset binary split; any per-record loop or successful-row retry violates the v6 detail contract.
 - **Resolution:** Preserve completed shards, discard only the conflicting local execution instructions, and regenerate the remaining v6 manifest. Load shared context once, produce one ordered batched verdict set, and retain failures per target. If the provider truly accepts one target, repartition before dispatch.
 - **Prevention:** Treat `parr0t.detail-contract.v1` as supplemental-only, reject free-form execution contracts, and enforce the bulk pilot/budget gate before later waves.
 
@@ -266,7 +266,7 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **General cause:** Long root/control sessions and nested model controllers replay instructions, tool definitions, conversation history, command results, and prior progress on every call. Cache hits reduce repeated computation but do not turn the repeated input into zero usage.
 - **Diagnosis:** Compare root and descendant session counts, maximum agent depth, model-call counts, aggregate input, cached input, output, progress messages, and work completed without reading game text. Any model controller, depth above one, follow-up shard, repeated contract read with the same digest, or continued turn beyond the manifest ceiling violates the execution contract.
 - **Resolution:** Regenerate v6 tasks with `prepare-native-pass`, then use `native-pass-step` as the only scheduler. Dispatch only its exact returned wave to fresh no-history workers, wait once, and call it again to import and advance. Do not repair a long session with direct manifest selection, per-shard turns, summaries, compaction, recovery controllers, or nested agents.
-- **Prevention:** Keep the default 64-ID/24,000-estimated-material-token bounds and preferred eight-record minimum, never reuse completed workers, prohibit worker delegation, and require the persisted deterministic step state for every wave. Treat a high cached-input ratio as a stop signal rather than evidence that a long session is efficient.
+- **Prevention:** Keep the default 64-ID/8,000-estimated-material-token bounds and preferred eight-record minimum, never reuse completed workers, prohibit worker delegation, and require the persisted deterministic step state for every wave. Treat a high cached-input ratio as a stop signal rather than evidence that a long session is efficient.
 
 ## A handful of residual review items takes hours to finish
 

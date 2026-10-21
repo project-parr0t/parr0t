@@ -13,7 +13,7 @@ CHECKPOINT_NAME = "parr0t-release-checkpoint.json"
 CHECKPOINT_SCHEMA = "parr0t.release-checkpoint/v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-fA-F]{7,64}$")
-_STATUS = {"reviewed", "source_preserved"}
+_STATUS = {"reviewed", "accepted_unreviewed", "source_preserved"}
 _FALLBACK_MODES = {"fallback_locale", "placeholder", "source_text", "none"}
 
 
@@ -228,7 +228,8 @@ def validate_release_checkpoint(
         status = entry["status"]
         if status not in _STATUS:
             raise ReleaseCheckpointError(
-                f"entries[{index}].status must be reviewed or source_preserved"
+                f"entries[{index}].status must be reviewed, accepted_unreviewed, "
+                "or source_preserved"
             )
         if status == "source_preserved" and source_digest != target_digest:
             raise ReleaseCheckpointError(
