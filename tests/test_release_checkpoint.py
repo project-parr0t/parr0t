@@ -106,6 +106,11 @@ class ReleaseCheckpointTests(unittest.TestCase):
         with self.assertRaises(ReleaseCheckpointError):
             validate_release_checkpoint(payload)
 
+    def test_user_accepted_unreviewed_target_remains_distinct(self) -> None:
+        payload = _checkpoint()
+        payload["entries"][0]["status"] = "accepted_unreviewed"  # type: ignore[index]
+        self.assertEqual(validate_release_checkpoint(payload), payload)
+
     def test_implemented_fallback_must_be_verified(self) -> None:
         payload = _checkpoint()
         payload["locale_fallback"] = {
