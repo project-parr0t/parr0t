@@ -35,7 +35,20 @@ The output contains:
 - `segments.jsonl`: ordered translation targets for the core pipeline;
 - `context-script.json`: ordered event context for full-script analysis;
 - `apply-manifest.json`: stable IDs, JSON paths, mirrors, spans, baseline hashes, and patch paths;
+- `primary-inventory.json` and `independent-inventory.json`: separately identified breadth-first and fixed-point static-scope inventories;
+- `inventory-attestation.json`: automatic agreement and accounting check for the paired inventories;
+- `static-scope.json`: ID-only reachability, conservative-retention, and proven-unused evidence ledger;
 - `baseline/`: immutable source JSON copies used for precondition checks.
+
+## Static display tracking
+
+The adapter builds a fixed-format runtime graph before translation. It follows the start map, direct map transfers, common-event calls, battle-processing references, map encounters, autorun and parallel common events, and item common-event effects. Two traversal implementations must agree before targets on an unreachable map, common event, or troop page are removed from the active inventory.
+
+Variable IDs, missing start-map metadata, unrecognized plugin commands, non-display event scripts, and active plugin JavaScript keep the affected graph categories as `conservative_retained`. Database and global UI strings also remain conservative unless a later engine capability proves their bindings. These records remain translation targets; uncertainty never becomes exclusion.
+
+Each retained segment records `statically_reachable` or `conservative_retained` in `metadata.display_scope`. Excluded IDs are recorded without source text in `static-scope.json`. Candidate, included, excluded, and conservative counts are reconciled automatically, and an inventory mismatch aborts extraction.
+
+This is static display-scope evidence only. It does not launch the game, inspect images, perform OCR, or claim runtime coverage. Runtime-observed coverage remains a separately authorized and separately recorded process.
 
 After the core translation and review pipeline produces its result file, build a separate patch tree:
 

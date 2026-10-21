@@ -8,6 +8,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
+from game_l10n.coverage import verify_inventory_pair
 from game_l10n.rpg_maker_mv.adapter import (
     RpgMakerMvError,
     apply_translations,
@@ -216,6 +217,93 @@ def _fixture_game(root: Path, *, version: str = "1.6.1") -> Path:
     return game
 
 
+def _fixture_static_scope_game(root: Path) -> Path:
+    game = _fixture_game(root)
+    data = game / "www" / "data"
+    system = json.loads((data / "System.json").read_text(encoding="utf-8"))
+    system["startMapId"] = 1
+    _write_json(data / "System.json", system)
+    _write_json(
+        data / "MapInfos.json",
+        [
+            None,
+            {"id": 1, "name": "SOURCE_MAP_ONE"},
+            {"id": 2, "name": "SOURCE_MAP_TWO"},
+            {"id": 3, "name": "SOURCE_MAP_THREE"},
+        ],
+    )
+    _write_json(
+        data / "CommonEvents.json",
+        [
+            None,
+            {
+                "id": 1,
+                "name": "CALLED",
+                "trigger": 0,
+                "switchId": 0,
+                "list": [{"code": 401, "indent": 0, "parameters": ["SOURCE_COMMON_CALLED"]}],
+            },
+            {
+                "id": 2,
+                "name": "UNUSED",
+                "trigger": 0,
+                "switchId": 0,
+                "list": [{"code": 401, "indent": 0, "parameters": ["SOURCE_COMMON_UNUSED"]}],
+            },
+            {
+                "id": 3,
+                "name": "AUTORUN",
+                "trigger": 1,
+                "switchId": 1,
+                "list": [{"code": 401, "indent": 0, "parameters": ["SOURCE_COMMON_AUTORUN"]}],
+            },
+        ],
+    )
+
+    def map_document(text: str, commands: list[dict[str, object]]) -> dict[str, object]:
+        return {
+            "displayName": text + "_DISPLAY",
+            "width": 20,
+            "height": 15,
+            "encounterList": [],
+            "events": [
+                None,
+                {
+                    "id": 1,
+                    "name": "SYNTHETIC_EVENT",
+                    "pages": [{"conditions": {}, "trigger": 0, "list": commands}],
+                },
+            ],
+        }
+
+    _write_json(
+        data / "Map001.json",
+        map_document(
+            "SOURCE_MAP_ONE",
+            [
+                {"code": 401, "indent": 0, "parameters": ["SOURCE_MAP_ONE_DIALOGUE"]},
+                {"code": 201, "indent": 0, "parameters": [0, 2, 1, 1, 2, 0]},
+                {"code": 117, "indent": 0, "parameters": [1]},
+            ],
+        ),
+    )
+    _write_json(
+        data / "Map002.json",
+        map_document(
+            "SOURCE_MAP_TWO",
+            [{"code": 401, "indent": 0, "parameters": ["SOURCE_MAP_TWO_DIALOGUE"]}],
+        ),
+    )
+    _write_json(
+        data / "Map003.json",
+        map_document(
+            "SOURCE_MAP_THREE",
+            [{"code": 401, "indent": 0, "parameters": ["SOURCE_MAP_THREE_UNUSED"]}],
+        ),
+    )
+    return game
+
+
 def _rows(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
@@ -233,6 +321,84 @@ def _source_hash(game: Path) -> str:
 
 
 class RpgMakerMvAdapterTests(unittest.TestCase):
+    def test_static_display_scope_excludes_only_independently_unreachable_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = _fixture_static_scope_game(root)
+            extracted = root / "scope-extracted"
+            report = extract_game(game, extracted)
+            sources = {str(row["source"]): row for row in _rows(extracted / "segments.jsonl")}
+
+            self.assertIn("SOURCE_MAP_TWO_DIALOGUE", sources)
+            self.assertIn("SOURCE_COMMON_CALLED", sources)
+            self.assertIn("SOURCE_COMMON_AUTORUN", sources)
+            self.assertNotIn("SOURCE_MAP_THREE_UNUSED", sources)
+            self.assertNotIn("SOURCE_COMMON_UNUSED", sources)
+            self.assertEqual(
+                sources["SOURCE_MAP_TWO_DIALOGUE"]["metadata"]["display_scope"]["status"],
+                "statically_reachable",
+            )
+            self.assertEqual(
+                sources["SOURCE_TITLE"]["metadata"]["display_scope"]["status"],
+                "conservative_retained",
+            )
+            scope = report["static_scope"]
+            self.assertTrue(scope["methods_agree"])
+            self.assertGreater(scope["proven_unused_count"], 0)
+            self.assertEqual(
+                scope["candidate_count"],
+                scope["included_count"] + scope["proven_unused_count"],
+            )
+            attestation = verify_inventory_pair(
+                extracted / "primary-inventory.json",
+                extracted / "independent-inventory.json",
+            )
+            self.assertEqual(attestation["status"], "static_verified")
+
+    def test_dynamic_map_reference_retains_other_maps_conservatively(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = _fixture_static_scope_game(root)
+            map_path = game / "www" / "data" / "Map001.json"
+            document = json.loads(map_path.read_text(encoding="utf-8"))
+            commands = document["events"][1]["pages"][0]["list"]
+            transfer = next(row for row in commands if row["code"] == 201)
+            transfer["parameters"] = [1, 7, 1, 1, 2, 0]
+            _write_json(map_path, document)
+
+            extracted = root / "dynamic-extracted"
+            report = extract_game(game, extracted)
+            sources = {str(row["source"]): row for row in _rows(extracted / "segments.jsonl")}
+            retained = sources["SOURCE_MAP_THREE_UNUSED"]
+            self.assertEqual(
+                retained["metadata"]["display_scope"]["status"],
+                "conservative_retained",
+            )
+            self.assertGreater(report["static_scope"]["unresolved_dynamic_reference_count"], 0)
+
+    def test_active_plugin_keeps_unproven_graph_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = _fixture_static_scope_game(root)
+            scripts = game / "www" / "js"
+            (scripts / "plugins.js").write_text(
+                'var $plugins = [{"name":"SyntheticPlugin","status":true}];',
+                encoding="utf-8",
+            )
+            plugin = scripts / "plugins" / "SyntheticPlugin.js"
+            plugin.parent.mkdir()
+            plugin.write_text("window.drawText('SOURCE_PLUGIN_UI', 0);", encoding="utf-8")
+
+            extracted = root / "plugin-extracted"
+            report = extract_game(game, extracted)
+            sources = {str(row["source"]): row for row in _rows(extracted / "segments.jsonl")}
+            retained = sources["SOURCE_MAP_THREE_UNUSED"]
+            self.assertEqual(
+                retained["metadata"]["display_scope"]["status"],
+                "conservative_retained",
+            )
+            self.assertEqual(report["static_scope"]["proven_unused_count"], 0)
+
     def test_extract_apply_verify_and_pack_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

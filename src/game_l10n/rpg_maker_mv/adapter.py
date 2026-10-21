@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from ..coverage import verify_inventory_pair
 from ..errors import GameL10nError
 from ..models import Segment
 from ..validators import DEFAULT_PROTECTED_PATTERNS, validate_integrity
@@ -20,6 +21,16 @@ from ..validators import DEFAULT_PROTECTED_PATTERNS, validate_integrity
 EXPECTED_ENGINE_VERSION = "1.6.1"
 MANIFEST_FORMAT = "rpg-maker-mv-1.6.1-manifest-v1"
 ENGINE_NAME = "RPG Maker MV"
+STATIC_SCOPE_SCHEMA = "parr0t.static-scope.v1"
+STATIC_SCOPE_CAPABILITY = "rpg-maker-mv-fixed-runtime-graph-v1"
+PRIMARY_SCOPE_METHOD = {
+    "name": "rpg-maker-mv-runtime-graph-bfs",
+    "implementation_fingerprint": "rpg-maker-mv-runtime-graph-bfs-v1",
+}
+INDEPENDENT_SCOPE_METHOD = {
+    "name": "rpg-maker-mv-runtime-graph-fixed-point",
+    "implementation_fingerprint": "rpg-maker-mv-runtime-graph-fixed-point-v1",
+}
 
 PROTECTED_TOKEN_RE = re.compile(
     r"\\(?:[A-Za-z]+(?:\[[^\]\r\n]*\])?|[.!|^><{}$\\])"
@@ -29,6 +40,11 @@ PROTECTED_TOKEN_RE = re.compile(
 SCRIPT_DISPLAY_RE = re.compile(
     r"(?:\$gameMessage\.add|\.setName|\.setNickname|\.setProfile)\s*\(\s*"
     r"((?:\"(?:\\.|[^\"\\])*\")|(?:'(?:\\.|[^'\\])*'))\s*\)"
+)
+SCRIPT_DISPLAY_ONLY_RE = re.compile(
+    r"^\s*(?:(?:\$gameMessage\.add|[A-Za-z_$][\w$\.\[\]]*\.(?:setName|setNickname|setProfile))"
+    r"\s*\(\s*(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')\s*\)\s*;?\s*)+$",
+    re.S,
 )
 PLUGIN_DISPLAY_RE = re.compile(r"(?i)^\s*D_TEXT\s+(.*?)(?:\s+\d+)?\s*$")
 VERSION_RE = re.compile(r"RPGMAKER_VERSION\s*=\s*['\"]([^'\"]+)")
@@ -66,6 +82,17 @@ class GameLayout:
     version: str
 
 
+@dataclass(slots=True, frozen=True)
+class StaticDisplayScope:
+    reachable_nodes: frozenset[str]
+    conservative_nodes: frozenset[str]
+    unused_nodes: frozenset[str]
+    methods_agree: bool
+    dynamic_reference_count: int
+    evidence_fingerprint: str
+    graph_counts: dict[str, int]
+
+
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -77,6 +104,367 @@ def _sha256_file(path: Path) -> str:
 def _stable_digest(rows: Iterable[tuple[str, str]]) -> str:
     encoded = json.dumps(list(rows), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return _sha256_bytes(encoded)
+
+
+def _scope_node(kind: str, identifier: int) -> str:
+    return f"{kind}:{identifier}"
+
+
+def _scene_scope_node(scene: str) -> str | None:
+    match = re.match(r"^(map|common|troop):(\d+)(?::|$)", scene)
+    return _scope_node(match.group(1), int(match.group(2))) if match else None
+
+
+def _event_command_lists(document: Any, kind: str) -> Iterable[tuple[str, list[dict[str, Any]]]]:
+    if kind == "map" and isinstance(document, dict):
+        map_id = int(document["_scope_id"])
+        for event in document.get("events", []):
+            if not isinstance(event, dict):
+                continue
+            for page in event.get("pages", []):
+                if isinstance(page, dict) and isinstance(page.get("list"), list):
+                    yield _scope_node("map", map_id), page["list"]
+    elif kind == "common" and isinstance(document, list):
+        for index, row in enumerate(document):
+            if isinstance(row, dict) and isinstance(row.get("list"), list):
+                yield _scope_node("common", index), row["list"]
+    elif kind == "troop" and isinstance(document, list):
+        for index, row in enumerate(document):
+            if not isinstance(row, dict):
+                continue
+            for page in row.get("pages", []):
+                if isinstance(page, dict) and isinstance(page.get("list"), list):
+                    yield _scope_node("troop", index), page["list"]
+
+
+def _literal_script_reference(script: str, function: str) -> tuple[set[int], bool]:
+    calls = list(re.finditer(rf"\b{re.escape(function)}\s*\(\s*([^,\)]+)", script))
+    values: set[int] = set()
+    dynamic = function in script and not calls
+    for call in calls:
+        expression = call.group(1).strip()
+        if re.fullmatch(r"\d+", expression):
+            values.add(int(expression))
+        else:
+            dynamic = True
+    return values, dynamic
+
+
+def _command_scope_references(
+    commands: Iterable[Mapping[str, Any]],
+) -> tuple[set[str], set[str]]:
+    references: set[str] = set()
+    dynamic: set[str] = set()
+    for command in commands:
+        if not isinstance(command, Mapping):
+            continue
+        code = command.get("code")
+        parameters = command.get("parameters", [])
+        if not isinstance(parameters, list):
+            continue
+        if code == 201:
+            if len(parameters) >= 2 and parameters[0] == 0 and type(parameters[1]) is int:
+                references.add(_scope_node("map", parameters[1]))
+            else:
+                dynamic.add("map")
+        elif code == 117:
+            if parameters and type(parameters[0]) is int:
+                references.add(_scope_node("common", parameters[0]))
+            else:
+                dynamic.add("common")
+        elif code == 301:
+            if len(parameters) >= 2 and parameters[0] == 0 and type(parameters[1]) is int:
+                references.add(_scope_node("troop", parameters[1]))
+            elif not parameters or parameters[0] != 2:
+                dynamic.add("troop")
+        elif code in {355, 655}:
+            script = parameters[0] if parameters and isinstance(parameters[0], str) else ""
+            for function, category in (
+                ("reserveTransfer", "map"),
+                ("reserveCommonEvent", "common"),
+                ("BattleManager.setup", "troop"),
+            ):
+                values, unresolved = _literal_script_reference(script, function)
+                references.update(_scope_node(category, value) for value in values)
+                if unresolved:
+                    dynamic.add(category)
+            if script.strip() and SCRIPT_DISPLAY_ONLY_RE.fullmatch(script) is None:
+                dynamic.update({"map", "common", "troop"})
+        elif code == 356:
+            value = parameters[0] if parameters and isinstance(parameters[0], str) else ""
+            if not PLUGIN_DISPLAY_RE.match(value):
+                dynamic.update({"map", "common", "troop"})
+    return references, dynamic
+
+
+def _scope_graph(
+    documents: Mapping[str, Any], external_sources: Mapping[str, str] | None = None
+) -> tuple[set[str], dict[str, set[str]], dict[str, set[str]]]:
+    maps: dict[int, dict[str, Any]] = {}
+    for filename, document in documents.items():
+        if re.fullmatch(r"Map\d+\.json", filename) and isinstance(document, dict):
+            map_id = int(re.search(r"\d+", filename).group())
+            maps[map_id] = {**document, "_scope_id": map_id}
+    commons = documents.get("CommonEvents.json", [])
+    troops = documents.get("Troops.json", [])
+    nodes = {
+        *(_scope_node("map", value) for value in maps),
+        *(_scope_node("common", index) for index, row in enumerate(commons) if isinstance(row, dict)),
+        *(_scope_node("troop", index) for index, row in enumerate(troops) if isinstance(row, dict)),
+    }
+    edges: dict[str, set[str]] = {node: set() for node in nodes}
+    dynamic: dict[str, set[str]] = {node: set() for node in nodes}
+
+    for map_id, document in maps.items():
+        owner = _scope_node("map", map_id)
+        for encounter in document.get("encounterList", []):
+            if isinstance(encounter, dict) and type(encounter.get("troopId")) is int:
+                edges[owner].add(_scope_node("troop", encounter["troopId"]))
+        for _, commands in _event_command_lists(document, "map"):
+            references, unresolved = _command_scope_references(commands)
+            edges[owner].update(references)
+            dynamic[owner].update(unresolved)
+    for owner, commands in _event_command_lists(commons, "common"):
+        references, unresolved = _command_scope_references(commands)
+        edges[owner].update(references)
+        dynamic[owner].update(unresolved)
+    for owner, commands in _event_command_lists(troops, "troop"):
+        references, unresolved = _command_scope_references(commands)
+        edges[owner].update(references)
+        dynamic[owner].update(unresolved)
+
+    roots: set[str] = set()
+    system = documents.get("System.json", {})
+    start_map = system.get("startMapId") if isinstance(system, dict) else None
+    if type(start_map) is int and start_map > 0:
+        roots.add(_scope_node("map", start_map))
+    else:
+        roots.update(node for node in nodes if node.startswith("map:"))
+        dynamic.setdefault("root", set()).add("map")
+    if isinstance(commons, list):
+        for index, row in enumerate(commons):
+            if isinstance(row, dict) and row.get("trigger") in {1, 2}:
+                roots.add(_scope_node("common", index))
+    items = documents.get("Items.json", [])
+    if isinstance(items, list):
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            for effect in row.get("effects", []):
+                if isinstance(effect, dict) and effect.get("code") == 44 and type(effect.get("dataId")) is int:
+                    roots.add(_scope_node("common", effect["dataId"]))
+    for filename, source in sorted((external_sources or {}).items()):
+        if not filename.endswith(".js"):
+            continue
+        if filename.startswith("js/plugins/"):
+            dynamic.setdefault("root", set()).update({"map", "common", "troop"})
+        for function, category in (
+            ("reserveTransfer", "map"),
+            ("reserveCommonEvent", "common"),
+            ("BattleManager.setup", "troop"),
+        ):
+            values, unresolved = _literal_script_reference(source, function)
+            roots.update(_scope_node(category, value) for value in values)
+            if unresolved:
+                dynamic.setdefault("root", set()).add(category)
+    return roots, edges, dynamic
+
+
+def _bfs_scope(
+    roots: set[str], edges: Mapping[str, set[str]], dynamic: Mapping[str, set[str]]
+) -> tuple[set[str], set[str], int]:
+    nodes = set(edges)
+    reached: set[str] = set()
+    root_categories = dynamic.get("root", set())
+    conservative = {
+        node for node in nodes if any(node.startswith(f"{category}:") for category in root_categories)
+    }
+    queue = list(sorted((roots & nodes) | conservative))
+    dynamic_count = len(dynamic.get("root", set()))
+    while queue:
+        node = queue.pop(0)
+        if node in reached:
+            continue
+        reached.add(node)
+        categories = dynamic.get(node, set())
+        dynamic_count += len(categories)
+        for category in categories:
+            additions = {item for item in nodes if item.startswith(f"{category}:")} - reached
+            conservative.update(additions)
+            queue.extend(sorted(additions))
+        queue.extend(sorted((edges.get(node, set()) & nodes) - reached))
+    return reached, conservative, dynamic_count
+
+
+def _fixed_point_scope(
+    roots: set[str], edges: Mapping[str, set[str]], dynamic: Mapping[str, set[str]]
+) -> tuple[set[str], set[str], int]:
+    nodes = set(edges)
+    root_categories = dynamic.get("root", set())
+    conservative = {
+        node for node in nodes if any(node.startswith(f"{category}:") for category in root_categories)
+    }
+    reached = (roots & nodes) | conservative
+    seen_dynamic: set[tuple[str, str]] = set()
+    changed = True
+    while changed:
+        changed = False
+        for node in sorted(tuple(reached)):
+            additions = (edges.get(node, set()) & nodes) - reached
+            if additions:
+                reached.update(additions)
+                changed = True
+            for category in dynamic.get(node, set()):
+                seen_dynamic.add((node, category))
+                additions = {item for item in nodes if item.startswith(f"{category}:")} - reached
+                if additions:
+                    conservative.update(additions)
+                    reached.update(additions)
+                    changed = True
+    return set(reached), conservative, len(dynamic.get("root", set())) + len(seen_dynamic)
+
+
+def build_static_display_scope(
+    documents: Mapping[str, Any], external_sources: Mapping[str, str] | None = None
+) -> StaticDisplayScope:
+    roots, edges, dynamic = _scope_graph(documents, external_sources)
+    primary = _bfs_scope(roots, edges, dynamic)
+    independent = _fixed_point_scope(roots, edges, dynamic)
+    agree = primary[:2] == independent[:2]
+    nodes = set(edges)
+    if agree:
+        reached, conservative = primary[:2]
+    else:
+        reached, conservative = nodes, nodes - (roots & nodes)
+    unused = nodes - reached
+    evidence = {
+        "roots": sorted(roots),
+        "edges": {key: sorted(value) for key, value in sorted(edges.items())},
+        "dynamic": {key: sorted(value) for key, value in sorted(dynamic.items()) if value},
+        "primary_reached": sorted(primary[0]),
+        "independent_reached": sorted(independent[0]),
+        "methods_agree": agree,
+    }
+    graph_counts = Counter(node.split(":", 1)[0] for node in nodes)
+    return StaticDisplayScope(
+        reachable_nodes=frozenset(reached),
+        conservative_nodes=frozenset(conservative),
+        unused_nodes=frozenset(unused),
+        methods_agree=agree,
+        dynamic_reference_count=max(primary[2], independent[2]),
+        evidence_fingerprint=_sha256_bytes(
+            json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ),
+        graph_counts=dict(graph_counts),
+    )
+
+
+def _apply_static_display_scope(
+    extractor: "_Extractor", scope: StaticDisplayScope
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    candidate_segments = list(extractor.segments)
+    included: list[dict[str, Any]] = []
+    excluded: list[dict[str, str]] = []
+    excluded_counts: Counter[str] = Counter()
+    conservative_count = 0
+
+    for row in candidate_segments:
+        node = _scene_scope_node(str(row.get("scene", "")))
+        if node is not None and node in scope.unused_nodes:
+            category = node.split(":", 1)[0]
+            excluded_counts[category] += 1
+            excluded.append({"id": str(row["id"]), "node": node})
+            continue
+        status = (
+            "conservative_retained"
+            if node is None or node in scope.conservative_nodes
+            else "statically_reachable"
+        )
+        if status == "conservative_retained":
+            conservative_count += 1
+        metadata = row.setdefault("metadata", {})
+        metadata["display_scope"] = {
+            "schema": STATIC_SCOPE_SCHEMA,
+            "claim": "static_reachability_only",
+            "status": status,
+            "node": node or "engine-global",
+            "evidence_fingerprint": scope.evidence_fingerprint,
+        }
+        included.append(row)
+
+    active_ids = {str(row["id"]) for row in included}
+    extractor.segments = included
+    extractor.mappings = [row for row in extractor.mappings if str(row["id"]) in active_ids]
+    extractor.contexts = [
+        row
+        for row in extractor.contexts
+        if (_scene_scope_node(str(row.get("scene", ""))) not in scope.unused_nodes)
+    ]
+    for index, row in enumerate(extractor.segments):
+        row["previous"] = ""
+        row["next"] = ""
+        row["metadata"]["order"] = index
+        if index and extractor.segments[index - 1]["scene"] == row["scene"]:
+            row["previous"] = extractor.segments[index - 1]["source"]
+        if index + 1 < len(extractor.segments) and extractor.segments[index + 1]["scene"] == row["scene"]:
+            row["next"] = extractor.segments[index + 1]["source"]
+
+    exclusions = [
+        {
+            "reason_code": f"RPG_MAKER_MV_STATIC_UNREACHABLE_{category.upper()}",
+            "scope": "static_reachability",
+            "target_count": count,
+            "affects_user_visible_text": False,
+            "evidence_fingerprint": scope.evidence_fingerprint,
+        }
+        for category, count in sorted(excluded_counts.items())
+    ]
+    tracking = {
+        "schema": STATIC_SCOPE_SCHEMA,
+        "claim": "static_reachability_only",
+        "engine_capability": STATIC_SCOPE_CAPABILITY,
+        "candidate_count": len(candidate_segments),
+        "included_count": len(included),
+        "proven_unused_count": len(excluded),
+        "conservative_retained_count": conservative_count,
+        "unresolved_dynamic_reference_count": scope.dynamic_reference_count,
+        "methods": [dict(PRIMARY_SCOPE_METHOD), dict(INDEPENDENT_SCOPE_METHOD)],
+        "methods_agree": scope.methods_agree,
+        "evidence_fingerprint": scope.evidence_fingerprint,
+    }
+    ledger = {
+        **tracking,
+        "runtime_complete": False,
+        "graph_node_counts": scope.graph_counts,
+        "reachable_nodes": sorted(scope.reachable_nodes),
+        "conservative_nodes": sorted(scope.conservative_nodes),
+        "proven_unused_nodes": sorted(scope.unused_nodes),
+        "excluded_targets": excluded,
+    }
+    extractor.counts["static_scope_candidates"] = len(candidate_segments)
+    extractor.counts["static_scope_included"] = len(included)
+    extractor.counts["static_scope_proven_unused"] = len(excluded)
+    extractor.counts["static_scope_conservative_retained"] = conservative_count
+    return tracking, exclusions, ledger
+
+
+def _source_inventory_document(
+    segments: list[dict[str, Any]],
+    method: Mapping[str, str],
+    tracking: Mapping[str, Any],
+    exclusions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema": "parr0t.source-inventory.v1",
+        "method": method["name"],
+        "implementation_fingerprint": method["implementation_fingerprint"],
+        "coverage": {
+            "declared_complete": True,
+            "exclusions": exclusions,
+            "static_scope": dict(tracking),
+        },
+        "segments": segments,
+    }
 
 
 def _source_snapshot(game_root: Path, files: Iterable[Mapping[str, Any]]) -> str:
@@ -746,6 +1134,10 @@ def extract_game(
                 external_paths.append(path)
     external_sources = {p.relative_to(runtime_root).as_posix(): p.read_text(encoding='utf-8-sig') for p in external_paths}
     extract_external_text(extractor, external_sources)
+    scope = build_static_display_scope(documents, external_sources)
+    static_tracking, static_exclusions, static_ledger = _apply_static_display_scope(
+        extractor, scope
+    )
     if not extractor.segments:
         raise RpgMakerMvError("NO_TRANSLATABLE_SEGMENTS")
 
@@ -791,6 +1183,31 @@ def extract_game(
             "ordered_scenes": extractor.contexts,
         },
     )
+    _write_json(output_root / "static-scope.json", static_ledger)
+    primary_inventory = output_root / "primary-inventory.json"
+    independent_inventory = output_root / "independent-inventory.json"
+    _write_json(
+        primary_inventory,
+        _source_inventory_document(
+            extractor.segments,
+            PRIMARY_SCOPE_METHOD,
+            static_tracking,
+            static_exclusions,
+        ),
+    )
+    _write_json(
+        independent_inventory,
+        _source_inventory_document(
+            extractor.segments,
+            INDEPENDENT_SCOPE_METHOD,
+            static_tracking,
+            static_exclusions,
+        ),
+    )
+    inventory_attestation = verify_inventory_pair(primary_inventory, independent_inventory)
+    if inventory_attestation["status"] != "static_verified":
+        raise RpgMakerMvError("STATIC_SCOPE_INVENTORY_MISMATCH")
+    _write_json(output_root / "inventory-attestation.json", inventory_attestation)
     manifest = {
         "format": MANIFEST_FORMAT,
         "engine": ENGINE_NAME,
@@ -800,6 +1217,10 @@ def extract_game(
         "segments": extractor.mappings,
         "segment_count": len(extractor.segments),
         "context_script": "context-script.json",
+        "static_scope": "static-scope.json",
+        "primary_inventory": "primary-inventory.json",
+        "independent_inventory": "independent-inventory.json",
+        "inventory_attestation": "inventory-attestation.json",
     }
     _write_json(output_root / "apply-manifest.json", manifest)
     source_before = _source_snapshot(layout.game_root, files)
@@ -814,6 +1235,11 @@ def extract_game(
         "segments": len(extractor.segments),
         "scenes": len(extractor.contexts),
         "counts": dict(extractor.counts),
+        "static_scope": {
+            **static_tracking,
+            "runtime_complete": False,
+        },
+        "inventory_status": inventory_attestation["status"],
         "issue_codes": dict(extractor.issues),
         "source_unchanged": True,
     }
