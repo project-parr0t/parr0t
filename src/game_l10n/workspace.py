@@ -142,10 +142,10 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "same_failure_limit": 2,
         "reuse_unchanged_checks": True,
         "delegate_simple_tasks": False,
-        "native_shard_policy_version": 4,
+        "native_shard_policy_version": 5,
         "native_shard_records": 64,
         "native_shard_min_records": 8,
-        "native_shard_material_tokens": 24000,
+        "native_shard_material_tokens": 8000,
         "native_review_shard_records": 2048,
         "native_review_shard_min_records": 64,
         "native_review_shard_material_tokens": 262144,
@@ -251,7 +251,7 @@ This private workspace contains game data and localization artifacts. Resolve th
 - Retryable failures stay in the metadata-only failure queue. Terminal source-preserved outcomes are recorded separately and are not retried as pending work; `metadata.blocking_on_failure=true` holds the entire patch.
 - Keep publication dormant and unmentioned until the user requests it. SDK promotion also requires confirmed patch success and the original exact target identity. Its separate engine-only commit must pass `game-l10n verify-sdk-promotion`; never mix a `main`-owned path into that commit.
 - Native orchestration uses one disposable isolated relay per authorized wave; root never directly parents semantic workers. Give only the `native-pass-step` artifact to a fresh relay. It dispatches exact workers once but cannot plan, retry, split, route, or forward raw responses. Wait once and step again; never select recovery. Reload prose only when `status.contract_set.digest` or the control generation changes.
-- Each v6 task embeds its bound segments. Read it once; never open the validation-only full source.
+- Each v6 task embeds its bound segments. Consume it once logically; ordered range reads may prevent transport truncation. Verify digest and order; never open the validation-only full source.
 - Use proportional checks, keep small coupled work in the current agent, and stop after the required layer passes. Once a pass leaves no more than `execution.residual_direct_records`, use one fresh worker on one cached residual task; do not create a job-local scheduler, controller, lease/owner system, liveness proof, memoization layer, or supplemental evidence pack. A native capacity failure ends that worker attempt and enters resumable state; it must not auto-restart the root turn. Aggregate once per wave, report progress only at a wave boundary or blocker, and stop after one unchanged progress observation or two control actions without measurable progress.
 
 ## Status routes
@@ -877,9 +877,14 @@ def _apply_execution_defaults(config: dict[str, Any]) -> None:
     ):
         execution["native_shard_records"] = 64
         execution["native_shard_material_tokens"] = 24_000
+    if (
+        policy_version < 5
+        and execution.get("native_shard_material_tokens") == 24_000
+    ):
+        execution["native_shard_material_tokens"] = 8_000
     for key, value in CONFIG_TEMPLATE["execution"].items():
         execution.setdefault(key, value)
-    execution["native_shard_policy_version"] = 4
+    execution["native_shard_policy_version"] = 5
 
 
 def _apply_review_routing_defaults(config: dict[str, Any]) -> None:

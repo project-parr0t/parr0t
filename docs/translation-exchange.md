@@ -112,3 +112,27 @@ The validator rejects modified requests, unknown or duplicate IDs, overlap betwe
 - Manual and fallback modes use the identical row format. Switching provider or handing a remainder to a human does not authorize format conversion, re-extraction, or retranslating valid successes.
 
 The control plane acts only on the sealed envelope. If it reads a text-bearing exchange file or creates another format, record `parent_opened_data_plane` or `unvalidated_worker_response` and rotate the control plane.
+
+For the locked `codex-app-deepseek` preset, a core-prepared fallback bundle may be processed only with:
+
+```text
+game-l10n process-translation-exchange --workspace <workspace> --bundle <bundle>
+```
+
+The command validates the unchanged request and any completed rows, invokes only the preset's configured `translation_fallback` compatible adapter, preserves completed successes, writes the same fixed success/failure rows, and seals the bundle. It never promotes DeepSeek to a primary role or performs review. Previously recorded failures are not called again unless a later user request is represented by `--user-requested-retry`.
+
+Bulk API fallback also requires the whole-job budget binding. On the first bundle, provide the user-approved ceiling and a confirmed cumulative baseline:
+
+```text
+game-l10n process-translation-exchange \
+  --workspace <workspace> \
+  --bundle <bundle> \
+  --max-input-tokens <whole-job-cap> \
+  --usage-baseline-input-tokens <confirmed-prior-input-tokens> \
+  --max-elapsed-minutes <whole-job-cap> \
+  --budget-started-at-epoch <original-job-start>
+```
+
+The core records provider-reported usage in `.game-l10n/provider-usage/translation-fallback.json`, processes bounded waves, and seals each wave before continuing. Later bundles reuse that ledger, so omit `--usage-baseline-input-tokens`; keep the same ceilings. If prior usage is absent or unverified, stop with `E_FALLBACK_BUDGET_BASELINE_REQUIRED` rather than treating it as zero. A provider event interrupted before usage can be proven stops with `E_FALLBACK_BUDGET_ACCOUNTING_UNCERTAIN`; reconcile that one event only with the exact provider-reported value and `--resolve-uncertain-input-tokens`. Never estimate either value from text length, task size, elapsed time, or an empty counter.
+
+When the ceiling is reached, already sealed successes remain cached, untouched targets remain pending in the same exchange, and no further provider call starts. This budget checkpoint is not permission to narrow scope, preserve source early, or open a new format.

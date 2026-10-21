@@ -60,6 +60,26 @@ class ControlPlaneContractTests(unittest.TestCase):
         )
         self.assertEqual(args.func.__name__, "cmd_native_pass_step")
 
+    def test_native_relay_seal_accepts_repeated_ended_tasks(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "seal-native-wave-relay",
+                "--workspace",
+                "fixture-workspace",
+                "--dispatch",
+                "relay.json",
+                "--ended-task",
+                "task-0002.jsonl",
+                "--ended-task",
+                "task-0003.jsonl",
+            ]
+        )
+
+        self.assertEqual(
+            args.ended_task,
+            ["task-0002.jsonl", "task-0003.jsonl"],
+        )
+
     def test_review_control_contract_is_deterministic_and_text_free(self) -> None:
         contract = review_control_contract()
 

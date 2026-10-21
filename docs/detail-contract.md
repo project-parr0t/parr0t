@@ -10,7 +10,7 @@ The native v6 task manifest is the only executable detail contract. Its `worker_
 
 The root may pass only the core-generated `parr0t.native-wave-relay.v1` path to a fresh isolated relay. It must not copy the bound task paths into direct semantic-worker prompts. The relay is restricted to exact dispatch and categorical collection; it cannot add instructions, inspect semantic payloads, retry, split, select a provider, or create a replacement format. A semantic worker's free-form response contaminates only that disposable relay unless the relay forwards it; forwarding is a control-plane incident.
 
-Each v6 task row binds the complete segment payload under `parr0t.native-task-payload.v1`. A data-plane worker reads that task once and must not open the full ordered `source_artifact`. The full source exists only for framework-side fingerprint, alignment, and merge validation.
+Each v6 task row binds the complete segment payload under `parr0t.native-task-payload.v1`. A data-plane worker consumes one immutable task snapshot and must not open the full ordered `source_artifact`. "Once" binds the worker to that single snapshot; it does not require one shell-output frame. When the host transport would truncate the task, the worker may consume deterministic ordered byte or line ranges from the same unchanged file, verifying its digest, complete record count, and order before the one semantic call. The full source exists only for framework-side fingerprint, alignment, and merge validation.
 
 ## Permitted detail
 

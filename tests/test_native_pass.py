@@ -20,10 +20,96 @@ from game_l10n.native_pass import (
     prepare_native_tasks,
     seal_native_wave_relay,
 )
+from game_l10n.native_followup import CANDIDATE_METADATA_KEY
+from game_l10n.store import stable_hash
 from tests.test_validators import optional_slot_fixture
 
 
+def review_segment(segment_id: str, source: str = "S", candidate: str = "T") -> Segment:
+    return Segment(
+        segment_id,
+        source,
+        metadata={
+            CANDIDATE_METADATA_KEY: {
+                "text": candidate,
+                "generation": 1,
+                "digest": stable_hash(candidate),
+                "provider": "fixture",
+            }
+        },
+    )
+
+
 class NativePassTests(unittest.TestCase):
+    def test_ended_malformed_transport_archives_bytes_and_keeps_good_rows(self) -> None:
+        from game_l10n.native_pass import _complete_ended_task_result
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            prepare_native_tasks(
+                root,
+                source,
+                [Segment("a", "S"), Segment("b", "S")],
+                tasks,
+                max_records=2,
+            )
+            result = root / "result.jsonl"
+            original = b'{"target_id":"a","status":"success","text":"T"}\n{broken\n'
+            result.write_bytes(original)
+
+            self.assertTrue(
+                _complete_ended_task_result(
+                    tasks / "task-0001.jsonl", result, expected_records=2
+                )
+            )
+            rows = [json.loads(line) for line in result.read_text().splitlines()]
+            self.assertEqual(rows[0]["text"], "T")
+            self.assertEqual(rows[1]["status"], "error")
+            archives = list(root.glob("result.jsonl.ended-original-*"))
+            self.assertEqual(len(archives), 1)
+            self.assertEqual(archives[0].read_bytes(), original)
+            self.assertFalse(
+                _complete_ended_task_result(
+                    tasks / "task-0001.jsonl", result, expected_records=2
+                )
+            )
+
+    def test_ready_review_resumes_after_validator_revision_without_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks, results = root / "tasks", root / "results"
+            prepare_native_tasks(
+                root,
+                source,
+                [review_segment("fixture-1")],
+                tasks,
+                pass_kind="review",
+            )
+            first = native_control_step(root, tasks / "manifest.json", results)
+            self._write_rows(
+                results / "task-0001.jsonl",
+                [{"target_id": "fixture-1", "status": "success", "text": "OK"}],
+            )
+            from game_l10n import native_pass as module
+
+            with patch.object(module, "import_native_wave", side_effect=ValueError):
+                stopped = native_control_step(root, tasks / "manifest.json", results)
+            state_path = root / stopped["state"]
+            state = json.loads(state_path.read_text())
+            state["control_steps_in_wave"] = 100
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            with patch.object(module, "RESULT_VALIDATION_REVISION", 3):
+                resumed = native_control_step(root, tasks / "manifest.json", results)
+
+            self.assertEqual(first["action"], "dispatch_isolated_wave_relay")
+            self.assertEqual(resumed["action"], "aggregate_completed_pass")
+            self.assertEqual(resumed["imported_wave"]["success"], 1)
+
     def test_review_pass_uses_large_batch_and_bounded_failure_split_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -33,7 +119,7 @@ class NativePassTests(unittest.TestCase):
             summary = prepare_native_tasks(
                 root,
                 source,
-                [Segment(f"fixture-{index}", "S") for index in range(4096)],
+                [review_segment(f"fixture-{index}") for index in range(4096)],
                 tasks,
                 pass_kind="review",
                 max_material_tokens=1_000_000,
@@ -62,7 +148,7 @@ class NativePassTests(unittest.TestCase):
             source.write_text("fixture", encoding="utf-8")
             tasks = root / "tasks"
             results = root / "results"
-            segments = [Segment(f"fixture-{index}", "S") for index in range(4)]
+            segments = [review_segment(f"fixture-{index}") for index in range(4)]
             prepare_native_tasks(
                 root,
                 source,
@@ -109,6 +195,122 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(merged["success"], 2)
         self.assertEqual(merged["failed"], 2)
         self.assertEqual(merged["imported_shards"], 1)
+
+    def test_review_missing_split_proof_isolated_without_reprocessing_success(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            segments = [review_segment(f"fixture-{index}") for index in range(4)]
+            prepare_native_tasks(
+                root,
+                source,
+                segments,
+                tasks,
+                pass_kind="review",
+                max_records=4,
+                max_workers=1,
+            )
+            native_control_step(root, tasks / "manifest.json", results)
+            task_rows = [
+                json.loads(line)
+                for line in (tasks / "task-0001.jsonl").read_text().splitlines()
+            ]
+            self._write_rows(
+                results / "task-0001.jsonl",
+                [
+                    {
+                        "target_id": row["target_id"],
+                        "status": "success" if index < 2 else "refused",
+                        "text": "T" if index < 2 else "",
+                    }
+                    for index, row in enumerate(task_rows)
+                ],
+            )
+            completed = native_control_step(root, tasks / "manifest.json", results)
+            merged_path = root / "merged.jsonl"
+            merged = merge_native_pass(
+                root,
+                segments,
+                merged_path,
+                manifest_path=tasks / "manifest.json",
+            )
+            rows = [json.loads(line) for line in merged_path.read_text().splitlines()]
+
+        self.assertEqual(completed["action"], "aggregate_completed_pass")
+        self.assertEqual(completed["imported_wave"]["success"], 2)
+        self.assertEqual(completed["imported_wave"]["failed"], 2)
+        self.assertEqual(merged["success"], 2)
+        self.assertEqual(rows[0]["status"], "success")
+        self.assertEqual(rows[1]["status"], "success")
+        self.assertEqual(
+            [row["issues"] for row in rows[2:]],
+            [["review_split_proof_missing"], ["review_split_proof_missing"]],
+        )
+
+    def test_review_relay_ended_worker_is_operational_failure_not_invalid_wave(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            segments = [review_segment(f"fixture-{index}") for index in range(3)]
+            prepare_native_tasks(
+                root,
+                source,
+                segments,
+                tasks,
+                pass_kind="review",
+                max_records=3,
+                max_workers=1,
+            )
+            step = native_control_step(root, tasks / "manifest.json", results)
+            dispatch = root / step["relay"]["dispatch"]
+            first = json.loads(
+                (tasks / "task-0001.jsonl").read_text().splitlines()[0]
+            )
+            self._write_rows(
+                results / "task-0001.jsonl",
+                [
+                    {
+                        "target_id": first["target_id"],
+                        "status": "success",
+                        "text": "T",
+                    }
+                ],
+            )
+            seal_native_wave_relay(
+                root,
+                dispatch,
+                ended_tasks=("task-0001.jsonl",),
+            )
+            completed = native_control_step(
+                root,
+                tasks / "manifest.json",
+                results,
+                require_relay_receipt=True,
+            )
+            merged_path = root / "merged.jsonl"
+            merged = merge_native_pass(
+                root,
+                segments,
+                merged_path,
+                manifest_path=tasks / "manifest.json",
+            )
+            rows = [json.loads(line) for line in merged_path.read_text().splitlines()]
+
+        self.assertEqual(completed["action"], "aggregate_completed_pass")
+        self.assertEqual(completed["imported_wave"]["success"], 1)
+        self.assertEqual(completed["imported_wave"]["failed"], 2)
+        self.assertEqual(merged["success"], 1)
+        self.assertEqual(rows[0]["status"], "success")
+        self.assertEqual(
+            [row["issues"] for row in rows[1:]],
+            [["worker_ended_without_result"], ["worker_ended_without_result"]],
+        )
 
     def test_native_step_hashes_only_the_selected_wave_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -924,6 +1126,143 @@ class NativePassTests(unittest.TestCase):
         )
         self.assertNotIn("SOURCE", json.dumps(receipt))
         self.assertNotIn("TARGET", json.dumps(receipt))
+
+    def test_native_wave_relay_records_ended_workers_without_overwriting_success(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            prepare_native_tasks(
+                root,
+                source,
+                [Segment("fixture-1", "SOURCE_1"), Segment("fixture-2", "SOURCE_2")],
+                tasks,
+                max_records=1,
+                max_workers=2,
+            )
+            step = native_control_step(root, tasks / "manifest.json", results)
+            dispatch = root / step["relay"]["dispatch"]
+            first_row = json.loads(
+                (tasks / "task-0001.jsonl").read_text(encoding="utf-8").splitlines()[0]
+            )
+            self._write_rows(
+                results / "task-0001.jsonl",
+                [
+                    {
+                        "target_id": first_row["target_id"],
+                        "status": "success",
+                        "text": "TARGET",
+                    }
+                ],
+            )
+
+            sealed = seal_native_wave_relay(
+                root,
+                dispatch,
+                ended_tasks=("task-0001.jsonl", "task-0002.jsonl"),
+            )
+            ended_rows = [
+                json.loads(line)
+                for line in (results / "task-0002.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            resumed = native_control_step(
+                root,
+                tasks / "manifest.json",
+                results,
+                require_relay_receipt=True,
+            )
+
+        self.assertEqual(sealed["counts"]["ready_tasks"], 2)
+        self.assertEqual(sealed["counts"]["pending_tasks"], 0)
+        self.assertEqual(sealed["ended_tasks_recorded"], 1)
+        self.assertEqual(ended_rows[0]["target_id"], "fixture-2")
+        self.assertEqual(ended_rows[0]["status"], "error")
+        self.assertEqual(ended_rows[0]["text"], "")
+        self.assertEqual(ended_rows[0]["issues"], ["worker_ended_without_result"])
+        self.assertEqual(resumed["action"], "aggregate_completed_pass")
+        self.assertEqual(resumed["imported_wave"]["success"], 1)
+        self.assertEqual(resumed["imported_wave"]["failed"], 1)
+
+    def test_native_wave_relay_rejects_unbound_ended_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            prepare_native_tasks(root, source, [Segment("fixture-1", "SOURCE")], tasks)
+            step = native_control_step(root, tasks / "manifest.json", results)
+
+            with self.assertRaisesRegex(ValueError, "ended task is not bound"):
+                seal_native_wave_relay(
+                    root,
+                    root / step["relay"]["dispatch"],
+                    ended_tasks=("task-9999.jsonl",),
+                )
+
+        self.assertFalse((results / "task-9999.jsonl").exists())
+
+    def test_native_wave_relay_preserves_partial_success_and_fills_only_missing_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            prepare_native_tasks(
+                root,
+                source,
+                [
+                    Segment("fixture-1", "SOURCE_1"),
+                    Segment("fixture-2", "SOURCE_2"),
+                    Segment("fixture-3", "SOURCE_3"),
+                ],
+                tasks,
+                max_records=3,
+                max_workers=1,
+            )
+            step = native_control_step(root, tasks / "manifest.json", results)
+            dispatch = root / step["relay"]["dispatch"]
+            self._write_rows(
+                results / "task-0001.jsonl",
+                [
+                    {
+                        "target_id": "fixture-1",
+                        "status": "success",
+                        "text": "TARGET_1",
+                    }
+                ],
+            )
+
+            incomplete = seal_native_wave_relay(root, dispatch)
+            sealed = seal_native_wave_relay(
+                root,
+                dispatch,
+                ended_tasks=("task-0001.jsonl",),
+            )
+            rows = [
+                json.loads(line)
+                for line in (results / "task-0001.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+        self.assertEqual(incomplete["counts"]["ready_tasks"], 0)
+        self.assertEqual(incomplete["counts"]["pending_tasks"], 1)
+        self.assertEqual(sealed["counts"]["ready_tasks"], 1)
+        self.assertEqual(sealed["ended_tasks_recorded"], 1)
+        self.assertEqual([row["target_id"] for row in rows], [
+            "fixture-1",
+            "fixture-2",
+            "fixture-3",
+        ])
+        self.assertEqual(rows[0]["status"], "success")
+        self.assertEqual(rows[0]["text"], "TARGET_1")
+        self.assertEqual([row["status"] for row in rows[1:]], ["error", "error"])
 
     def test_cli_mode_requires_relay_receipt_before_wave_import(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

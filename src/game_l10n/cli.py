@@ -52,6 +52,9 @@ from .formats import (
 )
 from .filesystem_package import build_filesystem_package, validate_filesystem_package
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext
+from .native_followup import collect_native_followup, prepare_native_followup
+from .native_review import (collect_native_review, collect_native_rewrite,
+                            collect_reviewed_candidates, process_native_review_followup)
 from .instance_release import validate_instance_release
 from .native_pass import (
     DEFAULT_BULK_BUDGET_GATE_RECORDS,
@@ -72,11 +75,21 @@ from .native_pass import (
 from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from .privacy import is_within, require_external_workdir
 from .providers import ProviderRegistry
-from .provider_policy import require_direct_provider_pipeline
+from .provider_policy import (
+    CODEX_APP_EXECUTION_MODE,
+    effective_execution_mode,
+    require_direct_provider_pipeline,
+    validate_provider_policy,
+)
 from .runtime_approval import create_runtime_approval
 from .store import stable_hash, stable_hash_sequence
 from .steam import build_steam_package, inspect_installed_state, validate_steam_package
-from .translation_exchange import prepare_translation_exchange, seal_translation_exchange
+from .translation_exchange import (
+    FALLBACK_USAGE_RELATIVE,
+    prepare_translation_exchange,
+    process_translation_exchange,
+    seal_translation_exchange,
+)
 from .tooling import cached_tool_state, run_cached_tool
 from .workspace import (
     initialize_workspace,
@@ -931,6 +944,7 @@ def cmd_seal_native_wave_relay(args: argparse.Namespace) -> int:
     result = seal_native_wave_relay(
         work_dir,
         _path_in_workspace(work_dir, args.dispatch, must_exist=True),
+        ended_tasks=tuple(args.ended_task or ()),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -1143,6 +1157,281 @@ def cmd_merge_native_pass(args: argparse.Namespace) -> int:
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result["complete"] else 1
+
+
+def cmd_prepare_native_followup(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
+    source = _path_in_workspace(work_dir, args.input, must_exist=True)
+    primary_results = _path_in_workspace(
+        work_dir, args.primary_results, must_exist=True
+    )
+    result = prepare_native_followup(
+        work_dir,
+        source,
+        read_segments(source),
+        primary_results,
+        _path_in_workspace(work_dir, args.output),
+        exchange_prefix=args.exchange_prefix,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_materialize_delivery_candidates(args: argparse.Namespace) -> int:
+    from .native_review import materialize_delivery_candidates
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
+    result = materialize_delivery_candidates(
+        work_dir, _path_in_workspace(work_dir, args.input, must_exist=True),
+        _path_in_workspace(work_dir, args.approved, must_exist=True),
+        [_path_in_workspace(work_dir, p, must_exist=True) for p in args.pending],
+        _path_in_workspace(work_dir, args.translation_failures, must_exist=True),
+        _path_in_workspace(work_dir, args.output), include_unreviewed=args.include_unreviewed,
+        report=_path_in_workspace(work_dir, args.report) if args.report else None,
+        **_native_review_integrity_options(work_dir, config),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_collect_translation_exchange_candidates(args: argparse.Namespace) -> int:
+    from .native_followup import collect_translation_exchange_candidates
+    work_dir = Path(args.workspace).resolve()
+    require_sdk_activation(work_dir, load_config(work_dir))
+    source = _path_in_workspace(work_dir, args.input, must_exist=True)
+    review = _path_in_workspace(work_dir, args.review_output)
+    unresolved = _path_in_workspace(work_dir, args.unresolved_output)
+    if source in {review, unresolved}:
+        raise ConfigurationError("E_NATIVE_REVIEW_OUTPUT_INVALID")
+    result = collect_translation_exchange_candidates(
+        work_dir, read_segments(source),
+        _path_in_workspace(work_dir, args.bundle, must_exist=True), review, unresolved,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_collect_native_review(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
+    routing = config.get("routing", {})
+    result = collect_native_review(
+        work_dir, _path_in_workspace(work_dir, args.input, must_exist=True),
+        _path_in_workspace(work_dir, args.manifest, must_exist=True),
+        _path_in_workspace(work_dir, args.output), tier=args.tier,
+        sample_percent=routing.get("strong_review_sample_percent", 5.0),
+        high_risk_categories=routing.get("strong_review_high_risk_categories", []),
+        **_native_review_integrity_options(work_dir, config),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_collect_native_rewrite(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
+    result = collect_native_rewrite(
+        work_dir, _path_in_workspace(work_dir, args.input, must_exist=True),
+        _path_in_workspace(work_dir, args.manifest, must_exist=True),
+        _path_in_workspace(work_dir, args.output),
+        review_max_rounds=int(config.get("routing", {}).get("review_max_rounds", 2)),
+        **_native_review_integrity_options(work_dir, config),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_process_native_review_followup(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
+    # This factory validates the immutable Codex App preset and creates only
+    # its configured DeepSeek adapter. This command never calls translate.
+    orchestrator = _codex_app_fallback_orchestrator(work_dir)
+    role = "judge_fallback" if args.operation == "judge" else "selective_rewrite"
+    if role not in config["native_workflow"]["external_provider_roles"]:
+        raise ConfigurationError("E_PROVIDER_MODE_DRIFT: review role is not authorized")
+    orchestrator.config.retry_refusals_once = False
+    orchestrator.config.grace_retries = 0
+    result = process_native_review_followup(
+        work_dir, _path_in_workspace(work_dir, args.input, must_exist=True),
+        _path_in_workspace(work_dir, args.output), orchestrator,
+        operation=args.operation,
+        deadline_epoch=args.budget_started_at_epoch + args.max_elapsed_minutes * 60,
+        wave_size=args.wave_size,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_collect_reviewed_candidates(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
+    result = collect_reviewed_candidates(
+        work_dir, _path_in_workspace(work_dir, args.input, must_exist=True),
+        [_path_in_workspace(work_dir, path, must_exist=True) for path in args.results],
+        _path_in_workspace(work_dir, args.output),
+        **_native_review_integrity_options(work_dir, config),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def _native_review_integrity_options(work_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
+    routing = config.get("routing", {})
+    glossary_path = _path_in_workspace(
+        work_dir, config.get("files", {}).get("glossary", "context/glossary.json"),
+        must_exist=True,
+    )
+    return {"glossary": _load_dataclass_list(glossary_path, GlossaryEntry),
+            "extra_patterns": list(routing.get("extra_protected_patterns", [])),
+            "max_length_ratio": float(routing.get("max_length_ratio", 4.0))}
+
+
+def _codex_app_fallback_orchestrator(work_dir: Path) -> LocalizationOrchestrator:
+    config = load_config(work_dir)
+    validate_provider_policy(config)
+    if effective_execution_mode(config) != CODEX_APP_EXECUTION_MODE:
+        raise ConfigurationError(
+            "E_PROVIDER_MODE_DRIFT: process-translation-exchange is reserved for "
+            "the configured Codex App translation_fallback route"
+        )
+    provider_policy = config.get("provider_policy", {})
+    if "translation_fallback" not in provider_policy.get("external_provider_roles", []):
+        # Older generated policy keeps this field under native_workflow.
+        native_roles = config.get("native_workflow", {}).get("external_provider_roles", [])
+        if "translation_fallback" not in native_roles:
+            raise ConfigurationError(
+                "E_PROVIDER_MODE_DRIFT: translation_fallback is not authorized"
+            )
+    file_config = config.get("files", {})
+    context_path = _path_in_workspace(
+        work_dir,
+        file_config.get("context_pack", "context/context-pack.json"),
+        must_exist=True,
+    )
+    context_payload = json.loads(context_path.read_text(encoding="utf-8-sig"))
+    if not isinstance(context_payload, dict):
+        raise ValueError("Context pack is malformed")
+    context_pack = ContextPack(**context_payload)
+    routing = config["routing"]
+    registry = ProviderRegistry.from_config(config, work_dir)
+    glossary = _load_dataclass_list(
+        _path_in_workspace(
+            work_dir, file_config.get("glossary", "context/glossary.json")
+        ),
+        GlossaryEntry,
+    )
+    characters = _load_dataclass_list(
+        _path_in_workspace(
+            work_dir, file_config.get("characters", "context/characters.json")
+        ),
+        CharacterProfile,
+    )
+    return LocalizationOrchestrator(
+        registry=registry,
+        config=OrchestratorConfig(
+            translator_chain=["deepseek"],
+            reviewer_chain=[],
+            require_review=False,
+            max_workers=int(routing.get("max_workers", 1)),
+            max_length_ratio=float(routing.get("max_length_ratio", 4.0)),
+            extra_protected_patterns=list(
+                routing.get("extra_protected_patterns", [])
+            ),
+            use_style_memory=False,
+            retry_refusals_once=bool(routing.get("retry_refusals_once", True)),
+            grace_retries=int(routing.get("grace_retries", 0)),
+            grace_retry_codes=list(
+                routing.get(
+                    "grace_retry_codes",
+                    [
+                        "malformed_response",
+                        "provider_error",
+                        "rate_limited",
+                        "timeout",
+                        "integrity_invalid",
+                    ],
+                )
+            ),
+            preserve_source_on_failure=False,
+        ),
+        project=ProjectContext(**config["project"]),
+        glossary=glossary,
+        characters=characters,
+        context_pack=context_pack,
+        work_dir=work_dir,
+    )
+
+
+def cmd_process_translation_exchange(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
+    execution = config.get("execution", {})
+    unlimited = bool(getattr(args, "input_tokens_unlimited", False))
+    max_input_tokens = (
+        args.max_input_tokens
+        if args.max_input_tokens is not None
+        else execution.get("bulk_max_input_tokens")
+    )
+    if unlimited:
+        if args.max_input_tokens is not None or args.usage_baseline_input_tokens is not None:
+            raise ConfigurationError("E_FALLBACK_UNLIMITED_POLICY_INVALID")
+        max_input_tokens = None
+    elif max_input_tokens is None:
+        raise ConfigurationError("E_FALLBACK_BUDGET_REQUIRED")
+    if (
+        not unlimited and not (work_dir / FALLBACK_USAGE_RELATIVE).is_file()
+        and args.usage_baseline_input_tokens is None
+    ):
+        raise ConfigurationError("E_FALLBACK_BUDGET_BASELINE_REQUIRED")
+    max_elapsed_minutes = (
+        args.max_elapsed_minutes
+        if args.max_elapsed_minutes is not None
+        else execution.get("bulk_max_elapsed_minutes")
+    )
+    orchestrator = _codex_app_fallback_orchestrator(work_dir)
+    result = process_translation_exchange(
+        work_dir,
+        _path_in_workspace(work_dir, args.bundle, must_exist=True),
+        lambda segments: orchestrator.translate_many(segments),
+        route="deepseek",
+        retry_failures=bool(args.user_requested_retry),
+        max_input_tokens=int(max_input_tokens) if max_input_tokens is not None else None,
+        baseline_input_tokens=args.usage_baseline_input_tokens,
+        max_elapsed_minutes=(
+            int(max_elapsed_minutes) if max_elapsed_minutes is not None else None
+        ),
+        started_at_epoch=args.budget_started_at_epoch,
+        resolve_uncertain_input_tokens=args.resolve_uncertain_input_tokens,
+        wave_size=min(32, max(1, int(config["routing"].get("max_workers", 1)))),
+        input_tokens_unlimited=unlimited,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["status"] == "complete" else 1
+
+
+def cmd_collect_native_followup(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
+    source = _path_in_workspace(work_dir, args.input, must_exist=True)
+    result = collect_native_followup(
+        work_dir,
+        _path_in_workspace(work_dir, args.followup, must_exist=True),
+        read_segments(source),
+        _path_in_workspace(work_dir, args.review_output),
+        _path_in_workspace(work_dir, args.unresolved_output),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["translation_barrier_complete"] else 1
 
 
 def cmd_prepare_translation_exchange(args: argparse.Namespace) -> int:
@@ -1936,6 +2225,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     native_relay.add_argument("--workspace", required=True)
     native_relay.add_argument("--dispatch", required=True)
+    native_relay.add_argument(
+        "--ended-task",
+        action="append",
+        help=(
+            "Record a bound worker that ended without a result as an operational "
+            "failure; never overwrite an existing result"
+        ),
+    )
     native_relay.set_defaults(func=cmd_seal_native_wave_relay)
 
     native_import = sub.add_parser(
@@ -1974,6 +2271,97 @@ def build_parser() -> argparse.ArgumentParser:
     )
     native_merge.set_defaults(func=cmd_merge_native_pass)
 
+    delivery = sub.add_parser("materialize-delivery-candidates")
+    delivery.add_argument("--workspace", required=True)
+    delivery.add_argument("--input", required=True)
+    delivery.add_argument("--approved", required=True)
+    delivery.add_argument("--pending", action="append", required=True)
+    delivery.add_argument("--translation-failures", required=True)
+    delivery.add_argument("--output", required=True)
+    delivery.add_argument("--report")
+    delivery.add_argument("--include-unreviewed", action="store_true")
+    delivery.set_defaults(func=cmd_materialize_delivery_candidates)
+
+    exchange_collect = sub.add_parser("collect-translation-exchange-candidates")
+    exchange_collect.add_argument("--workspace", required=True)
+    exchange_collect.add_argument("--input", required=True)
+    exchange_collect.add_argument("--bundle", required=True)
+    exchange_collect.add_argument("--review-output", required=True)
+    exchange_collect.add_argument("--unresolved-output", required=True)
+    exchange_collect.set_defaults(func=cmd_collect_translation_exchange_candidates)
+
+    native_review = sub.add_parser("collect-native-review")
+    native_review.add_argument("--workspace", required=True)
+    native_review.add_argument("--input", required=True)
+    native_review.add_argument("--manifest", required=True)
+    native_review.add_argument("--output", required=True)
+    native_review.add_argument("--tier", choices=["triage", "strong"], required=True)
+    native_review.set_defaults(func=cmd_collect_native_review)
+
+    native_rewrite = sub.add_parser("collect-native-rewrite")
+    native_rewrite.add_argument("--workspace", required=True)
+    native_rewrite.add_argument("--input", required=True)
+    native_rewrite.add_argument("--manifest", required=True)
+    native_rewrite.add_argument("--output", required=True)
+    native_rewrite.set_defaults(func=cmd_collect_native_rewrite)
+
+    reviewed_collect = sub.add_parser("collect-reviewed-candidates")
+    reviewed_collect.add_argument("--workspace", required=True)
+    reviewed_collect.add_argument("--input", required=True, help="Independently verified primary inventory")
+    reviewed_collect.add_argument("--results", action="append", required=True)
+    reviewed_collect.add_argument("--output", required=True)
+    reviewed_collect.set_defaults(func=cmd_collect_reviewed_candidates)
+
+    review_followup = sub.add_parser("process-native-review-followup")
+    review_followup.add_argument("--workspace", required=True)
+    review_followup.add_argument("--input", required=True)
+    review_followup.add_argument("--output", required=True)
+    review_followup.add_argument("--operation", choices=["judge", "rewrite"], required=True)
+    review_followup.add_argument("--wave-size", type=int, default=8)
+    review_followup.add_argument("--budget-started-at-epoch", type=float, required=True)
+    review_followup.add_argument("--max-elapsed-minutes", type=float, required=True)
+    review_followup.set_defaults(func=cmd_process_native_review_followup)
+
+    native_followup = sub.add_parser(
+        "prepare-native-followup",
+        help=(
+            "Bind merged native translation results to fixed fallback exchanges and "
+            "candidate review input"
+        ),
+    )
+    native_followup.add_argument("--workspace", required=True)
+    native_followup.add_argument(
+        "--input", required=True, help="Original ordered source segment file"
+    )
+    native_followup.add_argument(
+        "--primary-results", required=True, help="Complete manifest-bound native merge"
+    )
+    native_followup.add_argument(
+        "--output", required=True, help="New or matching private follow-up directory"
+    )
+    native_followup.add_argument(
+        "--exchange-prefix", required=True, help="Stable safe prefix for fallback bundles"
+    )
+    native_followup.set_defaults(func=cmd_prepare_native_followup)
+
+    native_followup_collect = sub.add_parser(
+        "collect-native-followup",
+        help=(
+            "Collect sealed fallback candidates into native review input without "
+            "reopening primary successes"
+        ),
+    )
+    native_followup_collect.add_argument("--workspace", required=True)
+    native_followup_collect.add_argument(
+        "--input", required=True, help="Original ordered source segment file"
+    )
+    native_followup_collect.add_argument(
+        "--followup", required=True, help="Prepared native follow-up directory"
+    )
+    native_followup_collect.add_argument("--review-output", required=True)
+    native_followup_collect.add_argument("--unresolved-output", required=True)
+    native_followup_collect.set_defaults(func=cmd_collect_native_followup)
+
     exchange_prepare = sub.add_parser(
         "prepare-translation-exchange",
         help="Create the fixed private manual/fallback translation exchange bundle",
@@ -1997,6 +2385,57 @@ def build_parser() -> argparse.ArgumentParser:
     exchange_seal.add_argument("--workspace", required=True)
     exchange_seal.add_argument("--bundle", required=True)
     exchange_seal.set_defaults(func=cmd_seal_translation_exchange)
+
+    exchange_process = sub.add_parser(
+        "process-translation-exchange",
+        help=(
+            "Run the locked Codex App translation-fallback adapter on one fixed "
+            "exchange bundle"
+        ),
+    )
+    exchange_process.add_argument("--workspace", required=True)
+    exchange_process.add_argument("--bundle", required=True)
+    exchange_process.add_argument(
+        "--input-tokens-unlimited", action="store_true",
+        help="User explicitly removed the input-token ceiling; preserve historical usage and enforce the original deadline",
+    )
+    exchange_process.add_argument(
+        "--max-input-tokens",
+        type=int,
+        help="User-approved whole-job input-token ceiling",
+    )
+    exchange_process.add_argument(
+        "--usage-baseline-input-tokens",
+        type=int,
+        help=(
+            "Confirmed cumulative input tokens before the first fallback call; "
+            "required only when the workspace fallback ledger does not exist"
+        ),
+    )
+    exchange_process.add_argument(
+        "--max-elapsed-minutes",
+        type=int,
+        help="User-approved whole-job elapsed-minute ceiling",
+    )
+    exchange_process.add_argument(
+        "--budget-started-at-epoch",
+        type=float,
+        help="Original whole-job start time as a Unix timestamp",
+    )
+    exchange_process.add_argument(
+        "--resolve-uncertain-input-tokens",
+        type=int,
+        help=(
+            "Exact total input tokens for the single interrupted fallback event, "
+            "only after user-authorized reconciliation"
+        ),
+    )
+    exchange_process.add_argument(
+        "--user-requested-retry",
+        action="store_true",
+        help="Retry previously recorded fallback failures after a new user request",
+    )
+    exchange_process.set_defaults(func=cmd_process_translation_exchange)
 
     control_validate = sub.add_parser(
         "validate-control-envelope",

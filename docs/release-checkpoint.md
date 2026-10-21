@@ -2,6 +2,8 @@
 
 Every Parr0t distribution contains `parr0t-release-checkpoint.json`. The file makes the released translation a machine-readable continuation point: when an agent later receives that release together with a readable game folder, it can recover verified unchanged targets without translating or reviewing them again. When a title-specific translation source repository is also supplied, it remains a separate build/apply input; use it instead of reconstructing equivalent title-specific work or copying it into the checkpoint repository.
 
+Each entry records one of three exact states: `reviewed`, user-authorized `accepted_unreviewed`, or `source_preserved`. A translated candidate that was shipped after review failure or review exhaustion must remain `accepted_unreviewed`; it must not be promoted to `reviewed`. A missing or deterministically unsafe candidate remains `source_preserved`. These states allow a later correction or resumed review to touch only the affected targets.
+
 The checkpoint is distribution data, not SDK data. It may contain only the target strings already shipped in the release; source text is represented by a digest and must not be duplicated in a separate field. A `source_preserved` target may necessarily equal its source, but remains explicitly marked unresolved. The file must not contain prompts, model output, provider explanations, credentials, logs, private workspace paths, or unpublished translation candidates.
 
 ## Bound identity
