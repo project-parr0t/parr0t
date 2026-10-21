@@ -217,7 +217,7 @@ def register_wolf_parser(subparsers: argparse._SubParsersAction) -> None:
 
     import_reviewed = commands.add_parser(
         "import-reviewed",
-        help="Import the complete reviewed result set into stable WOLF batches",
+        help="Import delivery candidates and preserve source for missing or unsafe targets",
     )
     import_reviewed.add_argument("--workspace", required=True)
     import_reviewed.add_argument("--reviewed", required=True)

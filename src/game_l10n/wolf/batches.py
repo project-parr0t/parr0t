@@ -382,35 +382,53 @@ def import_reviewed_results(reviewed_path: Path, batch_dir: Path) -> dict[str, A
             if not target_id or target_id in items:
                 raise ValueError(f"Missing or duplicate WOLF batch target: {target_id!r}")
             items[target_id] = item
-    if set(reviewed) != set(items):
-        missing = len(set(items) - set(reviewed))
-        extra = len(set(reviewed) - set(items))
+    unknown = set(reviewed) - set(items)
+    if unknown:
         raise ValueError(
-            f"Reviewed WOLF result set does not match batches (missing={missing}, extra={extra})"
+            f"Reviewed WOLF result set contains unknown targets (extra={len(unknown)})"
         )
 
     source_preserved = 0
+    source_preserved_missing = 0
+    source_preserved_invalid = 0
+    accepted_unreviewed = 0
+    resolved: dict[str, str] = {}
     for target_id, item in items.items():
-        row = reviewed[target_id]
-        status = str(row.get("status", ""))
-        if status not in {"reviewed", "source_preserved"}:
-            raise ValueError(f"WOLF target is not patchable: {target_id} ({status or 'missing status'})")
         source = str(item.get("source", ""))
+        row = reviewed.get(target_id)
+        if row is None:
+            resolved[target_id] = source
+            source_preserved += 1
+            source_preserved_missing += 1
+            continue
+        status = str(row.get("status", ""))
+        if status not in {"reviewed", "accepted_unreviewed", "source_preserved"}:
+            raise ValueError(f"WOLF target is not patchable: {target_id} ({status or 'missing status'})")
         if row.get("source") != source:
             raise ValueError(f"Reviewed WOLF source changed: {target_id}")
         target = row.get("text")
-        if not isinstance(target, str) or not target:
-            raise ValueError(f"Reviewed WOLF target is empty: {target_id}")
         if status == "source_preserved":
-            source_preserved += 1
             if target != source:
                 raise ValueError(f"Source-preserved WOLF target changed source text: {target_id}")
-        errors = _validate_target(source, target)
-        if errors:
-            raise ValueError(f"Reviewed WOLF target failed integrity checks: {target_id}")
+            resolved[target_id] = source
+            source_preserved += 1
+            continue
+        if not isinstance(target, str) or not target:
+            target = source
+            source_preserved += 1
+            source_preserved_invalid += 1
+        else:
+            errors = _validate_target(source, target)
+            if errors:
+                target = source
+                source_preserved += 1
+                source_preserved_invalid += 1
+            elif status == "accepted_unreviewed":
+                accepted_unreviewed += 1
+        resolved[target_id] = target
 
     for target_id, item in items.items():
-        item["target"] = reviewed[target_id]["text"]
+        item["target"] = resolved[target_id]
         item.pop("manual", None)
     for path, document in documents.items():
         path.write_text(
@@ -420,6 +438,9 @@ def import_reviewed_results(reviewed_path: Path, batch_dir: Path) -> dict[str, A
     return {
         "imported": len(items),
         "source_preserved": source_preserved,
+        "source_preserved_missing": source_preserved_missing,
+        "source_preserved_invalid": source_preserved_invalid,
+        "accepted_unreviewed": accepted_unreviewed,
         "batches": len(documents),
     }
 

@@ -47,7 +47,7 @@ game-l10n translate `
 
 The context-first translation/review orchestrator remains authoritative. Batch v2 assigns a stable ID to each source occurrence instead of collapsing repeated text, so the same words may receive different translations in different scenes. The primary inventory preserves speaker, neighboring lines, extraction order, engine kind, and exact JSON references while the independent audit checks that the collector did not omit a supported source shape.
 
-Import the complete reviewed output into the batches, then apply it:
+Import the deterministic delivery result into the batches, then apply it:
 
 ```powershell
 python -m game_l10n.wolf import-reviewed `
@@ -61,7 +61,7 @@ python -m game_l10n.wolf apply-batches `
   --translated-json translations\wolf-json
 ```
 
-The importer requires every current target to be `reviewed` or exact `source_preserved`, validates the complete ID/source set, and updates batches transactionally. Control-code or newline mismatches abort before any translated JSON document is written. A verified inventory fingerprint is mandatory, and any unresolved `metadata.blocking_on_failure=true` target holds import, application, and packing until a later user-requested resume resolves it.
+The importer accepts `reviewed`, explicitly user-authorized `accepted_unreviewed`, and exact `source_preserved` rows. Missing translation results preserve their source instead of invalidating the whole delivery. A candidate with a control-code or newline mismatch also preserves the source for that target; unknown IDs, changed sources, and invalid statuses still fail before any batch file is written. The returned counts distinguish applied unreviewed targets, missing translations, and structural rejections. A verified inventory fingerprint is mandatory, and any unresolved `metadata.blocking_on_failure=true` target holds import, application, and packing until a later user-requested resume resolves it.
 
 ## Manual translator queue
 

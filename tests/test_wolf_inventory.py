@@ -89,9 +89,9 @@ class WolfInventoryTests(unittest.TestCase):
                                 "segment_id": row["id"],
                                 "source": row["source"],
                                 "text": f"TARGET_{index}",
-                                "status": "reviewed",
+                                "status": "reviewed" if index == 1 else "accepted_unreviewed",
                             }
-                            for index, row in enumerate(inventory["segments"], 1)
+                            for index, row in enumerate(inventory["segments"][:2], 1)
                         ]
                     }
                 ),
@@ -106,7 +106,56 @@ class WolfInventoryTests(unittest.TestCase):
             ]
 
         self.assertEqual(summary["imported"], 3)
-        self.assertEqual(imported_targets, ["TARGET_1", "TARGET_2", "TARGET_3"])
+        self.assertEqual(summary["accepted_unreviewed"], 1)
+        self.assertEqual(summary["source_preserved_missing"], 1)
+        self.assertEqual(
+            imported_targets,
+            ["TARGET_1", "TARGET_2", inventory["segments"][2]["source"]],
+        )
+
+    def test_import_source_preserves_structurally_invalid_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            batches = root / "batches"
+            batches.mkdir()
+            (batches / "batch_0001.json").write_text(
+                json.dumps(
+                    {
+                        "format": "wolf-rpg-agent-batch-v2",
+                        "items": [
+                            {
+                                "id": "fixture-control",
+                                "source": "SOURCE\\c[1]",
+                                "target": "",
+                                "refs": [],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            results = root / "delivery.json"
+            results.write_text(
+                json.dumps(
+                    {
+                        "results": [
+                            {
+                                "segment_id": "fixture-control",
+                                "source": "SOURCE\\c[1]",
+                                "text": "TARGET",
+                                "status": "accepted_unreviewed",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = import_reviewed_results(results, batches)
+            item = json.loads((batches / "batch_0001.json").read_text())["items"][0]
+
+            self.assertEqual(item["target"], "SOURCE\\c[1]")
+            self.assertEqual(summary["source_preserved_invalid"], 1)
 
     def test_blocking_failure_queue_holds_wolf_patch_steps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
