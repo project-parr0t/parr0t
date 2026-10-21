@@ -9,6 +9,7 @@ from pathlib import Path
 
 from game_l10n.cli import build_parser, main
 from game_l10n.control_plane import (
+    CONTROL_HANDOFF_PATH,
     REVIEW_CONTROL_ALLOWED_ACTIONS,
     REVIEW_CONTROL_CONTRACT_SCHEMA,
     REVIEW_CONTROL_MODE,
@@ -29,6 +30,22 @@ from game_l10n.native_pass import _detail_contract, prepare_native_tasks
 
 
 class ControlPlaneContractTests(unittest.TestCase):
+    def test_native_review_pass_kind_is_registered(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "prepare-native-pass",
+                "--workspace",
+                "fixture-workspace",
+                "--input",
+                "source.jsonl",
+                "--output",
+                "tasks",
+                "--pass-kind",
+                "review",
+            ]
+        )
+        self.assertEqual(args.pass_kind, "review")
+
     def test_native_pass_step_cli_is_registered(self) -> None:
         args = build_parser().parse_args(
             [
@@ -42,6 +59,26 @@ class ControlPlaneContractTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.func.__name__, "cmd_native_pass_step")
+
+    def test_native_relay_seal_accepts_repeated_ended_tasks(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "seal-native-wave-relay",
+                "--workspace",
+                "fixture-workspace",
+                "--dispatch",
+                "relay.json",
+                "--ended-task",
+                "task-0002.jsonl",
+                "--ended-task",
+                "task-0003.jsonl",
+            ]
+        )
+
+        self.assertEqual(
+            args.ended_task,
+            ["task-0002.jsonl", "task-0003.jsonl"],
+        )
 
     def test_review_control_contract_is_deterministic_and_text_free(self) -> None:
         contract = review_control_contract()
@@ -89,7 +126,7 @@ class ControlPlaneContractTests(unittest.TestCase):
         self.assertEqual(_detail_contract()["review_control"], contract)
 
     def test_review_control_action_allowlist_rejects_autonomous_recovery(self) -> None:
-        permit = validate_review_control_action("dispatch_authorized_task")
+        permit = validate_review_control_action("dispatch_isolated_wave_relay")
         self.assertTrue(permit["authorized"])
 
         for action in (
@@ -452,7 +489,9 @@ class ControlPlaneContractTests(unittest.TestCase):
                     root / "batches",
                 )
 
-            resumed = acknowledge_control_plane_rotation(root, incident["incident_id"])
+            resumed = acknowledge_control_plane_rotation(
+                root, root / CONTROL_HANDOFF_PATH
+            )
             self.assertEqual(control_plane_entry_state(root)["status"], "pending")
             establish_control_plane_entry(root)
             result = prepare_native_tasks(
@@ -470,8 +509,12 @@ class ControlPlaneContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             record_control_plane_leak(root, "source_or_candidate_received")
-            with self.assertRaisesRegex(ConfigurationError, "incident ID"):
-                acknowledge_control_plane_rotation(root, "wrong")
+            receipt = root / CONTROL_HANDOFF_PATH
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            payload["incident_id"] = "0" * 32
+            receipt.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ConfigurationError, "HANDOFF_INVALID"):
+                acknowledge_control_plane_rotation(root, receipt)
             state = control_plane_state(root)
 
         self.assertEqual(state["status"], "rotation_required")
@@ -518,6 +561,8 @@ class ControlPlaneContractTests(unittest.TestCase):
                         "--workspace",
                         str(root),
                         "--fresh-session-confirmed",
+                        "--contracts-read",
+                        "--source-unopened",
                     ]
                 )
 
@@ -526,6 +571,58 @@ class ControlPlaneContractTests(unittest.TestCase):
         self.assertEqual(resumed, 0)
         self.assertNotIn(incident["incident_id"], stdout.getvalue())
         self.assertIn("E_CONTROL_PLANE_FRESH_SESSION_REQUIRED", stderr.getvalue())
+        self.assertIn('"status": "ready"', stdout.getvalue())
+
+    def test_resume_rejects_arbitrary_continuation_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record_control_plane_leak(root, "unvalidated_worker_response")
+            continuation = root / "continuation.txt"
+            continuation.write_text("metadata only", encoding="utf-8")
+            with self.assertRaisesRegex(ConfigurationError, "HANDOFF_REQUIRED"):
+                acknowledge_control_plane_rotation(root, continuation)
+
+    def test_legacy_rotation_without_receipt_gets_canonical_core_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            incident = record_control_plane_leak(root, "unvalidated_worker_response")
+            (root / CONTROL_HANDOFF_PATH).unlink()
+            resumed = acknowledge_control_plane_rotation(
+                root, root / CONTROL_HANDOFF_PATH
+            )
+
+        self.assertEqual(resumed["generation"], incident["generation"] + 1)
+        self.assertEqual(resumed["status"], "ready")
+
+    def test_resume_resets_only_generation_local_native_polling_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            native_state = root / ".game-l10n" / "native" / "control" / "state.json"
+            native_state.parent.mkdir(parents=True)
+            native_state.write_text(
+                json.dumps(
+                    {
+                        "schema": "parr0t.native-control-state.v2",
+                        "control_steps_in_wave": 7,
+                        "last_progress_marker": "unchanged",
+                        "unchanged_observations": 3,
+                        "last_action": "checkpoint_and_stop",
+                        "input_tokens": 1234,
+                        "imported_tasks": 9,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            record_control_plane_leak(root, "unvalidated_worker_response")
+            acknowledge_control_plane_rotation(root, root / CONTROL_HANDOFF_PATH)
+            reset = json.loads(native_state.read_text(encoding="utf-8"))
+
+        self.assertEqual(reset["control_steps_in_wave"], 0)
+        self.assertEqual(reset["last_progress_marker"], "")
+        self.assertEqual(reset["unchanged_observations"], 0)
+        self.assertEqual(reset["last_action"], "")
+        self.assertEqual(reset["input_tokens"], 1234)
+        self.assertEqual(reset["imported_tasks"], 9)
 
     def test_rotation_blocks_non_recovery_cli_commands(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
