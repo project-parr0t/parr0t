@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import html
 import json
 import re
 import tempfile
@@ -223,7 +224,28 @@ def discover_game(game_root: Path, *, expected_version: str = EXPECTED_ENGINE_VE
     game_root = game_root.resolve()
     if not game_root.is_dir():
         raise RpgMakerMvError("GAME_ROOT_MISSING")
-    candidates = sorted(
+    # NW.js resolves main relative to the launch package, not recursively.
+    # Prefer that explicit entry to incidental nested copies of a project.
+    package = game_root / "package.json"
+    entry_data: Path | None = None
+    if package.is_file():
+        try:
+            config = json.loads(package.read_text(encoding="utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RpgMakerMvError("INVALID_RUNTIME_PACKAGE") from exc
+        main = config.get("main") if isinstance(config, dict) else None
+        if isinstance(main, str) and main:
+            entry = (game_root / _safe_relative_path(main, label="runtime_main")).resolve()
+            if not entry.is_relative_to(game_root):
+                raise RpgMakerMvError("UNSAFE_RUNTIME_MAIN")
+            candidate = entry.parent / "data"
+            if (entry.is_file() and (candidate / "System.json").is_file()
+                    and (candidate / "MapInfos.json").is_file()
+                    and (entry.parent / "js" / "rpg_core.js").is_file()):
+                entry_data = candidate
+            else:
+                raise RpgMakerMvError("RUNTIME_ENTRY_LAYOUT_UNSUPPORTED")
+    candidates = [entry_data] if entry_data else sorted(
         path.parent
         for path in game_root.rglob("System.json")
         if (path.parent / "MapInfos.json").is_file()
@@ -288,6 +310,10 @@ class _Extractor:
             "preserve_control_code_order": True,
             "context": dict(context or {}),
         }
+        if kind == "battle_message" or (kind == "database" and str((context or {}).get('field', '')).startswith('message')):
+            metadata.update(ui_slot_role="template_fragment", ui_render_pattern="{name}{value}")
+        if span is not None:
+            metadata['source_span'] = list(span)
         if kind in {"dialogue", "scrolling_text"}:
             metadata["required_line_count"] = len(paths)
         nameboxes = re.findall(r"\\[nN]<([^>\r\n]*)>", value)
@@ -601,6 +627,76 @@ class _Extractor:
                 row["next"] = self.segments[index + 1]["source"]
 
 
+def extract_external_text(extractor: _Extractor, sources: Mapping[str, str]) -> None:
+    """Select statically bound first-argument literals without evaluating JavaScript.
+
+    Indirect values and concatenations require a separate dataflow audit. Callers
+    supply only scripts reachable from the selected runtime entry point.
+    """
+    lexical = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|\x27(?:\\.|[^\x27\\])*\x27|`(?:\\.|[^`\\])*`', re.S)
+    display = re.compile(r'(?:\.drawText(?:Ex)?|\.addCommand|\.setText|\$gameMessage\.add|\.setName|\.setNickname|\.setProfile)\s*\(\s*$')
+    for filename, text in sorted(sources.items()):
+        candidates = []
+        if filename.endswith('.js'):
+            masked = list(text)
+            for match in lexical.finditer(text):
+                literal = match[0]
+                if literal.startswith(('//', '/*')):
+                    masked[match.start():match.end()] = ' ' * len(literal)
+                    continue
+                if literal[0] not in {'"', "'"}:
+                    continue
+                if display.search(''.join(masked[:match.start()])) and re.match(r'\s*[,)]', text[match.end():]):
+                    candidates.append((decode_js_literal(literal), match.span(), 'script_display_text', literal[0], []))
+                masked[match.start():match.end()] = ' ' * len(literal)
+        elif filename.endswith('.html'):
+            for match in re.finditer(r'<title\b[^>]*>(.*?)</title\s*>', text, re.I | re.S):
+                candidates.append((html.unescape(match[1]), match.span(1), 'html_title', None, ['title']))
+        for value, span, kind, quote, identity_path in candidates:
+            before = len(extractor.segments)
+            extractor.add(filename, [['text']], value, kind, filename, span=span, quote=quote)
+            if len(extractor.segments) == before:
+                continue
+            identity_span = span if kind == 'script_display_text' else None
+            identifier = 'mv-' + hashlib.sha256(f'{filename}#{_json_pointer(identity_path)}#{identity_span or ""}'.encode()).hexdigest()[:24]
+            extractor.segments[-1]['id'] = extractor.mappings[-1]['id'] = identifier
+            extractor.segments[-1]['metadata'].update(json_pointer=_json_pointer(identity_path), source_span=list(span))
+
+
+def extract_bound_external_text(
+    extractor: _Extractor,
+    sources: Mapping[str, str],
+    bindings: Iterable[Mapping[str, Any]],
+) -> None:
+    """Extract independently audited indirect display literals from retained sources.
+
+    Bindings are caller-owned evidence, never executable expressions. Each exact
+    quoted source span is sealed to its source-file digest. No title rules live
+    in the adapter, and existing apply/verify paths enforce immutable surroundings.
+    """
+    for binding in bindings:
+        filename = str(binding["file"])
+        _safe_relative_path(filename, label="bound_external_file")
+        text = sources[filename]
+        if _sha256_bytes(text.encode("utf-8")) != binding["text_sha256"]:
+            raise RpgMakerMvError("BOUND_EXTERNAL_SOURCE_CHANGED")
+        span = tuple(binding["span"])
+        if len(span) != 2 or any(type(v) is not int for v in span) or not 0 <= span[0] < span[1] <= len(text):
+            raise RpgMakerMvError("INVALID_SPAN_MAPPING")
+        literal = text[span[0]:span[1]]
+        value = decode_js_literal(literal)
+        if not value.strip():
+            raise RpgMakerMvError("EMPTY_BOUND_DISPLAY_LITERAL")
+        before = len(extractor.segments)
+        extractor.add(filename, [["text"]], value, "script_display_text", filename,
+                      span=span, quote=literal[0])
+        if len(extractor.segments) == before:
+            continue
+        identifier = "mv-" + hashlib.sha256(f"{filename}#/#{span}".encode()).hexdigest()[:24]
+        extractor.segments[-1]["id"] = extractor.mappings[-1]["id"] = identifier
+        extractor.segments[-1]["metadata"].update(json_pointer="/", source_span=list(span))
+
+
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -631,6 +727,25 @@ def extract_game(
 
     extractor = _Extractor(documents)
     extractor.run()
+    runtime_root = layout.data_root.parent
+    external_paths = []
+    index = runtime_root / 'index.html'
+    if index.is_file():
+        external_paths.append(index)
+    registry = runtime_root / 'js' / 'plugins.js'
+    if registry.is_file():
+        match = re.search(r'var\s+\$plugins\s*=\s*(\[.*\])\s*;', registry.read_text(encoding='utf-8-sig'), re.S)
+        if not match:
+            raise RpgMakerMvError('INVALID_PLUGIN_REGISTRY')
+        for plugin in json.loads(match[1]):
+            if plugin.get('status'):
+                name = _safe_relative_path(str(plugin['name']), label='plugin')
+                path = runtime_root / 'js' / 'plugins' / Path(str(name) + '.js')
+                if not path.is_file():
+                    raise RpgMakerMvError('ACTIVE_PLUGIN_MISSING')
+                external_paths.append(path)
+    external_sources = {p.relative_to(runtime_root).as_posix(): p.read_text(encoding='utf-8-sig') for p in external_paths}
+    extract_external_text(extractor, external_sources)
     if not extractor.segments:
         raise RpgMakerMvError("NO_TRANSLATABLE_SEGMENTS")
 
@@ -654,6 +769,16 @@ def extract_game(
         )
 
     segment_path = output_root / "segments.jsonl"
+    for path in external_paths:
+        filename = path.relative_to(runtime_root).as_posix()
+        if not any(entry['file'] == filename for entry in extractor.mappings):
+            continue
+        baseline = output_root / 'baseline' / filename
+        baseline.parent.mkdir(parents=True, exist_ok=True)
+        baseline.write_bytes(path.read_bytes())
+        files.append({'file': filename, 'baseline': 'baseline/' + filename,
+                      'patch_path': path.relative_to(layout.game_root).as_posix(),
+                      'sha256': _sha256_file(path), 'storage': 'text'})
     segment_path.write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in extractor.segments),
         encoding="utf-8",
@@ -770,8 +895,9 @@ def _load_baselines(
         if not isinstance(item, dict):
             raise RpgMakerMvError("INVALID_FILE_MANIFEST")
         filename = item.get("file")
-        if not isinstance(filename, str) or Path(filename).name != filename or filename in filenames:
+        if not isinstance(filename, str) or filename in filenames:
             raise RpgMakerMvError("INVALID_FILE_MANIFEST")
+        _safe_relative_path(filename, label="file")
         filenames.add(filename)
         baseline_relative = _safe_relative_path(str(item.get("baseline", "")), label="baseline")
         baseline = (root / baseline_relative).resolve()
@@ -785,7 +911,28 @@ def _load_baselines(
         if not source.is_file() or _sha256_file(source) != expected:
             raise RpgMakerMvError("READ_ONLY_SOURCE_CHANGED")
         try:
-            baseline_document = json.loads(baseline.read_text(encoding="utf-8-sig"))
+            raw = baseline.read_bytes().decode("utf-8-sig")
+            if item.get('storage') == 'text':
+                bindings = [e for e in manifest["segments"] if e["file"] == filename]
+                def matches_bindings(value: str) -> bool:
+                    for entry in bindings:
+                        start, end = entry["span"]
+                        literal = value[start:end]
+                        try:
+                            decoded = (decode_js_literal(literal) if entry.get("kind") == "script_display_text"
+                                       else html.unescape(literal) if entry.get("kind") == "html_title"
+                                       else literal)
+                        except RpgMakerMvError:
+                            return False
+                        if decoded != entry["source"]:
+                            return False
+                    return True
+                normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+                if not matches_bindings(raw):
+                    if not matches_bindings(normalized):
+                        raise RpgMakerMvError("TEXT_SPAN_SOURCE_MISMATCH")
+                    raw = normalized
+            baseline_document = {'text': raw} if item.get('storage') == 'text' else json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RpgMakerMvError("INVALID_BASELINE_JSON") from exc
         baselines[filename] = baseline_document
@@ -804,6 +951,45 @@ def _record_direct_assignment(
     if existing is not None and existing != value:
         raise RpgMakerMvError("CONFLICTING_PATH_ASSIGNMENT")
     assignments[key] = value
+
+
+def inspect_script_span_bindings(manifest_path: Path, game_root: Path) -> dict[str, Any]:
+    """Return only structural span-coordinate counts, never source or candidates."""
+    manifest = _load_manifest(manifest_path)
+    baselines, _ = _load_baselines(manifest_path, manifest, game_root)
+    counts: Counter[str] = Counter()
+    files = {item["file"]: item for item in manifest["files"]}
+    for entry in manifest["segments"]:
+        if entry.get("kind") != "script_display_text" or "span" not in entry:
+            continue
+        parent = _get_path(baselines[entry["file"]], entry["paths"][0])
+        start, end = entry["span"]
+        def matches(value: str) -> bool:
+            try:
+                return decode_js_literal(value) == entry["source"]
+            except RpgMakerMvError:
+                return False
+        if matches(parent[start:end]):
+            counts["canonical"] += 1
+            continue
+        counts["noncanonical"] += 1
+        for name, encoding in (("utf16_offsets", "utf-16-le"), ("utf8_offsets", "utf-8")):
+            try:
+                data = parent.encode(encoding)
+                unit = 2 if name == "utf16_offsets" else 1
+                if matches(data[start*unit:end*unit].decode(encoding)):
+                    counts[name] += 1
+            except UnicodeError:
+                pass
+        if start > 0 and matches(parent[start-1:end+1]):
+            counts["body_only_offsets"] += 1
+        item = files[entry["file"]]
+        if item.get("storage") == "text":
+            data = (manifest_path.parent / item["baseline"]).read_bytes()
+            for name, encoding in (("raw_utf8", "utf-8"), ("raw_utf8_sig", "utf-8-sig")):
+                if matches(data.decode(encoding)[start:end]):
+                    counts[name] += 1
+    return {"status": "inspected", "span_counts": dict(counts)}
 
 
 def apply_translations(
@@ -876,8 +1062,9 @@ def apply_translations(
                     issue_counts.update(issues)
                     if not preserve_invalid:
                         raise RpgMakerMvError("INVALID_TRANSLATION:" + ",".join(issues))
-                    target = source
-                    status_counts["source_preserved_invalid"] += 1
+                    else:
+                        target = source
+                        status_counts["source_preserved_invalid"] += 1
                 else:
                     status_counts["applied"] += 1
 
@@ -902,6 +1089,10 @@ def apply_translations(
                 if decode_js_literal(original) != source:
                     raise RpgMakerMvError("SCRIPT_SPAN_SOURCE_MISMATCH")
                 replacement = encode_js_literal(target, str(entry.get("quote", "")))
+            elif entry.get("kind") == "html_title":
+                if html.unescape(original) != source:
+                    raise RpgMakerMvError("HTML_SPAN_SOURCE_MISMATCH")
+                replacement = html.escape(target, quote=False)
             else:
                 if original != source:
                     raise RpgMakerMvError("PLUGIN_SPAN_SOURCE_MISMATCH")
@@ -916,9 +1107,14 @@ def apply_translations(
             edits.append((span[0], span[1], replacement))
             continue
 
-        source_lines = source.split("\n")
-        target_lines = target.split("\n")
-        if len(source_lines) != len(paths) or len(target_lines) != len(paths):
+        # Only event dialogue groups distribute text over multiple commands.
+        # Database/UI values may contain literal newlines in one JSON field.
+        grouped = entry.get("kind") in {"dialogue", "scrolling_text"}
+        source_lines = source.split("\n") if grouped else [source]
+        target_lines = target.split("\n") if grouped else [target]
+        if len(source_lines) != len(paths):
+            raise RpgMakerMvError("LINE_PATH_MISMATCH")
+        if len(target_lines) != len(paths):
             raise RpgMakerMvError("LINE_PATH_MISMATCH")
         for path, source_line, target_line in zip(paths, source_lines, target_lines):
             if _get_path(baseline_document, path) != source_line:
@@ -952,11 +1148,11 @@ def apply_translations(
             relative = _safe_relative_path(str(item["patch_path"]), label="patch_path")
             target = temporary_root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(
-                json.dumps(documents[item["file"]], ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
-            )
-            json.loads(target.read_text(encoding="utf-8"))
+            output_text = (documents[item['file']]['text'] if item.get('storage') == 'text'
+                           else json.dumps(documents[item["file"]], ensure_ascii=False, separators=(",", ":")))
+            target.write_bytes(output_text.encode("utf-8"))
+            if item.get('storage') != 'text':
+                json.loads(target.read_text(encoding="utf-8"))
         verification = _verify_patch_loaded(manifest_path, manifest, game_root, temporary_root)
         temporary_root.replace(output_root)
 
@@ -1021,6 +1217,31 @@ def _verify_patch_loaded(
 
     for item in manifest["files"]:
         relative = _safe_relative_path(str(item["patch_path"]), label="patch_path")
+        if item.get('storage') == 'text':
+            original = baselines[item['file']]['text']
+            current = (patch_root / relative).read_bytes().decode('utf-8-sig')
+            entries = sorted((entry for entry in manifest['segments'] if entry['file'] == item['file']), key=lambda entry: entry['span'])
+            cursor = 0
+            chunks = []
+            for entry in entries:
+                start, end = entry['span']
+                if start < cursor or end > len(original):
+                    raise RpgMakerMvError('INVALID_SPAN_MAPPING')
+                chunks.append(re.escape(original[cursor:start]))
+                if entry.get('kind') == 'script_display_text':
+                    quote = str(entry.get('quote', ''))
+                    if quote not in {'"', "'"} or original[start:end][:1] != quote:
+                        raise RpgMakerMvError('INVALID_SCRIPT_QUOTE')
+                    chunks.append(re.escape(quote) + r'(?:\\[^\r\n]|[^' + re.escape(quote) + r'\\\r\n])*' + re.escape(quote))
+                elif entry.get('kind') == 'html_title':
+                    chunks.append(r'(?:[^<&]|&(?:[A-Za-z][A-Za-z0-9]*|#[0-9]+|#x[0-9A-Fa-f]+);)*')
+                else:
+                    raise RpgMakerMvError('INVALID_EXTERNAL_SPAN_KIND')
+                cursor = end
+            chunks.append(re.escape(original[cursor:]))
+            if not re.fullmatch(''.join(chunks), current):
+                raise RpgMakerMvError('PATCH_CHANGED_UNMAPPED_DATA')
+            continue
         try:
             output_document = json.loads((patch_root / relative).read_text(encoding="utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1054,11 +1275,13 @@ def pack_patch(patch_root: Path, archive_path: Path) -> dict[str, Any]:
     if archive_path == patch_root or archive_path.is_relative_to(patch_root):
         raise RpgMakerMvError("ARCHIVE_INSIDE_PATCH_ROOT")
     files = sorted(path for path in patch_root.rglob("*") if path.is_file())
-    if not files or any(path.suffix.casefold() != ".json" for path in files):
+    if not files or any(path.suffix.casefold() not in {".json", ".js", ".html"} for path in files):
         raise RpgMakerMvError("PATCH_CONTAINS_UNEXPECTED_FILES")
     for path in files:
         try:
-            json.loads(path.read_text(encoding="utf-8"))
+            text = path.read_bytes().decode("utf-8-sig")
+            if path.suffix.casefold() == ".json":
+                json.loads(text)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RpgMakerMvError("INVALID_PATCH_JSON") from exc
     archive_path.parent.mkdir(parents=True, exist_ok=True)

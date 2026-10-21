@@ -51,6 +51,8 @@ python -m game_l10n.rpg_maker_mv build `
 
 By default, missing or unsuccessful results and translations with deterministic integrity failures keep their source text. Use `--require-all-results` or `--fail-on-invalid` only when an incomplete build must stop instead.
 
+There is no delivery override for a candidate with mismatched control tokens or event-line structure. Such a candidate either preserves the source or, with `--fail-on-invalid`, stops the build. Review completion cannot override this engine-safety gate.
+
 Verify and package:
 
 ```powershell

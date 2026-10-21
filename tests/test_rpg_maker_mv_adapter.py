@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import tempfile
 import unittest
@@ -17,6 +18,111 @@ from game_l10n.rpg_maker_mv.adapter import (
     pack_patch,
     verify_patch,
 )
+
+
+class RuntimeEntryDiscoveryTests(unittest.TestCase):
+    def test_unsafe_candidate_override_is_not_exposed(self):
+        self.assertNotIn("keep_candidate_text", inspect.signature(apply_translations).parameters)
+
+    def test_text_spans_support_both_raw_crlf_and_normalized_coordinates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = _fixture_game(root)
+            _write_json(game / "www/js/plugins.js", [])
+            (game / "www/js/plugins.js").write_text('var $plugins = [{"name":"SyntheticDisplay","status":true}];')
+            plugin = game / "www/js/plugins/SyntheticDisplay.js"
+            plugin.parent.mkdir()
+            raw = "// FIXTURE\r\nwin.drawText('SOURCE_UI',0);\r\n"
+            plugin.write_bytes(b"\xef\xbb\xbf" + raw.encode())
+            extracted = root / "extracted"
+            extract_game(game, extracted)
+            manifest_path = extracted / "apply-manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            entry = next(e for e in manifest["segments"] if e["source"] == "SOURCE_UI")
+            results = root / "results.json"
+            _write_json(results, {"results": [_result(entry["id"], "TARGET_UI")]})
+            apply_translations(manifest_path, results, game, root / "normalized")
+            entry["span"] = [raw.index("'SOURCE_UI'"), raw.index("'SOURCE_UI'") + len("'SOURCE_UI'")]
+            legacy = extracted / "legacy-manifest.json"
+            _write_json(legacy, manifest)
+            patch = root / "raw"
+            apply_translations(legacy, results, game, patch)
+            self.assertIn(b"\r\n", (patch / "www/js/plugins/SyntheticDisplay.js").read_bytes())
+            self.assertEqual(verify_patch(legacy, game, patch)["status"], "verified")
+            archive = root / "patch.zip"
+            pack_patch(patch, archive)
+            with zipfile.ZipFile(archive) as z:
+                self.assertIn("www/js/plugins/SyntheticDisplay.js", z.namelist())
+
+    def test_multiline_scalar_stays_in_one_field_including_preserved_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = _fixture_game(root)
+            items = game / "www/data/Items.json"
+            _write_json(items, [None, {"id": 1, "name": "ITEM", "description": "SOURCE_A\nSOURCE_B"}])
+            extracted = root / "extracted"
+            extract_game(game, extracted)
+            segment = next(s for s in _rows(extracted / "segments.jsonl")
+                           if s["source"] == "SOURCE_A\nSOURCE_B")
+            results = root / "results.json"
+            _write_json(results, {"results": [_result(segment["id"], "TARGET_A\nTARGET_B")]})
+            patch = root / "patch"
+            report = apply_translations(extracted / "apply-manifest.json", results, game, patch,
+                                        preserve_invalid=False)
+            self.assertTrue(report["source_unchanged"])
+            self.assertEqual(json.loads((patch / "www/data/Items.json").read_text())[1]["description"],
+                             "TARGET_A\nTARGET_B")
+            _write_json(results, {"results": []})
+            preserved = root / "preserved"
+            apply_translations(extracted / "apply-manifest.json", results, game, preserved)
+            self.assertEqual(json.loads((preserved / "www/data/Items.json").read_text())[1]["description"],
+                             "SOURCE_A\nSOURCE_B")
+
+    def test_external_display_spans_apply_and_reject_unmapped_edits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            game = _fixture_game(root)
+            (game / 'www/index.html').write_text('<title>SOURCE_TITLE &amp; DETAIL</title><p>IMMUTABLE</p>', encoding='utf-8')
+            (game / 'www/js/plugins.js').write_text('var $plugins = [{"name":"SyntheticDisplay","status":true}];', encoding='utf-8')
+            plugin = game / 'www/js/plugins/SyntheticDisplay.js'
+            plugin.parent.mkdir()
+            plugin.write_text("// win.drawText('COMMENT',0);\nwin.drawText('SOURCE_UI',0);\nconst hidden = 'KEY';", encoding='utf-8')
+            extracted = root / 'extract'
+            extract_game(game, extracted)
+            manifest = json.loads((extracted / 'apply-manifest.json').read_text(encoding='utf-8'))
+            rows = [r for r in manifest['segments'] if r['file'].endswith(('.html', '.js'))]
+            self.assertEqual(len(rows), 2)
+            results = root / 'results.json'
+            _write_json(results, [{'id': r['id'], 'status': 'success', 'text': 'TARGET <&>' if r['kind'] == 'html_title' else "TARGET 'UI'"} for r in rows])
+            patch = root / 'patch'
+            apply_translations(extracted / 'apply-manifest.json', results, game, patch)
+            self.assertIn('TARGET &lt;&amp;&gt;', (patch / 'www/index.html').read_text(encoding='utf-8'))
+            self.assertIn("TARGET \\'UI\\'", (patch / 'www/js/plugins/SyntheticDisplay.js').read_text(encoding='utf-8'))
+            patch_script = patch / 'www/js/plugins/SyntheticDisplay.js'
+            safe_script = patch_script.read_text(encoding='utf-8')
+            patch_script.write_text(safe_script.replace("'TARGET \\'UI\\''", "'TARGET'); attack(); ('UI'"), encoding='utf-8')
+            with self.assertRaisesRegex(RpgMakerMvError, 'PATCH_CHANGED_UNMAPPED_DATA'):
+                verify_patch(extracted / 'apply-manifest.json', game, patch)
+            patch_script.write_text(safe_script, encoding='utf-8')
+            (patch / 'www/index.html').write_text('<title>TARGET</title><p>CHANGED</p>', encoding='utf-8')
+            with self.assertRaisesRegex(RpgMakerMvError, 'PATCH_CHANGED_UNMAPPED_DATA'):
+                verify_patch(extracted / 'apply-manifest.json', game, patch)
+
+    def test_package_main_selects_launch_payload_among_nested_projects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            game = _fixture_game(root)
+            _fixture_game(game / "www")
+            (game / "www" / "index.html").write_text("<html></html>", encoding="utf-8")
+            _write_json(game / "package.json", {"main": "www/index.html"})
+            self.assertEqual(discover_game(game).data_root, game / "www" / "data")
+
+    def test_package_main_cannot_escape_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            game = _fixture_game(Path(temporary))
+            _write_json(game / "package.json", {"main": "../outside/index.html"})
+            with self.assertRaisesRegex(RpgMakerMvError, "UNSAFE_RUNTIME_MAIN"):
+                discover_game(game)
 
 
 def _write_json(path: Path, value: object) -> None:
