@@ -10,13 +10,13 @@ choose a model, invent a review plan, or reinterpret a worker result.
 
 The only review-control actions are: read validated status; prepare the
 repository-defined manifest; run `game-l10n native-pass-step`; dispatch the
-single exact wave it returns; wait once for that active wave; validate a
+single exact `dispatch_isolated_wave_relay` artifact it returns to one fresh relay; wait once for that active wave; validate a
 text-free control envelope; aggregate a completed pass; route an exact
 categorical status; record aggregate usage; or checkpoint and stop.
 
 Anything else is denied. In particular, the control plane must not create an
 ad-hoc manifest, receipt, queue, or result format; clone or rebind the SDK;
-move files to repair tools; change batch shape or model; repeat an unchanged
+move files to repair tools; change batch shape outside the core split or change models; repeat an unchanged
 success; or clear a halted/cost-audit state on its own. User approval is an
 input to the repository contract, not permission to improvise missing budget
 or execution fields. Resuming additionally requires a regenerated, validated
@@ -37,7 +37,15 @@ to an unbudgeted universal pass.
 
 The top-level Parr0t agent schedules work and advances queues. It does not inspect or judge game text. This boundary applies from preliminary discovery through final validation; it is not limited to translation and review providers. Arbitrary subprocess output remains in private workspace logs; a parent-facing tool failure is categorical only.
 
-Deterministic native-wave collection is part of the private data plane. `native-pass-step` is the normative scheduler: it persists text-free progress and aggregate usage, enforces unchanged-observation and budget stops, imports a complete active wave atomically, and emits exactly one next action. Its dispatch response contains only task/result paths and counts. The parent must not select another wave, call legacy `import-native-wave` as a recovery path, or open imported shards. The same manifest binds the final aggregate merge.
+Deterministic native-wave collection is part of the private data plane. `native-pass-step` is the normative scheduler: it persists text-free progress and aggregate usage, enforces unchanged-observation and budget stops, imports a complete active wave atomically, and emits exactly one next action. For review refusal/error only, it may lock successes and apply the manifest's bounded failed-subset rule. Its parent-facing dispatch contains only one relay-artifact path and counts. The parent must not open that artifact, select another wave, call legacy import as recovery, or open shards.
+
+The top-level control plane is never the direct parent of a semantic worker. For each authorized wave, `native-pass-step` writes one metadata-only `parr0t.native-wave-relay.v1` dispatch file. The root gives only that path to one fresh no-history `isolated_wave_relay`. The relay may start only the exact bound workers, once; it may not open their task payloads, plan, retry, split, change providers, alter routes, or interpret failures. Semantic workers remain non-delegating and write their normal private artifacts. Raw child responses terminate at the disposable relay and must never be forwarded to the root. After the bounded wait, the relay runs `game-l10n seal-native-wave-relay --workspace <workspace> --dispatch <relay-path>`, appending one `--ended-task <task-file-name>` for each bound child that ended without a result, and returns only the resulting workspace-relative `parr0t.native-wave-relay-receipt.v1` path. The deterministic seal records those exact tasks as operational-error rows without overwriting any result that won the race, so the complete wave can be imported and its failed targets can enter the configured resumable queue. Review split-proof validation never applies to those relay-generated operational rows. If a review worker omits the required bounded-split proof for a semantic failure, core locks every structurally valid success in the same task and downgrades only the unsupported failure rows to the categorical `review_split_proof_missing` operational error for failed-only routing; it does not invalidate or repeat the successful rows. The seal never semantically interprets result rows. The relay must not invent a supplemental lifecycle envelope. If a child emits prose or private content, quarantine that relay, preserve valid completed result files, and report only its bound task name through the same categorical seal path.
+
+## Deterministic delivery selection
+
+Packaging eligibility is computed by `materialize-delivery-candidates`; the control plane must not recreate this join in an ad hoc script. A translated and reviewed target is emitted as `reviewed`. A translated target whose review did not complete may be emitted only after the user's explicit inclusion request, and remains `accepted_unreviewed` with its review history intact. A translation failure is omitted from the result artifact so the selected SDK preserves the exact source. A placeholder, markup, control-token, script-integrity, or other deterministic integrity failure is also omitted and recorded in the metadata-only `parr0t.delivery-selection.v1` report. Review failure alone never converts an existing candidate into a translation failure, while an unsafe structure never becomes acceptable merely because semantic review passed.
+
+The selected SDK may apply stricter engine-specific structural checks, such as line-slot counts or engine escape-code order. Such a check may only preserve the source or fail the build; it may not silently apply the unsafe candidate. The top-level plane receives counts, stable target IDs, categorical issue codes, and artifact paths only. The release checkpoint must retain `reviewed`, `accepted_unreviewed`, and `source_preserved` as distinct states so a later run can resume only the unfinished work.
 
 ## Entry gate
 
@@ -150,14 +158,17 @@ game-l10n record-control-plane-leak \
 
 This writes a text-free `rotation_required` marker. All non-recovery CLI work, including native task preparation, import, merge, and envelope validation, then stops with `E_CONTROL_PLANE_ROTATION_REQUIRED`. Metadata-only status, diagnostics, incident recording, and rotation acknowledgment remain available. Preserve completed data-plane artifacts and queue metadata; do not delete or redo them.
 
-The contaminated top-level agent must stop and must not run or confirm the resume command. Status output intentionally omits the internal incident identifier. A fresh control plane, with no inherited game-content history, reads only the categorical state and acknowledges the current incident:
+The contaminated top-level agent must stop and must not run or confirm the resume command. `record-control-plane-leak` writes the only valid, digest-bound, metadata-only handoff receipt at `.game-l10n/control-plane-handoff.json`; status output intentionally omits its internal incident identifier. Do not write or read a prose `continuation.txt`, summary, or alternate handoff file. A fresh control plane, with no inherited game-content history, acknowledges the exact receipt and establishes its entry gate atomically:
 
 ```text
 game-l10n resume-control-plane \
   --workspace <workspace> \
-  --fresh-session-confirmed
+  --handoff-receipt .game-l10n/control-plane-handoff.json \
+  --fresh-session-confirmed \
+  --contracts-read \
+  --source-unopened
 ```
 
-The confirmation flag is an assertion by the newly started agent, not a recovery option for the contaminated one. Acknowledgment advances the control-plane generation; it does not approve omitted targets or discard pending work. The fresh agent resumes the configured primary/fallback/review order from existing checkpoints.
+The confirmation flag is necessary but insufficient: the command rejects any receipt path, schema, digest, incident, or generation not bound to the pending rotation. Acknowledgment advances the generation, resets only generation-local polling observations, and preserves queues, completed results, usage, and pass checkpoints. It does not approve omitted targets or discard pending work. A successful command returns an already-ready entry gate; do not run a second entry or resume sequence.
 
 Use `game-l10n control-plane-status --workspace <workspace>` to inspect the text-free generation and rotation state.
