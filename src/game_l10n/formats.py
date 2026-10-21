@@ -12,19 +12,35 @@ from .models import AttemptRecord, Segment, TranslationResult
 def read_segments(path: Path) -> list[Segment]:
     suffix = path.suffix.lower()
     if suffix == ".jsonl":
-        rows = [json.loads(line) for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+        def rows() -> Iterable[dict[str, object]]:
+            with path.open("r", encoding="utf-8-sig") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    if not isinstance(row, dict):
+                        raise ValueError(f"Row {line_number} must be an object")
+                    yield row
     elif suffix == ".json":
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
-        rows = payload["segments"] if isinstance(payload, dict) else payload
+        raw_rows = payload["segments"] if isinstance(payload, dict) else payload
+        if not isinstance(raw_rows, list):
+            raise ValueError("JSON segment input must contain a list")
+
+        def rows() -> Iterable[dict[str, object]]:
+            yield from raw_rows
     elif suffix == ".csv":
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            rows = list(csv.DictReader(handle))
+        def rows() -> Iterable[dict[str, object]]:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                yield from csv.DictReader(handle)
     else:
         raise ValueError(f"Unsupported segment format: {suffix}; use .jsonl, .json, or .csv")
 
     segments: list[Segment] = []
     seen: set[str] = set()
-    for index, row in enumerate(rows, start=1):
+    for index, row in enumerate(rows(), start=1):
+        if not isinstance(row, dict):
+            raise ValueError(f"Row {index} must be an object")
         segment_id = str(row.get("id", "")).strip()
         source = row.get("source")
         if not segment_id or not isinstance(source, str):
@@ -46,7 +62,6 @@ def read_segments(path: Path) -> list[Segment]:
                 metadata=metadata,
             )
         )
-    enriched: list[Segment] = []
     for index, segment in enumerate(segments):
         previous = segment.previous
         following = segment.next
@@ -54,8 +69,8 @@ def read_segments(path: Path) -> list[Segment]:
             previous = segments[index - 1].source
         if not following and index + 1 < len(segments):
             following = segments[index + 1].source
-        enriched.append(replace(segment, previous=previous, next=following))
-    return enriched
+        segments[index] = replace(segment, previous=previous, next=following)
+    return segments
 
 
 def write_results(path: Path, results: Iterable[TranslationResult]) -> None:

@@ -10,7 +10,7 @@ from typing import Any
 from .errors import ProviderError
 from .models import ContextMode, ContextPack, Segment
 from .providers import ProviderRegistry
-from .store import stable_hash
+from .store import stable_hash, stable_hash_sequence
 
 SUPPORTED_CONTEXT_MODES = {mode.value for mode in ContextMode}
 CONTEXT_DOMAINS = {
@@ -534,7 +534,7 @@ def context_attestation(
     covered_functional = sorted(set(functional_ids) & functional_evidence)
     covered_knowledge = sorted(set(knowledge_ids) & knowledge_evidence)
     return {
-        "ordered_script_hash": stable_hash([asdict(item) for item in segments]),
+        "ordered_script_hash": stable_hash_sequence(asdict(item) for item in segments),
         "context_pack_hash": stable_hash(asdict(context_pack)),
         "context_mode": analyzer.resolve_mode(segments),
         "required_domains": sorted(required_domains),
@@ -703,7 +703,7 @@ def analyze_with_cache(
     force: bool = False,
 ) -> tuple[ContextPack, bool]:
     mode = analyzer.resolve_mode(segments)
-    source_segments_digest = stable_hash([asdict(item) for item in segments])
+    source_segments_digest = stable_hash_sequence(asdict(item) for item in segments)
     fingerprint = stable_hash(
         {
             "source_segments_digest": source_segments_digest,

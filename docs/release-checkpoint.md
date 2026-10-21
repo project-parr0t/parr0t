@@ -2,6 +2,8 @@
 
 Every Parr0t distribution contains `parr0t-release-checkpoint.json`. The file makes the released translation a machine-readable continuation point: when an agent later receives that release together with a readable game folder, it can recover verified unchanged targets without translating or reviewing them again. When a title-specific translation source repository is also supplied, it remains a separate build/apply input; use it instead of reconstructing equivalent title-specific work or copying it into the checkpoint repository.
 
+Each entry records one of three exact states: `reviewed`, user-authorized `accepted_unreviewed`, or `source_preserved`. A translated candidate that was shipped after review failure or review exhaustion must remain `accepted_unreviewed`; it must not be promoted to `reviewed`. A missing or deterministically unsafe candidate remains `source_preserved`. These states allow a later correction or resumed review to touch only the affected targets.
+
 The checkpoint is distribution data, not SDK data. It may contain only the target strings already shipped in the release; source text is represented by a digest and must not be duplicated in a separate field. A `source_preserved` target may necessarily equal its source, but remains explicitly marked unresolved. The file must not contain prompts, model output, provider explanations, credentials, logs, private workspace paths, or unpublished translation candidates.
 
 ## Bound identity
@@ -37,6 +39,8 @@ A new game build always requires a newly validated patch and compatibility recor
 When the user requests a wording or terminology change, resolve it to stable target IDs and invalidate those entries plus the transitive reverse dependency closure declared by the SDK. Examples of dependencies include shared glossary terms, paired UI states, speaker voice anchors, and references whose interpretation depends on another line.
 
 When the user supplies or approves the exact final target wording, use the deterministic `apply-user-correction` flow in `docs/minimal-corrections.md`. This is user-directed correction rather than model translation: do not re-run context analysis or semantic review for the named IDs. The command still verifies the released source/target bindings and all deterministic integrity constraints. If the reverse dependency closure contains unnamed IDs, stop and review only that closure before packaging.
+
+When the user requests tone, voice, nuance, or naturalness improvement without final wording, use the same document's bounded semantic route. Freeze no more than 32 directly affected and reverse-dependent IDs, reuse their existing target-scoped context, and perform at most one rewrite batch plus one focused review batch. This does not authorize a full-inventory review, new extraction, SDK work, branch maintenance, publication, installation, or launch.
 
 Do not invalidate the full inventory merely because one entry changed. Expand the invalidation set only when evidence shows a wider dependency, a global glossary/voice/context policy changes, or stable mapping is ambiguous. If the user explicitly requests a complete re-review, `docs/coverage-gates.md` still requires a fresh verdict for every current target.
 
