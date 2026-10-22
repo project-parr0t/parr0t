@@ -38,6 +38,7 @@ from .coverage import (
 )
 from .context_analysis import ContextAnalyzer, analyze_with_cache
 from .corrections import apply_user_corrections
+from .correction_ui import CorrectionWorkspace, serve_correction_ui
 from .data_plane_task import (
     DATA_PLANE_PROFILES,
     prepare_data_plane_task,
@@ -871,6 +872,43 @@ def cmd_apply_user_correction(args: argparse.Namespace) -> int:
         expected_inventory_fingerprint=inventory_state["primary_fingerprint"],
     )
     print(json.dumps(summary, ensure_ascii=False))
+    return 0
+
+
+def cmd_correction_ui(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
+    sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
+    require_external_workdir(work_dir, sdk_root)
+    source = _path_in_workspace(work_dir, args.input, must_exist=True)
+    checkpoint = _path_in_workspace(work_dir, args.checkpoint, must_exist=True)
+    base_results = (
+        _path_in_workspace(work_dir, args.existing, must_exist=True)
+        if args.existing
+        else None
+    )
+    state = _path_in_workspace(work_dir, args.state)
+    request_output = _path_in_workspace(work_dir, args.request_output)
+    corrected_output = _path_in_workspace(work_dir, args.output)
+    agent_task = _path_in_workspace(work_dir, args.agent_task)
+    paths = [source, checkpoint, state, request_output, corrected_output, agent_task]
+    if base_results is not None:
+        paths.append(base_results)
+    if len(set(paths)) != len(paths):
+        raise ValueError("Correction UI inputs, state, task, request, and output must be distinct")
+    inventory_state = require_inventory_attestation(work_dir, source)
+    correction_workspace = CorrectionWorkspace.prepare(
+        state_path=state,
+        source_path=source,
+        checkpoint_path=checkpoint,
+        base_results_path=base_results,
+        request_output_path=request_output,
+        corrected_output_path=corrected_output,
+        agent_task_path=agent_task,
+        expected_inventory_fingerprint=inventory_state["primary_fingerprint"],
+    )
+    serve_correction_ui(correction_workspace, port=args.port)
     return 0
 
 
@@ -2208,6 +2246,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Assert that the user explicitly supplied or approved the exact replacement wording",
     )
     correction.set_defaults(func=cmd_apply_user_correction)
+
+    correction_ui = sub.add_parser(
+        "correction-ui",
+        help="Open a local, file-backed UI for bounded user and agent corrections",
+    )
+    correction_ui.add_argument("--workspace", required=True)
+    correction_ui.add_argument("--input", required=True, help="Verified current source inventory")
+    correction_ui.add_argument(
+        "--existing",
+        help="Released full result artifact; omit to use checkpoint candidates",
+    )
+    correction_ui.add_argument("--checkpoint", required=True, help="Matching release checkpoint")
+    correction_ui.add_argument(
+        "--state",
+        default="translations/user-interpretation.sqlite3",
+        help="Single private SQLite state file inside the workspace",
+    )
+    correction_ui.add_argument(
+        "--request-output",
+        default="translations/user-correction-request.json",
+        help="New exact-correction request written after user approval",
+    )
+    correction_ui.add_argument(
+        "--output",
+        default="translations/user-corrected-results.jsonl",
+        help="New corrected full result artifact",
+    )
+    correction_ui.add_argument(
+        "--agent-task",
+        default="translations/user-interpretation-task.json",
+        help="Bounded private task exported for a semantic agent",
+    )
+    correction_ui.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Loopback port; 0 selects an available port",
+    )
+    correction_ui.set_defaults(func=cmd_correction_ui)
 
     inventory = sub.add_parser(
         "verify-inventory",
