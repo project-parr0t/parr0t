@@ -279,6 +279,7 @@ class WorkspaceTests(unittest.TestCase):
             with redirect_stdout(output):
                 cmd_status(SimpleNamespace(workspace=str(work)))
             status = json.loads(output.getvalue())
+
             self.assertEqual(status["next_actions"], ["register_portable_sdk_snapshot"])
             self.assertEqual(
                 status["required_contracts"],
@@ -1393,6 +1394,99 @@ class WorkspaceTests(unittest.TestCase):
         )
         self.assertTrue(gap_status["inventory_gate"]["continuation_required"])
         self.assertFalse(gap_status["inventory_gate"]["reconciliation"]["terminal"])
+
+    def test_status_retries_a_sealed_inventory_failure_instead_of_verifying_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            game = root / "game"
+            work = root / "work"
+            sdk.mkdir()
+            game.mkdir()
+            initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+            establish_control_plane_entry(work)
+            record_sdk_selection(
+                work,
+                "private-new",
+                target_engine="fixture-engine",
+                target_version="1.0",
+            )
+            activate_workspace_adapter(work)
+            inputs = work / "inputs"
+            (inputs / "primary-inventory.json").write_text("{}", encoding="utf-8")
+            (inputs / "independent-inventory.json").write_text("{}", encoding="utf-8")
+            receipt = work / ".game-l10n" / "data-plane" / "independent_inventory" / "receipt.json"
+            receipt.parent.mkdir(parents=True)
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "schema": "parr0t.data-plane-receipt.v1",
+                        "task_id": "fixture-task",
+                        "worker_role": "independent_inventory",
+                        "stage": "inventory",
+                        "status": "error",
+                        "counts": {"total": 1, "error": 1},
+                        "issue_codes": ["task_incomplete"],
+                        "artifact_paths": ["inputs/independent-inventory.json"],
+                        "queue_transitions": [],
+                        "control_generation": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = StringIO()
+            with redirect_stdout(output):
+                cmd_status(SimpleNamespace(workspace=str(work)))
+            status = json.loads(output.getvalue())
+
+            receipt_payload = json.loads(receipt.read_text(encoding="utf-8"))
+            receipt_payload["issue_codes"] = ["sdk_identity_mismatch"]
+            receipt.write_text(json.dumps(receipt_payload), encoding="utf-8")
+            mismatch_output = StringIO()
+            with redirect_stdout(mismatch_output):
+                cmd_status(SimpleNamespace(workspace=str(work)))
+            mismatch_status = json.loads(mismatch_output.getvalue())
+
+        self.assertEqual(
+            status["next_actions"], ["extract_independent_source_inventory"]
+        )
+        self.assertEqual(
+            status["data_plane_task"]["worker_role"], "independent_inventory"
+        )
+        self.assertEqual(
+            mismatch_status["next_actions"],
+            ["record_target_identity_evaluate_and_select_sdk"],
+        )
+        self.assertEqual(mismatch_status["data_plane_task"]["worker_role"], "source_probe")
+
+    def test_status_exposes_a_native_context_relay_after_inventory_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            game = root / "game"
+            work = root / "work"
+            sdk.mkdir()
+            game.mkdir()
+            initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+            establish_control_plane_entry(work)
+            record_sdk_selection(
+                work,
+                "private-new",
+                target_engine="fixture-engine",
+                target_version="1.0",
+            )
+            activate_workspace_adapter(work)
+            write_verified_inventory(work)
+            output = StringIO()
+            with redirect_stdout(output):
+                cmd_status(SimpleNamespace(workspace=str(work)))
+            status = json.loads(output.getvalue())
+
+        self.assertEqual(
+            status["next_actions"], ["analyze_complete_script_context"]
+        )
+        self.assertEqual(status["data_plane_task"]["worker_role"], "context_analyzer")
+        self.assertEqual(status["data_plane_task"]["stage"], "context")
 
     def test_status_exit_code_matches_the_immediate_action(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import asdict
 from pathlib import Path
 
 from game_l10n.cli import build_parser, main
@@ -29,7 +30,8 @@ from game_l10n.data_plane_task import (
     prepare_data_plane_task,
     seal_data_plane_task,
 )
-from game_l10n.models import Segment
+from game_l10n.coverage import save_inventory_attestation
+from game_l10n.models import ContextPack, Segment
 from game_l10n.native_pass import _detail_contract, prepare_native_tasks
 
 
@@ -106,6 +108,134 @@ class ControlPlaneContractTests(unittest.TestCase):
         self.assertEqual(sealed["worker_role"], "source_probe")
         self.assertEqual(sealed["stage"], "discovery")
         self.assertTrue(sealed["receipt_path"].endswith("receipt.json"))
+
+    def test_reprepared_data_plane_task_gets_a_new_bound_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            work = root / "work"
+            sdk = root / "sdk"
+            game.mkdir()
+            work.mkdir()
+            sdk.mkdir()
+            (work / "game-l10n.json").write_text("{}", encoding="utf-8")
+            establish_control_plane_entry(work)
+            config = {
+                "game_roots": [str(game)],
+                "sdk_root": str(sdk),
+                "sdk_selection": {"inventory_fingerprint": "fixture-inventory"},
+            }
+            output = work / ".game-l10n" / "data-plane" / "source_probe"
+            first = prepare_data_plane_task(
+                work, output, worker_role="source_probe", config=config
+            )
+            second = prepare_data_plane_task(
+                work, output, worker_role="source_probe", config=config
+            )
+            task = json.loads((output / "task.json").read_text(encoding="utf-8"))
+
+        self.assertNotEqual(first["task_id"], second["task_id"])
+        self.assertEqual(task["attempt"], 2)
+
+    def test_native_context_worker_is_sealed_into_core_context_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            work = root / "work"
+            sdk = root / "sdk"
+            game.mkdir()
+            work.mkdir()
+            sdk.mkdir()
+            establish_control_plane_entry(work)
+            inputs = work / "inputs"
+            inputs.mkdir()
+            inventory = {
+                "schema": "parr0t.source-inventory.v1",
+                "method": "fixture",
+                "implementation_fingerprint": "fixture-implementation",
+                "coverage": {"declared_complete": True, "exclusions": []},
+                "segments": [{"id": "fixture-1", "source": "SOURCE"}],
+            }
+            primary = inputs / "primary-inventory.json"
+            independent = inputs / "independent-inventory.json"
+            primary.write_text(json.dumps(inventory), encoding="utf-8")
+            independent.write_text(
+                json.dumps(
+                    {
+                        **inventory,
+                        "method": "fixture-independent",
+                        "implementation_fingerprint": "fixture-independent-implementation",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            verified = save_inventory_attestation(work, primary, independent)
+            config = {
+                "game_roots": [str(game)],
+                "sdk_root": str(sdk),
+                "sdk_selection": {"inventory_fingerprint": "fixture-sdk"},
+                "files": {"context_pack": "context/context-pack.json"},
+                "project": {"context_mode": "auto"},
+                "routing": {"context_analyzers": ["native-sol"]},
+            }
+            prepared = prepare_data_plane_task(
+                work,
+                work / ".game-l10n" / "data-plane" / "context_analyzer",
+                worker_role="context_analyzer",
+                config=config,
+                sdk_activation={"status": "active"},
+            )
+            relay = work / prepared["relay_path"]
+            relay_payload = json.loads(relay.read_text(encoding="utf-8"))
+            context_path = work / "context" / "context-pack.json"
+            context_path.parent.mkdir()
+            context_path.write_text(
+                json.dumps(
+                    asdict(
+                        ContextPack(
+                            context_mode="functional",
+                            functional_summary="Fixture screen flow.",
+                            global_style_rules=("Use consistent UI terms.",),
+                            screen_flows={
+                                "fixture": {"evidence_line_ids": ["fixture-1"]}
+                            },
+                        )
+                    )
+                ),
+                encoding="utf-8",
+            )
+            envelope = work / relay_payload["expected_envelope"]
+            envelope.write_text(
+                json.dumps(
+                    {
+                        "schema": "parr0t.control-envelope.v2",
+                        "worker_role": "context_analyzer",
+                        "stage": "context",
+                        "status": "success",
+                        "target_ids": [],
+                        "counts": {"total": 1, "success": 1},
+                        "issue_codes": [],
+                        "artifact_paths": ["context/context-pack.json"],
+                        "queue_transitions": [],
+                        "route_evidence_path": "",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            sealed = seal_data_plane_task(work, relay)
+            state = json.loads(
+                (work / ".game-l10n" / "context-state.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(sealed["status"], "success")
+        self.assertEqual(state["status"], "success")
+        self.assertEqual(
+            state["source_inventory_fingerprint"], verified["primary_fingerprint"]
+        )
+        self.assertTrue(state["attestation"]["functional_coverage"]["complete"])
 
     def test_native_review_pass_kind_is_registered(self) -> None:
         args = build_parser().parse_args(
