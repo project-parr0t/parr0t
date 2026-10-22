@@ -155,6 +155,9 @@ class InstructionSurfaceTests(unittest.TestCase):
         self.assertIn("combined set must remain at or below 32", minimal)
         self.assertIn("one ordered semantic batch", minimal)
         self.assertIn("normal ceiling is two semantic calls", minimal)
+        self.assertIn("game-l10n correction-ui", minimal)
+        self.assertIn("file-local lexical vector search", minimal)
+        self.assertIn("must not imitate it by opening the full inventory", minimal)
         self.assertIn("A supervision or analysis lane", execution)
         self.assertIn("enumerate the outgoing commits", execution)
 
