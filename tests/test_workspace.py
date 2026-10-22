@@ -370,10 +370,47 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(upgraded["native_review_shard_material_tokens"], 262_144)
         self.assertFalse(upgraded["model_controller_allowed"])
         self.assertFalse(upgraded["worker_delegation_allowed"])
-        self.assertEqual(upgraded["max_root_model_calls_per_turn"], 64)
+        self.assertEqual(upgraded["control_turn_budget_policy_version"], 2)
+        self.assertFalse(upgraded["control_turn_budget_user_approved"])
+        self.assertIsNone(upgraded["max_root_model_calls_per_wave"])
+        self.assertIsNone(upgraded["max_root_model_calls_per_turn"])
+        self.assertIsNone(upgraded["max_root_input_tokens_per_turn"])
         self.assertEqual(upgraded["max_semantic_model_calls_per_task"], 1)
         self.assertFalse(upgraded["per_record_semantic_call_loop_allowed"])
         self.assertEqual(upgraded["bulk_budget_gate_records"], 4096)
+
+    def test_legacy_framework_turn_limits_are_not_treated_as_user_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            initialize_workspace(work, sdk, git_choice="disabled")
+            config_path = work / "game-l10n.json"
+            legacy = json.loads(config_path.read_text(encoding="utf-8"))
+            execution = legacy["execution"]
+            execution.pop("control_turn_budget_policy_version", None)
+            execution.pop("control_turn_budget_user_approved", None)
+            execution["max_root_model_calls_per_wave"] = 12
+            execution["max_root_model_calls_per_turn"] = 64
+            execution["max_root_input_tokens_per_turn"] = 5_000_000
+            execution["budget_exhaustion_action"] = "checkpoint_and_return_control"
+            config_path.write_text(
+                json.dumps(legacy, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            upgraded = load_config(work)["execution"]
+
+        self.assertEqual(upgraded["control_turn_budget_policy_version"], 2)
+        self.assertFalse(upgraded["control_turn_budget_user_approved"])
+        self.assertIsNone(upgraded["max_root_model_calls_per_wave"])
+        self.assertIsNone(upgraded["max_root_model_calls_per_turn"])
+        self.assertIsNone(upgraded["max_root_input_tokens_per_turn"])
+        self.assertEqual(
+            upgraded["budget_exhaustion_action"],
+            "continue_until_terminal_or_actionable_blocker",
+        )
 
     def test_legacy_workspace_gains_selective_review_defaults_in_memory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -397,6 +434,31 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(routing["review_triagers"], ["native-luna"])
         self.assertEqual(routing["strong_review_sample_percent"], 5.0)
         self.assertIn("wordplay", routing["strong_review_high_risk_categories"])
+
+    def test_explicit_user_control_turn_budget_survives_config_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            initialize_workspace(work, sdk, git_choice="disabled")
+            config_path = work / "game-l10n.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            execution = config["execution"]
+            execution["control_turn_budget_user_approved"] = True
+            execution["max_root_model_calls_per_turn"] = 20
+            config_path.write_text(
+                json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            loaded = load_config(work)["execution"]
+
+        self.assertTrue(loaded["control_turn_budget_user_approved"])
+        self.assertEqual(loaded["max_root_model_calls_per_turn"], 20)
+        self.assertEqual(
+            loaded["budget_exhaustion_action"], "checkpoint_and_return_control"
+        )
 
     def test_completion_state_rejects_contradictory_semantic_claims(self) -> None:
         state = {
@@ -521,14 +583,14 @@ class WorkspaceTests(unittest.TestCase):
         )
         self.assertFalse(config["execution"]["free_form_execution_contract_allowed"])
         self.assertEqual(config["execution"]["bulk_budget_gate_records"], 4096)
-        self.assertEqual(config["execution"]["max_root_model_calls_per_wave"], 12)
-        self.assertEqual(config["execution"]["max_root_model_calls_per_turn"], 64)
-        self.assertEqual(
-            config["execution"]["max_root_input_tokens_per_turn"], 5_000_000
-        )
+        self.assertEqual(config["execution"]["control_turn_budget_policy_version"], 2)
+        self.assertFalse(config["execution"]["control_turn_budget_user_approved"])
+        self.assertIsNone(config["execution"]["max_root_model_calls_per_wave"])
+        self.assertIsNone(config["execution"]["max_root_model_calls_per_turn"])
+        self.assertIsNone(config["execution"]["max_root_input_tokens_per_turn"])
         self.assertEqual(
             config["execution"]["budget_exhaustion_action"],
-            "checkpoint_and_return_control",
+            "continue_until_terminal_or_actionable_blocker",
         )
         self.assertEqual(config["execution"]["residual_direct_records"], 32)
         self.assertFalse(config["execution"]["job_local_controller_allowed"])

@@ -163,9 +163,11 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "native_agent_max_depth": 1,
         "model_controller_allowed": False,
         "worker_delegation_allowed": False,
-        "max_root_model_calls_per_wave": 12,
-        "max_root_model_calls_per_turn": 64,
-        "max_root_input_tokens_per_turn": 5000000,
+        "control_turn_budget_policy_version": 2,
+        "control_turn_budget_user_approved": False,
+        "max_root_model_calls_per_wave": None,
+        "max_root_model_calls_per_turn": None,
+        "max_root_input_tokens_per_turn": None,
         "max_root_progress_messages_per_wave": 1,
         "max_worker_model_calls_per_task": 16,
         "max_semantic_model_calls_per_task": 1,
@@ -178,7 +180,7 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "bulk_max_provider_cost_usd": None,
         "bulk_provider_cost_unmetered": False,
         "bulk_budget_user_approved": False,
-        "budget_exhaustion_action": "checkpoint_and_return_control",
+        "budget_exhaustion_action": "continue_until_terminal_or_actionable_blocker",
         "contract_reload_policy": "digest_change_or_new_control_generation_only",
         "residual_direct_records": 32,
         "job_local_controller_allowed": False,
@@ -256,6 +258,7 @@ This private workspace contains game data and localization artifacts. Resolve th
 - Native orchestration uses one disposable isolated relay per authorized wave. Give it only the `native-pass-step` artifact; it cannot inspect payloads, plan, retry, split, route, or forward raw responses. Wait once, then step. Reload prose only when `status.contract_set.digest` or the control generation changes.
 - V7 tasks embed bound segments; never open the full source. Review starts at 256 records/65,536 estimated tokens or less (hard ceilings: 2,048/262,144). One semantic call ends the worker; core locks successes and emits smaller failed-only manifests.
 - Use proportional checks and stop after the required layer passes. For large inventory, scan once per method and continue bounded cached gap work while the core gap score improves; incomplete inventory is not terminal. Once a semantic pass leaves no more than `execution.residual_direct_records`, use one fresh worker on one cached residual task; do not create a job-local scheduler or supplemental evidence pack. A native capacity failure enters resumable state and must not auto-restart the root turn. Aggregate once per wave, report progress only at a wave boundary or blocker, and stop only after the configured unchanged limit.
+- Only user-set turn limits recorded in the manifest apply; never infer them.
 
 ## Status routes
 
@@ -1144,9 +1147,63 @@ def _apply_execution_defaults(config: dict[str, Any]) -> None:
         and execution.get("native_shard_material_tokens") == 24_000
     ):
         execution["native_shard_material_tokens"] = 8_000
+    try:
+        control_budget_policy_version = int(
+            execution.get("control_turn_budget_policy_version", 1)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError(
+            "control_turn_budget_policy_version must be an integer"
+        ) from exc
+    if control_budget_policy_version < 2:
+        # Older workspaces carried framework-selected 12/64/5M ceilings. They
+        # were not evidence of a user request and must not survive migration.
+        execution["control_turn_budget_user_approved"] = False
+        execution["max_root_model_calls_per_wave"] = None
+        execution["max_root_model_calls_per_turn"] = None
+        execution["max_root_input_tokens_per_turn"] = None
+        execution["budget_exhaustion_action"] = (
+            "continue_until_terminal_or_actionable_blocker"
+        )
     for key, value in CONFIG_TEMPLATE["execution"].items():
         execution.setdefault(key, value)
     execution["native_shard_policy_version"] = 5
+    execution["control_turn_budget_policy_version"] = 2
+    control_turn_budget_user_approved = execution.get(
+        "control_turn_budget_user_approved", False
+    )
+    if not isinstance(control_turn_budget_user_approved, bool):
+        raise ConfigurationError("control_turn_budget_user_approved must be a boolean")
+    if not control_turn_budget_user_approved:
+        execution["max_root_model_calls_per_wave"] = None
+        execution["max_root_model_calls_per_turn"] = None
+        execution["max_root_input_tokens_per_turn"] = None
+        execution["budget_exhaustion_action"] = (
+            "continue_until_terminal_or_actionable_blocker"
+        )
+    else:
+        limits = (
+            execution.get("max_root_model_calls_per_wave"),
+            execution.get("max_root_model_calls_per_turn"),
+            execution.get("max_root_input_tokens_per_turn"),
+        )
+        if not any(value is not None for value in limits):
+            raise ConfigurationError(
+                "A user-approved control-turn budget requires an explicit limit"
+            )
+        if any(
+            value is not None
+            and (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 1
+            )
+            for value in limits
+        ):
+            raise ConfigurationError(
+                "Control-turn budget limits must be positive integers"
+            )
+        execution["budget_exhaustion_action"] = "checkpoint_and_return_control"
 
 
 def _apply_review_routing_defaults(config: dict[str, Any]) -> None:

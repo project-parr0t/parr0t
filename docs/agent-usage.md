@@ -50,7 +50,7 @@ Do not reorder barriers. Failures affect only their target and route; they canno
 
 - Select and activate before data-plane work. Bind exact matches to a Git checkout/worktree or authenticated portable snapshot. Portable activation records the full commit ID and verifies normalized content. Other identities are read-only `derive-new` references, never promotion targets. Pass-through tools are placeholders.
 - Inventory completeness requires two independent ordered manifests. Alignment, review, and runtime observation are separate claims.
-- At 10,000+ records, scan once per method. Continue cached gap-only reconciliation while the core gap score falls; stop only for a status blocker, budget gate, or unchanged limit. Never rescan.
+- At 10,000+ records, scan once per method. Continue cached gap-only reconciliation while the core gap score falls; stop only for a status-proven blocker, an applicable deterministic gate, or the configured unchanged-progress limit. A root call/token turn limit is applicable only when the user explicitly requested its value and the manifest records that approval. Never rescan or infer a limit from elapsed time, context pressure, or model judgment.
 - Keep relevant narrative/voice, functional/UI, knowledge, adjacency, glossary, and immutable evidence target-scoped.
 - The text-free parent handles only IDs, counts, states, queues, paths, and codes. It dispatches only core relays and never inspects game-root contents; a missing SDK changes nothing.
 - Presets fix provider roles. Keys do not change mode, role, or service. Parent sees only `fallback_required`, never rationale.
