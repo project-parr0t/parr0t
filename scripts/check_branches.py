@@ -449,13 +449,15 @@ def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", re
         required = {"privacy", "tests"} | ({"engine_faq"} if plan["sdk"] else set())
         checks = hit.get("checks", {}) if isinstance(hit, dict) else {}
         valid = (
-            isinstance(hit, dict) and type(hit.get("passed")) is bool
+            isinstance(hit, dict) and hit.get("passed") is True
             and isinstance(checks, dict) and set(checks) == required
-            and all(isinstance(check, dict) and type(check.get("passed")) is bool for check in checks.values())
+            and all(isinstance(check, dict) and check.get("passed") is True for check in checks.values())
             and type(checks.get("tests", {}).get("count")) is int
             and checks["tests"]["count"] > 0
             and type(checks["tests"].get("skipped")) is int
-            and checks["tests"]["skipped"] >= 0
+            and checks["tests"]["skipped"] == 0
+            and checks["tests"].get("complete") is True
+            and "error" not in hit
         )
         if not force and valid:
             results[key] = {**hit, "cached": True}

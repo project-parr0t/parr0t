@@ -158,6 +158,15 @@ class BranchAuditTests(unittest.TestCase):
             self.assertFalse(self.audit()["checks_passed"])
         with patch("scripts.check_branches.run_checks", side_effect=self.passed):
             self.assertEqual(self.audit()["executed"], 2)
+        def complete_failure(*args: object) -> dict:
+            result = self.passed(*args)
+            result["passed"] = False
+            result["checks"]["tests"]["passed"] = False
+            return result
+        with patch("scripts.check_branches.run_checks", side_effect=complete_failure):
+            self.assertEqual(self.audit(force=True)["executed"], 2)
+        with patch("scripts.check_branches.run_checks", side_effect=self.passed):
+            self.assertEqual(self.audit()["executed"], 2)
         cache = json.loads((self.state / "cache.json").read_text())
         for value in cache["results"].values():
             value["checks"] = {}
