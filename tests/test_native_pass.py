@@ -979,21 +979,24 @@ class NativePassTests(unittest.TestCase):
             manifest["execution_contract"]["orchestration_owner"],
             "deterministic_core_via_isolated_wave_relay",
         )
-        self.assertEqual(
-            manifest["execution_contract"]["max_root_model_calls_per_wave"],
-            12,
+        self.assertFalse(
+            manifest["execution_contract"]["control_turn_budget_user_approved"]
         )
-        self.assertEqual(
-            manifest["execution_contract"]["max_root_model_calls_per_turn"],
-            64,
+        self.assertIsNone(
+            manifest["execution_contract"]["max_root_model_calls_per_wave"]
         )
-        self.assertEqual(
-            manifest["execution_contract"]["max_root_input_tokens_per_turn"],
-            5_000_000,
+        self.assertIsNone(
+            manifest["execution_contract"]["max_root_model_calls_per_turn"]
+        )
+        self.assertIsNone(
+            manifest["execution_contract"]["max_root_input_tokens_per_turn"]
         )
         self.assertEqual(
             manifest["execution_contract"]["budget_exhaustion_action"],
-            "checkpoint_and_return_control",
+            "continue_until_terminal_or_actionable_blocker",
+        )
+        self.assertFalse(
+            manifest["execution_contract"]["self_inferred_control_turn_limit_allowed"]
         )
         self.assertFalse(
             manifest["execution_contract"]["automatic_root_turn_restart_allowed"]
@@ -1012,6 +1015,46 @@ class NativePassTests(unittest.TestCase):
         )
         self.assertTrue(
             all(task["records"] == 1 for task in manifest["tasks"])
+        )
+
+    def test_control_turn_budget_requires_explicit_user_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            segments = [Segment("fixture", "SOURCE")]
+
+            with self.assertRaisesRegex(ValueError, "explicit user approval"):
+                prepare_native_tasks(
+                    root,
+                    source,
+                    segments,
+                    root / "unapproved",
+                    max_root_model_calls_per_turn=20,
+                )
+
+            tasks = root / "approved"
+            prepare_native_tasks(
+                root,
+                source,
+                segments,
+                tasks,
+                max_root_model_calls_per_wave=8,
+                max_root_model_calls_per_turn=20,
+                max_root_input_tokens_per_turn=100_000,
+                control_turn_budget_user_approved=True,
+            )
+            manifest = json.loads(
+                (tasks / "manifest.json").read_text(encoding="utf-8")
+            )
+
+        contract = manifest["execution_contract"]
+        self.assertTrue(contract["control_turn_budget_user_approved"])
+        self.assertEqual(contract["max_root_model_calls_per_wave"], 8)
+        self.assertEqual(contract["max_root_model_calls_per_turn"], 20)
+        self.assertEqual(contract["max_root_input_tokens_per_turn"], 100_000)
+        self.assertEqual(
+            contract["budget_exhaustion_action"], "checkpoint_and_return_control"
         )
 
     def test_bulk_pass_stops_after_pilot_until_user_budget_is_bound(self) -> None:
@@ -1476,6 +1519,107 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(first["action"], "dispatch_isolated_wave_relay")
         self.assertEqual(second["action"], "checkpoint_and_stop")
         self.assertEqual(second["issue_codes"], ["E_NATIVE_NO_MEASURABLE_PROGRESS"])
+
+    def test_legacy_unapproved_root_limit_is_not_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            prepare_native_tasks(
+                root,
+                source,
+                [Segment(f"fixture-{index}", "SOURCE") for index in range(14)],
+                tasks,
+                max_records=1,
+                min_records=1,
+                max_workers=20,
+            )
+            manifest_path = tasks / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            contract = manifest["execution_contract"]
+            contract.pop("control_turn_budget_user_approved", None)
+            contract["max_root_model_calls_per_wave"] = 12
+            contract["max_root_model_calls_per_turn"] = 64
+            contract["max_root_input_tokens_per_turn"] = 5_000_000
+            contract["budget_exhaustion_action"] = "checkpoint_and_return_control"
+            manifest["contract_fingerprint"] = stable_hash(
+                {
+                    "worker_contract": manifest["worker_contract"],
+                    "detail_contract": manifest["detail_contract"],
+                    "execution_contract": contract,
+                }
+            )
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            native_control_step(root, manifest_path, results)
+            last = None
+            for task in manifest["tasks"][:12]:
+                task_row = json.loads(
+                    (tasks / task["file"]).read_text(encoding="utf-8").splitlines()[0]
+                )
+                self._write_rows(
+                    results / task["file"],
+                    [
+                        {
+                            "target_id": task_row["target_id"],
+                            "status": "success",
+                            "text": "TARGET",
+                        }
+                    ],
+                )
+                last = native_control_step(root, manifest_path, results)
+
+        self.assertEqual(last["action"], "wait_for_active_wave")
+        self.assertNotIn("E_NATIVE_WAVE_CONTROL_LIMIT", last["issue_codes"])
+
+    def test_explicit_user_root_wave_limit_is_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            prepare_native_tasks(
+                root,
+                source,
+                [Segment("fixture-1", "SOURCE"), Segment("fixture-2", "SOURCE")],
+                tasks,
+                max_records=1,
+                min_records=1,
+                max_workers=2,
+                max_root_model_calls_per_wave=1,
+                control_turn_budget_user_approved=True,
+            )
+            manifest = json.loads(
+                (tasks / "manifest.json").read_text(encoding="utf-8")
+            )
+            native_control_step(root, tasks / "manifest.json", results)
+            first_task = manifest["tasks"][0]
+            first_row = json.loads(
+                (tasks / first_task["file"])
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self._write_rows(
+                results / first_task["file"],
+                [
+                    {
+                        "target_id": first_row["target_id"],
+                        "status": "success",
+                        "text": "TARGET",
+                    }
+                ],
+            )
+            stopped = native_control_step(root, tasks / "manifest.json", results)
+
+        self.assertEqual(stopped["action"], "checkpoint_and_stop")
+        self.assertEqual(stopped["issue_codes"], ["E_NATIVE_WAVE_CONTROL_LIMIT"])
 
     def test_native_control_step_normalizes_invalid_wave_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
