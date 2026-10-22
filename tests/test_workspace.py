@@ -1062,6 +1062,11 @@ class WorkspaceTests(unittest.TestCase):
             third["required_contracts"],
             ["docs/sdk-selection.md", "docs/sdk-branch-contract.md"],
         )
+        self.assertEqual(third["data_plane_task"]["worker_role"], "source_probe")
+        self.assertEqual(third["data_plane_task"]["stage"], "discovery")
+        self.assertEqual(
+            third["data_plane_task"]["dispatch"], "fresh_isolated_relay_only"
+        )
 
     def test_status_requires_sdk_activation_after_selection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1093,6 +1098,94 @@ class WorkspaceTests(unittest.TestCase):
             status["required_contracts"],
             ["docs/sdk-selection.md", "docs/sdk-branch-contract.md"],
         )
+
+    def test_status_emits_core_data_plane_tasks_for_each_inventory_method(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            game = root / "game"
+            work = root / "work"
+            sdk.mkdir()
+            game.mkdir()
+            initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+            establish_control_plane_entry(work)
+            record_sdk_selection(
+                work,
+                "private-new",
+                target_engine="fixture-engine",
+                target_version="1.0",
+            )
+            activate_workspace_adapter(work)
+
+            primary_output = StringIO()
+            with redirect_stdout(primary_output):
+                cmd_status(SimpleNamespace(workspace=str(work)))
+            primary_status = json.loads(primary_output.getvalue())
+
+            inputs = work / "inputs"
+            (inputs / "primary-inventory.json").write_text("{}", encoding="utf-8")
+            independent_output = StringIO()
+            with redirect_stdout(independent_output):
+                cmd_status(SimpleNamespace(workspace=str(work)))
+            independent_status = json.loads(independent_output.getvalue())
+
+            (inputs / "independent-inventory.json").write_text("{}", encoding="utf-8")
+            verify_output = StringIO()
+            with redirect_stdout(verify_output):
+                cmd_status(SimpleNamespace(workspace=str(work)))
+            verify_status = json.loads(verify_output.getvalue())
+
+            def inventory_payload(method: str, rows: list[dict]) -> dict:
+                return {
+                    "schema": "parr0t.source-inventory.v1",
+                    "method": method,
+                    "implementation_fingerprint": f"{method}-implementation",
+                    "coverage": {"declared_complete": True, "exclusions": []},
+                    "segments": rows,
+                }
+
+            primary_rows = [
+                {"id": "first", "source": "SOURCE_ONE"},
+                {"id": "second", "source": "SOURCE_TWO"},
+            ]
+            (inputs / "primary-inventory.json").write_text(
+                json.dumps(inventory_payload("primary", primary_rows)), encoding="utf-8"
+            )
+            (inputs / "independent-inventory.json").write_text(
+                json.dumps(inventory_payload("independent", primary_rows[:1])),
+                encoding="utf-8",
+            )
+            save_inventory_attestation(
+                work,
+                inputs / "primary-inventory.json",
+                inputs / "independent-inventory.json",
+            )
+            gap_output = StringIO()
+            with redirect_stdout(gap_output):
+                cmd_status(SimpleNamespace(workspace=str(work)))
+            gap_status = json.loads(gap_output.getvalue())
+
+        self.assertEqual(
+            primary_status["data_plane_task"]["worker_role"], "primary_inventory"
+        )
+        self.assertEqual(
+            independent_status["next_actions"],
+            ["extract_independent_source_inventory"],
+        )
+        self.assertEqual(
+            independent_status["data_plane_task"]["worker_role"],
+            "independent_inventory",
+        )
+        self.assertEqual(
+            verify_status["next_actions"], ["verify_independent_source_inventory"]
+        )
+        self.assertIsNone(verify_status["data_plane_task"])
+        self.assertEqual(gap_status["next_actions"], ["resolve_source_inventory_gaps"])
+        self.assertEqual(
+            gap_status["data_plane_task"]["worker_role"], "inventory_reconciler"
+        )
+        self.assertTrue(gap_status["inventory_gate"]["continuation_required"])
+        self.assertFalse(gap_status["inventory_gate"]["reconciliation"]["terminal"])
 
     def test_status_exit_code_matches_the_immediate_action(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
