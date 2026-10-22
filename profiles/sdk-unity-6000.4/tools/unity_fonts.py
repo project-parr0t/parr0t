@@ -10,6 +10,18 @@ def pointer(path_id=0, file_id=0):
     return {'m_FileID': file_id, 'm_PathID': path_id}
 
 
+def _clone_object_reader(template, path_id):
+    """Clone UnityPy reader metadata without depending on attrs internals."""
+    state = getattr(template, '__dict__', None)
+    if not isinstance(state, dict):
+        raise ValueError('FONT_OBJECT_READER_LAYOUT_UNSUPPORTED')
+    clone = object.__new__(type(template))
+    clone.__dict__.update(state)
+    clone.path_id = path_id
+    clone.data = None
+    return clone
+
+
 def _same_tree(left, right):
     # Unity scalar float serialization rounds to binary32. Only that bounded
     # numeric rounding is tolerated; keys, sequences and all other values match.
@@ -129,7 +141,6 @@ def integrate(members, groups, fallbacks):
     names, label, repertoire, space_advance, license_confirmed=True.
     Fallback: member, object_id, group (zero-based index). No IDs are discovered.
     """
-    from attrs import evolve
     from UnityPy.helpers.TypeTreeNode import TypeTreeNode
     from UnityPy.helpers.TypeTreeHelper import read_typetree
     from UnityPy.streams import EndianBinaryReader
@@ -163,7 +174,7 @@ def integrate(members, groups, fallbacks):
         built = build_group(trees, group['font_bytes'], names=group['names'], label=group['label'],
             ids=ids, repertoire=group['repertoire'], space_advance=group['space_advance'])
         for template, schema, oid, tree in zip(originals, nodes, ids, built):
-            clone = evolve(template, path_id=oid, data=None)
+            clone = _clone_object_reader(template, oid)
             payload = clone.save_typetree(tree, nodes=schema)
             clone.byte_size = len(payload)
             canonical = read_typetree(schema or clone.serialized_type.node,
