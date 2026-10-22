@@ -7,9 +7,9 @@ Parr0t is engine-neutral. Keep game data, translations, prompts, caches, logs, c
 1. Read this file before accessing game-root contents; path existence may be checked only for workspace initialization.
 2. Read `docs/agent-usage.md`, initialize or resume the external workspace without content inspection, then read its `AGENTS.md`.
 3. Run `game-l10n status --workspace <workspace>`. For `establish_text_free_control_plane`, read its contracts and run `game-l10n enter-control-plane --workspace <workspace> --contracts-read --source-unopened` before other work.
-4. Resolve each `required_contracts` entry against `contract_base` and read only those contracts. For a user-requested route outside workspace state, use the table below.
+4. Resolve each `required_contracts` entry against `contract_base`; read only those contracts. For other user-requested routes, use the table.
 
-`local_patch_ready` is the only terminal local-work status. It requires current static completion and an unchanged packed artifact bound to that completion attestation.
+Only `local_patch_ready` is terminal; it requires current static completion and an unchanged packed artifact bound to its attestation.
 
 ## Non-negotiable rules
 
@@ -27,6 +27,7 @@ Parr0t is engine-neutral. Keep game data, translations, prompts, caches, logs, c
 12. **Keep provider mode fixed.** A selected preset defines the authorized providers and roles. A key does not change mode or promote a fallback. Native App workers and API providers are distinct; never emulate a native worker with another Codex process or silently replace the locked route.
 13. **Bind every write to the current work lane.** Before writing, bind the turn to game, supervision, core, or SDK work and resolve its checkout and branch anew. Supervision and inspection stay read-only unless the current request names the mutation. Never inherit another lane's checkout or push plan; reject outgoing commits unrelated to the current request.
 14. **Start large jobs linearly.** At 10,000+ records, scan once per inventory method. Reconcile cached outputs; while the core gap score improves, continue only reported gaps. Never repeat full discovery/scans or create per-record startup artifacts, proof files, or speculative tooling.
+15. **Use the branch updater.** Run `scripts/update_branches.py`; never manually merge a hold. Fix its cause and replan.
 
 ## Standard job sequence
 

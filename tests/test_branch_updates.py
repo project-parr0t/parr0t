@@ -44,7 +44,9 @@ class BranchUpdateTests(unittest.TestCase):
     @staticmethod
     def proof(*args: object, **kwargs: object) -> dict:
         plans = kwargs["pinned_plans"]
-        rows = [{**plan, "passed": True, "checks": {"tests": {"count": 2, "skipped": 0}}, "cached": False} for plan in plans]
+        rows = [{**plan, "validation_key": "fixture-" + plan["content_digest"],
+                 "passed": True, "checks": {"tests": {"count": 2, "skipped": 0, "complete": True}},
+                 "cached": False} for plan in plans]
         return {"branches": rows, "executed": len(rows), "reused": 0}
 
     def plan(self, **kwargs: object) -> dict:
@@ -139,16 +141,67 @@ class BranchUpdateTests(unittest.TestCase):
         self.write("adapter.py", "# private uncommitted fixture edit\n")
         result = apply_updates(self.repo, report)
         self.assertEqual(result["applied"], 0)
-        self.assertIn("CHECKED_OUT", result["branches"][0]["error"])
+        self.assertIn("DIRTY_WORKTREE", result["branches"][0]["error"])
         self.assertEqual(self.git("rev-parse", "HEAD"), self.sdk)
         self.assertEqual((self.repo / "adapter.py").read_text(), "# private uncommitted fixture edit\n")
 
-    def test_linked_worktree_target_is_held(self) -> None:
+    def test_clean_linked_worktree_is_fast_forwarded_to_exact_validated_tree(self) -> None:
         report = self.plan()
-        self.git("worktree", "add", str(self.root / "linked"), "sdk-fixture-1.0")
+        linked = self.root / "linked"
+        self.git("worktree", "add", str(linked), "sdk-fixture-1.0")
         result = apply_updates(self.repo, report)
-        self.assertIn("CHECKED_OUT", result["branches"][0]["error"])
-        self.assertEqual(result["applied"], 0)
+        row = result["branches"][0]
+        self.assertEqual(result["applied"], 1)
+        self.assertEqual(row["apply_mode"], "checked_out_clean_worktree")
+        self.assertEqual(subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=linked, text=True).strip(), row["new_commit"])
+        self.assertEqual(subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=linked, text=True).strip(), row["merge_tree"])
+        self.assertEqual((linked / "core.py").read_text(), "# newer core\n")
+        self.assertEqual(subprocess.check_output(["git", "status", "--porcelain"], cwd=linked, text=True), "")
+
+    def test_one_dirty_sdk_does_not_block_other_validated_sdk_updates(self) -> None:
+        self.git("branch", "sdk-fixture-2.0", self.sdk)
+        with patch("scripts.update_branches.audit_branches", side_effect=self.proof):
+            report = plan_updates(
+                self.repo,
+                self.root / "multi-state",
+                main_ref="main",
+                refs=["refs/heads/sdk-fixture-1.0", "refs/heads/sdk-fixture-2.0"],
+            )
+        linked = self.root / "linked"
+        self.git("worktree", "add", str(linked), "sdk-fixture-1.0")
+        (linked / "adapter.py").write_text("# dirty fixture\n", encoding="utf-8")
+        result = apply_updates(self.repo, report)
+        rows = {row["ref"]: row for row in result["branches"]}
+        self.assertEqual(result["applied"], 1)
+        self.assertEqual(rows["refs/heads/sdk-fixture-1.0"]["action"], "apply_held")
+        self.assertIn("DIRTY_WORKTREE", rows["refs/heads/sdk-fixture-1.0"]["error"])
+        self.assertEqual(rows["refs/heads/sdk-fixture-2.0"]["action"], "updated")
+        self.assertEqual(
+            self.git("rev-parse", "sdk-fixture-2.0^{tree}"),
+            rows["refs/heads/sdk-fixture-2.0"]["merge_tree"],
+        )
+
+    def test_merge_commit_records_validation_attestation(self) -> None:
+        result = apply_updates(self.repo, self.plan())
+        row = result["branches"][0]
+        message = self.git("show", "-s", "--format=%B", row["new_commit"])
+        self.assertIn("Parr0t-Core: " + result["main_commit"], message)
+        self.assertIn("Parr0t-Validated-Tree: " + row["merge_tree"], message)
+        self.assertIn("Parr0t-Validation-Key: " + row["validation"]["validation_key"], message)
+
+    def test_apply_rejects_tampered_or_incomplete_validation(self) -> None:
+        for mutation, issue in (
+            (lambda row: row["validation"]["checks"]["tests"].update(complete=False), "INCOMPLETE"),
+            (lambda row: row["validation"].update(content_digest="different"), "CONTENT_MISMATCH"),
+            (lambda row: row["validation"].update(main_commit="different"), "MAIN_MISMATCH"),
+        ):
+            report = self.plan()
+            mutation(report["branches"][0])
+            with self.subTest(issue=issue):
+                result = apply_updates(self.repo, report)
+                self.assertEqual(result["applied"], 0)
+                self.assertIn(issue, result["branches"][0]["error"])
+                self.assertEqual(self.git("rev-parse", "sdk-fixture-1.0"), self.sdk)
 
     def test_target_or_main_drift_holds_without_overwrite(self) -> None:
         for target in ("main", "sdk-fixture-1.0"):
