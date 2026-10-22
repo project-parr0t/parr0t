@@ -23,10 +23,66 @@ def local_ref(name: str) -> str:
     return "refs/heads/" + branch
 
 
-def checked_out_refs(repo: Path) -> set[str]:
-    return {line.removeprefix("branch ") for line in
-            git(repo, "worktree", "list", "--porcelain").decode().splitlines()
-            if line.startswith("branch ")}
+def complete_validation(proof: object) -> bool:
+    """Accept only a complete, non-skipped test attestation."""
+    if not isinstance(proof, dict) or proof.get("passed") is not True:
+        return False
+    tests = proof.get("checks", {}).get("tests", {})
+    return (
+        isinstance(tests, dict)
+        and tests.get("complete") is True
+        and type(tests.get("count")) is int
+        and tests["count"] > 0
+        and tests.get("skipped") == 0
+    )
+
+
+def checked_out_worktrees(repo: Path) -> dict[str, Path]:
+    """Return checked-out local refs and their exact linked worktree paths."""
+    result: dict[str, Path] = {}
+    worktree: Path | None = None
+    for raw in git(repo, "worktree", "list", "--porcelain", "-z").split(b"\0"):
+        if not raw:
+            worktree = None
+            continue
+        line = raw.decode("utf-8")
+        if line.startswith("worktree "):
+            worktree = Path(line.removeprefix("worktree "))
+        elif line.startswith("branch ") and worktree is not None:
+            result[line.removeprefix("branch ")] = worktree
+    return result
+
+
+def require_clean_worktree(worktree: Path, target: str, expected: str) -> None:
+    if git(worktree, "symbolic-ref", "-q", "HEAD").decode().strip() != target:
+        raise ValueError("E_BRANCH_UPDATE_WRONG_WORKTREE_BRANCH")
+    if git(worktree, "rev-parse", "--verify", "HEAD").decode().strip() != expected:
+        raise ValueError("E_BRANCH_UPDATE_STALE_TARGET")
+    if git(worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all"):
+        raise ValueError("E_BRANCH_UPDATE_DIRTY_WORKTREE")
+    for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"):
+        marker_path = Path(git(worktree, "rev-parse", "--git-path", marker).decode().strip())
+        if not marker_path.is_absolute():
+            marker_path = worktree / marker_path
+        if marker_path.exists():
+            raise ValueError("E_BRANCH_UPDATE_OPERATION_IN_PROGRESS")
+
+
+def update_clean_worktree(worktree: Path, target: str, expected: str, commit: str, merged: str) -> None:
+    """Fast-forward one exact clean checked-out branch without switching it."""
+    require_clean_worktree(worktree, target, expected)
+    result = subprocess.run(
+        ["git", "-C", str(worktree), "merge", "--ff-only", "--no-edit", commit],
+        capture_output=True, shell=False,
+    )
+    if result.returncode:
+        raise ValueError("E_BRANCH_UPDATE_WORKTREE_FF_FAILED")
+    if git(worktree, "rev-parse", "--verify", "HEAD").decode().strip() != commit:
+        raise ValueError("E_BRANCH_UPDATE_WORKTREE_HEAD_MISMATCH")
+    if git(worktree, "rev-parse", "--verify", "HEAD^{tree}").decode().strip() != merged:
+        raise ValueError("E_BRANCH_UPDATE_WORKTREE_TREE_MISMATCH")
+    if git(worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all"):
+        raise ValueError("E_BRANCH_UPDATE_WORKTREE_NOT_CLEAN")
 
 
 def merge_tree(repo: Path, plan: dict) -> str:
@@ -44,7 +100,7 @@ def merge_tree(repo: Path, plan: dict) -> str:
 
 def plan_updates(repo: Path, state: Path, *, main_ref: str = "origin/main", refs: list[str] | None = None,
                  python: str = sys.executable, environment_key: str = "", jobs: int = 2,
-                 require_ancestry: bool = False) -> dict:
+                 require_ancestry: bool = False, provision_dependencies: bool = False) -> dict:
     repo, state = repo.resolve(), state.resolve()
     if state.is_relative_to(repo):
         raise ValueError("Update state must be outside the repository")
@@ -75,16 +131,20 @@ def plan_updates(repo: Path, state: Path, *, main_ref: str = "origin/main", refs
         validation = audit_branches(
             repo, state, main_ref=main_ref, python=python,
             environment_key=environment_key, jobs=jobs, pinned_plans=[plans[0], *pending],
+            provision_dependencies=provision_dependencies,
         )
         evidence = {row["ref"]: row for row in validation["branches"]}
-        core_ok = evidence[plans[0]["ref"]]["passed"] and not evidence[plans[0]["ref"]]["checks"]["tests"]["skipped"]
+        core_proof = evidence.get(plans[0]["ref"])
+        core_ok = complete_validation(core_proof)
         for row in rows:
             if row["action"] != "validation_required":
                 continue
-            proof = evidence[row["ref"]]
+            proof = evidence.get(row["ref"])
+            if proof is None:
+                row.update(action="validation_held", error="E_BRANCH_VALIDATION_EVIDENCE_MISSING")
+                continue
             row["validation"] = proof
-            tests = proof.get("checks", {}).get("tests", {})
-            if not core_ok or not proof["passed"] or tests.get("skipped", 0):
+            if not core_ok or not complete_validation(proof):
                 row["action"] = "validation_held"
             elif row["core_current"] and not require_ancestry:
                 row["action"] = "skip_compatible"
@@ -106,14 +166,11 @@ def apply_updates(repo: Path, report: dict) -> dict:
     main_ref = git(repo, "rev-parse", "--symbolic-full-name", report["main_ref"]).decode().strip()
     if not main_ref.startswith(("refs/heads/", "refs/remotes/")):
         raise ValueError("An apply operation requires a named main ref")
-    occupied = checked_out_refs(repo)
     for row in report["branches"]:
         if row["action"] != "update_ready":
             continue
         try:
             target = local_ref(row["ref"])
-            if target in occupied:
-                raise ValueError("E_BRANCH_UPDATE_CHECKED_OUT")
             if git(repo, "rev-parse", "--verify", target).decode().strip() != row["commit"]:
                 raise ValueError("E_BRANCH_UPDATE_STALE_TARGET")
             if git(repo, "rev-parse", "--verify", main_ref).decode().strip() != report["main_commit"]:
@@ -129,22 +186,48 @@ def apply_updates(repo: Path, report: dict) -> dict:
             )
             if signing.returncode not in {0, 1}:
                 raise ValueError("E_BRANCH_UPDATE_SIGNING_CONFIG")
+            validation = row.get("validation", {})
+            validation_key = validation.get("validation_key")
+            if not isinstance(validation_key, str) or not validation_key:
+                raise ValueError("E_BRANCH_UPDATE_VALIDATION_KEY_MISSING")
+            if not complete_validation(validation):
+                raise ValueError("E_BRANCH_UPDATE_VALIDATION_INCOMPLETE")
+            if validation.get("content_digest") != row.get("content_digest"):
+                raise ValueError("E_BRANCH_UPDATE_VALIDATION_CONTENT_MISMATCH")
+            if validation.get("main_commit") != report.get("main_commit"):
+                raise ValueError("E_BRANCH_UPDATE_VALIDATION_MAIN_MISMATCH")
+            message = (
+                f"Merge core {report['main_commit'][:12]} into {target.removeprefix('refs/heads/')}\n\n"
+                f"Parr0t-Core: {report['main_commit']}\n"
+                f"Parr0t-Validated-Tree: {merged}\n"
+                f"Parr0t-Validation-Key: {validation_key}"
+            )
             args = ["commit-tree", merged, "-p", row["commit"], "-p", report["main_commit"],
-                    "-m", f"Merge core {report['main_commit'][:12]} into {target.removeprefix('refs/heads/')}"]
+                    "-m", message]
             if signing.stdout.strip() == "true":
                 args.append("-S")
             commit = git(repo, *args).decode().strip()
-            # Git verifies both expected refs atomically. A stale plan cannot
-            # overwrite another process's main or SDK advance.
-            if target in checked_out_refs(repo):
-                raise ValueError("E_BRANCH_UPDATE_CHECKED_OUT")
-            transaction = (f"start\nverify {main_ref} {report['main_commit']}\n"
-                           f"update {target} {commit} {row['commit']}\nprepare\ncommit\n")
-            applied = subprocess.run(["git", "-C", str(repo), "update-ref", "--stdin"],
-                                     input=transaction.encode("ascii"), capture_output=True, shell=False)
-            if applied.returncode:
-                raise ValueError("E_BRANCH_UPDATE_STALE_REF")
-            row.update(action="updated", new_commit=commit)
+            # An explicitly requested clean linked worktree can be advanced by
+            # the same validated fast-forward. Dirty worktrees are held. This
+            # removes the former manual-merge escape hatch without checking out,
+            # stashing, resetting, or resolving anything automatically.
+            occupied = checked_out_worktrees(repo)
+            if target in occupied:
+                if git(repo, "rev-parse", "--verify", main_ref).decode().strip() != report["main_commit"]:
+                    raise ValueError("E_BRANCH_UPDATE_STALE_MAIN")
+                update_clean_worktree(occupied[target], target, row["commit"], commit, merged)
+                mode = "checked_out_clean_worktree"
+            else:
+                # Git verifies both expected refs atomically. A stale plan cannot
+                # overwrite another process's main or SDK advance.
+                transaction = (f"start\nverify {main_ref} {report['main_commit']}\n"
+                               f"update {target} {commit} {row['commit']}\nprepare\ncommit\n")
+                applied = subprocess.run(["git", "-C", str(repo), "update-ref", "--stdin"],
+                                         input=transaction.encode("ascii"), capture_output=True, shell=False)
+                if applied.returncode:
+                    raise ValueError("E_BRANCH_UPDATE_STALE_REF")
+                mode = "ref_transaction"
+            row.update(action="updated", new_commit=commit, apply_mode=mode)
             report["applied"] += 1
         except ValueError as error:
             row.update(action="apply_held", error=str(error))
@@ -161,14 +244,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--environment-key", default="")
     parser.add_argument("--jobs", type=int, choices=range(1, 9), default=2)
     parser.add_argument("--require-ancestry", action="store_true", help="Require main ancestry, including for equivalent core content")
-    parser.add_argument("--apply", action="store_true", help="Create local merge commits and advance only named, unoccupied local SDK refs")
+    parser.add_argument("--provision-dependencies", action="store_true",
+                        help="Install required branch-declared Python test dependencies into the external state directory")
+    parser.add_argument("--apply", action="store_true",
+                        help="Create local merge commits and advance named local SDK refs or their exact clean worktrees")
     args = parser.parse_args(argv)
     if args.apply and not args.branch:
         parser.error("--apply requires explicit --branch targets")
     refs = [local_ref(branch) for branch in args.branch] if args.branch else None
     report = plan_updates(args.repo, args.state_dir, main_ref=args.main_ref, refs=refs,
                           python=args.python, environment_key=args.environment_key, jobs=args.jobs,
-                          require_ancestry=args.require_ancestry)
+                          require_ancestry=args.require_ancestry,
+                          provision_dependencies=args.provision_dependencies)
     if args.apply:
         report = apply_updates(args.repo.resolve(), report)
         (args.state_dir / "update-result.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
