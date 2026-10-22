@@ -12,6 +12,14 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **Resolution:** Authenticate the relevant client or grant the Git application access to that repository. Prefer a repository-scoped credential with the minimum required permission.
 - **Prevention:** Validate repository access at task startup without placing credentials in prompts, configuration, or logs.
 
+## A portable SDK snapshot is rejected because it has no `.git` directory
+
+- **Symptom:** An agent can read a complete Parr0t SDK snapshot, but claims SDK inventory or activation is impossible until Git is initialized or the repository is cloned again.
+- **General cause:** Game-workspace publication policy was incorrectly coupled to SDK provenance, or a Git checkout was treated as the only verifiable SDK runtime.
+- **Diagnosis:** Confirm that the snapshot contains the Parr0t public contract and record its declared branch and immutable source commit. Inventory it with `sdk-inventory --runtime-root <path> --portable-branch <branch> --portable-commit <commit>` and inspect the generated content fingerprint.
+- **Resolution:** Evaluate, select, and activate the registered portable snapshot normally. Parr0t verifies its canonical file-content fingerprint instead of requiring local Git metadata. Obtain an authenticated snapshot first if its branch or source commit cannot be established; do not invent either value.
+- **Prevention:** Keep the game's `pending`, `enabled`, or `disabled` Git choice limited to initialization, commit, and publication of that game workspace. Never use that choice to block SDK acquisition, inventory, selection, or activation.
+
 ## An identical unpack or pack step runs again
 
 - **Symptom:** A cached tool stage executes even though its source and tool appear unchanged.

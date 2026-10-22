@@ -6,6 +6,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -17,6 +18,8 @@ from dataclasses import asdict
 from game_l10n.cli import (
     _completion_state_valid,
     _context_state_valid,
+    cmd_init,
+    cmd_policy,
     cmd_status,
     cmd_translate,
 )
@@ -41,6 +44,7 @@ from game_l10n.workspace import (
     record_sdk_evaluation,
     record_sdk_selection,
     refresh_sdk_inventory,
+    require_sdk_activation,
     require_sdk_selection,
     update_repository_policy,
     verify_sdk_promotion_commit,
@@ -78,6 +82,209 @@ def activate_workspace_adapter(work: Path, *, reference_checkout: Path | None = 
 
 
 class WorkspaceTests(unittest.TestCase):
+    def test_cli_cannot_infer_the_initial_game_workspace_git_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            args = SimpleNamespace(
+                workspace=str(work),
+                sdk_root=str(sdk),
+                game_root=[],
+                git_choice="disabled",
+                provider_preset="codex-app-deepseek",
+                user_confirmed_git_choice=False,
+            )
+            with self.assertRaisesRegex(
+                ConfigurationError, "explicit user confirmation"
+            ):
+                cmd_init(args)
+            args.user_confirmed_git_choice = True
+            with redirect_stdout(StringIO()):
+                cmd_init(args)
+            self.assertEqual(
+                load_config(work)["repository"]["initial_choice"], "disabled"
+            )
+
+            policy_work = root / "policy-work"
+            initialize_workspace(policy_work, sdk)
+            policy_args = SimpleNamespace(
+                workspace=str(policy_work),
+                git_choice="disabled",
+                user_confirmed_git_choice=False,
+                publish_approved=None,
+            )
+            with self.assertRaisesRegex(
+                ConfigurationError, "explicit user confirmation"
+            ):
+                cmd_policy(policy_args)
+            self.assertEqual(
+                load_config(policy_work)["repository"]["initial_choice"], "pending"
+            )
+            policy_args.user_confirmed_git_choice = True
+            with redirect_stdout(StringIO()):
+                cmd_policy(policy_args)
+            self.assertEqual(
+                load_config(policy_work)["repository"]["initial_choice"], "disabled"
+            )
+
+    def test_portable_sdk_snapshot_activates_without_git(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "portable-sdk"
+            work = root / "work"
+            game = root / "game"
+            (sdk / "docs").mkdir(parents=True)
+            (sdk / "src" / "game_l10n").mkdir(parents=True)
+            game.mkdir()
+            (sdk / "AGENTS.md").write_text("portable fixture\n", encoding="utf-8")
+            (sdk / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
+            (sdk / "docs" / "fixture-sdk.md").write_text(
+                "fixture contract\n", encoding="utf-8"
+            )
+            adapter = sdk / "src" / "game_l10n" / "adapter.py"
+            adapter.write_text("VALUE = 1\n", encoding="utf-8")
+
+            initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+            initial = load_config(work)["sdk_selection"]
+            self.assertEqual(initial["inventory_source"], "portable_unidentified")
+            self.assertEqual(initial["candidates"], [])
+
+            selection = refresh_sdk_inventory(
+                work,
+                runtime_root=sdk,
+                portable_branch="sdk-fixture-1.0",
+                portable_commit="a" * 40,
+            )
+            self.assertEqual(selection["inventory_source"], "portable_sdk_snapshot")
+            self.assertEqual(selection["candidates"][0]["binding_kind"], "content")
+            self.assertEqual(selection["candidates"][0]["file_count"], 4)
+            record_sdk_evaluation(
+                work,
+                "sdk-fixture-1.0",
+                "compatible",
+                "public_contract_match",
+                ["docs/fixture-sdk.md"],
+                target_engine="fixture",
+                target_version="1.0",
+            )
+            record_sdk_selection(
+                work,
+                "reuse",
+                "sdk-fixture-1.0",
+                target_engine="fixture",
+                target_version="1.0",
+            )
+            activation = record_sdk_activation(work, runtime_root=sdk)
+            self.assertEqual(activation["runtime"]["kind"], "content")
+            self.assertEqual(activation["candidate_commit"], "a" * 40)
+            self.assertEqual(require_sdk_activation(work), activation)
+
+            adapter.write_text("VALUE = 2\n", encoding="utf-8")
+            with self.assertRaisesRegex(ConfigurationError, "recorded by sdk-activate"):
+                require_sdk_activation(work)
+
+    def test_git_sdk_candidate_accepts_its_exact_portable_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            portable = root / "portable-sdk"
+            work = root / "work"
+            archive = root / "sdk.zip"
+            sdk.mkdir()
+
+            def git(*args: str) -> subprocess.CompletedProcess[str]:
+                completed = subprocess.run(
+                    ["git", *args], cwd=sdk, text=True, capture_output=True, shell=False
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                return completed
+
+            git("init", "-b", "main")
+            git("config", "user.name", "Fixture User")
+            git("config", "user.email", "fixture@example.invalid")
+            git("config", "commit.gpgsign", "false")
+            (sdk / "AGENTS.md").write_text("fixture\n", encoding="utf-8")
+            (sdk / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
+            git("add", "AGENTS.md", "pyproject.toml")
+            git("commit", "-m", "fixture main")
+            git("switch", "-c", "sdk-fixture-1.0")
+            (sdk / "docs").mkdir()
+            (sdk / "docs" / "fixture-sdk.md").write_text(
+                "fixture contract\n", encoding="utf-8"
+            )
+            git("add", "docs/fixture-sdk.md")
+            git("commit", "-m", "fixture sdk")
+            candidate_commit = git("rev-parse", "HEAD").stdout.strip()
+            git("switch", "main")
+
+            initialize_workspace(work, sdk, git_choice="disabled")
+            candidate = load_config(work)["sdk_selection"]["candidates"][0]
+            self.assertEqual(candidate["commit"], candidate_commit)
+            record_sdk_evaluation(
+                work,
+                "sdk-fixture-1.0",
+                "compatible",
+                "public_contract_match",
+                ["docs/fixture-sdk.md"],
+                target_engine="fixture",
+                target_version="1.0",
+            )
+            record_sdk_selection(
+                work,
+                "reuse",
+                "sdk-fixture-1.0",
+                target_engine="fixture",
+                target_version="1.0",
+            )
+
+            git("archive", "--format=zip", f"--output={archive}", "sdk-fixture-1.0")
+            with zipfile.ZipFile(archive) as source:
+                source.extractall(portable)
+            activation = record_sdk_activation(work, runtime_root=portable)
+            self.assertEqual(activation["runtime"]["kind"], "content")
+            self.assertEqual(
+                activation["runtime"]["content_fingerprint"],
+                candidate["content_fingerprint"],
+            )
+            self.assertEqual(
+                require_sdk_activation(work, runtime_root=portable), activation
+            )
+
+    def test_unidentified_portable_runtime_cannot_justify_private_new(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "portable-main"
+            work = root / "work"
+            game = root / "game"
+            (sdk / "src" / "game_l10n").mkdir(parents=True)
+            game.mkdir()
+            (sdk / "AGENTS.md").write_text("portable fixture\n", encoding="utf-8")
+            (sdk / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
+            (sdk / "src" / "game_l10n" / "workspace.py").write_text(
+                "# fixture\n", encoding="utf-8"
+            )
+            initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+            establish_control_plane_entry(work)
+
+            with self.assertRaisesRegex(ConfigurationError, "no SDK identity"):
+                record_sdk_selection(
+                    work,
+                    "private-new",
+                    target_engine="fixture",
+                    target_version="1.0",
+                )
+            output = StringIO()
+            with redirect_stdout(output):
+                cmd_status(SimpleNamespace(workspace=str(work)))
+            status = json.loads(output.getvalue())
+            self.assertEqual(status["next_actions"], ["register_portable_sdk_snapshot"])
+            self.assertEqual(
+                status["required_contracts"],
+                ["docs/sdk-selection.md", "docs/sdk-branch-contract.md"],
+            )
+
     def test_context_status_binding_supports_fast_and_legacy_states(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             context = Path(directory) / "context.json"
