@@ -38,6 +38,11 @@ from .coverage import (
 )
 from .context_analysis import ContextAnalyzer, analyze_with_cache
 from .corrections import apply_user_corrections
+from .data_plane_task import (
+    DATA_PLANE_PROFILES,
+    prepare_data_plane_task,
+    seal_data_plane_task,
+)
 from .failure_queue import (
     FAILURE_QUEUE_SCHEMA,
     held_checkpoint_path,
@@ -130,6 +135,7 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
         "docs/sdk-branch-contract.md",
     ),
     "unpack_and_extract_ordered_script": ("docs/coverage-gates.md",),
+    "extract_independent_source_inventory": ("docs/coverage-gates.md",),
     "verify_independent_source_inventory": ("docs/coverage-gates.md",),
     "resolve_source_inventory_gaps": ("docs/coverage-gates.md",),
     "analyze_complete_script_context": (
@@ -185,6 +191,56 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
     ),
     "local_patch_ready": (),
 }
+
+STATUS_DATA_PLANE_ROLES = {
+    "record_target_identity_evaluate_and_select_sdk": "source_probe",
+    "unpack_and_extract_ordered_script": "primary_inventory",
+    "extract_independent_source_inventory": "independent_inventory",
+    "resolve_source_inventory_gaps": "inventory_reconciler",
+}
+
+
+def _status_data_plane_task(action: str) -> dict[str, Any] | None:
+    role = STATUS_DATA_PLANE_ROLES.get(action)
+    if role is None:
+        return None
+    return {
+        "worker_role": role,
+        "stage": DATA_PLANE_PROFILES[role]["stage"],
+        "prepare_command": (
+            "game-l10n prepare-data-plane-task --workspace <workspace> "
+            f"--worker-role {role}"
+        ),
+        "seal_command": (
+            "game-l10n seal-data-plane-task --workspace <workspace> "
+            "--relay <relay-path>"
+        ),
+        "dispatch": "fresh_isolated_relay_only",
+    }
+
+
+def _public_inventory_gate(state: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(state, dict):
+        return {"status": "not_checked"}
+    reconciliation = state.get("reconciliation", {})
+    return {
+        "status": state.get("status"),
+        "static_complete": state.get("static_complete") is True,
+        "primary_segments": state.get("primary_segments", 0),
+        "independent_segments": state.get("independent_segments", 0),
+        "gap_score": state.get("gap_score", 0),
+        "issue_codes": list(state.get("issue_codes", [])),
+        "continuation_required": state.get("static_complete") is not True,
+        "reconciliation": {
+            "generation": reconciliation.get("generation", 0),
+            "progress_state": reconciliation.get("progress_state", "unknown"),
+            "previous_gap_score": reconciliation.get("previous_gap_score"),
+            "unchanged_observations": reconciliation.get(
+                "unchanged_observations", 0
+            ),
+            "terminal": False,
+        },
+    }
 
 
 def _status_contracts(action: str) -> list[str]:
@@ -963,6 +1019,34 @@ def cmd_validate_control_envelope(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    activation = None
+    if args.worker_role != "source_probe":
+        activation = require_sdk_activation(work_dir, config)
+    output_value = args.output or f".game-l10n/data-plane/{args.worker_role}"
+    result = prepare_data_plane_task(
+        work_dir,
+        _path_in_workspace(work_dir, output_value),
+        worker_role=args.worker_role,
+        config=config,
+        sdk_activation=activation,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_seal_data_plane_task(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    result = seal_data_plane_task(
+        work_dir,
+        _path_in_workspace(work_dir, args.relay, must_exist=True),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["status"] in {"success", "partial"} else 1
+
+
 def cmd_control_plane_status(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     print(
@@ -1513,6 +1597,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     action: str | None = None
     state_issue_codes: list[str] = []
     local_artifact: dict[str, Any] = {"status": "not_checked"}
+    inventory_gate: dict[str, Any] = {"status": "not_checked"}
     if policy.get("initial_choice") == "pending":
         action = "ask_user_for_initial_git_choice"
     game_roots = [Path(item) for item in config.get("game_roots", [])]
@@ -1542,7 +1627,21 @@ def cmd_status(args: argparse.Namespace) -> int:
             sdk_activation = {"status": "required"}
             action = "activate_selected_sdk_implementation"
     if action is None:
+        primary_inventory_path = work_dir / "inputs" / "primary-inventory.json"
+        independent_inventory_path = (
+            work_dir / "inputs" / "independent-inventory.json"
+        )
         if not any((work_dir / "inputs").glob("*")):
+            action = "unpack_and_extract_ordered_script"
+        elif (
+            primary_inventory_path.is_file()
+            and not independent_inventory_path.is_file()
+        ):
+            action = "extract_independent_source_inventory"
+        elif (
+            independent_inventory_path.is_file()
+            and not primary_inventory_path.is_file()
+        ):
             action = "unpack_and_extract_ordered_script"
         else:
             inventory_state_path = work_dir / ".game-l10n" / "inventory-attestation.json"
@@ -1558,6 +1657,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             elif inventory_state is None:
                 action = "verify_independent_source_inventory"
             else:
+                inventory_gate = _public_inventory_gate(inventory_state)
                 inventory_verified = bool(
                     inventory_state.get("status") == "static_verified"
                     and inventory_state.get("static_complete") is True
@@ -1722,7 +1822,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "control_plane": public_control_plane_state(control_state),
                 "entry_gate": public_control_plane_entry_state(entry_state),
                 "local_artifact": local_artifact,
+                "inventory_gate": inventory_gate,
                 "state_issue_codes": state_issue_codes,
+                "data_plane_task": _status_data_plane_task(action),
                 "contract_base": contract_base,
                 "next_actions": [action],
                 "required_contracts": _status_contracts(action),
@@ -2436,6 +2538,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Retry previously recorded fallback failures after a new user request",
     )
     exchange_process.set_defaults(func=cmd_process_translation_exchange)
+
+    data_plane_prepare = sub.add_parser(
+        "prepare-data-plane-task",
+        help="Create one core-bound isolated discovery or inventory relay task",
+    )
+    data_plane_prepare.add_argument("--workspace", required=True)
+    data_plane_prepare.add_argument(
+        "--worker-role", choices=sorted(DATA_PLANE_PROFILES), required=True
+    )
+    data_plane_prepare.add_argument(
+        "--output",
+        help="Private task directory; defaults under .game-l10n/data-plane",
+    )
+    data_plane_prepare.set_defaults(func=cmd_prepare_data_plane_task)
+
+    data_plane_seal = sub.add_parser(
+        "seal-data-plane-task",
+        help="Validate one exact isolated discovery or inventory task result",
+    )
+    data_plane_seal.add_argument("--workspace", required=True)
+    data_plane_seal.add_argument("--relay", required=True)
+    data_plane_seal.set_defaults(func=cmd_seal_data_plane_task)
 
     control_validate = sub.add_parser(
         "validate-control-envelope",
