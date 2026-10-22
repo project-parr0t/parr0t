@@ -237,12 +237,14 @@ class BranchAuditTests(unittest.TestCase):
             "            target=Path(path)/'proof'; target.write_text('ok'); self.assertEqual(target.read_text(),'ok')\n"
             "        self.assertEqual(Path(tempfile.gettempdir()),Path(os.environ['TEMP']))\n"
         )
-        log = self.root / "audit" / "fixture.log"
+        log = self.root / "audit" / (("a" * 64) + ".log")
         log.parent.mkdir()
         with patch.dict("os.environ", {"TMP": str(self.root / "denied"), "TEMP": str(self.root / "denied")}, clear=False):
             result = run_checks(snapshot, sys.executable, False, log)
         self.assertTrue(result["passed"])
-        self.assertTrue((log.parent / "tmp" / log.stem).is_dir())
+        temporary = log.parent / "tmp" / log.stem[:12]
+        self.assertTrue(temporary.is_dir())
+        self.assertEqual(len(temporary.name), 12)
 
     def test_adapter_test_scope_does_not_repeat_core_suite(self) -> None:
         snapshot = self.root / "snapshot"

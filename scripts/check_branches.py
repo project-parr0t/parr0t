@@ -321,7 +321,11 @@ def run_checks(snapshot: Path, python: str, sdk: bool, log: Path,
     # to the external audit state instead of the repository or inherited host
     # location.  The per-validation directory also prevents parallel branches
     # from sharing mutable test state.
-    temporary = log.parent / "tmp" / log.stem
+    # Keep this component short.  Legacy .NET/Win32 tools used by SDK tests can
+    # still inherit MAX_PATH limits, and the full 64-character validation key
+    # left too little room for their nested temporary outputs.  Twelve hex
+    # characters retain per-validation separation while preserving path budget.
+    temporary = log.parent / "tmp" / log.stem[:12]
     temporary.mkdir(parents=True, exist_ok=True)
     for variable in ("TMP", "TEMP", "TMPDIR"):
         environment[variable] = str(temporary)
