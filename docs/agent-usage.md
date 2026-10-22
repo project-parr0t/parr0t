@@ -67,6 +67,7 @@ Use the routing table in repository `AGENTS.md`. Common short paths are:
 - native worker/control-plane work: `control-plane-contract.md`, `execution-budget.md`, and `detail-contract.md`;
 - manual/API fallback exchange: `translation-exchange.md`;
 - exact user-approved wording correction: `minimal-corrections.md` without model or context calls;
+- dialogue/reference flag without a stable ID: use `minimal-corrections.md` and its local correction UI once; accept its frozen export and never repeat a global inventory, text, or vector search;
 - prior release, game update, or selective continuation: `release-checkpoint.md`;
 - composed UI slots: `segment-metadata.md`;
 - real runtime action: `runtime-approval.md` only after the matching explicit request;
