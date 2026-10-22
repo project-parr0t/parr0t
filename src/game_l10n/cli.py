@@ -1276,6 +1276,25 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
         args.user_approved_budget
         or execution.get("bulk_budget_user_approved", False)
     )
+    control_turn_budget_user_approved = bool(
+        getattr(args, "user_approved_control_turn_budget", False)
+        or execution.get("control_turn_budget_user_approved", False)
+    )
+    max_root_model_calls_per_wave = (
+        getattr(args, "max_root_model_calls_per_wave", None)
+        if getattr(args, "max_root_model_calls_per_wave", None) is not None
+        else execution.get("max_root_model_calls_per_wave")
+    )
+    max_root_model_calls_per_turn = (
+        getattr(args, "max_root_model_calls_per_turn", None)
+        if getattr(args, "max_root_model_calls_per_turn", None) is not None
+        else execution.get("max_root_model_calls_per_turn")
+    )
+    max_root_input_tokens_per_turn = (
+        getattr(args, "max_root_input_tokens_per_turn", None)
+        if getattr(args, "max_root_input_tokens_per_turn", None) is not None
+        else execution.get("max_root_input_tokens_per_turn")
+    )
     result = prepare_native_tasks(
         work_dir,
         source,
@@ -1292,6 +1311,10 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
         max_provider_cost_usd=max_provider_cost_usd,
         provider_cost_unmetered=provider_cost_unmetered,
         user_approved_budget=user_approved_budget,
+        max_root_model_calls_per_wave=max_root_model_calls_per_wave,
+        max_root_model_calls_per_turn=max_root_model_calls_per_turn,
+        max_root_input_tokens_per_turn=max_root_input_tokens_per_turn,
+        control_turn_budget_user_approved=control_turn_budget_user_approved,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -2445,6 +2468,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--user-approved-budget",
         action="store_true",
         help="Assert that the user supplied the bound bulk time, token, and cost policy",
+    )
+    native_prepare.add_argument(
+        "--max-root-model-calls-per-wave",
+        type=int,
+        help="User-specified root model-call ceiling for one native wave",
+    )
+    native_prepare.add_argument(
+        "--max-root-model-calls-per-turn",
+        type=int,
+        help="User-specified root model-call ceiling for one Codex turn",
+    )
+    native_prepare.add_argument(
+        "--max-root-input-tokens-per-turn",
+        type=int,
+        help="User-specified root input-token ceiling for one Codex turn",
+    )
+    native_prepare.add_argument(
+        "--user-approved-control-turn-budget",
+        action="store_true",
+        help="Assert that the user explicitly requested the supplied control-turn limit",
     )
     native_prepare.set_defaults(func=cmd_prepare_native_pass)
 
