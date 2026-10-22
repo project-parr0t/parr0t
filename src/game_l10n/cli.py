@@ -127,6 +127,10 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
         "docs/sdk-selection.md",
         "docs/sdk-branch-contract.md",
     ),
+    "register_portable_sdk_snapshot": (
+        "docs/sdk-selection.md",
+        "docs/sdk-branch-contract.md",
+    ),
     "record_target_identity_evaluate_and_select_sdk": (
         "docs/sdk-selection.md",
         "docs/sdk-branch-contract.md",
@@ -652,7 +656,16 @@ def _finalize_translation_results(
         },
         0 if target_complete else 2,
     )
+
+
 def cmd_init(args: argparse.Namespace) -> int:
+    if args.git_choice != "pending" and not getattr(
+        args, "user_confirmed_git_choice", False
+    ):
+        raise ConfigurationError(
+            "A non-pending game-workspace Git choice requires explicit user confirmation; "
+            "do not infer it from SDK download or activation method"
+        )
     initialize_workspace(
         Path(args.workspace),
         Path(args.sdk_root or _sdk_root()),
@@ -670,6 +683,12 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def cmd_policy(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
+    if args.git_choice is not None and not getattr(
+        args, "user_confirmed_git_choice", False
+    ):
+        raise ConfigurationError(
+            "Recording a game-workspace Git choice requires explicit user confirmation"
+        )
     publish = None
     if args.publish_approved is not None:
         publish = args.publish_approved == "yes"
@@ -1647,7 +1666,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     sdk_selection = config.get("sdk_selection", {})
     sdk_activation: dict[str, Any] = {"status": "not_checked"}
     if action is None and sdk_selection.get("status") != "selected":
-        if not sdk_selection.get("inventory_fingerprint"):
+        if sdk_selection.get("inventory_source") == "portable_unidentified":
+            action = "register_portable_sdk_snapshot"
+        elif not sdk_selection.get("inventory_fingerprint"):
             action = "inventory_sdk_branches"
         else:
             action = "record_target_identity_evaluate_and_select_sdk"
@@ -1658,7 +1679,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "status": "active",
                 "mode": active.get("mode"),
                 "target": active.get("target"),
-                "runtime_commit": active.get("runtime", {}).get("commit"),
+                "runtime_commit": active.get("runtime", {}).get("commit")
+                or active.get("candidate_commit"),
+                "runtime_binding": active.get("runtime", {}).get("kind"),
                 "workspace_tools_bound": active.get("workspace_tools") is not None,
             }
         except (GameL10nError, OSError, ValueError, json.JSONDecodeError):
@@ -1891,6 +1914,11 @@ def cmd_sdk_inventory(args: argparse.Namespace) -> int:
         Path(args.workspace).resolve(),
         refresh_remote=args.refresh_remote,
         remote=args.remote,
+        runtime_root=(
+            Path(args.runtime_root).resolve() if args.runtime_root else None
+        ),
+        portable_branch=args.portable_branch,
+        portable_commit=args.portable_commit,
     )
     print(json.dumps(selection, ensure_ascii=False, indent=2))
     return 0
@@ -1925,6 +1953,7 @@ def cmd_sdk_select(args: argparse.Namespace) -> int:
 def cmd_sdk_activate(args: argparse.Namespace) -> int:
     state = record_sdk_activation(
         Path(args.workspace).resolve(),
+        runtime_root=(Path(args.runtime_root).resolve() if args.runtime_root else None),
         reference_checkout=(
             Path(args.reference_checkout).resolve() if args.reference_checkout else None
         ),
@@ -1935,7 +1964,9 @@ def cmd_sdk_activate(args: argparse.Namespace) -> int:
                 "schema": state["schema"],
                 "mode": state["mode"],
                 "target": state["target"],
-                "runtime_commit": state["runtime"]["commit"],
+                "runtime_commit": state["runtime"]["commit"]
+                or state.get("candidate_commit"),
+                "runtime_binding": state["runtime"].get("kind"),
                 "reference_commit": (
                     state["reference"]["commit"] if state.get("reference") else None
                 ),
@@ -2148,6 +2179,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.add_argument("--git-choice", choices=["pending", "enabled", "disabled"], default="pending")
     init.add_argument(
+        "--user-confirmed-git-choice",
+        action="store_true",
+        help=(
+            "Assert that the user explicitly chose the game workspace Git policy; "
+            "this is unrelated to obtaining or activating an SDK"
+        ),
+    )
+    init.add_argument(
         "--provider-preset",
         choices=["openai-deepseek", "codex-app-deepseek", "custom"],
         default="codex-app-deepseek",
@@ -2161,6 +2200,11 @@ def build_parser() -> argparse.ArgumentParser:
     policy = sub.add_parser("policy", help="Record explicit user Git/publish choices")
     policy.add_argument("--workspace", required=True)
     policy.add_argument("--git-choice", choices=["pending", "enabled", "disabled"])
+    policy.add_argument(
+        "--user-confirmed-git-choice",
+        action="store_true",
+        help="Assert that the user explicitly chose this game-workspace Git policy",
+    )
     policy.add_argument("--publish-approved", choices=["yes", "no"])
     policy.set_defaults(func=cmd_policy)
 
@@ -2715,6 +2759,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fetch only sdk-* tracking refs before inventorying them",
     )
     sdk_inventory.add_argument("--remote", default="origin")
+    sdk_inventory.add_argument(
+        "--runtime-root",
+        help="Git checkout/worktree or extracted portable SDK snapshot to inventory",
+    )
+    sdk_inventory.add_argument(
+        "--portable-branch",
+        help="Authenticated sdk-* branch identity for a non-Git runtime root",
+    )
+    sdk_inventory.add_argument(
+        "--portable-commit",
+        help="Authenticated full commit ID for a non-Git runtime root",
+    )
     sdk_inventory.set_defaults(func=cmd_sdk_inventory)
 
     sdk_evaluate = sub.add_parser(
@@ -2779,8 +2835,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sdk_activate.add_argument("--workspace", required=True)
     sdk_activate.add_argument(
+        "--runtime-root",
+        help="Explicit selected SDK checkout/worktree or extracted portable snapshot",
+    )
+    sdk_activate.add_argument(
         "--reference-checkout",
-        help="Exact clean reference checkout required only for derive-new",
+        help="Exact clean Git or content-bound reference runtime required only for derive-new",
     )
     sdk_activate.set_defaults(func=cmd_sdk_activate)
 
