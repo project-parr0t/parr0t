@@ -18,6 +18,7 @@ class InstructionSurfaceTests(unittest.TestCase):
         test_collection = workflow.index("python -m unittest discover")
 
         self.assertLess(dependency_install, test_collection)
+        self.assertIn("-name 'requirements.txt'", workflow)
         self.assertIn("--requirement \"$requirements\"", workflow)
 
     def test_review_control_is_documented_as_a_deterministic_router(self) -> None:

@@ -16,9 +16,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for requirements in requirements-*.txt; do
-            [[ -f "$requirements" ]] || continue
+          while IFS= read -r -d '' requirements; do
             python -m pip install --disable-pip-version-check --requirement "$requirements"
-          done
+          done < <(find . -type f \( -name 'requirements.txt' -o -name 'requirements-*.txt' -o -name '*-requirements.txt' \) -not -path './.git/*' -print0 | sort -z)
       - run: python scripts/check_repo_privacy.py
       - run: python -m unittest discover -s tests -t . -v
