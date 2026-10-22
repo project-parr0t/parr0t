@@ -107,7 +107,7 @@ An older workspace that still has either the former implicit 256-record setting 
 
 ## Large-inventory startup budget
 
-At 10,000 or more records, startup is a bounded linear phase. The primary and independent inventory workers each enumerate the source once; reconciliation is one ordered comparison. Do not add another full extraction, whole-tree rescan, per-record agent, per-record proof/status file, or speculative tool build before context analysis. Context preparation may make its one required ordered read and must then checkpoint reusable typed artifacts.
+At 10,000 or more records, startup is a bounded linear phase. The primary and independent workers each enumerate the source once; each changed inventory generation gets one ordered core comparison. If that comparison is incomplete, status emits an `inventory_reconciler` task bound to the cached pair and current gap vector. A lower gap score requires another bounded gap-only generation; it does not authorize a rescan or a terminal failure report. Do not add another full extraction, whole-tree rescan, per-record agent, proof file, or speculative tool before context.
 
 An unchanged verified inventory uses its saved path/size/mtime binding instead of reparsing the complete inventory on every status, translation, review, or resume command. JSONL input is streamed, and one command reuses the same in-memory segments when translation input and context inventory are the same file. A changed binding falls back to full semantic fingerprint verification.
 

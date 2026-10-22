@@ -278,6 +278,104 @@ class CoverageTests(unittest.TestCase):
         self.assertTrue(state["order_mismatch"])
         self.assertIn("INVENTORY_ORDER_MISMATCH", state["issue_codes"])
 
+    def test_method_specific_ids_can_share_a_canonical_comparison_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            primary_rows = [
+                {
+                    "id": "primary-label-id",
+                    "source": "SOURCE_LABEL",
+                    "metadata": {
+                        "inventory_comparison_key": "physical-label-occurrence",
+                        "ui_slot_role": "label",
+                    },
+                },
+                {
+                    "id": "primary-resource-id",
+                    "source": "SOURCE_ONE",
+                    "metadata": {
+                        "inventory_comparison_key": "physical-occurrence-1",
+                        "ui_slot_role": "value",
+                        "ui_composed_with_ids": ["primary-label-id"],
+                    },
+                }
+            ]
+            independent_rows = [
+                {
+                    "id": "independent-label-id",
+                    "source": "SOURCE_LABEL",
+                    "metadata": {
+                        "inventory_comparison_key": "physical-label-occurrence",
+                        "ui_slot_role": "label",
+                    },
+                },
+                {
+                    "id": "independent-resource-id",
+                    "source": "SOURCE_ONE",
+                    "metadata": {
+                        "inventory_comparison_key": "physical-occurrence-1",
+                        "ui_slot_role": "value",
+                        "ui_composed_with_ids": ["independent-label-id"],
+                    },
+                }
+            ]
+            write_inventory(primary, "synthetic-ast", primary_rows)
+            write_inventory(independent, "synthetic-secondary", independent_rows)
+
+            state = verify_inventory_pair(primary, independent)
+
+        self.assertTrue(state["static_complete"])
+        self.assertEqual(state["missing_from_primary_count"], 0)
+        self.assertEqual(state["missing_from_independent_count"], 0)
+        self.assertFalse(state["order_mismatch"])
+
+    def test_inventory_comparison_keys_must_be_unique(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            rows = [
+                {
+                    "id": "first",
+                    "source": "SOURCE_ONE",
+                    "metadata": {"inventory_comparison_key": "same-occurrence"},
+                },
+                {
+                    "id": "second",
+                    "source": "SOURCE_TWO",
+                    "metadata": {"inventory_comparison_key": "same-occurrence"},
+                },
+            ]
+            write_inventory(primary, "synthetic-ast", rows)
+            write_inventory(independent, "synthetic-secondary", rows)
+
+            with self.assertRaisesRegex(ConfigurationError, "duplicate comparison key"):
+                verify_inventory_pair(primary, independent)
+
+    def test_saved_inventory_attestation_records_measured_gap_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            rows = [
+                {"id": "first", "source": "SOURCE_ONE"},
+                {"id": "second", "source": "SOURCE_TWO"},
+            ]
+            write_inventory(primary, "synthetic-ast", rows)
+            write_inventory(independent, "synthetic-secondary", rows[:1])
+            first = save_inventory_attestation(root, primary, independent)
+
+            write_inventory(independent, "synthetic-secondary", rows)
+            second = save_inventory_attestation(root, primary, independent)
+
+        self.assertEqual(first["reconciliation"]["progress_state"], "initial")
+        self.assertTrue(first["reconciliation"]["continuation_required"])
+        self.assertEqual(second["reconciliation"]["progress_state"], "complete")
+        self.assertFalse(second["reconciliation"]["continuation_required"])
+        self.assertFalse(second["reconciliation"]["terminal"])
+
     def test_independent_inventory_must_confirm_ui_composition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

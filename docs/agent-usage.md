@@ -21,7 +21,7 @@ For a new job:
 1. Confirm repository/workspace access and only that the source path exists; do not inspect its contents.
 2. Initialize with that path and run status. For `establish_text_free_control_plane`, read its contracts and run `game-l10n enter-control-plane --workspace <workspace> --contracts-read --source-unopened`. If the parent already saw game content, record a leak and stop.
 3. Ask once whether Git may be used for this game task and record the choice. Disabled means no `git init`, commit, branch, remote, or push for that job.
-4. Follow the single later `next_actions`. Resolve only its `required_contracts`; load another contract only for a new user route. Isolated workers perform locale/engine discovery, inventory, and classification, update private state, and return validated envelope paths. Only `local_patch_ready` is terminal.
+4. Follow only status `next_actions` and contracts. If `data_plane_task` exists, run its prepare, relay, and seal commands; never request an exception. Only `local_patch_ready` is terminal.
 
 For an existing job, start with status and reuse valid checkpoints. Do not repeat work with unchanged fingerprints.
 
@@ -50,10 +50,9 @@ Do not skip or reorder barriers. One refusal, timeout, malformed result, capacit
 
 - Select and activate the SDK before data-plane work. Exact engine/version matches run from the bound branch checkout. A different identity may be a bound read-only code reference for `derive-new`, never a compatibility or promotion destination. Generated pass-through workspace tools are placeholders, not an active adapter.
 - Inventory completeness requires two independently implemented ordered manifests. Result alignment, semantic review coverage, and runtime observation are separate claims.
-- At 10,000+ records, each inventory method scans once and reconciliation runs once. Reuse unchanged attestations; never create per-record startup files or repeat discovery before context.
+- At 10,000+ records, scan once per method. Continue cached gap-only reconciliation while the core gap score falls; stop only for a status blocker, budget gate, or unchanged limit. Never rescan.
 - Context is target-scoped, not absent. Use narrative/voice, functional/UI, knowledge/prerequisite, adjacent, glossary, and immutable evidence relevant to that target.
-- The top-level agent is a text-free control plane. It handles IDs, counts, categorical status, queue movement, artifact paths, and deterministic codes. Workers access private text and return only validated metadata envelopes.
-- The top-level agent never inspects game-root files, including preliminary discovery; it passes paths to isolated workers. A missing SDK does not relax this boundary.
+- The text-free parent handles only IDs, counts, states, queues, paths, and codes. It dispatches only core relays and never inspects game-root contents; a missing SDK changes nothing.
 - Provider roles come from the selected preset. A key does not select a mode, change a role, or authorize another service. Parent-facing refusal is only `fallback_required`; provider rationale remains private.
 - Translation is faithful transformation, not content generation. Independent review checks meaning, omission, voice, tone, function, conditions, units, terminology, allusions, placeholders, markup, control codes, ordering, and material layout risk.
 - Build new outputs in the workspace. Automated checks use synthetic targets and never install or launch the real game.
@@ -91,6 +90,8 @@ game-l10n sdk-inventory --workspace <external-workspace> --refresh-remote
 game-l10n sdk-evaluate --workspace <external-workspace> --target-engine <engine> --target-version <version-line> --branch <sdk-branch> --result <compatible|partial|reference|incompatible> --reason <reason-code> --evidence-path <public-contract-path>
 game-l10n sdk-select --workspace <external-workspace> --target-engine <engine> --target-version <version-line> --mode <reuse|extend|derive-new|private-new> [--branch <sdk-branch>]
 game-l10n sdk-activate --workspace <external-workspace> [--reference-checkout <reference-worktree>]
+game-l10n prepare-data-plane-task --workspace <external-workspace> --worker-role <source_probe|primary_inventory|independent_inventory|inventory_reconciler>
+game-l10n seal-data-plane-task --workspace <external-workspace> --relay <relay-path>
 game-l10n native-pass-step --workspace <external-workspace> --manifest <private-manifest> --results-dir <private-wave-results>
 ```
 

@@ -26,6 +26,7 @@ UI_COMPOSITION_FIELDS = (
     "ui_max_chars",
 )
 UI_SLOT_ROLES = {"standalone", "label", "value", "state_value", "template_fragment"}
+INVENTORY_COMPARISON_KEY = "inventory_comparison_key"
 
 
 def _static_scope_tracking(coverage: dict[str, Any]) -> dict[str, Any] | None:
@@ -158,8 +159,11 @@ def _inventory_document(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _segment_map(payload: dict[str, Any]) -> dict[str, str]:
+def _segment_map(
+    payload: dict[str, Any], *, use_comparison_key: bool = False
+) -> dict[str, str]:
     result: dict[str, str] = {}
+    seen_target_ids: set[str] = set()
     for index, row in enumerate(payload["segments"], start=1):
         if not isinstance(row, dict):
             raise ConfigurationError(f"Inventory segment {index} must be an object")
@@ -167,24 +171,62 @@ def _segment_map(payload: dict[str, Any]) -> dict[str, str]:
         source = row.get("source")
         if not isinstance(target_id, str) or not target_id:
             raise ConfigurationError(f"Inventory segment {index} requires a stable id")
+        if target_id in seen_target_ids:
+            raise ConfigurationError(f"Inventory contains duplicate target id: {target_id}")
+        seen_target_ids.add(target_id)
         if not isinstance(source, str):
             raise ConfigurationError(f"Inventory segment {target_id!r} requires source text")
-        if target_id in result:
-            raise ConfigurationError(f"Inventory contains duplicate target id: {target_id}")
-        result[target_id] = source
+        comparison_key = target_id
+        if use_comparison_key:
+            metadata = row.get("metadata", {})
+            if not isinstance(metadata, dict):
+                raise ConfigurationError(
+                    f"Inventory segment {target_id!r} metadata must be an object"
+                )
+            comparison_key = metadata.get(INVENTORY_COMPARISON_KEY, target_id)
+            if not isinstance(comparison_key, str) or not comparison_key.strip():
+                raise ConfigurationError(
+                    f"Inventory segment {target_id!r} has an invalid {INVENTORY_COMPARISON_KEY}"
+                )
+        if comparison_key in result:
+            kind = "comparison key" if use_comparison_key else "target id"
+            raise ConfigurationError(
+                f"Inventory contains duplicate {kind}: {comparison_key}"
+            )
+        result[comparison_key] = source
     return result
 
 
-def _ui_contract_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def _ui_contract_map(
+    payload: dict[str, Any], *, use_comparison_key: bool = False
+) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
+    comparison_keys: dict[str, str] = {}
+    if use_comparison_key:
+        for row in payload["segments"]:
+            metadata = row.get("metadata", {})
+            if not isinstance(metadata, dict):
+                continue
+            comparison_keys[str(row.get("id", ""))] = str(
+                metadata.get(INVENTORY_COMPARISON_KEY, row.get("id", ""))
+            )
     for row in payload["segments"]:
         target_id = str(row["id"])
         metadata = row.get("metadata", {})
         if not isinstance(metadata, dict):
             raise ConfigurationError(f"Inventory segment {target_id!r} metadata must be an object")
+        comparison_key = (
+            metadata.get(INVENTORY_COMPARISON_KEY, target_id)
+            if use_comparison_key
+            else target_id
+        )
+        if not isinstance(comparison_key, str) or not comparison_key.strip():
+            raise ConfigurationError(
+                f"Inventory segment {target_id!r} has an invalid {INVENTORY_COMPARISON_KEY}"
+            )
         contract = {key: metadata[key] for key in UI_COMPOSITION_FIELDS if key in metadata}
         if not contract:
-            result[target_id] = {}
+            result[comparison_key] = {}
             continue
         role = contract.get("ui_slot_role")
         if role not in UI_SLOT_ROLES:
@@ -209,6 +251,10 @@ def _ui_contract_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
             raise ConfigurationError(
                 f"Inventory segment {target_id!r} ui_composed_with_ids must be string IDs"
             )
+        if related is not None and use_comparison_key:
+            contract["ui_composed_with_ids"] = [
+                comparison_keys.get(item, item) for item in related
+            ]
         max_chars = contract.get("ui_max_chars")
         if max_chars is not None and (
             not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 0
@@ -216,7 +262,7 @@ def _ui_contract_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
             raise ConfigurationError(
                 f"Inventory segment {target_id!r} ui_max_chars must be a non-negative integer"
             )
-        result[target_id] = contract
+        result[comparison_key] = contract
     return result
 
 
@@ -240,10 +286,12 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
     if primary["implementation_fingerprint"] == independent["implementation_fingerprint"]:
         raise ConfigurationError("Inventory methods must use different implementation fingerprints")
 
-    primary_rows = _segment_map(primary)
-    independent_rows = _segment_map(independent)
-    primary_ui_contracts = _ui_contract_map(primary)
-    independent_ui_contracts = _ui_contract_map(independent)
+    primary_rows = _segment_map(primary, use_comparison_key=True)
+    independent_rows = _segment_map(independent, use_comparison_key=True)
+    primary_ui_contracts = _ui_contract_map(primary, use_comparison_key=True)
+    independent_ui_contracts = _ui_contract_map(
+        independent, use_comparison_key=True
+    )
     primary_order = list(primary_rows)
     independent_order = list(independent_rows)
     primary_ids = set(primary_rows)
@@ -300,6 +348,16 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
         issue_codes.append("STATIC_SCOPE_TRACKING_MISMATCH")
     if not declared_complete:
         issue_codes.append("INVENTORY_NOT_DECLARED_COMPLETE")
+    gap_score = (
+        len(missing_from_primary)
+        + len(missing_from_independent)
+        + len(source_mismatches)
+        + len(ui_contract_mismatches)
+        + len(visible_exclusions)
+        + int(order_mismatch)
+        + int(scope_tracking_mismatch)
+        + int(not declared_complete)
+    )
     return {
         "schema": "parr0t.inventory-attestation.v1",
         "status": "static_verified" if complete else "incomplete",
@@ -325,6 +383,8 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
         "static_scope_tracking_mismatch": scope_tracking_mismatch,
         "static_complete": complete,
         "issue_codes": issue_codes,
+        "gap_score": gap_score,
+        "continuation_required": not complete,
         "file_bindings": {
             "primary": _file_binding(primary_path),
             "independent": _file_binding(independent_path),
@@ -336,7 +396,83 @@ def save_inventory_attestation(
     work_dir: Path, primary_path: Path, independent_path: Path
 ) -> dict[str, Any]:
     attestation = verify_inventory_pair(primary_path, independent_path)
-    _atomic_json(work_dir / ".game-l10n" / "inventory-attestation.json", attestation)
+    state_path = work_dir / ".game-l10n" / "inventory-attestation.json"
+    previous: dict[str, Any] | None = None
+    if state_path.is_file():
+        try:
+            candidate = json.loads(state_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("schema") == "parr0t.inventory-attestation.v1"
+            ):
+                previous = candidate
+        except (OSError, ValueError, json.JSONDecodeError):
+            previous = None
+
+    previous_reconciliation = (
+        previous.get("reconciliation", {}) if isinstance(previous, dict) else {}
+    )
+    previous_score = (
+        previous.get("gap_score") if isinstance(previous, dict) else None
+    )
+    current_vector = {
+        "missing_from_primary_count": attestation["missing_from_primary_count"],
+        "missing_from_independent_count": attestation[
+            "missing_from_independent_count"
+        ],
+        "source_mismatch_count": attestation["source_mismatch_count"],
+        "ui_composition_mismatch_count": attestation[
+            "ui_composition_mismatch_count"
+        ],
+        "user_visible_exclusion_count": attestation[
+            "user_visible_exclusion_count"
+        ],
+        "order_mismatch": attestation["order_mismatch"],
+        "static_scope_tracking_mismatch": attestation[
+            "static_scope_tracking_mismatch"
+        ],
+        "declared_complete": "INVENTORY_NOT_DECLARED_COMPLETE"
+        not in attestation["issue_codes"],
+    }
+    previous_vector = (
+        previous_reconciliation.get("gap_vector")
+        if isinstance(previous_reconciliation, dict)
+        else None
+    )
+    same_inputs = bool(
+        previous
+        and previous.get("primary_fingerprint") == attestation["primary_fingerprint"]
+        and previous.get("independent_fingerprint")
+        == attestation["independent_fingerprint"]
+    )
+    if attestation["static_complete"]:
+        progress_state = "complete"
+        unchanged_observations = 0
+    elif previous is None:
+        progress_state = "initial"
+        unchanged_observations = 0
+    elif same_inputs or previous_vector == current_vector:
+        progress_state = "unchanged"
+        unchanged_observations = int(
+            previous_reconciliation.get("unchanged_observations", 0)
+        ) + 1
+    elif isinstance(previous_score, int) and attestation["gap_score"] < previous_score:
+        progress_state = "improved"
+        unchanged_observations = 0
+    else:
+        progress_state = "changed"
+        unchanged_observations = 0
+    attestation["reconciliation"] = {
+        "generation": int(previous_reconciliation.get("generation", 0)) + 1,
+        "progress_state": progress_state,
+        "gap_score": attestation["gap_score"],
+        "previous_gap_score": previous_score,
+        "gap_vector": current_vector,
+        "unchanged_observations": unchanged_observations,
+        "continuation_required": attestation["continuation_required"],
+        "terminal": False,
+    }
+    _atomic_json(state_path, attestation)
     return attestation
 
 

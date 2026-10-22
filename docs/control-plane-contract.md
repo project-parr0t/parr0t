@@ -49,7 +49,9 @@ The selected SDK may apply stricter engine-specific structural checks, such as l
 
 ## Entry gate
 
-The boundary begins before preliminary discovery. The top-level agent may confirm that repository, workspace, and supplied source paths exist, but it must not list, open, search, grep, preview, parse, or classify files inside a game root. README files, manifests, configuration, scripts, assets, archives, and existing locale files are all data-plane material. Existing-locale detection and engine/version discovery therefore run in a fresh isolated `source_probe` worker at the `discovery` stage. It records resulting SDK-selection metadata inside the private workspace and returns only a validated control-envelope path.
+The boundary begins before preliminary discovery. The top-level agent may confirm that repository, workspace, and supplied source paths exist, but it must not inspect game-root contents. Existing-locale and engine/version discovery therefore run as a core-bound `source_probe`. When status exposes `data_plane_task`, run `prepare-data-plane-task`, give only its `parr0t.data-plane-relay.v1` path to one fresh no-history relay, and seal it with `seal-data-plane-task`. Primary inventory, independent inventory, and gap reconciliation use the same route. The existence of a core task means no extra user exception is needed; a model must not replace it with a manual assignment.
+
+The relay starts exactly one non-delegating worker from the bound private task, never opens the task payload, and returns only the core-generated `parr0t.data-plane-receipt.v1` path. The task fixes source roots, SDK binding, output artifact, output envelope, counterpart-read prohibition, and role/stage. Sealing rejects a changed task, wrong role/stage, missing bound artifact, invalid inventory schema, discovery success without recorded SDK selection, or reconciliation that did not run a newer core verification.
 
 Every new workspace starts with `parr0t.control-plane-entry.v1` in `pending`. Existing workspaces without this marker are also treated as pending. `game-l10n status` then returns only `establish_text_free_control_plane` and the contracts that must be read. If the parent has not inspected or received game content, it establishes the gate with:
 
@@ -68,6 +70,7 @@ The following roles are data-plane workers:
 
 - source and existing-locale discovery;
 - primary and independent inventory;
+- inventory gap reconciliation;
 - context analysis;
 - translation;
 - compact review judgment and selective rewriting;
