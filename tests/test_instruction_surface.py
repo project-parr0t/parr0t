@@ -70,7 +70,7 @@ class InstructionSurfaceTests(unittest.TestCase):
             "docs/filesystem-packaging.md",
             "docs/instance-release.md",
             "no model controllers or worker delegation",
-            "binary-splits only failures",
+            "Core locks successes and emits smaller failed-only manifests",
         ):
             self.assertIn(required, agents)
 
@@ -106,8 +106,8 @@ class InstructionSurfaceTests(unittest.TestCase):
         self.assertIn("must not open the full ordered `source_artifact`", detail)
         self.assertIn("must not make another full game-tree copy", execution)
         self.assertIn("must not reopen the complete ordered source", review)
-        self.assertIn("up to 2,048 candidates", review)
-        self.assertIn("half the prior bound", detail)
+        self.assertIn("hard ceilings, not initial packing targets", review)
+        self.assertIn("half the prior task bound", detail)
         self.assertIn("Large-inventory startup budget", execution)
         self.assertIn("validates only tasks in the wave", execution)
 
