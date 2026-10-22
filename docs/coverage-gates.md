@@ -38,7 +38,9 @@ The selected engine SDK produces two JSON documents in the private workspace. Th
 }
 ```
 
-The two documents must name different methods and carry different implementation fingerprints; copying one manifest and changing its label is not an independent check. An exclusion has `reason_code` and `affects_user_visible_text`. If the latter is true, the inventory cannot pass. Inventory workers classify structure and player visibility only: subject matter, an anticipated safeguard response, or a content-policy guess is never an extraction exclusion. Overcapture is resolved inside the engine SDK; it is not a reason to silently omit an entire source class.
+The two documents must name different methods and carry different implementation fingerprints; copying one manifest and changing its label is not an independent check. When an engine format gives the same physical occurrence different method-specific IDs, each row may carry the same nonempty `metadata.inventory_comparison_key`. The core compares that canonical key, source, UI contract, and order while preserving the primary ID used downstream. Keys must be unique in each inventory; this is deterministic alias normalization, not permission to merge duplicate text by value.
+
+An exclusion has `reason_code` and `affects_user_visible_text`. If the latter is true, the inventory cannot pass. Inventory workers classify structure and player visibility only: subject matter, an anticipated safeguard response, or a content-policy guess is never an extraction exclusion. Overcapture is resolved inside the engine SDK; it is not a reason to silently omit an entire source class.
 
 An engine SDK may reduce overcapture through the capability contract in `docs/engine-static-scope.md`. The inventory then records candidate, included, conservatively retained, and proven-unused counts in `coverage.static_scope`. Two differently implemented graph analyses must agree before an SDK removes a target. Dynamic or indirect references retain the affected targets; absence of a direct reference is not proof of non-display. Static reachability is not runtime observation and never satisfies the runtime coverage gate.
 
@@ -51,6 +53,8 @@ game-l10n verify-inventory --workspace <workspace> --primary <primary.json> --in
 ```
 
 The attestation is bound to the primary path and content fingerprint. Changing either inventory invalidates downstream context and completion claims.
+
+Every saved attestation also records a metadata-only reconciliation generation, gap vector, gap score, and progress state. `incomplete` always has `continuation_required=true` and is never a terminal job result. If a bounded repair reduces the gap score, run the next `inventory_reconciler` task from cached scans. An ID/order mismatch, local parser/layout error, or newly found target is not a user decision and must not end the job. Stop only when status proves an external missing input/capability, an explicit budget gate, or the configured unchanged-progress limit; preserve the checkpoint and exact remaining codes.
 
 ## Context execution gate
 
