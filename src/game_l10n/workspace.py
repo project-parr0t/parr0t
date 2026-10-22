@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import os
 import shutil
 import subprocess
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -319,7 +322,20 @@ if __name__ == "__main__":
 '''
 
 SDK_ACTIVATION_PATH = ".game-l10n/sdk-activation.json"
-SDK_ACTIVATION_SCHEMA = "parr0t.sdk-activation.v1"
+SDK_ACTIVATION_SCHEMA = "parr0t.sdk-activation.v2"
+
+PORTABLE_RUNTIME_IGNORED_DIRS = {
+    ".game-l10n",
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "venv",
+}
+PORTABLE_RUNTIME_IGNORED_SUFFIXES = {".pyc", ".pyo"}
 
 
 SDK_EVALUATION_REASONS = {
@@ -368,13 +384,163 @@ def _run_git(sdk_root: Path, *args: str) -> str:
     return completed.stdout
 
 
-def inventory_sdk_branches(sdk_root: Path) -> dict[str, Any]:
+def _content_fingerprint(entries: list[dict[str, Any]]) -> str:
+    return _json_fingerprint(sorted(entries, key=lambda item: item["path"]))
+
+
+def _git_tree_content_binding(sdk_root: Path, ref: str) -> dict[str, Any]:
+    completed = subprocess.run(
+        ["git", "archive", "--format=tar", ref],
+        cwd=sdk_root,
+        capture_output=True,
+        check=False,
+        shell=False,
+    )
+    if completed.returncode != 0:
+        error = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise ConfigurationError(f"Unable to fingerprint SDK tree {ref}: {error}")
+    entries: list[dict[str, Any]] = []
+    with tarfile.open(fileobj=io.BytesIO(completed.stdout), mode="r:") as archive:
+        for member in archive.getmembers():
+            if member.isfile():
+                source = archive.extractfile(member)
+                if source is None:
+                    raise ConfigurationError(
+                        f"Unable to read SDK tree member while fingerprinting: {member.name}"
+                    )
+                data = source.read()
+                kind = "file"
+            elif member.issym():
+                data = member.linkname.encode("utf-8")
+                kind = "symlink"
+            else:
+                continue
+            entries.append(
+                {
+                    "path": member.name.replace("\\", "/"),
+                    "kind": kind,
+                    "size": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+            )
+    return {
+        "content_fingerprint": _content_fingerprint(entries),
+        "file_count": len(entries),
+    }
+
+
+def _portable_runtime_content_binding(root: Path) -> dict[str, Any]:
+    root = root.resolve()
+    if not root.is_dir():
+        raise ConfigurationError(f"SDK runtime directory does not exist: {root}")
+    entries: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+        relative = path.relative_to(root)
+        if any(
+            part in PORTABLE_RUNTIME_IGNORED_DIRS or part.endswith(".egg-info")
+            for part in relative.parts
+        ):
+            continue
+        if path.suffix.lower() in PORTABLE_RUNTIME_IGNORED_SUFFIXES:
+            continue
+        if path.is_symlink():
+            data = os.readlink(path).encode("utf-8")
+            kind = "symlink"
+        elif path.is_file():
+            data = path.read_bytes()
+            kind = "file"
+        else:
+            continue
+        entries.append(
+            {
+                "path": relative.as_posix(),
+                "kind": kind,
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+    if not entries:
+        raise ConfigurationError(f"SDK runtime directory contains no bindable files: {root}")
+    return {
+        "content_fingerprint": _content_fingerprint(entries),
+        "file_count": len(entries),
+    }
+
+
+def _validate_portable_sdk_identity(branch: str, commit: str) -> None:
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+    if not branch.startswith("sdk-") or any(
+        character not in allowed for character in branch
+    ):
+        raise ConfigurationError("Portable SDK branch must be a safe sdk-* branch name")
+    if len(commit) not in {40, 64} or any(
+        character not in "0123456789abcdefABCDEF" for character in commit
+    ):
+        raise ConfigurationError("Portable SDK commit must be a full hexadecimal commit ID")
+
+
+def _portable_public_contract_paths(root: Path) -> list[str]:
+    prefixes = ("docs/", "profiles/", "src/game_l10n/", "tests/")
+    return sorted(
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file() and path.relative_to(root).as_posix().startswith(prefixes)
+    )
+
+
+def _looks_like_portable_parr0t_runtime(root: Path) -> bool:
+    return (root / "AGENTS.md").is_file() and (
+        (root / "src" / "game_l10n" / "workspace.py").is_file()
+        or (root / "pyproject.toml").is_file()
+    )
+
+
+def inventory_sdk_branches(
+    sdk_root: Path,
+    *,
+    portable_branch: str | None = None,
+    portable_commit: str | None = None,
+) -> dict[str, Any]:
     """Return an engine-branch inventory without checking out or changing any ref."""
 
     sdk_root = sdk_root.resolve()
     if not (sdk_root / ".git").exists():
-        candidates: list[dict[str, Any]] = []
+        if bool(portable_branch) != bool(portable_commit):
+            raise ConfigurationError(
+                "Portable SDK inventory requires both branch and full commit ID"
+            )
+        if portable_branch and portable_commit:
+            _validate_portable_sdk_identity(portable_branch, portable_commit)
+            binding = _portable_runtime_content_binding(sdk_root)
+            candidates: list[dict[str, Any]] = [
+                {
+                    "branch": portable_branch,
+                    "commit": portable_commit.lower(),
+                    "inspect_ref": f"portable:{portable_branch}",
+                    "refs": [
+                        {
+                            "name": f"portable:{portable_branch}",
+                            "commit": portable_commit.lower(),
+                        }
+                    ],
+                    "public_contract_paths": _portable_public_contract_paths(sdk_root),
+                    **binding,
+                    "binding_kind": "content",
+                }
+            ]
+            source = "portable_sdk_snapshot"
+        else:
+            candidates = []
+            source = (
+                "portable_unidentified"
+                if _looks_like_portable_parr0t_runtime(sdk_root)
+                else "filesystem_without_sdk_refs"
+            )
     else:
+        if portable_branch or portable_commit:
+            raise ConfigurationError(
+                "Portable SDK identity options cannot be combined with a Git checkout"
+            )
         output = _run_git(
             sdk_root,
             "for-each-ref",
@@ -412,6 +578,7 @@ def inventory_sdk_branches(sdk_root: Path) -> dict[str, Any]:
                 ),
             )
             selected_ref, commit = refs[0]
+            binding = _git_tree_content_binding(sdk_root, selected_ref)
             changed = _run_git(
                 sdk_root, "diff", "--name-only", f"main...{selected_ref}"
             ).splitlines()
@@ -427,25 +594,42 @@ def inventory_sdk_branches(sdk_root: Path) -> dict[str, Any]:
                     "inspect_ref": selected_ref,
                     "refs": [{"name": ref, "commit": ref_commit} for ref, ref_commit in refs],
                     "public_contract_paths": public_paths,
+                    **binding,
+                    "binding_kind": "git",
                 }
             )
+        source = "local_and_remote_tracking_refs"
 
     fingerprint_payload = json.dumps(
         candidates, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     )
     return {
-        "source": "local_and_remote_tracking_refs",
+        "source": source,
         "candidates": candidates,
         "fingerprint": hashlib.sha256(fingerprint_payload.encode("utf-8")).hexdigest(),
     }
 
 
 def refresh_sdk_inventory(
-    work_dir: Path, *, refresh_remote: bool = False, remote: str = "origin"
+    work_dir: Path,
+    *,
+    refresh_remote: bool = False,
+    remote: str = "origin",
+    runtime_root: Path | None = None,
+    portable_branch: str | None = None,
+    portable_commit: str | None = None,
 ) -> dict[str, Any]:
     config = load_config(work_dir)
-    sdk_root = Path(config.get("sdk_root") or "").resolve()
+    sdk_root = (runtime_root or Path(config.get("sdk_root") or "")).resolve()
+    if runtime_root is not None:
+        config["sdk_root"] = str(sdk_root)
     if refresh_remote:
+        if not (sdk_root / ".git").exists():
+            raise ConfigurationError(
+                "Remote refresh requires a Git checkout, but SDK activation does not. "
+                "Register an authenticated portable snapshot with --runtime-root, "
+                "--portable-branch, and --portable-commit instead."
+            )
         allowed_remote_characters = (
             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
         )
@@ -458,13 +642,28 @@ def refresh_sdk_inventory(
             remote,
             f"+refs/heads/sdk-*:refs/remotes/{remote}/sdk-*",
         )
-    inventory = inventory_sdk_branches(sdk_root)
+    inventory = inventory_sdk_branches(
+        sdk_root,
+        portable_branch=portable_branch,
+        portable_commit=portable_commit,
+    )
     previous = config.get("sdk_selection", {})
-    candidate_commits = {item["branch"]: item["commit"] for item in inventory["candidates"]}
+    candidate_commits = {
+        item["branch"]: item["commit"] for item in inventory["candidates"]
+    }
     evaluations = {
         branch: evaluation
         for branch, evaluation in previous.get("evaluations", {}).items()
         if candidate_commits.get(branch) == evaluation.get("commit")
+        and next(
+            (
+                candidate.get("content_fingerprint")
+                for candidate in inventory["candidates"]
+                if candidate["branch"] == branch
+            ),
+            None,
+        )
+        == evaluation.get("content_fingerprint")
     }
     config["sdk_selection"] = {
         "status": "pending",
@@ -526,6 +725,7 @@ def record_sdk_evaluation(
         "result": result,
         "reason": reason,
         "commit": candidates[branch]["commit"],
+        "content_fingerprint": candidates[branch].get("content_fingerprint"),
         "evidence_paths": evidence,
         "target": target,
     }
@@ -583,6 +783,11 @@ def record_sdk_selection(
     elif mode == "private-new":
         if branch:
             raise ConfigurationError("private-new does not accept a branch")
+        if selection.get("inventory_source") == "portable_unidentified":
+            raise ConfigurationError(
+                "A portable Parr0t runtime is present but has no SDK identity. Register the "
+                "authenticated SDK snapshot before selecting private-new."
+            )
         if target["branch"] in candidates:
             raise ConfigurationError(
                 "The target SDK branch already exists; evaluate and reuse or extend that branch"
@@ -689,10 +894,18 @@ def _workspace_tool_binding(work_dir: Path) -> dict[str, Any]:
     }
 
 
-def _git_checkout_binding(checkout: Path) -> dict[str, Any]:
+def _sdk_runtime_binding(checkout: Path) -> dict[str, Any]:
     checkout = checkout.resolve()
-    if not checkout.is_dir() or not (checkout / ".git").exists():
-        raise ConfigurationError(f"SDK activation requires a Git checkout or worktree: {checkout}")
+    if not checkout.is_dir():
+        raise ConfigurationError(f"SDK runtime directory does not exist: {checkout}")
+    if not (checkout / ".git").exists():
+        return {
+            "kind": "content",
+            "path": str(checkout),
+            "commit": None,
+            "dirty": False,
+            **_portable_runtime_content_binding(checkout),
+        }
     status = _run_git(checkout, "status", "--porcelain").strip()
     diff = subprocess.run(
         ["git", "diff", "--binary", "HEAD"],
@@ -711,10 +924,12 @@ def _git_checkout_binding(checkout: Path) -> dict[str, Any]:
         if path.is_file():
             dirty.update(hashlib.sha256(path.read_bytes()).digest())
     return {
+        "kind": "git",
         "path": str(checkout),
         "commit": _run_git(checkout, "rev-parse", "HEAD").strip(),
         "dirty": bool(status),
         "worktree_fingerprint": dirty.hexdigest(),
+        **_git_tree_content_binding(checkout, "HEAD"),
     }
 
 
@@ -731,8 +946,16 @@ def record_sdk_activation(
     decision = require_sdk_selection(config)
     candidate = _selected_candidate(config, decision)
     mode = decision["mode"]
-    runtime_root = (runtime_root or Path(__file__).resolve().parents[2]).resolve()
-    runtime = _git_checkout_binding(runtime_root)
+    module_root = Path(__file__).resolve().parents[2]
+    configured_root = Path(config.get("sdk_root") or module_root)
+    if runtime_root is None:
+        runtime_root = (
+            configured_root
+            if mode in {"reuse", "extend"} and not (module_root / ".git").exists()
+            else module_root
+        )
+    runtime_root = runtime_root.resolve()
+    runtime = _sdk_runtime_binding(runtime_root)
     tools: dict[str, Any] | None = None
     reference: dict[str, Any] | None = None
 
@@ -740,17 +963,36 @@ def record_sdk_activation(
         if candidate is None:
             raise ConfigurationError("Selected SDK activation has no candidate commit")
         expected = str(candidate.get("commit", ""))
-        if mode == "reuse" and (runtime["commit"] != expected or runtime["dirty"]):
-            raise ConfigurationError(
-                "Reuse activation must run from a clean checkout of the exact inventoried SDK commit"
-            )
-        if mode == "extend":
-            try:
-                _run_git(runtime_root, "merge-base", "--is-ancestor", expected, runtime["commit"])
-            except ConfigurationError as exc:
+        if mode == "reuse":
+            if runtime.get("content_fingerprint") != candidate.get("content_fingerprint"):
                 raise ConfigurationError(
-                    "Extended SDK runtime must descend from the inventoried same-identity commit"
-                ) from exc
+                    "Reuse activation runtime does not match the inventoried SDK content"
+                )
+            if runtime["kind"] == "git" and (
+                runtime["commit"] != expected or runtime["dirty"]
+            ):
+                raise ConfigurationError(
+                    "Reuse activation must run from the clean exact inventoried SDK commit"
+                )
+        if mode == "extend":
+            if runtime["kind"] == "git":
+                try:
+                    _run_git(
+                        runtime_root,
+                        "merge-base",
+                        "--is-ancestor",
+                        expected,
+                        runtime["commit"],
+                    )
+                except ConfigurationError as exc:
+                    raise ConfigurationError(
+                        "Extended SDK runtime must descend from the inventoried same-identity commit"
+                    ) from exc
+            elif runtime.get("content_fingerprint") != candidate.get("content_fingerprint"):
+                raise ConfigurationError(
+                    "A modified portable SDK cannot prove extension ancestry. Use the exact "
+                    "portable snapshot for reuse or a Git worktree for an extension."
+                )
     else:
         tools = _workspace_tool_binding(work_dir)
         if tools["default_pass_through_tools"]:
@@ -763,12 +1005,19 @@ def record_sdk_activation(
                 raise ConfigurationError(
                     "derive-new activation requires the selected reference SDK checkout"
                 )
-            reference = _git_checkout_binding(reference_checkout)
+            reference = _sdk_runtime_binding(reference_checkout)
             if reference["dirty"]:
                 raise ConfigurationError(
                     "derive-new requires a clean checkout of the selected reference SDK"
                 )
-            if reference["commit"] != candidate.get("commit"):
+            if reference.get("content_fingerprint") != candidate.get("content_fingerprint"):
+                raise ConfigurationError(
+                    "Reference runtime does not match the inventoried SDK content"
+                )
+            if (
+                reference["kind"] == "git"
+                and reference["commit"] != candidate.get("commit")
+            ):
                 raise ConfigurationError(
                     "Reference checkout does not match the inventoried SDK commit "
                     f"({reference['commit']} != {candidate.get('commit')})"
@@ -779,6 +1028,9 @@ def record_sdk_activation(
     selection_binding = {
         "decision": decision,
         "candidate_commit": candidate.get("commit") if candidate else None,
+        "candidate_content_fingerprint": (
+            candidate.get("content_fingerprint") if candidate else None
+        ),
     }
     state = {
         "schema": SDK_ACTIVATION_SCHEMA,
@@ -786,6 +1038,7 @@ def record_sdk_activation(
         "mode": mode,
         "target": decision["target"],
         "runtime": runtime,
+        "candidate_commit": candidate.get("commit") if candidate else None,
         "reference": reference,
         "workspace_tools": tools,
     }
@@ -812,6 +1065,9 @@ def require_sdk_activation(
     selection_binding = {
         "decision": decision,
         "candidate_commit": candidate.get("commit") if candidate else None,
+        "candidate_content_fingerprint": (
+            candidate.get("content_fingerprint") if candidate else None
+        ),
     }
     path = work_dir / SDK_ACTIVATION_PATH
     if not path.is_file():
@@ -831,9 +1087,15 @@ def require_sdk_activation(
         raise ConfigurationError("SDK activation is stale for the current selection")
 
     expected_runtime = state.get("runtime")
-    current_runtime = _git_checkout_binding(
-        (runtime_root or Path(__file__).resolve().parents[2]).resolve()
-    )
+    if not isinstance(expected_runtime, dict) or not expected_runtime.get("path"):
+        raise ConfigurationError("SDK activation record has no runtime binding")
+    if runtime_root is None:
+        runtime_root = (
+            Path(expected_runtime["path"])
+            if expected_runtime.get("kind") == "content"
+            else Path(__file__).resolve().parents[2]
+        )
+    current_runtime = _sdk_runtime_binding(runtime_root.resolve())
     if expected_runtime != current_runtime:
         raise ConfigurationError(
             "This command is not running from the SDK implementation recorded by sdk-activate"
@@ -846,7 +1108,7 @@ def require_sdk_activation(
             raise ConfigurationError("Workspace SDK adapter changed after activation")
 
     reference = state.get("reference")
-    if reference is not None and _git_checkout_binding(Path(reference["path"])) != reference:
+    if reference is not None and _sdk_runtime_binding(Path(reference["path"])) != reference:
         raise ConfigurationError("Selected SDK reference checkout changed after activation")
     return state
 
