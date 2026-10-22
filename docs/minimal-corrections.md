@@ -8,6 +8,53 @@ A typo, a few tone/voice adjustments, or a bounded data change is not a new tran
 
 One narrow private data-plane lookup may resolve a user-visible label or description to stable IDs. The control plane receives only the resolved IDs, counts, fingerprints, and deterministic codes. It must not search the full translation, reopen the game root, or read candidate text.
 
+## Local interpretation and search UI
+
+When the user identifies wording by dialogue, translation, or reference rather than a stable ID, use the private local correction UI. It creates one SQLite state file inside the external workspace; it does not use an external database, embedding API, browser service, or provider call.
+
+```text
+game-l10n correction-ui \
+  --workspace <external-workspace> \
+  --input <verified-current-primary-inventory> \
+  --existing <released-full-results.jsonl> \
+  --checkpoint <matching-parr0t-release-checkpoint.json>
+```
+
+Open the loopback URL printed by the command. The URL contains an in-memory session token in its fragment. The server binds only to `127.0.0.1`, serves no game text before token validation, and persists private text, flags, user interpretations, references, and staged changes only in `translations/user-interpretation.sqlite3`. Reopening the same file requires identical source, result, checkpoint, and inventory bindings.
+
+The UI supports three deterministic search modes:
+
+- **Exact:** normalized equality against ID, source, current target, user note, or user reference.
+- **Character distance:** bounded candidate selection followed by normalized Levenshtein distance.
+- **Vector distance:** local character n-gram vectors with cosine distance. This is a file-local lexical vector search, not an external semantic embedding claim.
+
+Search executes in the local index. An agent must not imitate it by opening the full inventory, reading every result, or creating per-query scan files. Result limits and candidate ceilings are search boundaries, not permission to omit a user-flagged target.
+
+Each flag has one of two routes:
+
+- **Direct:** the user enters the final replacement. Deterministic integrity checks run immediately; pressing apply writes the standard `parr0t.user-correction-request/v1` and one new full result artifact. It makes zero model calls.
+- **Agent:** the user records an interpretation, problem, or reference. Export writes `parr0t.user-interpretation-task/v1` containing only the flagged IDs and their reverse dependency closure, capped at 32 records. A fresh data-plane agent may read that task and return `parr0t.user-interpretation-proposals/v1`. Proposals are not accepted translations until the user reviews and approves them in the UI.
+
+The proposal file has exactly:
+
+```json
+{
+  "schema": "parr0t.user-interpretation-proposals/v1",
+  "task_id": "<copied task id>",
+  "proposals": [
+    {
+      "id": "synthetic-target-001",
+      "decision": "replace",
+      "target": "TARGET_PROPOSAL",
+      "source_sha256": "<copied source binding>",
+      "context_sha256": "<copied context binding>"
+    }
+  ]
+}
+```
+
+Use `decision: replace` with a changed target. For a reverse dependency that was checked and needs no wording change, use `decision: unchanged` and copy its current target exactly. The UI records that decision only after the user approves it; it never treats an omitted dependency as reviewed. Do not add explanations, hidden source copies, alternative schemas, or unflagged suggestions. The UI rejects stale bindings, unknown IDs, malformed proposals, invalid decision/target pairs, and deterministic integrity failures. The control plane sees only counts and paths; it never opens the SQLite state, task, proposal, request, or corrected result.
+
 ## Fast path
 
 Keep the correction request in the private workspace:
@@ -49,6 +96,8 @@ For a bounded wording request, use the already verified inventory, released resu
 3. Send the whole frozen set as one ordered semantic batch to one fresh data-plane worker. Do not create a call, prompt file, agent, or retry loop per record.
 4. Run one ordered independent focused review batch only for generated wording. Rewrite only flagged records in one batch. Exact values and non-semantic data changes do not receive semantic review.
 5. Run deterministic validation on the frozen set, merge it into the unchanged released result once, repack owning payloads once, and verify the package once.
+
+If the UI already resolved the requested IDs, that fixed set is authoritative. Do not run another label search, global text search, vector search, inventory scan, or context reconstruction. An agent may read only the exported focused task and must return only proposals for its bound records.
 
 The normal ceiling is two semantic calls for the complete correction set: one rewrite and one focused review. A provider failure enters the existing resumable failure queue for only the affected IDs; it must not reopen the full pipeline. Stop after two failures with the same cause. Do not spawn a controller, promote an SDK, maintain branches, publish, install, launch, or create a new task/result format as part of a correction.
 

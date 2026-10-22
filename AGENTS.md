@@ -46,7 +46,7 @@ Parr0t is engine-neutral. Keep game data, translations, prompts, caches, logs, c
 | Codex App + DeepSeek preset | `docs/codex-app-deepseek.md` |
 | Manual or external fallback exchange | `docs/translation-exchange.md` |
 | Existing release, game update, or selective continuation | `docs/release-checkpoint.md` |
-| Exact wording, small tone/style correction, or bounded data correction | `docs/minimal-corrections.md` |
+| Exact wording, dialogue/reference flag, small tone/style correction, or bounded data correction | `docs/minimal-corrections.md` |
 | Composed UI text | `docs/segment-metadata.md` |
 | Real install/update/remove/launch | `docs/runtime-approval.md` |
 | Windows package | `docs/installer-contract.md` plus `docs/filesystem-packaging.md` or `docs/steam-packaging.md` |
