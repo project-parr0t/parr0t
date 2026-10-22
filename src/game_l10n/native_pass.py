@@ -219,6 +219,10 @@ def _execution_contract(
     max_provider_cost_usd: float | None,
     provider_cost_unmetered: bool,
     user_approved_budget: bool,
+    max_root_model_calls_per_wave: int | None,
+    max_root_model_calls_per_turn: int | None,
+    max_root_input_tokens_per_turn: int | None,
+    control_turn_budget_user_approved: bool,
 ) -> dict[str, Any]:
     bulk_gate_active = record_count >= bulk_budget_gate_records
     budget_complete = (
@@ -236,6 +240,17 @@ def _execution_contract(
         )
     )
     budget_approved = bool(user_approved_budget and budget_complete)
+    control_turn_budget_active = bool(
+        control_turn_budget_user_approved
+        and any(
+            value is not None
+            for value in (
+                max_root_model_calls_per_wave,
+                max_root_model_calls_per_turn,
+                max_root_input_tokens_per_turn,
+            )
+        )
+    )
     return {
         "pass_kind": pass_kind,
         "strategy": "direct_single_task" if task_count == 1 else "bounded_slot_queue",
@@ -256,14 +271,29 @@ def _execution_contract(
         "max_parallel_workers": max_workers,
         "max_tasks_per_wave": max_workers,
         "estimated_waves": (task_count + max_workers - 1) // max_workers,
-        "max_root_model_calls_per_wave": 12,
-        "max_root_model_calls_per_turn": 64,
-        "max_root_input_tokens_per_turn": 5_000_000,
+        "control_turn_budget_user_approved": control_turn_budget_active,
+        "max_root_model_calls_per_wave": (
+            max_root_model_calls_per_wave if control_turn_budget_active else None
+        ),
+        "max_root_model_calls_per_turn": (
+            max_root_model_calls_per_turn if control_turn_budget_active else None
+        ),
+        "max_root_input_tokens_per_turn": (
+            max_root_input_tokens_per_turn if control_turn_budget_active else None
+        ),
         "max_root_progress_messages_per_wave": 1,
         "max_worker_model_calls_per_task": (
             24 if pass_kind == "review" else 16
         ),
-        "budget_exhaustion_action": "checkpoint_and_return_control",
+        "budget_exhaustion_action": (
+            "checkpoint_and_return_control"
+            if control_turn_budget_active
+            else "continue_until_terminal_or_actionable_blocker"
+        ),
+        "self_inferred_control_turn_limit_allowed": False,
+        "control_turn_limit_signal_authority": (
+            "deterministic_core_with_user_approved_limit"
+        ),
         "contract_reload_policy": "digest_change_or_new_control_generation_only",
         "job_local_controller_allowed": False,
         "task_replanning_allowed": False,
@@ -678,6 +708,10 @@ def prepare_native_tasks(
     max_provider_cost_usd: float | None = None,
     provider_cost_unmetered: bool = False,
     user_approved_budget: bool = False,
+    max_root_model_calls_per_wave: int | None = None,
+    max_root_model_calls_per_turn: int | None = None,
+    max_root_input_tokens_per_turn: int | None = None,
+    control_turn_budget_user_approved: bool = False,
     _review_split: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     require_control_plane_ready(work_dir)
@@ -762,6 +796,28 @@ def prepare_native_tasks(
         raise ValueError(
             "A user-approved bulk budget requires elapsed, input-token, and cost-or-unmetered limits"
         )
+    control_turn_limits = (
+        max_root_model_calls_per_wave,
+        max_root_model_calls_per_turn,
+        max_root_input_tokens_per_turn,
+    )
+    if control_turn_budget_user_approved:
+        if not any(value is not None for value in control_turn_limits):
+            raise ValueError(
+                "A user-approved control-turn budget requires at least one explicit limit"
+            )
+        if any(
+            value is not None
+            and (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 1
+            )
+            for value in control_turn_limits
+        ):
+            raise ValueError("Control-turn budget limits must be positive integers")
+    elif any(value is not None for value in control_turn_limits):
+        raise ValueError("Control-turn budget limits require explicit user approval")
     if not segments:
         raise ValueError("Ordered source contains no segments")
     _require_candidate_bindings(segments, pass_kind)
@@ -817,6 +873,10 @@ def prepare_native_tasks(
                 max_provider_cost_usd=max_provider_cost_usd,
                 provider_cost_unmetered=provider_cost_unmetered,
                 user_approved_budget=user_approved_budget,
+                max_root_model_calls_per_wave=max_root_model_calls_per_wave,
+                max_root_model_calls_per_turn=max_root_model_calls_per_turn,
+                max_root_input_tokens_per_turn=max_root_input_tokens_per_turn,
+                control_turn_budget_user_approved=control_turn_budget_user_approved,
             )
             expected_contract_fingerprint = stable_hash(
                 {
@@ -950,6 +1010,10 @@ def prepare_native_tasks(
         max_provider_cost_usd=max_provider_cost_usd,
         provider_cost_unmetered=provider_cost_unmetered,
         user_approved_budget=user_approved_budget,
+        max_root_model_calls_per_wave=max_root_model_calls_per_wave,
+        max_root_model_calls_per_turn=max_root_model_calls_per_turn,
+        max_root_input_tokens_per_turn=max_root_input_tokens_per_turn,
+        control_turn_budget_user_approved=control_turn_budget_user_approved,
     )
     budget_gate = execution_contract["bulk_budget_gate"]
     for task in tasks:
@@ -2056,7 +2120,11 @@ def _prepare_review_split_child(
 
     child_max_records = max(1, parent_task_records // 2)
     child_max_material = max(256, parent_task_material // 2)
-    gate = current_manifest["execution_contract"]["bulk_budget_gate"]
+    execution_contract = current_manifest["execution_contract"]
+    control_turn_budget_user_approved = (
+        execution_contract.get("control_turn_budget_user_approved") is True
+    )
+    gate = execution_contract["bulk_budget_gate"]
     prepare_native_tasks(
         work_dir,
         child_source,
@@ -2073,6 +2141,22 @@ def _prepare_review_split_child(
         max_provider_cost_usd=gate.get("max_provider_cost_usd"),
         provider_cost_unmetered=bool(gate.get("provider_cost_unmetered")),
         user_approved_budget=bool(gate.get("user_approved")),
+        max_root_model_calls_per_wave=(
+            execution_contract.get("max_root_model_calls_per_wave")
+            if control_turn_budget_user_approved
+            else None
+        ),
+        max_root_model_calls_per_turn=(
+            execution_contract.get("max_root_model_calls_per_turn")
+            if control_turn_budget_user_approved
+            else None
+        ),
+        max_root_input_tokens_per_turn=(
+            execution_contract.get("max_root_input_tokens_per_turn")
+            if control_turn_budget_user_approved
+            else None
+        ),
+        control_turn_budget_user_approved=control_turn_budget_user_approved,
         _review_split={
             "depth": next_depth,
             "semantic_passes": split["semantic_passes"] + 1,
@@ -2285,8 +2369,16 @@ def _native_control_step_single(
             state["last_progress_marker"] = progress_marker
             state["unchanged_observations"] = 0
 
-        max_root_calls = int(
-            manifest["execution_contract"].get("max_root_model_calls_per_wave", 12)
+        execution_contract = manifest["execution_contract"]
+        configured_max_root_calls = (
+            execution_contract.get("max_root_model_calls_per_wave")
+            if execution_contract.get("control_turn_budget_user_approved") is True
+            else None
+        )
+        max_root_calls = (
+            int(configured_max_root_calls)
+            if configured_max_root_calls is not None
+            else None
         )
         max_unchanged = int(
             manifest["execution_contract"].get(
@@ -2334,7 +2426,11 @@ def _native_control_step_single(
         elif budget_issue and ready_results != len(tasks):
             action = "checkpoint_and_stop"
             issue_codes = [budget_issue]
-        elif state["control_steps_in_wave"] > max_root_calls and ready_results != len(tasks):
+        elif (
+            max_root_calls is not None
+            and state["control_steps_in_wave"] > max_root_calls
+            and ready_results != len(tasks)
+        ):
             action = "checkpoint_and_stop"
             issue_codes = ["E_NATIVE_WAVE_CONTROL_LIMIT"]
         elif state["unchanged_observations"] >= max_unchanged:

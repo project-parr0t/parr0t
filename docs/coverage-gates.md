@@ -54,7 +54,7 @@ game-l10n verify-inventory --workspace <workspace> --primary <primary.json> --in
 
 The attestation is bound to the primary path and content fingerprint. Changing either inventory invalidates downstream context and completion claims.
 
-Every saved attestation also records a metadata-only reconciliation generation, gap vector, gap score, and progress state. `incomplete` always has `continuation_required=true` and is never a terminal job result. If a bounded repair reduces the gap score, run the next `inventory_reconciler` task from cached scans. An ID/order mismatch, local parser/layout error, or newly found target is not a user decision and must not end the job. Stop only when status proves an external missing input/capability, an explicit budget gate, or the configured unchanged-progress limit; preserve the checkpoint and exact remaining codes.
+Every saved attestation also records a metadata-only reconciliation generation, gap vector, gap score, and progress state. `incomplete` always has `continuation_required=true` and is never a terminal job result. If a bounded repair reduces the gap score, run the next `inventory_reconciler` task from cached scans. An ID/order mismatch, local parser/layout error, or newly found target is not a user decision and must not end the job. Stop only when status proves an external missing input/capability, an applicable deterministic gate, or the configured unchanged-progress limit; preserve the checkpoint and exact remaining codes. A root call/token turn ceiling is not applicable unless the user explicitly requested its concrete value and the manifest records that approval.
 
 ## Context execution gate
 
