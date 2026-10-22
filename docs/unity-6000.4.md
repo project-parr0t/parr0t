@@ -24,12 +24,17 @@ unsupported bindings fail. No player file is written, installed or executed.
 
 ## Dependencies
 
-Install `UnityPy==1.25.4` in the private workspace. Keep its dependencies and
-generated schemas outside this repository. Embedded type trees may be used
+The branch declares `UnityPy==1.25.4` in
+`profiles/unity-6000.4-requirements.txt`; validation installs it only into the
+external audit state when dependency provisioning is requested. Keep generated
+schemas outside this repository. Embedded type trees may be used
 directly; stripped behaviours require caller-supplied matching nodes or an
 explicit private `typetree_dll_directory` containing the matching copied managed
 assemblies. The profile uses UnityPy's type-tree generator for that directory.
 It does not search the player for assemblies or acquire them automatically.
+If the host cannot complete the transitive pure-Python `tpk_ar` PEP 517 build,
+build its wheel in external tooling storage and expose that directory through
+`PIP_FIND_LINKS` before provisioning. Do not vendor the wheel or package source.
 
 Managed application additionally needs Mono.Cecil 0.11.6 and a compatible C#
 compiler/runtime with `System.Web.Extensions`. Compile the provided source into
@@ -44,6 +49,11 @@ reads/writes managed assembly copies as data. It never loads the target assembly
 for execution. Strong-named assemblies and assemblies with multiple modules are
 rejected; IL2CPP/native binary modification is unsupported. No dependency binary
 or font is bundled in the SDK.
+
+For the synthetic managed regression tests, set `GAME_L10N_CSC` to the compiler
+and `GAME_L10N_CECIL` to the exact Mono.Cecil DLL. Their required file bindings
+are declared in `profiles/sdk-validation.json`; a missing binding is a
+categorical validation hold, not a merge conflict.
 
 ## Private binding plan
 

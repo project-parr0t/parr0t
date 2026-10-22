@@ -11,14 +11,15 @@ def pointer(path_id=0, file_id=0):
 
 
 def _clone_object_reader(template, path_id):
-    """Clone UnityPy reader metadata without depending on attrs internals."""
-    state = getattr(template, '__dict__', None)
-    if not isinstance(state, dict):
+    """Shallow-clone reader metadata across slotted UnityPy layouts."""
+    try:
+        clone = copy.copy(template)
+        clone.path_id = path_id
+        clone.data = None
+    except (AttributeError, TypeError):
         raise ValueError('FONT_OBJECT_READER_LAYOUT_UNSUPPORTED')
-    clone = object.__new__(type(template))
-    clone.__dict__.update(state)
-    clone.path_id = path_id
-    clone.data = None
+    if clone is template or clone.path_id != path_id:
+        raise ValueError('FONT_OBJECT_READER_LAYOUT_UNSUPPORTED')
     return clone
 
 

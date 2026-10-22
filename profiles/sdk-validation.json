@@ -1,0 +1,7 @@
+{
+  "schema": "parr0t.sdk-validation.v1",
+  "required_environment_files": [
+    "GAME_L10N_CSC",
+    "GAME_L10N_CECIL"
+  ]
+}

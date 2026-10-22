@@ -37,6 +37,16 @@ class FontGroupTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec('UnityPy') is not None,'Install pinned private UnityPy')
 class FontIntegrationTests(unittest.TestCase):
+    def test_reader_clone_supports_the_pinned_slotted_unitypy_layout(self):
+        members,group = font_members()
+        original = environment(members['synthetic-a']).file.objects[group['template_ids'][0]]
+        clone = sdk._clone_object_reader(original, 9001)
+        self.assertIsNot(clone, original)
+        self.assertEqual(clone.path_id, 9001)
+        self.assertEqual(original.path_id, group['template_ids'][0])
+        self.assertIs(clone.assets_file, original.assets_file)
+        self.assertIs(clone.reader, original.reader)
+
     def test_real_serialized_clone_external_and_fallback_roundtrip(self):
         members,group = font_members()
         before = {name:environment(raw).file for name,raw in members.items()}
