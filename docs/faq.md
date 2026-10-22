@@ -220,6 +220,14 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **Resolution:** Route the incomplete part through the next configured analyzer. If every route fails, stop without writing a successful context state or starting translation.
 - **Prevention:** Use the CLI context gate, write output and state atomically, and reject partial or stale attestations.
 
+## A failed inventory or native context step leaves status with no runnable path
+
+- **Symptom:** An isolated worker returns zero/partial output, but status sees the placeholder artifact and asks to verify it; after inventory succeeds, `analyze-context` returns `E_NATIVE_WORKFLOW_REQUIRED` and the agent stops.
+- **General cause:** Artifact existence was evaluated before the sealed receipt, or the App-native context role had no core relay mapping.
+- **Diagnosis:** Read only the metadata receipt status, issue codes, role, and control generation. Do not open the failed inventory, context pack, worker prose, or game text in the parent.
+- **Resolution:** Run status again. It must expose the failed inventory role as a new bound attempt, route `sdk_identity_mismatch` through the private source-probe/selection step, or expose `context_analyzer` after a verified inventory. Dispatch and seal that exact relay; `E_NATIVE_WORKFLOW_REQUIRED` ends only the incorrect direct-provider command.
+- **Prevention:** Give every prepared attempt a new task binding, prioritize current non-success receipts over placeholder files, and let only the core seal create context state.
+
 ## A transient provider failure leaves a patch partly usable
 
 - **Symptom:** Capacity, timeout, quota, rate-limit, authentication, or malformed-output failure preserves source text and the workflow proceeds as if the patch were complete.
