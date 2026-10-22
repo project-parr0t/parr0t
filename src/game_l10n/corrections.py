@@ -56,7 +56,7 @@ def _load_results(path: Path) -> list[TranslationResult]:
         if not isinstance(attempts, list) or not all(isinstance(item, dict) for item in attempts):
             raise CorrectionError(f"Correction base result {target_id!r} has invalid attempts")
         value["attempts"] = [AttemptRecord(**item) for item in attempts]
-        value["from_cache"] = False
+        value.setdefault("from_cache", False)
         try:
             results.append(TranslationResult(**value))
         except TypeError as error:
@@ -119,6 +119,7 @@ def apply_user_corrections(
     request_path: Path,
     output_path: Path,
     expected_inventory_fingerprint: str,
+    reviewed_dependency_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Apply exact user-specified wording without model calls or broad re-review."""
 
@@ -180,10 +181,18 @@ def apply_user_corrections(
     selected = set(changes)
     invalidated = _reverse_dependency_closure(selected, dependencies)
     dependent_review = invalidated - selected
-    if dependent_review:
+    reviewed_dependencies = set(reviewed_dependency_ids or ())
+    invalid_reviewed = reviewed_dependencies - dependent_review
+    if invalid_reviewed:
+        raise CorrectionError(
+            "Dependency review contains IDs outside the required reverse dependency closure: "
+            + ", ".join(sorted(invalid_reviewed))
+        )
+    pending_dependency_review = dependent_review - reviewed_dependencies
+    if pending_dependency_review:
         raise CorrectionError(
             "Exact correction requires targeted review of reverse dependencies before application: "
-            + ", ".join(sorted(dependent_review))
+            + ", ".join(sorted(pending_dependency_review))
         )
 
     deterministic_issues: dict[str, list[str]] = {}
@@ -201,6 +210,25 @@ def apply_user_corrections(
 
     corrected: list[TranslationResult] = []
     for result in results:
+        if result.segment_id in reviewed_dependencies:
+            updated = copy.deepcopy(result)
+            updated.from_cache = False
+            updated.review_outcome = "dependency_review_unchanged"
+            updated.acceptance_authority = "user"
+            updated.metadata = {
+                **updated.metadata,
+                "dependency_review_origin": "explicit_user_approval",
+            }
+            updated.attempts.append(
+                AttemptRecord(
+                    stage="user-correction-dependency-review",
+                    provider="explicit-user-approval",
+                    status="unchanged",
+                    candidate_generation=updated.candidate_generation,
+                )
+            )
+            corrected.append(updated)
+            continue
         if result.segment_id not in changes:
             corrected.append(result)
             continue
@@ -242,7 +270,8 @@ def apply_user_corrections(
         "changed_count": len(changes),
         "unchanged_count": len(results) - len(changes),
         "changed_target_ids": sorted(changes),
-        "dependent_review_count": 0,
+        "dependent_review_count": len(reviewed_dependencies),
+        "reviewed_dependency_ids": sorted(reviewed_dependencies),
         "model_calls": 0,
         "context_analysis_runs": 0,
         "base_source": base_source,

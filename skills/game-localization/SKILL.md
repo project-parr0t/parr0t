@@ -39,7 +39,7 @@ Use `game-l10n` as the execution boundary. Read the repository `AGENTS.md`, `doc
 
 ## Fast routes
 
-- Exact wording or bounded tone/style/data correction: `docs/minimal-corrections.md`; freeze one target set, preserve others, repack and verify once. Exact values use no model call; generation uses one small data-plane batch.
+- Correction: `docs/minimal-corrections.md`; resolve a missing ID once in its local UI, freeze that export, preserve all else, and never repeat global search. Exact values use no model; generated wording uses one batch.
 - Earlier release or updated game build: `docs/release-checkpoint.md`; reuse only still-compatible unchanged reviewed targets.
 - Composed UI text: `docs/segment-metadata.md`.
 - Launcher-neutral package: `docs/filesystem-packaging.md`; `-GameRoot` supports absolute and startup-current-directory-relative paths and defaults to the validated startup current directory when omitted.
