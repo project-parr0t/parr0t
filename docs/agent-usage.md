@@ -14,7 +14,7 @@ Resolve these locations before acting:
 - source game root: read-only input;
 - external workspace: all private extraction, context, translation, cache, report, build, and patch data.
 
-Text translation is the default. Do not inspect images for text or consider OCR/image translation unless the user requested it.
+Text translation is default; never consider OCR or image translation unless requested.
 
 For a new job:
 
@@ -58,7 +58,7 @@ Do not skip or reorder barriers. One refusal, timeout, malformed result, capacit
 - Translation is faithful transformation, not content generation. Independent review checks meaning, omission, voice, tone, function, conditions, units, terminology, allusions, placeholders, markup, control codes, ordering, and material layout risk.
 - Build new outputs in the workspace. Automated checks use synthetic targets and never install or launch the real game.
 - Apply proportional verification and stop after the changed layer passes. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.
-- Native passes are root-to-relay only. Give the `native-pass-step` artifact to a fresh relay, never semantic workers. Only it advances waves. Review starts at 2,048 candidates and uses bounded failed-only splitting.
+- Native passes are root-to-relay. Dispatch only the fresh relay path from `native-pass-step`. Review ceiling: 2,048; initial tasks: 256 records/65,536 tokens. Core alone emits failed-only child manifests.
 
 ## Status-driven routes
 
