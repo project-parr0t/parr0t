@@ -41,6 +41,7 @@ from .corrections import apply_user_corrections
 from .correction_ui import CorrectionWorkspace, serve_correction_ui
 from .data_plane_task import (
     DATA_PLANE_PROFILES,
+    current_data_plane_receipt,
     prepare_data_plane_task,
     seal_data_plane_task,
 )
@@ -202,6 +203,7 @@ STATUS_DATA_PLANE_ROLES = {
     "unpack_and_extract_ordered_script": "primary_inventory",
     "extract_independent_source_inventory": "independent_inventory",
     "resolve_source_inventory_gaps": "inventory_reconciler",
+    "analyze_complete_script_context": "context_analyzer",
 }
 
 
@@ -222,6 +224,22 @@ def _status_data_plane_task(action: str) -> dict[str, Any] | None:
         ),
         "dispatch": "fresh_isolated_relay_only",
     }
+
+
+def _failed_inventory_data_plane_action(work_dir: Path) -> str | None:
+    """Turn a sealed inventory failure back into an executable next step."""
+
+    for role, action in (
+        ("primary_inventory", "unpack_and_extract_ordered_script"),
+        ("independent_inventory", "extract_independent_source_inventory"),
+    ):
+        receipt = current_data_plane_receipt(work_dir, role)
+        if receipt is None or receipt.get("status") == "success":
+            continue
+        if "sdk_identity_mismatch" in receipt.get("issue_codes", []):
+            return "record_target_identity_evaluate_and_select_sdk"
+        return action
+    return None
 
 
 def _public_inventory_gate(state: dict[str, Any] | None) -> dict[str, Any]:
@@ -1692,7 +1710,15 @@ def cmd_status(args: argparse.Namespace) -> int:
         independent_inventory_path = (
             work_dir / "inputs" / "independent-inventory.json"
         )
-        if not any((work_dir / "inputs").glob("*")):
+        inventory_state_path = work_dir / ".game-l10n" / "inventory-attestation.json"
+        failed_inventory_action = (
+            None
+            if inventory_state_path.is_file()
+            else _failed_inventory_data_plane_action(work_dir)
+        )
+        if failed_inventory_action is not None:
+            action = failed_inventory_action
+        elif not any((work_dir / "inputs").glob("*")):
             action = "unpack_and_extract_ordered_script"
         elif (
             primary_inventory_path.is_file()
@@ -1705,7 +1731,6 @@ def cmd_status(args: argparse.Namespace) -> int:
         ):
             action = "unpack_and_extract_ordered_script"
         else:
-            inventory_state_path = work_dir / ".game-l10n" / "inventory-attestation.json"
             inventory_verified = False
             inventory_state, inventory_issue = _read_status_object(
                 inventory_state_path,
@@ -2662,7 +2687,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     data_plane_prepare = sub.add_parser(
         "prepare-data-plane-task",
-        help="Create one core-bound isolated discovery or inventory relay task",
+        help="Create one core-bound isolated discovery, inventory, or context relay task",
     )
     data_plane_prepare.add_argument("--workspace", required=True)
     data_plane_prepare.add_argument(
@@ -2676,7 +2701,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     data_plane_seal = sub.add_parser(
         "seal-data-plane-task",
-        help="Validate one exact isolated discovery or inventory task result",
+        help="Validate one exact isolated discovery, inventory, or context task result",
     )
     data_plane_seal.add_argument("--workspace", required=True)
     data_plane_seal.add_argument("--relay", required=True)
