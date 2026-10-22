@@ -28,6 +28,7 @@ Only `local_patch_ready` is terminal; it requires current static completion and 
 13. **Bind every write to the current work lane.** Before writing, bind the turn to game, supervision, core, or SDK work and resolve its checkout and branch anew. Supervision and inspection stay read-only unless the current request names the mutation. Never inherit another lane's checkout or push plan; reject outgoing commits unrelated to the current request.
 14. **Start large jobs linearly.** At 10,000+ records, scan once per inventory method. Reconcile cached outputs; while the core gap score improves, continue only reported gaps. Never repeat full discovery/scans or create per-record startup artifacts, proof files, or speculative tooling.
 15. **Use the branch updater.** Run `scripts/update_branches.py`; never manually merge a hold. Fix its cause and replan.
+16. **Root turn limits are opt-in.** Only user-set manifest values apply.
 
 ## Standard job sequence
 
