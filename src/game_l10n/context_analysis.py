@@ -508,8 +508,45 @@ def context_attestation(
     context_pack: ContextPack,
     analyzer: "ContextAnalyzer",
 ) -> dict[str, Any]:
-    required_domains = analyzer.required_domains(segments)
-    domains_by_id = analyzer.domains_by_id(segments)
+    return context_attestation_for_mode(
+        segments,
+        context_pack,
+        context_mode=analyzer.context_mode,
+        analyzer_routes=analyzer.registry.fingerprints(analyzer.provider_chain),
+    )
+
+
+def context_attestation_for_mode(
+    segments: list[Segment],
+    context_pack: ContextPack,
+    *,
+    context_mode: str = ContextMode.AUTO.value,
+    analyzer_routes: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build the deterministic context gate without invoking a provider.
+
+    Native Codex App workers write the private context pack themselves. The
+    core uses this provider-free form while sealing their relay, so the parent
+    never needs to open game text or invent a second context-state format.
+    """
+
+    if context_mode not in SUPPORTED_CONTEXT_MODES:
+        raise ValueError(
+            f"unsupported context mode {context_mode!r}; expected one of "
+            f"{', '.join(sorted(SUPPORTED_CONTEXT_MODES))}"
+        )
+    if context_mode in CONTEXT_DOMAINS:
+        domains_by_id = {item.id: {context_mode} for item in segments}
+    else:
+        domains_by_id = {item.id: infer_segment_domains(item) for item in segments}
+    required_domains = {
+        domain for domains in domains_by_id.values() for domain in domains
+    }
+    resolved_mode = (
+        infer_context_mode(segments)
+        if context_mode == ContextMode.AUTO.value
+        else context_mode
+    )
     narrative_segments = [
         item for item in segments if ContextMode.NARRATIVE.value in domains_by_id[item.id]
     ]
@@ -536,7 +573,7 @@ def context_attestation(
     return {
         "ordered_script_hash": stable_hash_sequence(asdict(item) for item in segments),
         "context_pack_hash": stable_hash(asdict(context_pack)),
-        "context_mode": analyzer.resolve_mode(segments),
+        "context_mode": resolved_mode,
         "required_domains": sorted(required_domains),
         "segment_count": len(segments),
         "scene_coverage": {
@@ -564,7 +601,7 @@ def context_attestation(
         "knowledge_summary_present": bool(context_pack.knowledge_summary.strip()),
         "global_style_rules_present": bool(context_pack.global_style_rules),
         "relationship_timeline_present": bool(context_pack.relationship_timeline),
-        "analyzer_routes": analyzer.registry.fingerprints(analyzer.provider_chain),
+        "analyzer_routes": analyzer_routes or [],
     }
 
 
