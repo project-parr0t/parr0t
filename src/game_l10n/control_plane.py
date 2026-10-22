@@ -219,6 +219,7 @@ INVENTORY_ISSUE_CODES = {
     "inventory_order_mismatch",
     "user_visible_scope_excluded",
     "inventory_not_declared_complete",
+    "sdk_identity_mismatch",
 }
 
 DISCOVERY_ISSUE_CODES = {

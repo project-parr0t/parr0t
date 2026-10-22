@@ -155,6 +155,8 @@ def require_direct_provider_pipeline(config: dict[str, Any], operation: str) -> 
         raise ConfigurationError(
             "E_NATIVE_WORKFLOW_REQUIRED: "
             f"{operation} must use native collaboration workers and private native-pass "
-            "artifacts; do not run codex.exe, codex exec, another Codex session, or a "
-            "command provider as a substitute"
+            "or core data-plane relay artifacts; stop only this direct-provider command, "
+            "then run game-l10n status and dispatch its reported relay. Do not run "
+            "codex.exe, codex exec, another Codex session, or a command provider as a "
+            "substitute"
         )
