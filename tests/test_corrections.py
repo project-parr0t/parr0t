@@ -111,6 +111,7 @@ class CorrectionTests(unittest.TestCase):
                 _result("fixture-a", "SOURCE_A", "TARGET_A_OLD"),
                 _result("fixture-b", "SOURCE_B", "TARGET_B"),
             ]
+            results[1].from_cache = True
             base = root / "base.jsonl"
             checkpoint = root / "checkpoint.json"
             request = root / "request.json"
