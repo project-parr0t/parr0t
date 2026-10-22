@@ -58,7 +58,7 @@ Every saved attestation also records a metadata-only reconciliation generation, 
 
 ## Context execution gate
 
-The context state records a successful route for every chunk. Provider refusal, capacity, timeout, malformed output, or another operational error advances to the next configured context route. If all routes fail for any chunk, no successful state is written and translation stops. A context-pack file without its matching successful execution attestation is never accepted.
+The context state records a successful sealed context task. Provider refusal, capacity, timeout, malformed output, or another operational error produces a non-success receipt and status exposes a fresh bound `context_analyzer` attempt; an existing partial file never converts that failure into success. The top-level agent must not substitute `analyze-context` in Codex App mode or inspect the partial pack. Only the core seal may write a successful context state after deterministic domain and evidence coverage passes. A context-pack file without that matching state is never accepted.
 
 ## Existing translation review
 

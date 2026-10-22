@@ -23,6 +23,12 @@ or execution fields. Resuming additionally requires a regenerated, validated
 manifest. If a required state is missing, contradictory, or not
 recognized, the sole transition is `checkpoint_and_stop`.
 
+That unknown-state rule is scoped to an active native review manifest and its
+budget/control state. It does not turn a sealed discovery, inventory, or
+context failure into a terminal job state. Those stages return to
+`game-l10n status`, which emits the exact retry or repair relay; the parent
+must not broaden `checkpoint_and_stop` beyond the review router.
+
 Every native review manifest embeds `parr0t.review-control-contract.v1` inside
 its immutable detail contract. Changing or removing it invalidates the
 manifest, so lower-priority notes cannot silently restore control-plane
@@ -49,9 +55,11 @@ The selected SDK may apply stricter engine-specific structural checks, such as l
 
 ## Entry gate
 
-The boundary begins before preliminary discovery. The top-level agent may confirm that repository, workspace, and supplied source paths exist, but it must not inspect game-root contents. Existing-locale and engine/version discovery therefore run as a core-bound `source_probe`. When status exposes `data_plane_task`, run `prepare-data-plane-task`, give only its `parr0t.data-plane-relay.v1` path to one fresh no-history relay, and seal it with `seal-data-plane-task`. Primary inventory, independent inventory, and gap reconciliation use the same route. The existence of a core task means no extra user exception is needed; a model must not replace it with a manual assignment.
+The boundary begins before preliminary discovery. The top-level agent may confirm that repository, workspace, and supplied source paths exist, but it must not inspect game-root contents. Existing-locale and engine/version discovery therefore run as a core-bound `source_probe`. When status exposes `data_plane_task`, run `prepare-data-plane-task`, give only its `parr0t.data-plane-relay.v1` path to one fresh no-history relay, and seal it with `seal-data-plane-task`. Primary inventory, independent inventory, gap reconciliation, and complete typed context analysis use the same route. The existence of a core task means no extra user exception is needed; a model must not replace it with a manual assignment or the direct-provider `analyze-context` command.
 
-The relay starts exactly one non-delegating worker from the bound private task, never opens the task payload, and returns only the core-generated `parr0t.data-plane-receipt.v1` path. The task fixes source roots, SDK binding, output artifact, output envelope, counterpart-read prohibition, and role/stage. Sealing rejects a changed task, wrong role/stage, missing bound artifact, invalid inventory schema, discovery success without recorded SDK selection, or reconciliation that did not run a newer core verification.
+The relay starts exactly one non-delegating worker from the bound private task, never opens the task payload, and returns only the core-generated `parr0t.data-plane-receipt.v1` path. The task fixes source roots, SDK binding, output artifact, output envelope, counterpart-read prohibition, attempt number, and role/stage. Sealing rejects a changed task, wrong role/stage, missing bound artifact, invalid inventory schema, discovery success without recorded SDK selection, reconciliation that did not run a newer core verification, or a context pack that fails deterministic domain/evidence coverage. On context success the core—not the worker or parent—writes the bound context-state attestation.
+
+A non-success receipt cannot be hidden by an empty or partial artifact at the expected path. Status routes that role back to a fresh bound attempt. Inventory workers use the parent-safe `sdk_identity_mismatch` code when selected and observed engine identities conflict; status then routes to the private source probe/SDK selection step instead of inviting the parent to diagnose engine files.
 
 Every new workspace starts with `parr0t.control-plane-entry.v1` in `pending`. Existing workspaces without this marker are also treated as pending. `game-l10n status` then returns only `establish_text_free_control_plane` and the contracts that must be read. If the parent has not inspected or received game content, it establishes the gate with:
 

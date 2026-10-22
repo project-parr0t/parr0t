@@ -93,12 +93,12 @@ game-l10n sdk-inventory --workspace <external-workspace> --runtime-root <extract
 game-l10n sdk-evaluate --workspace <external-workspace> --target-engine <engine> --target-version <version-line> --branch <sdk-branch> --result <compatible|partial|reference|incompatible> --reason <reason-code> --evidence-path <public-contract-path>
 game-l10n sdk-select --workspace <external-workspace> --target-engine <engine> --target-version <version-line> --mode <reuse|extend|derive-new|private-new> [--branch <sdk-branch>]
 game-l10n sdk-activate --workspace <external-workspace> [--runtime-root <selected-sdk-runtime>] [--reference-checkout <reference-runtime>]
-game-l10n prepare-data-plane-task --workspace <external-workspace> --worker-role <source_probe|primary_inventory|independent_inventory|inventory_reconciler>
+game-l10n prepare-data-plane-task --workspace <external-workspace> --worker-role <source_probe|primary_inventory|independent_inventory|inventory_reconciler|context_analyzer>
 game-l10n seal-data-plane-task --workspace <external-workspace> --relay <relay-path>
 game-l10n native-pass-step --workspace <external-workspace> --manifest <private-manifest> --results-dir <private-wave-results>
 ```
 
-These are agent boundaries. Portable inventory requires an authenticated connector or immutable commit archive; never invent branch or commit. Configure OpenCodex proxies separately and keep their credentials outside this repository.
+These are agent boundaries. A non-success data-plane receipt remains executable work: run status again and dispatch its reported retry or SDK-identity repair. Never verify a failed worker's placeholder artifact merely because the file exists. Portable inventory requires an authenticated connector or immutable commit archive; never invent branch or commit. Configure OpenCodex proxies separately and keep their credentials outside this repository.
 
 ## Completion
 
