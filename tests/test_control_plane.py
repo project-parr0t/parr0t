@@ -25,11 +25,88 @@ from game_l10n.control_plane import (
     validate_control_envelope,
 )
 from game_l10n.errors import ConfigurationError
+from game_l10n.data_plane_task import (
+    prepare_data_plane_task,
+    seal_data_plane_task,
+)
 from game_l10n.models import Segment
 from game_l10n.native_pass import _detail_contract, prepare_native_tasks
 
 
 class ControlPlaneContractTests(unittest.TestCase):
+    def test_discovery_cli_uses_a_core_bound_data_plane_relay(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "prepare-data-plane-task",
+                "--workspace",
+                "fixture-workspace",
+                "--worker-role",
+                "source_probe",
+            ]
+        )
+        self.assertEqual(args.func.__name__, "cmd_prepare_data_plane_task")
+
+    def test_core_bound_source_probe_seals_only_its_expected_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            work = root / "work"
+            sdk = root / "sdk"
+            game.mkdir()
+            work.mkdir()
+            sdk.mkdir()
+            (work / "game-l10n.json").write_text("{}", encoding="utf-8")
+            establish_control_plane_entry(work)
+            config = {
+                "game_roots": [str(game)],
+                "sdk_root": str(sdk),
+                "sdk_selection": {"inventory_fingerprint": "fixture-inventory"},
+            }
+            prepared = prepare_data_plane_task(
+                work,
+                work / ".game-l10n" / "data-plane" / "source_probe",
+                worker_role="source_probe",
+                config=config,
+            )
+            relay = work / prepared["relay_path"]
+            relay_payload = json.loads(relay.read_text(encoding="utf-8"))
+            (work / "game-l10n.json").write_text(
+                json.dumps(
+                    {
+                        "sdk_selection": {
+                            "status": "selected",
+                            "inventory_fingerprint": "fixture-inventory",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            envelope = work / relay_payload["expected_envelope"]
+            envelope.write_text(
+                json.dumps(
+                    {
+                        "schema": "parr0t.control-envelope.v2",
+                        "worker_role": "source_probe",
+                        "stage": "discovery",
+                        "status": "success",
+                        "target_ids": [],
+                        "counts": {"total": 1, "success": 1},
+                        "issue_codes": [],
+                        "artifact_paths": ["game-l10n.json"],
+                        "queue_transitions": [],
+                        "route_evidence_path": "",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            sealed = seal_data_plane_task(work, relay)
+
+        self.assertEqual(sealed["status"], "success")
+        self.assertEqual(sealed["worker_role"], "source_probe")
+        self.assertEqual(sealed["stage"], "discovery")
+        self.assertTrue(sealed["receipt_path"].endswith("receipt.json"))
+
     def test_native_review_pass_kind_is_registered(self) -> None:
         args = build_parser().parse_args(
             [

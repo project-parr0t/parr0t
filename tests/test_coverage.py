@@ -28,6 +28,7 @@ def write_inventory(
     *,
     declared_complete: bool = True,
     exclusions: list[dict] | None = None,
+    static_scope: dict | None = None,
 ) -> None:
     path.write_text(
         json.dumps(
@@ -38,6 +39,7 @@ def write_inventory(
                 "coverage": {
                     "declared_complete": declared_complete,
                     "exclusions": exclusions or [],
+                    **({"static_scope": static_scope} if static_scope is not None else {}),
                 },
                 "segments": segments,
             }
@@ -47,6 +49,72 @@ def write_inventory(
 
 
 class CoverageTests(unittest.TestCase):
+    @staticmethod
+    def _static_scope(*, unused: int = 1) -> dict:
+        return {
+            "schema": "parr0t.static-scope.v1",
+            "claim": "static_reachability_only",
+            "engine_capability": "synthetic-fixed-path-graph-v1",
+            "candidate_count": 2,
+            "included_count": 2 - unused,
+            "proven_unused_count": unused,
+            "conservative_retained_count": 0,
+            "unresolved_dynamic_reference_count": 0,
+            "methods": [
+                {"name": "synthetic-bfs", "implementation_fingerprint": "bfs-v1"},
+                {"name": "synthetic-fixed-point", "implementation_fingerprint": "fixed-point-v1"},
+            ],
+            "methods_agree": True,
+            "evidence_fingerprint": "fixture-scope-evidence",
+        }
+
+    def test_independent_static_scope_can_account_for_proven_unused_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            rows = [{"id": "synthetic-active", "source": "SOURCE_ACTIVE"}]
+            scope = self._static_scope()
+            exclusions = [{
+                "reason_code": "SYNTHETIC_STATIC_UNREACHABLE",
+                "affects_user_visible_text": False,
+                "scope": "static_reachability",
+                "target_count": 1,
+                "evidence_fingerprint": "fixture-exclusion-evidence",
+            }]
+            write_inventory(primary, "synthetic-bfs", rows, exclusions=exclusions, static_scope=scope)
+            write_inventory(independent, "synthetic-fixed-point", rows, exclusions=exclusions, static_scope=scope)
+
+            state = verify_inventory_pair(primary, independent)
+
+        self.assertTrue(state["static_complete"])
+        self.assertEqual(state["static_scope"]["proven_unused_count"], 1)
+        self.assertFalse(state["static_scope_tracking_mismatch"])
+
+    def test_static_scope_disagreement_cannot_silently_filter_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            rows = [{"id": "synthetic-active", "source": "SOURCE_ACTIVE"}]
+            exclusions = [{
+                "reason_code": "SYNTHETIC_STATIC_UNREACHABLE",
+                "affects_user_visible_text": False,
+                "scope": "static_reachability",
+                "target_count": 1,
+                "evidence_fingerprint": "fixture-exclusion-evidence",
+            }]
+            first = self._static_scope()
+            second = {**first, "evidence_fingerprint": "different-evidence"}
+            write_inventory(primary, "synthetic-bfs", rows, exclusions=exclusions, static_scope=first)
+            write_inventory(independent, "synthetic-fixed-point", rows, exclusions=exclusions, static_scope=second)
+
+            state = verify_inventory_pair(primary, independent)
+
+        self.assertFalse(state["static_complete"])
+        self.assertTrue(state["static_scope_tracking_mismatch"])
+        self.assertIn("STATIC_SCOPE_TRACKING_MISMATCH", state["issue_codes"])
+
     def test_verified_inventory_uses_unchanged_file_binding_fast_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -209,6 +277,104 @@ class CoverageTests(unittest.TestCase):
         self.assertFalse(state["static_complete"])
         self.assertTrue(state["order_mismatch"])
         self.assertIn("INVENTORY_ORDER_MISMATCH", state["issue_codes"])
+
+    def test_method_specific_ids_can_share_a_canonical_comparison_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            primary_rows = [
+                {
+                    "id": "primary-label-id",
+                    "source": "SOURCE_LABEL",
+                    "metadata": {
+                        "inventory_comparison_key": "physical-label-occurrence",
+                        "ui_slot_role": "label",
+                    },
+                },
+                {
+                    "id": "primary-resource-id",
+                    "source": "SOURCE_ONE",
+                    "metadata": {
+                        "inventory_comparison_key": "physical-occurrence-1",
+                        "ui_slot_role": "value",
+                        "ui_composed_with_ids": ["primary-label-id"],
+                    },
+                }
+            ]
+            independent_rows = [
+                {
+                    "id": "independent-label-id",
+                    "source": "SOURCE_LABEL",
+                    "metadata": {
+                        "inventory_comparison_key": "physical-label-occurrence",
+                        "ui_slot_role": "label",
+                    },
+                },
+                {
+                    "id": "independent-resource-id",
+                    "source": "SOURCE_ONE",
+                    "metadata": {
+                        "inventory_comparison_key": "physical-occurrence-1",
+                        "ui_slot_role": "value",
+                        "ui_composed_with_ids": ["independent-label-id"],
+                    },
+                }
+            ]
+            write_inventory(primary, "synthetic-ast", primary_rows)
+            write_inventory(independent, "synthetic-secondary", independent_rows)
+
+            state = verify_inventory_pair(primary, independent)
+
+        self.assertTrue(state["static_complete"])
+        self.assertEqual(state["missing_from_primary_count"], 0)
+        self.assertEqual(state["missing_from_independent_count"], 0)
+        self.assertFalse(state["order_mismatch"])
+
+    def test_inventory_comparison_keys_must_be_unique(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            rows = [
+                {
+                    "id": "first",
+                    "source": "SOURCE_ONE",
+                    "metadata": {"inventory_comparison_key": "same-occurrence"},
+                },
+                {
+                    "id": "second",
+                    "source": "SOURCE_TWO",
+                    "metadata": {"inventory_comparison_key": "same-occurrence"},
+                },
+            ]
+            write_inventory(primary, "synthetic-ast", rows)
+            write_inventory(independent, "synthetic-secondary", rows)
+
+            with self.assertRaisesRegex(ConfigurationError, "duplicate comparison key"):
+                verify_inventory_pair(primary, independent)
+
+    def test_saved_inventory_attestation_records_measured_gap_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            rows = [
+                {"id": "first", "source": "SOURCE_ONE"},
+                {"id": "second", "source": "SOURCE_TWO"},
+            ]
+            write_inventory(primary, "synthetic-ast", rows)
+            write_inventory(independent, "synthetic-secondary", rows[:1])
+            first = save_inventory_attestation(root, primary, independent)
+
+            write_inventory(independent, "synthetic-secondary", rows)
+            second = save_inventory_attestation(root, primary, independent)
+
+        self.assertEqual(first["reconciliation"]["progress_state"], "initial")
+        self.assertTrue(first["reconciliation"]["continuation_required"])
+        self.assertEqual(second["reconciliation"]["progress_state"], "complete")
+        self.assertFalse(second["reconciliation"]["continuation_required"])
+        self.assertFalse(second["reconciliation"]["terminal"])
 
     def test_independent_inventory_must_confirm_ui_composition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
