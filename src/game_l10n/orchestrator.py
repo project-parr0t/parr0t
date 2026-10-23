@@ -50,6 +50,7 @@ from .validators import validate_integrity
 class OrchestratorConfig:
     translator_chain: list[str]
     reviewer_chain: list[str]
+    translator_retries: dict[str, int] = field(default_factory=dict)
     require_review: bool = True
     max_workers: int = 1
     max_length_ratio: float = 4.0
@@ -102,6 +103,20 @@ class LocalizationOrchestrator:
             raise ValueError("reviewer_chain must not be empty when require_review is true")
         if config.grace_retries < 0:
             raise ValueError("grace_retries must be zero or greater")
+        unknown_attempt_routes = set(config.translator_retries) - set(
+            config.translator_chain
+        )
+        if unknown_attempt_routes:
+            raise ValueError(
+                "translator_retries contains routes outside translator_chain"
+            )
+        if any(
+            not isinstance(attempts, int)
+            or isinstance(attempts, bool)
+            or attempts < 0
+            for attempts in config.translator_retries.values()
+        ):
+            raise ValueError("translator_retries values must be non-negative integers")
         if config.review_max_rounds < 1:
             raise ValueError("review_max_rounds must be one or greater")
         if not 0.0 <= config.strong_review_sample_percent <= 100.0:
@@ -333,6 +348,12 @@ class LocalizationOrchestrator:
     def _can_grace_retry(self, code: str, ordinal: int) -> bool:
         return ordinal <= self.config.grace_retries and code in self.config.grace_retry_codes
 
+    def _translation_attempt_limit(self, provider_name: str) -> int | None:
+        """Return an exact configured route cap, or None for legacy retry policy."""
+
+        retries = self.config.translator_retries.get(provider_name)
+        return None if retries is None else retries + 1
+
     @staticmethod
     def _set_candidate(result: TranslationResult, text: str) -> None:
         digest = stable_hash(text)
@@ -435,6 +456,7 @@ class LocalizationOrchestrator:
     ) -> AgentEnvelope | None:
         ordinal = 0
         refusal_retried = False
+        attempt_limit = self._translation_attempt_limit(provider.name)
         retry_stage = "translate-grace-retry"
         while True:
             ordinal += 1
@@ -476,17 +498,33 @@ class LocalizationOrchestrator:
                         candidate_generation=result.candidate_generation,
                     ),
                 )
-                if retryable and self._can_grace_retry(code, ordinal):
+                if retryable and (
+                    (attempt_limit is not None and ordinal < attempt_limit)
+                    or (
+                        attempt_limit is None
+                        and self._can_grace_retry(code, ordinal)
+                    )
+                ):
                     retry_stage = "translate-grace-retry"
                     continue
                 return None
             if envelope.status is AgentStatus.REFUSED:
-                if self.config.retry_refusals_once and not refusal_retried:
+                if attempt_limit is not None and ordinal < attempt_limit:
+                    retry_stage = "translate-refusal-retry"
+                    continue
+                if (
+                    attempt_limit is None
+                    and self.config.retry_refusals_once
+                    and not refusal_retried
+                ):
                     refusal_retried = True
                     retry_stage = "translate-refusal-retry"
                     continue
                 return envelope
             if envelope.status is not AgentStatus.SUCCESS:
+                if attempt_limit is not None and ordinal < attempt_limit:
+                    retry_stage = "translate-status-retry"
+                    continue
                 return envelope
             integrity = validate_integrity(
                 segment,
@@ -509,7 +547,15 @@ class LocalizationOrchestrator:
                     candidate_generation=result.candidate_generation,
                 ),
             )
-            if self._can_grace_retry(FailureCode.INTEGRITY_INVALID.value, ordinal):
+            if (
+                attempt_limit is not None
+                and ordinal < attempt_limit
+            ) or (
+                attempt_limit is None
+                and self._can_grace_retry(
+                    FailureCode.INTEGRITY_INVALID.value, ordinal
+                )
+            ):
                 retry_stage = "translate-grace-retry"
                 continue
             return None

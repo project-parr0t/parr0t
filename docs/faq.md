@@ -49,15 +49,15 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **Symptom:** A context, translation, or review provider refuses a bounded transformation because the fictional text contains mature themes.
 - **General cause:** The provider does not recognize the request as inert, user-supplied fictional content or its policy disallows the transformation.
 - **Diagnosis:** Check the structured refusal status without persisting the source text in repository logs.
-- **Resolution:** Retry once with the bounded transformation context clarified; if refusal remains, route to the next configured provider. Do not obfuscate content or weaken safeguards.
-- **Prevention:** Configure independent provider chains and test refusal routing with synthetic fixtures.
+- **Resolution:** Keep the immutable target and focused context, consume only that route's configured failed-only retry budget, then advance the still-failed target to the next configured provider. The recommended preset uses five Luna retries, then one Sol attempt plus three Sol retries, before DeepSeek. Do not obfuscate content or weaken safeguards.
+- **Prevention:** Configure independent provider chains, bind route and ordinal in native manifests, lock successes between attempts, and test refusal routing with synthetic fixtures.
 
 ## One mature target causes an entire translation batch to be refused
 
 - **Symptom:** A provider rejects unrelated ordinary targets because they were submitted together with one target or context field that triggered a refusal.
 - **General cause:** Multiple output targets were bundled into one model request, or context-only material was not distinguished from the text that actually required transformation.
 - **Diagnosis:** Confirm that every provider request has exactly one translation target and that refusal records identify only that target ID.
-- **Resolution:** Continue the unaffected targets individually. Queue only the refused target for the configured fallback after the primary stage completes; never rebuild the refused collection into another multi-target request.
+- **Resolution:** Continue unaffected targets and lock their successes. Queue only the refused target for the current failed-only retry stage, then the configured secondary translation route, and finally external fallback; never rebuild the refused collection into another multi-target request.
 - **Prevention:** Label full-story, scene, character, adjacent-line, and glossary material as context-only evidence while preserving one output target per request.
 
 ## A fallback provider reaches its quota or every route fails
