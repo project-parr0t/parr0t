@@ -564,6 +564,7 @@ def _reset_native_control_observations(work_dir: Path) -> None:
         if not isinstance(payload, dict) or payload.get("schema") not in {
             "parr0t.native-control-state.v1",
             "parr0t.native-control-state.v2",
+            "parr0t.native-control-state.v3",
         }:
             continue
         required = {
