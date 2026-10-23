@@ -41,6 +41,60 @@ def review_segment(segment_id: str, source: str = "S", candidate: str = "T") -> 
 
 
 class NativePassTests(unittest.TestCase):
+    def test_ended_invalid_binding_archives_task_and_preserves_ready_peer(self) -> None:
+        for invalid_ids in (("c", "c"), ("c", "foreign"), ("d", "c")):
+            with self.subTest(invalid_ids=invalid_ids), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "source.jsonl"
+                source.write_text("fixture", encoding="utf-8")
+                tasks, results = root / "tasks", root / "results"
+                prepare_native_tasks(
+                    root,
+                    source,
+                    [Segment(item, "S") for item in ("a", "b", "c", "d")],
+                    tasks,
+                    max_records=2,
+                    max_workers=2,
+                )
+                step = native_control_step(root, tasks / "manifest.json", results)
+                good_result = results / "task-0001.jsonl"
+                self._write_rows(
+                    good_result,
+                    [
+                        {"target_id": item, "status": "success", "text": "T"}
+                        for item in ("a", "b")
+                    ],
+                )
+                good_bytes = good_result.read_bytes()
+                invalid_result = results / "task-0002.jsonl"
+                self._write_rows(
+                    invalid_result,
+                    [
+                        {"target_id": item, "status": "success", "text": "T"}
+                        for item in invalid_ids
+                    ],
+                )
+                original = invalid_result.read_bytes()
+                sealed = seal_native_wave_relay(
+                    root,
+                    root / step["relay"]["dispatch"],
+                    ended_tasks=("task-0001.jsonl", "task-0002.jsonl"),
+                )
+                self.assertEqual(sealed["counts"]["pending_tasks"], 0)
+                self.assertEqual(good_result.read_bytes(), good_bytes)
+                archives = list(results.glob("task-0002.jsonl.ended-original-*"))
+                self.assertEqual(len(archives), 1)
+                self.assertEqual(archives[0].read_bytes(), original)
+                rows = [
+                    json.loads(line) for line in invalid_result.read_text().splitlines()
+                ]
+                self.assertEqual([row["target_id"] for row in rows], ["c", "d"])
+                self.assertEqual([row["status"] for row in rows], ["error", "error"])
+                completed = native_control_step(root, tasks / "manifest.json", results)
+                self.assertEqual(completed["action"], "aggregate_completed_pass")
+                self.assertEqual(completed["imported_wave"]["success"], 2)
+                self.assertEqual(completed["imported_wave"]["failed"], 2)
+
     def test_ended_malformed_transport_archives_bytes_and_keeps_good_rows(self) -> None:
         from game_l10n.native_pass import _complete_ended_task_result
 
