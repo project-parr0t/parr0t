@@ -51,6 +51,8 @@ Before every commit or push, enumerate the outgoing commits and changed paths ag
 - Do not create a second verifier for a property already covered by a deterministic validator.
 - Do not retranslate, re-review, recompile, or repackage unchanged inputs merely for reassurance.
 
+Configured translation retries are fresh failed-only tasks, not extra calls hidden inside one semantic worker. Their provider and ordinal are manifest-bound, successful rows are immutable, and cumulative usage carries across the Luna, Sol, and external-fallback stages. The preset's five Luna retries and three Sol retries are explicit route limits, not permission for the control plane to invent more attempts; each count is in addition to the route's first call. Existing whole-job time, token, and cost gates apply to the combined chain.
+
 ## Delegation budget
 
 Use subagents when work divides into independent, non-overlapping bulk translation or review shards, or when parallel research materially shortens a blocking discovery phase. Keep simple packaging, a single script, a small bug fix, documentation, state inspection, and deterministic validation in the current agent.
@@ -115,7 +117,7 @@ An unchanged verified inventory uses its saved path/size/mtime binding instead o
 
 `native-pass-step` validates only tasks in the wave it is about to dispatch or import. It stores imported-wave counters in its control checkpoint and does not reopen every pending task or old shard at each step. Final merge still validates the complete binding once. Repeated discovery, unchanged inventory verification, and all-task validation are not startup progress and must not postpone the first semantic wave.
 
-When native usage telemetry is available, record only aggregate input, cached-input, output, reasoning, event, and worker counts in the private workspace. Count root and every descendant separately. A high cached-input ratio is diagnostic evidence that old conversation is being replayed, not authority to end an incomplete job or invent a control-turn limit. Keep later semantic work in fresh no-history workers and continue through the deterministic checkpoint; do not add summaries or compactions to an already long chat.
+When native usage telemetry is available, the bound relay/provider adapter records aggregate input, cached-input, output, reasoning, event, and worker counts in the core-owned private ledger or sealed receipt. Root reads only that metadata. Missing telemetry is unknown; never reconstruct it from `.codex/sessions`, chat transcripts, agent trees, nested-worker status/output, semantic-worker logs, or terminal previews. Per-worker accounting must be emitted at the event boundary. A high cached-input ratio diagnoses replayed history but does not authorize ending an incomplete job or inventing a turn limit. Keep later semantic work in fresh no-history workers and continue through the deterministic checkpoint.
 
 ## API fallback input budget
 
