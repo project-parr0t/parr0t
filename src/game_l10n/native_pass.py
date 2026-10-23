@@ -44,8 +44,9 @@ DEFAULT_REVIEW_SPLIT_MAX_CALLS = 16
 DEFAULT_MAX_WORKERS = 8
 DEFAULT_BULK_BUDGET_GATE_RECORDS = 4_096
 PASS_KINDS = {"translation", "review", "rewrite"}
-NATIVE_CONTROL_STATE_SCHEMA = "parr0t.native-control-state.v2"
+NATIVE_CONTROL_STATE_SCHEMA = "parr0t.native-control-state.v3"
 LEGACY_NATIVE_CONTROL_STATE_SCHEMA = "parr0t.native-control-state.v1"
+LEGACY_NATIVE_CONTROL_STATE_SCHEMA_V2 = "parr0t.native-control-state.v2"
 NATIVE_CONTROL_STEP_SCHEMA = "parr0t.native-control-step.v1"
 NATIVE_WAVE_RECEIPT_SCHEMA = "parr0t.native-wave-receipt.v1"
 NATIVE_WAVE_RELAY_SCHEMA = "parr0t.native-wave-relay.v1"
@@ -1712,12 +1713,20 @@ def _native_control_state_path(
 def _new_native_control_state(
     manifest: dict[str, Any], plan_fingerprint: str
 ) -> dict[str, Any]:
+    created_at_epoch = time.time()
+    budget_approved = (
+        manifest.get("execution_contract", {})
+        .get("bulk_budget_gate", {})
+        .get("user_approved")
+        is True
+    )
     return {
         "schema": NATIVE_CONTROL_STATE_SCHEMA,
         "source_fingerprint": manifest["source_fingerprint"],
         "plan_fingerprint": plan_fingerprint,
         "contract_fingerprint": manifest["contract_fingerprint"],
-        "created_at_epoch": time.time(),
+        "created_at_epoch": created_at_epoch,
+        "budget_started_at_epoch": created_at_epoch if budget_approved else None,
         "active_wave": 0,
         "control_steps_in_wave": 0,
         "last_progress_marker": "",
@@ -1756,20 +1765,42 @@ def _load_native_control_state(
         "provider_cost_usd",
         "usage_event_ids",
     }
-    required = legacy_required | {
+    v2_required = legacy_required | {
         "checkpoint_initialized",
         "imported_wave_count",
         "imported_tasks",
     }
+    required = v2_required | {"budget_started_at_epoch"}
     if (
         isinstance(state, dict)
         and state.get("schema") == LEGACY_NATIVE_CONTROL_STATE_SCHEMA
         and set(state) == legacy_required
     ):
-        state["schema"] = NATIVE_CONTROL_STATE_SCHEMA
+        state["schema"] = LEGACY_NATIVE_CONTROL_STATE_SCHEMA_V2
         state["checkpoint_initialized"] = False
         state["imported_wave_count"] = 0
         state["imported_tasks"] = 0
+    contract_changed = (
+        isinstance(state, dict)
+        and state.get("contract_fingerprint") != manifest["contract_fingerprint"]
+    )
+    if (
+        isinstance(state, dict)
+        and state.get("schema") == LEGACY_NATIVE_CONTROL_STATE_SCHEMA_V2
+        and set(state) == v2_required
+    ):
+        state["schema"] = NATIVE_CONTROL_STATE_SCHEMA
+        budget_approved = (
+            manifest.get("execution_contract", {})
+            .get("bulk_budget_gate", {})
+            .get("user_approved")
+            is True
+        )
+        state["budget_started_at_epoch"] = (
+            state["created_at_epoch"]
+            if budget_approved and not contract_changed
+            else None
+        )
     if not isinstance(state, dict) or set(state) != required:
         raise ValueError("E_NATIVE_CONTROL_STATE_INVALID: state shape is invalid")
     if (
@@ -1778,6 +1809,15 @@ def _load_native_control_state(
         or state.get("plan_fingerprint") != plan_fingerprint
         or not isinstance(state.get("created_at_epoch"), (int, float))
         or isinstance(state.get("created_at_epoch"), bool)
+        or (
+            state.get("budget_started_at_epoch") is not None
+            and (
+                not isinstance(state["budget_started_at_epoch"], (int, float))
+                or isinstance(state["budget_started_at_epoch"], bool)
+                or not math.isfinite(state["budget_started_at_epoch"])
+                or state["budget_started_at_epoch"] < 0
+            )
+        )
         or not isinstance(state.get("active_wave"), int)
         or isinstance(state.get("active_wave"), bool)
         or state["active_wave"] < 0
@@ -1813,12 +1853,22 @@ def _load_native_control_state(
         raise ValueError("E_NATIVE_CONTROL_STATE_INVALID: state values are invalid")
     # A regenerated manifest may bind an approved budget without changing the task plan.
     # Preserve pilot usage and imported checkpoints, but start a new decision generation.
-    if state["contract_fingerprint"] != manifest["contract_fingerprint"]:
+    if contract_changed:
         state["active_wave"] = 0
         state["control_steps_in_wave"] = 0
         state["last_progress_marker"] = ""
         state["unchanged_observations"] = 0
         state["last_action"] = ""
+    budget_approved = (
+        manifest.get("execution_contract", {})
+        .get("bulk_budget_gate", {})
+        .get("user_approved")
+        is True
+    )
+    if budget_approved and state["budget_started_at_epoch"] is None:
+        state["budget_started_at_epoch"] = time.time()
+    elif not budget_approved:
+        state["budget_started_at_epoch"] = None
     state["contract_fingerprint"] = manifest["contract_fingerprint"]
     return state
 
@@ -1966,7 +2016,7 @@ def _native_budget_issue(
     if gate.get("user_approved") is not True:
         return ""
     max_elapsed = gate.get("max_elapsed_minutes")
-    elapsed_minutes = (time.time() - float(state["created_at_epoch"])) / 60.0
+    elapsed_minutes = _native_budget_elapsed_minutes(state)
     if isinstance(max_elapsed, int) and elapsed_minutes >= max_elapsed:
         return "E_NATIVE_ELAPSED_BUDGET_EXHAUSTED"
     max_input = gate.get("max_input_tokens")
@@ -1981,6 +2031,13 @@ def _native_budget_issue(
     ):
         return "E_NATIVE_COST_BUDGET_EXHAUSTED"
     return ""
+
+
+def _native_budget_elapsed_minutes(state: dict[str, Any]) -> float:
+    started_at = state.get("budget_started_at_epoch")
+    if not isinstance(started_at, (int, float)) or isinstance(started_at, bool):
+        return 0.0
+    return max(0.0, (time.time() - float(started_at)) / 60.0)
 
 
 def _review_split_chain_path(
@@ -2077,6 +2134,7 @@ def _inherit_native_control_usage(
     child_state = _new_native_control_state(child_manifest, child_plan)
     for key in (
         "created_at_epoch",
+        "budget_started_at_epoch",
         "input_tokens",
         "provider_cost_usd",
         "usage_event_ids",
@@ -2545,7 +2603,7 @@ def _native_control_step_single(
             "input_tokens": state["input_tokens"],
             "provider_cost_usd": state["provider_cost_usd"],
             "elapsed_minutes": round(
-                max(0.0, (time.time() - float(state["created_at_epoch"])) / 60.0),
+                _native_budget_elapsed_minutes(state),
                 3,
             ),
         },
