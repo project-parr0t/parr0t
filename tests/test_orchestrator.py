@@ -13,6 +13,49 @@ from game_l10n.providers import ProviderRegistry, ScriptedProvider
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_route_attempt_caps_retry_refusal_before_advancing(self) -> None:
+        calls = {"luna": 0, "sol": 0, "deepseek": 0}
+
+        def refused(route: str):
+            def handler(**_):
+                calls[route] += 1
+                return {"status": "refused", "text": "", "reason": "private"}
+
+            return handler
+
+        deepseek = ScriptedProvider(
+            "deepseek",
+            lambda **_: (
+                calls.__setitem__("deepseek", calls["deepseek"] + 1)
+                or {"status": "success", "text": "TARGET", "reason": ""}
+            ),
+        )
+        providers = [
+            ScriptedProvider("luna", refused("luna")),
+            ScriptedProvider("sol", refused("sol")),
+            deepseek,
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            result = LocalizationOrchestrator(
+                registry=ProviderRegistry({item.name: item for item in providers}),
+                config=OrchestratorConfig(
+                    ["luna", "sol", "deepseek"],
+                    [],
+                    translator_retries={"luna": 5, "sol": 3},
+                    require_review=False,
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                context_pack=ContextPack(story_summary="STORY"),
+                work_dir=Path(directory),
+            ).translate_one(Segment("retry-route", "SOURCE"))
+
+        self.assertEqual(result.status, "translated")
+        self.assertEqual(calls, {"luna": 6, "sol": 4, "deepseek": 1})
+        self.assertEqual(
+            [item.reason for item in result.attempts if item.status == "refused"],
+            ["explicit_provider_refusal"] * 10,
+        )
+
     def test_low_cost_triage_approval_skips_strong_reviewer(self) -> None:
         translator = ScriptedProvider(
             "fixture-translator",
