@@ -536,7 +536,14 @@ class WorkspaceTests(unittest.TestCase):
             256,
         )
         self.assertEqual(providers["openai-sol"]["reasoning_effort"], "low")
-        self.assertEqual(config["routing"]["translators"], ["openai-luna", "deepseek"])
+        self.assertEqual(
+            config["routing"]["translators"],
+            ["openai-luna", "openai-sol", "deepseek"],
+        )
+        self.assertEqual(
+            config["routing"]["translator_retries"],
+            {"openai-luna": 5, "openai-sol": 3},
+        )
         self.assertEqual(config["routing"]["review_triagers"], ["openai-luna"])
         self.assertEqual(config["routing"]["reviewers"], ["openai-sol", "deepseek"])
         self.assertEqual(config["routing"]["rewriters"], ["deepseek", "openai-sol"])
@@ -703,6 +710,72 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(config["execution_mode"], "codex_app_native")
         self.assertEqual([item["name"] for item in config["providers"]], ["deepseek"])
 
+    def test_known_legacy_presets_receive_pre_fallback_retry_defaults(self) -> None:
+        cases = (
+            (
+                "codex-app-deepseek",
+                ["native-luna", "deepseek"],
+                ["native-luna", "native-sol", "deepseek"],
+                {"native-luna": 5, "native-sol": 3},
+            ),
+            (
+                "openai-deepseek",
+                ["openai-luna", "deepseek"],
+                ["openai-luna", "openai-sol", "deepseek"],
+                {"openai-luna": 5, "openai-sol": 3},
+            ),
+        )
+        for preset, legacy, expected, retries in cases:
+            with self.subTest(preset=preset), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                sdk = root / "sdk"
+                work = root / "work"
+                sdk.mkdir()
+                initialize_workspace(
+                    work,
+                    sdk,
+                    git_choice="disabled",
+                    provider_preset=preset,
+                )
+                config_path = work / "game-l10n.json"
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                config["routing"]["translators"] = legacy
+                config["routing"].pop("translator_retries")
+                config_path.write_text(
+                    json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+
+                loaded = load_config(work)
+
+            self.assertEqual(loaded["routing"]["translators"], expected)
+            self.assertEqual(loaded["routing"]["translator_retries"], retries)
+
+    def test_custom_provider_routing_is_not_rewritten_with_retry_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            initialize_workspace(
+                work,
+                sdk,
+                git_choice="disabled",
+                provider_preset="custom",
+            )
+            config_path = work / "game-l10n.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["routing"].pop("translator_retries")
+            config_path.write_text(
+                json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            loaded = load_config(work)
+
+        self.assertEqual(loaded["routing"]["translators"], ["translator-primary"])
+        self.assertNotIn("translator_retries", loaded["routing"])
+
     def test_codex_app_preset_locks_native_workers_and_scopes_key_to_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ,
@@ -742,7 +815,14 @@ class WorkspaceTests(unittest.TestCase):
             {"translation_fallback", "selective_rewrite", "judge_fallback"},
         )
         self.assertEqual(config["routing"]["context_analyzers"], ["native-sol"])
-        self.assertEqual(config["routing"]["translators"], ["native-luna", "deepseek"])
+        self.assertEqual(
+            config["routing"]["translators"],
+            ["native-luna", "native-sol", "deepseek"],
+        )
+        self.assertEqual(
+            config["routing"]["translator_retries"],
+            {"native-luna": 5, "native-sol": 3},
+        )
         self.assertEqual(config["routing"]["review_triagers"], ["native-luna"])
         self.assertEqual(config["routing"]["reviewers"], ["native-sol", "deepseek"])
         self.assertEqual(config["routing"]["rewriters"], ["deepseek"])

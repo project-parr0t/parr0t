@@ -51,6 +51,8 @@ Before every commit or push, enumerate the outgoing commits and changed paths ag
 - Do not create a second verifier for a property already covered by a deterministic validator.
 - Do not retranslate, re-review, recompile, or repackage unchanged inputs merely for reassurance.
 
+Configured translation retries are fresh failed-only tasks, not extra calls hidden inside one semantic worker. Their provider and ordinal are manifest-bound, successful rows are immutable, and cumulative usage carries across the Luna, Sol, and external-fallback stages. The preset's five Luna retries and three Sol retries are explicit route limits, not permission for the control plane to invent more attempts; each count is in addition to the route's first call. Existing whole-job time, token, and cost gates apply to the combined chain.
+
 ## Delegation budget
 
 Use subagents when work divides into independent, non-overlapping bulk translation or review shards, or when parallel research materially shortens a blocking discovery phase. Keep simple packaging, a single script, a small bug fix, documentation, state inspection, and deterministic validation in the current agent.

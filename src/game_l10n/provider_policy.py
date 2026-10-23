@@ -133,7 +133,7 @@ def validate_provider_policy(
         _mode_drift("strong-review categories must be unique non-empty strings")
     required_routes = {
         "context_analyzers": ["native-sol"],
-        "translators": ["native-luna", "deepseek"],
+        "translators": ["native-luna", "native-sol", "deepseek"],
         "review_triagers": ["native-luna"],
         "reviewers": ["native-sol", "deepseek"],
         "rewriters": ["deepseek"],
@@ -141,6 +141,13 @@ def validate_provider_policy(
     for role, expected in required_routes.items():
         if routing.get(role) != expected:
             _mode_drift(f"Codex App route {role!r} must remain {expected!r}")
+    if routing.get("translator_retries") != {
+        "native-luna": 5,
+        "native-sol": 3,
+    }:
+        _mode_drift(
+            "Codex App translation retries must remain native-luna=5 and native-sol=3"
+        )
     if routing.get("defer_fallbacks_until_primary_complete") is not True:
         _mode_drift("fallback cannot start before the complete native primary barrier")
     if routing.get("review_refusal_policy") != "fallback":

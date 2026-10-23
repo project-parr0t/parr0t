@@ -93,7 +93,11 @@ CONFIG_TEMPLATE: dict[str, Any] = {
     ],
     "routing": {
         "context_analyzers": ["openai-sol", "deepseek"],
-        "translators": ["openai-luna", "deepseek"],
+        "translators": ["openai-luna", "openai-sol", "deepseek"],
+        "translator_retries": {
+            "openai-luna": 5,
+            "openai-sol": 3,
+        },
         "review_triagers": ["openai-luna"],
         "reviewers": ["openai-sol", "deepseek"],
         "rewriters": ["deepseek", "openai-sol"],
@@ -1231,6 +1235,28 @@ def _apply_review_routing_defaults(config: dict[str, Any]) -> None:
     )
 
 
+def _apply_translation_retry_defaults(config: dict[str, Any]) -> None:
+    """Upgrade only the two known preset topologies; never rewrite custom routing."""
+
+    routing = config.setdefault("routing", {})
+    if not isinstance(routing, dict):
+        raise ConfigurationError("Workspace routing policy must be an object")
+    preset = str(config.get("provider_preset", ""))
+    translators = routing.get("translators")
+    if preset == CODEX_APP_PRESET:
+        if translators == ["native-luna", "deepseek"]:
+            routing["translators"] = ["native-luna", "native-sol", "deepseek"]
+        routing.setdefault(
+            "translator_retries", {"native-luna": 5, "native-sol": 3}
+        )
+    elif preset == "openai-deepseek":
+        if translators == ["openai-luna", "deepseek"]:
+            routing["translators"] = ["openai-luna", "openai-sol", "deepseek"]
+        routing.setdefault(
+            "translator_retries", {"openai-luna": 5, "openai-sol": 3}
+        )
+
+
 def initialize_workspace(
     work_dir: Path,
     sdk_root: Path,
@@ -1269,7 +1295,11 @@ def initialize_workspace(
         }
         config["routing"] = {
             "context_analyzers": ["native-sol"],
-            "translators": ["native-luna", "deepseek"],
+            "translators": ["native-luna", "native-sol", "deepseek"],
+            "translator_retries": {
+                "native-luna": 5,
+                "native-sol": 3,
+            },
             "review_triagers": ["native-luna"],
             "reviewers": ["native-sol", "deepseek"],
             "rewriters": ["deepseek"],
@@ -1317,6 +1347,7 @@ def initialize_workspace(
         config["routing"] = {
             "context_analyzers": ["translator-primary"],
             "translators": ["translator-primary"],
+            "translator_retries": {},
             "review_triagers": [],
             "reviewers": ["reviewer-primary"],
             "rewriters": ["reviewer-primary"],
@@ -1379,6 +1410,7 @@ def load_config(work_dir: Path) -> dict[str, Any]:
     config = json.loads(path.read_text(encoding="utf-8"))
     _apply_execution_defaults(config)
     _apply_review_routing_defaults(config)
+    _apply_translation_retry_defaults(config)
     lock_path = work_dir / MODE_LOCK_PATH
     mode_lock = (
         json.loads(lock_path.read_text(encoding="utf-8"))

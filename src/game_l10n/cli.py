@@ -60,6 +60,12 @@ from .formats import (
 from .filesystem_package import build_filesystem_package, validate_filesystem_package
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext
 from .native_followup import collect_native_followup, prepare_native_followup
+from .native_translation_retry import (
+    STATE_NAME as NATIVE_RETRY_STATE_NAME,
+    advance_native_translation_retries,
+    require_pre_fallback_retry_state,
+    start_native_translation_retries,
+)
 from .native_review import (collect_native_review, collect_native_rewrite,
                             collect_reviewed_candidates, process_native_review_followup)
 from .instance_release import validate_instance_release
@@ -493,6 +499,10 @@ def _orchestrator(work_dir: Path, context_pack: ContextPack) -> LocalizationOrch
     orchestrator_config = OrchestratorConfig(
         translator_chain=list(routing["translators"]),
         reviewer_chain=list(routing.get("reviewers", [])),
+        translator_retries={
+            str(name): int(attempts)
+            for name, attempts in routing.get("translator_retries", {}).items()
+        },
         review_triager_chain=list(routing.get("review_triagers", [])),
         rewriter_chain=list(routing.get("rewriters", [])),
         require_review=bool(routing.get("require_review", True)),
@@ -1193,6 +1203,23 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
     output = _path_in_workspace(work_dir, args.output)
     execution = config.get("execution", {})
     pass_kind = args.pass_kind
+    route_binding = None
+    if pass_kind == "translation" and effective_execution_mode(config) == CODEX_APP_EXECUTION_MODE:
+        plan = _native_translation_route_plan(config)
+        provider = args.native_provider or plan[0]["provider"]
+        limits = {
+            item["provider"]: 1 + item["max_retries"] for item in plan
+        }
+        attempt = args.route_attempt or 1
+        if provider not in limits or not 1 <= attempt <= limits[provider]:
+            raise ConfigurationError(
+                "Native translation provider/attempt is outside the configured route plan"
+            )
+        route_binding = {"provider": provider, "attempt": attempt}
+    elif args.native_provider is not None or args.route_attempt is not None:
+        raise ConfigurationError(
+            "Native provider and route attempt apply only to Codex App translation passes"
+        )
     stored_records = execution.get("native_shard_records")
     stored_material = execution.get("native_shard_material_tokens")
     legacy_default = int(execution.get("native_shard_policy_version", 1)) < 2 and (
@@ -1315,6 +1342,7 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
         max_root_model_calls_per_turn=max_root_model_calls_per_turn,
         max_root_input_tokens_per_turn=max_root_input_tokens_per_turn,
         control_turn_budget_user_approved=control_turn_budget_user_approved,
+        route_binding=route_binding,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -1349,6 +1377,18 @@ def cmd_prepare_native_followup(args: argparse.Namespace) -> int:
     primary_results = _path_in_workspace(
         work_dir, args.primary_results, must_exist=True
     )
+    if effective_execution_mode(config) == CODEX_APP_EXECUTION_MODE:
+        if not args.retry_state:
+            raise ConfigurationError(
+                "E_NATIVE_PRE_FALLBACK_RETRY_REQUIRED: complete the configured Luna "
+                "and Sol translation attempts before DeepSeek"
+            )
+        require_pre_fallback_retry_state(
+            work_dir,
+            _path_in_workspace(work_dir, args.retry_state, must_exist=True),
+            source,
+            primary_results,
+        )
     result = prepare_native_followup(
         work_dir,
         source,
@@ -1356,6 +1396,61 @@ def cmd_prepare_native_followup(args: argparse.Namespace) -> int:
         primary_results,
         _path_in_workspace(work_dir, args.output),
         exchange_prefix=args.exchange_prefix,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def _native_translation_route_plan(config: dict[str, Any]) -> list[dict[str, Any]]:
+    routing = config.get("routing", {})
+    retries = routing.get("translator_retries", {})
+    routes = [
+        route
+        for route in routing.get("translators", [])
+        if isinstance(route, str) and route.startswith("native-")
+    ]
+    return [
+        {"provider": route, "max_retries": int(retries.get(route, 0))}
+        for route in routes
+    ]
+
+
+def cmd_start_native_translation_retries(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
+    if effective_execution_mode(config) != CODEX_APP_EXECUTION_MODE:
+        raise ConfigurationError(
+            "E_PROVIDER_MODE_DRIFT: native translation retries require Codex App mode"
+        )
+    source = _path_in_workspace(work_dir, args.input, must_exist=True)
+    result = start_native_translation_retries(
+        work_dir,
+        source,
+        read_segments(source),
+        _path_in_workspace(work_dir, args.results, must_exist=True),
+        _path_in_workspace(work_dir, args.output),
+        route_plan=_native_translation_route_plan(config),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_advance_native_translation_retries(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
+    if effective_execution_mode(config) != CODEX_APP_EXECUTION_MODE:
+        raise ConfigurationError(
+            "E_PROVIDER_MODE_DRIFT: native translation retries require Codex App mode"
+        )
+    state = _path_in_workspace(work_dir, args.state, must_exist=True)
+    if state.name != NATIVE_RETRY_STATE_NAME:
+        raise ConfigurationError("Native retry state path is not canonical")
+    result = advance_native_translation_retries(
+        work_dir,
+        state.parent,
+        _path_in_workspace(work_dir, args.results, must_exist=True),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -1521,6 +1616,7 @@ def _codex_app_fallback_orchestrator(work_dir: Path) -> LocalizationOrchestrator
         config=OrchestratorConfig(
             translator_chain=["deepseek"],
             reviewer_chain=[],
+            translator_retries={},
             require_review=False,
             max_workers=int(routing.get("max_workers", 1)),
             max_length_ratio=float(routing.get("max_length_ratio", 4.0)),
@@ -2427,6 +2523,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="translation",
         help="Use review to enable 2048-record batches and bounded failed-subset splitting",
     )
+    native_prepare.add_argument(
+        "--native-provider",
+        choices=["native-luna", "native-sol"],
+        help="Bind a Codex App translation pass to the reported native route",
+    )
+    native_prepare.add_argument(
+        "--route-attempt",
+        type=int,
+        help="Bind a Codex App translation pass to its configured attempt ordinal",
+    )
     native_prepare.add_argument("--max-records", type=int)
     native_prepare.add_argument(
         "--min-records",
@@ -2633,7 +2739,33 @@ def build_parser() -> argparse.ArgumentParser:
     native_followup.add_argument(
         "--exchange-prefix", required=True, help="Stable safe prefix for fallback bundles"
     )
+    native_followup.add_argument(
+        "--retry-state",
+        help=(
+            "Canonical completed native retry state; required by the Codex App preset "
+            "before external fallback"
+        ),
+    )
     native_followup.set_defaults(func=cmd_prepare_native_followup)
+
+    native_retry_start = sub.add_parser(
+        "start-native-translation-retries",
+        help="Lock primary successes and begin configured failed-only native retries",
+    )
+    native_retry_start.add_argument("--workspace", required=True)
+    native_retry_start.add_argument("--input", required=True)
+    native_retry_start.add_argument("--results", required=True)
+    native_retry_start.add_argument("--output", required=True)
+    native_retry_start.set_defaults(func=cmd_start_native_translation_retries)
+
+    native_retry_advance = sub.add_parser(
+        "advance-native-translation-retries",
+        help="Import one bound native retry result and advance only its failed targets",
+    )
+    native_retry_advance.add_argument("--workspace", required=True)
+    native_retry_advance.add_argument("--state", required=True)
+    native_retry_advance.add_argument("--results", required=True)
+    native_retry_advance.set_defaults(func=cmd_advance_native_translation_retries)
 
     native_followup_collect = sub.add_parser(
         "collect-native-followup",
