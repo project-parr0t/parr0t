@@ -1460,9 +1460,11 @@ def _complete_ended_task_result(
             or [expected_positions[target_id] for target_id in partial_ids]
             != sorted(expected_positions[target_id] for target_id in partial_ids)
         ):
-            raise ValueError(
-                "E_NATIVE_RELAY_INVALID: ended task result is not an ordered subset"
-            )
+            # An ended worker's invalid ID binding must not block its peers.
+            # Keep the original bytes as evidence and route the whole task as
+            # an operational failure; none of its candidates are safe to keep.
+            malformed = True
+            partial_rows = []
         if malformed:
             digest = hashlib.sha256(original).hexdigest()
             archive = result.with_name(f"{result.name}.ended-original-{digest}")
