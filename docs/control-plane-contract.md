@@ -66,6 +66,12 @@ The boundary begins before preliminary discovery. The top-level agent may confir
 
 The relay starts exactly one non-delegating worker from the bound private task, never opens the task payload, and returns only the core-generated `parr0t.data-plane-receipt.v1` path. The task fixes source roots, SDK binding, output artifact, output envelope, counterpart-read prohibition, attempt number, and role/stage. Sealing rejects a changed task, wrong role/stage, missing bound artifact, invalid inventory schema, discovery success without recorded SDK selection, reconciliation that did not run a newer core verification, or a context pack that fails deterministic domain/evidence coverage. On context success the core—not the worker or parent—writes the bound context-state attestation.
 
+## Control-plane observation boundary
+
+The top-level agent may observe only core CLI metadata, a validated control-envelope path, a sealed relay-receipt path, and the categorical lifecycle of its direct relay. It may perform one bounded wait on that relay and then return to the core state machine. It must not inspect `.codex/sessions`, chat transcripts, agent trees, nested-worker status or output, semantic-worker logs, terminal previews of semantic work, or another session to reconstruct progress. It must not query a nested worker even when the worker is visible to the host.
+
+Usage accounting comes only from the core-owned usage ledger or a sealed relay receipt populated at the event boundary. Missing telemetry is unknown, not permission to scrape host/session logs. The relay may observe only bound task lifecycle categories needed to seal an ended task and must never forward child output. Any forbidden detail that reaches root is a control-plane leak: do not interpret it; record the fixed incident and rotate.
+
 A non-success receipt cannot be hidden by an empty or partial artifact at the expected path. Status routes that role back to a fresh bound attempt. Inventory workers use the parent-safe `sdk_identity_mismatch` code when selected and observed engine identities conflict; status then routes to the private source probe/SDK selection step instead of inviting the parent to diagnose engine files.
 
 Every new workspace starts with `parr0t.control-plane-entry.v1` in `pending`. Existing workspaces without this marker are also treated as pending. `game-l10n status` then returns only `establish_text_free_control_plane` and the contracts that must be read. If the parent has not inspected or received game content, it establishes the gate with:

@@ -10,6 +10,29 @@ CODEX_APP_EXECUTION_MODE = "codex_app_native"
 MODE_LOCK_VERSION = 1
 MODE_LOCK_PATH = ".game-l10n/provider-mode.json"
 
+CONTROL_OBSERVATION_POLICY = {
+    "observation_policy_schema": "parr0t.control-observation-policy.v1",
+    "root_observation_sources": [
+        "core_cli_metadata",
+        "sealed_relay_receipt",
+        "validated_control_envelope",
+    ],
+    "root_forbidden_observation_sources": [
+        "agent_tree",
+        "chat_transcript",
+        "codex_session_log",
+        "nested_worker_output",
+        "nested_worker_status",
+        "semantic_worker_log",
+    ],
+    "direct_relay_wait_only": True,
+    "usage_telemetry_sources": [
+        "core_usage_ledger",
+        "sealed_relay_receipt",
+    ],
+    "forbidden_observation_action": "record_leak_and_rotate",
+}
+
 CODEX_APP_EXTERNAL_ROLES = {
     "translation_fallback",
     "selective_rewrite",
@@ -76,6 +99,13 @@ def validate_provider_policy(
             _mode_drift("provider_policy.selected_preset does not match provider_preset")
         if policy.get("key_presence_selects_mode") is not False:
             _mode_drift("API-key presence must never select or change execution mode")
+
+    control_plane = config.get("control_plane")
+    if not isinstance(control_plane, dict):
+        _mode_drift("control_plane must be an object")
+    for key, expected in CONTROL_OBSERVATION_POLICY.items():
+        if control_plane.get(key) != expected:
+            _mode_drift(f"control-plane observation policy {key!r} is immutable")
 
     if require_mode_lock and mode_lock is None:
         _mode_drift("the workspace provider-mode lock is missing")

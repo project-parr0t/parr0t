@@ -616,6 +616,38 @@ class WorkspaceTests(unittest.TestCase):
         self.assertTrue(config["control_plane"]["metadata_only_for_all_data_plane_stages"])
         self.assertTrue(config["control_plane"]["reject_free_form_worker_returns"])
         self.assertTrue(config["control_plane"]["rotate_after_leak"])
+        self.assertEqual(
+            config["control_plane"]["observation_policy_schema"],
+            "parr0t.control-observation-policy.v1",
+        )
+        self.assertEqual(
+            config["control_plane"]["root_observation_sources"],
+            [
+                "core_cli_metadata",
+                "sealed_relay_receipt",
+                "validated_control_envelope",
+            ],
+        )
+        self.assertEqual(
+            config["control_plane"]["root_forbidden_observation_sources"],
+            [
+                "agent_tree",
+                "chat_transcript",
+                "codex_session_log",
+                "nested_worker_output",
+                "nested_worker_status",
+                "semantic_worker_log",
+            ],
+        )
+        self.assertTrue(config["control_plane"]["direct_relay_wait_only"])
+        self.assertEqual(
+            config["control_plane"]["usage_telemetry_sources"],
+            ["core_usage_ledger", "sealed_relay_receipt"],
+        )
+        self.assertEqual(
+            config["control_plane"]["forbidden_observation_action"],
+            "record_leak_and_rotate",
+        )
         self.assertEqual(control_state["status"], "ready")
         self.assertEqual(control_state["generation"], 1)
         self.assertEqual(entry_state["status"], "pending")
@@ -844,6 +876,26 @@ class WorkspaceTests(unittest.TestCase):
             config["provider_preset"] = "custom"
             config["execution_mode"] = "custom_provider"
             config["provider_policy"]["selected_preset"] = "custom"
+            config_path.write_text(
+                json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ConfigurationError, "E_PROVIDER_MODE_DRIFT"):
+                load_config(work)
+
+    def test_control_plane_observation_policy_rejects_transcript_access(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            initialize_workspace(work, sdk, git_choice="disabled")
+            config_path = work / "game-l10n.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["control_plane"]["root_forbidden_observation_sources"].remove(
+                "codex_session_log"
+            )
             config_path.write_text(
                 json.dumps(config, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",

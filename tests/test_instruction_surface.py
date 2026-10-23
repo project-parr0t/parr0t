@@ -78,6 +78,26 @@ class InstructionSurfaceTests(unittest.TestCase):
         self.assertLess(agents.count("docs/instance-release.md"), 3)
         self.assertLess(agents.count("docs/runtime-approval.md"), 3)
 
+    def test_control_plane_cannot_scrape_host_or_nested_worker_state(self) -> None:
+        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        contract = (ROOT / "docs/control-plane-contract.md").read_text(
+            encoding="utf-8"
+        )
+        budget = (ROOT / "docs/execution-budget.md").read_text(encoding="utf-8")
+
+        for required in (
+            "session transcripts/logs",
+            "agent trees",
+            "nested-worker status/output",
+            "core ledgers/receipts",
+        ):
+            self.assertIn(required, agents)
+        self.assertIn("`.codex/sessions`", contract)
+        self.assertIn("one bounded wait", contract)
+        self.assertIn("must not query a nested worker", contract)
+        self.assertIn("Missing telemetry is unknown", budget)
+        self.assertIn("never reconstruct it from `.codex/sessions`", budget)
+
     def test_public_entry_prompts_keep_the_parent_out_of_game_content(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         prompts = (ROOT / "docs/prompt-examples.md").read_text(encoding="utf-8")

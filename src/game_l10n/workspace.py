@@ -22,6 +22,7 @@ from .provider_policy import (
     CODEX_APP_EXTERNAL_ROLES,
     CODEX_APP_EXECUTION_MODE,
     CODEX_APP_PRESET,
+    CONTROL_OBSERVATION_POLICY,
     MODE_LOCK_PATH,
     provider_mode_lock,
     validate_provider_policy,
@@ -201,6 +202,7 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "reject_free_form_worker_returns": True,
         "reject_ad_hoc_exchange_formats": True,
         "rotate_after_leak": True,
+        **CONTROL_OBSERVATION_POLICY,
     },
     "coverage": {
         "require_independent_inventory": True,
@@ -249,17 +251,17 @@ This private workspace contains game data and localization artifacts. Resolve th
 - This is a text-localization workspace. Do not inspect images for text, run OCR, plan image translation, or create image tooling unless the user specifically requests image translation.
 - Select and activate the exact engine/version SDK before data-plane work. A different SDK may be a bound `reference` for `derive-new`; generated pass-through tools are not an adapter.
 - Require two independent complete ordered inventories, typed context analysis, primary translation, translation fallback for failures only, complete low-cost triage, selective strong review for flags/risk/sample, flagged-only rewrite, review fallback for failures only, deterministic validation, then packing. Do not shrink scope or reorder barriers.
-- The top-level agent is a text-free control plane. It sees hashed control IDs, counts, categorical states, queue transitions, artifact paths, and deterministic codes only. Data-plane workers return a `parr0t.control-envelope.v2` path; validate it with `game-l10n validate-control-envelope`.
-- Existing-locale discovery, source inventory, gap reconciliation, and typed context analysis use only the exact core relay from `prepare-data-plane-task`; seal it with `seal-data-plane-task`. The parent never directly assigns a data worker, opens game content, calls a direct provider in native mode, or asks for an ad-hoc exception. A non-success receipt is retried or repaired through the next status action even when a partial artifact exists.
+- The top-level agent is text-free. It may observe only core CLI metadata, validated `parr0t.control-envelope.v2`/receipt paths, and direct-relay categorical lifecycle. Never inspect session transcripts/logs, agent trees, nested-worker status/output, or semantic-worker logs. Usage comes only from core ledgers/receipts. Run `game-l10n validate-control-envelope`; forbidden detail requires rotation.
+- Existing-locale discovery, inventory, gap reconciliation, and context analysis use only the relay from `prepare-data-plane-task`; seal it with `seal-data-plane-task`. The parent never assigns a data worker directly, opens game content, calls a direct native-mode provider, or requests an exception. Retry or repair non-success through the next status action even when a partial artifact exists.
 - If private text or semantic/refusal prose reaches the parent, run `game-l10n record-control-plane-leak` and stop. The contaminated agent cannot resume. A fresh control plane uses only the canonical receipt with `--fresh-session-confirmed --contracts-read --source-unopened`; prose handoffs are invalid.
 - Normalize every refusal to `fallback_required` / “폴백 처리 필요”. It is a routing event, never an exclusion, batch cancellation, or content decision. `source_preserved` requires route evidence that every configured route was attempted and exhausted.
 - Translate each target with its relevant narrative/voice, functional/UI, knowledge/prerequisite, adjacent, glossary, and immutable evidence. Preserve meaning, function, natural tone, character voice, terminology, allusions, placeholders, markup, control codes, conditions, units, and order.
 - Provider roles are fixed by the selected preset. An API key does not select or alter a mode. Fresh native workers use no parent history and return metadata only. Manual/fallback handoff uses only `parr0t.translation-exchange/v1`.
 - Send external fallback requests only through the configured provider adapter. Do not create a job-local API loop, embed a context pack inside segment metadata, or resend an unchanged successful target. The adapter enforces focused per-target input budgets; `budget_exhausted` queues that exact target without a network call or scope reduction.
-- Build and validate a new recoverable output here. Never mutate or launch the real game during automated validation. Real install, update, remove/restore, and launch each require their own explicit one-shot authorization.
+- Build and validate recoverable output here. Never mutate or launch the real game during automated validation. Real install, update, remove/restore, and launch each require their own explicit one-shot authorization.
 - Retryable failures stay in the metadata-only failure queue. Terminal source-preserved outcomes are recorded separately and are not retried as pending work; `metadata.blocking_on_failure=true` holds the entire patch.
 - Keep publication dormant and unmentioned until the user requests it. SDK promotion also requires confirmed patch success and the original exact target identity. Its separate engine-only commit must pass `game-l10n verify-sdk-promotion`; never mix a `main`-owned path into that commit.
-- Native orchestration uses one disposable isolated relay per authorized wave. Give it only the `native-pass-step` artifact; it cannot inspect payloads, plan, retry, split, route, or forward raw responses. Wait once, then step. Reload prose only when `status.contract_set.digest` or the control generation changes.
+- Native orchestration uses one disposable isolated relay per authorized wave. Give it only the `native-pass-step` artifact; it cannot inspect payloads, plan, retry, split, route, or forward raw responses. Wait once on that direct relay, then step. Reload prose only when `status.contract_set.digest` or the control generation changes.
 - V7 tasks embed bound segments; never open the full source. Review starts at 256 records/65,536 estimated tokens or less (hard ceilings: 2,048/262,144). One semantic call ends the worker; core locks successes and emits smaller failed-only manifests.
 - Use proportional checks and stop after the required layer passes. For large inventory, scan once per method and continue bounded cached gap work while the core gap score improves; incomplete inventory is not terminal. Once a semantic pass leaves no more than `execution.residual_direct_records`, use one fresh worker on one cached residual task; do not create a job-local scheduler or supplemental evidence pack. A native capacity failure enters resumable state and must not auto-restart the root turn. Aggregate once per wave, report progress only at a wave boundary or blocker, and stop only after the configured unchanged limit.
 - Only user-set turn limits recorded in the manifest apply; never infer them.
@@ -1257,6 +1259,16 @@ def _apply_translation_retry_defaults(config: dict[str, Any]) -> None:
         )
 
 
+def _apply_control_plane_defaults(config: dict[str, Any]) -> None:
+    """Migrate the fixed observation boundary without weakening explicit drift."""
+
+    control_plane = config.setdefault("control_plane", {})
+    if not isinstance(control_plane, dict):
+        raise ConfigurationError("Workspace control_plane policy must be an object")
+    for key, value in CONTROL_OBSERVATION_POLICY.items():
+        control_plane.setdefault(key, json.loads(json.dumps(value)))
+
+
 def initialize_workspace(
     work_dir: Path,
     sdk_root: Path,
@@ -1411,6 +1423,7 @@ def load_config(work_dir: Path) -> dict[str, Any]:
     _apply_execution_defaults(config)
     _apply_review_routing_defaults(config)
     _apply_translation_retry_defaults(config)
+    _apply_control_plane_defaults(config)
     lock_path = work_dir / MODE_LOCK_PATH
     mode_lock = (
         json.loads(lock_path.read_text(encoding="utf-8"))
