@@ -846,6 +846,58 @@ class NativePassTests(unittest.TestCase):
 
         self.assertEqual(imported, [])
 
+    def test_translation_route_binding_rejects_a_result_from_another_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            results.mkdir()
+            prepare_native_tasks(
+                root,
+                source,
+                [Segment("fixture-1", "SOURCE")],
+                tasks,
+                route_binding={"provider": "native-sol", "attempt": 2},
+            )
+            manifest = json.loads((tasks / "manifest.json").read_text())
+            self.assertEqual(
+                manifest["route_binding"],
+                {"provider": "native-sol", "attempt": 2},
+            )
+            self._write_rows(
+                results / "task-0001.jsonl",
+                [
+                    {
+                        "target_id": "fixture-1",
+                        "status": "success",
+                        "text": "TARGET",
+                        "provider": "native-luna",
+                    }
+                ],
+            )
+
+            with self.assertRaisesRegex(ValueError, "^E_NATIVE_WAVE_RESULT_INVALID:"):
+                import_native_wave(root, tasks / "manifest.json", results, 1)
+            self.assertFalse((root / ".game-l10n/native/shards").exists())
+
+            self._write_rows(
+                results / "task-0001.jsonl",
+                [
+                    {
+                        "target_id": "fixture-1",
+                        "status": "success",
+                        "text": "TARGET",
+                        "provider": "native-sol",
+                    }
+                ],
+            )
+            summary = import_native_wave(root, tasks / "manifest.json", results, 1)
+
+        self.assertEqual(summary["success"], 1)
+        self.assertEqual(summary["failed"], 0)
+
     def test_native_tasks_are_exclusive_and_cached(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

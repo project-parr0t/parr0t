@@ -4,6 +4,8 @@ A successful review retry counts toward semantic completion only when its approv
 
 The framework reviews by **role**, not by vendor or model name. Translation, compact judging, selective rewriting, and fallback judging may each use a different API, native App agent, command adapter, local model, or compatible endpoint.
 
+Review starts only after the translation barrier. A configured translation retry is still translation, not review: lock every successful candidate, retry only failed targets on the same route, advance only the remainder to the secondary translator, and use the external fallback only after that route's retry budget. The recommended preset is Luna first attempt plus five retries, Sol first attempt plus three retries, then DeepSeek. None of these stages authorizes the top-level control plane to read or judge text.
+
 ## Cost-aware quality flow
 
 ```text

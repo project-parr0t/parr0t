@@ -439,14 +439,26 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
         worker_contract = payload.get("worker_contract")
         detail_contract = payload.get("detail_contract")
         execution_contract = payload.get("execution_contract")
+        route_binding = payload.get("route_binding")
+        if route_binding is not None and (
+            not isinstance(route_binding, dict)
+            or set(route_binding) != {"provider", "attempt"}
+            or not isinstance(route_binding.get("provider"), str)
+            or not route_binding["provider"]
+            or not isinstance(route_binding.get("attempt"), int)
+            or isinstance(route_binding["attempt"], bool)
+            or route_binding["attempt"] < 1
+        ):
+            raise ValueError("E_DETAIL_CONTRACT_CONFLICT: route binding is invalid")
         contract_fingerprint = payload.get("contract_fingerprint")
-        expected_fingerprint = stable_hash(
-            {
-                "worker_contract": worker_contract,
-                "detail_contract": detail_contract,
-                "execution_contract": execution_contract,
-            }
-        )
+        fingerprint_payload = {
+            "worker_contract": worker_contract,
+            "detail_contract": detail_contract,
+            "execution_contract": execution_contract,
+        }
+        if route_binding is not None:
+            fingerprint_payload["route_binding"] = route_binding
+        expected_fingerprint = stable_hash(fingerprint_payload)
         if (
             worker_contract
             != _worker_contract(pass_kind, manifest_version=version)
@@ -713,11 +725,22 @@ def prepare_native_tasks(
     max_root_model_calls_per_turn: int | None = None,
     max_root_input_tokens_per_turn: int | None = None,
     control_turn_budget_user_approved: bool = False,
+    route_binding: dict[str, Any] | None = None,
     _review_split: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     require_control_plane_ready(work_dir)
     if pass_kind not in PASS_KINDS:
         raise ValueError(f"pass_kind must be one of: {', '.join(sorted(PASS_KINDS))}")
+    if route_binding is not None and (
+        pass_kind != "translation"
+        or set(route_binding) != {"provider", "attempt"}
+        or not isinstance(route_binding.get("provider"), str)
+        or not route_binding["provider"]
+        or not isinstance(route_binding.get("attempt"), int)
+        or isinstance(route_binding["attempt"], bool)
+        or route_binding["attempt"] < 1
+    ):
+        raise ValueError("route_binding is valid only for a bound translation pass")
     if max_records is None:
         max_records = (
             DEFAULT_REVIEW_MAX_RECORDS
@@ -860,6 +883,7 @@ def prepare_native_tasks(
             and manifest.get("task_max_material_tokens")
             == task_max_material_tokens
             and manifest.get("review_split") == review_split
+            and manifest.get("route_binding") == route_binding
             and manifest.get("task_payload_schema") == TASK_PAYLOAD_SCHEMA
         ):
             task_rows = manifest.get("tasks", [])
@@ -884,6 +908,11 @@ def prepare_native_tasks(
                     "worker_contract": _worker_contract(pass_kind),
                     "detail_contract": _detail_contract(pass_kind),
                     "execution_contract": expected_execution_contract,
+                    **(
+                        {"route_binding": route_binding}
+                        if route_binding is not None
+                        else {}
+                    ),
                 }
             )
             valid = (
@@ -1030,6 +1059,7 @@ def prepare_native_tasks(
             "worker_contract": worker_contract,
             "detail_contract": detail_contract,
             "execution_contract": execution_contract,
+            **({"route_binding": route_binding} if route_binding is not None else {}),
         }
     )
     manifest = {
@@ -1046,6 +1076,7 @@ def prepare_native_tasks(
         "max_workers": max_workers,
         "records": len(segments),
         "review_split": review_split,
+        "route_binding": route_binding,
         "worker_contract": worker_contract,
         "detail_contract": detail_contract,
         "execution_contract": execution_contract,
@@ -1205,6 +1236,12 @@ def _validate_manifest_rows(
         )
         for row in rows
     ]
+    route_binding = manifest.get("route_binding")
+    if route_binding is not None:
+        expected_provider = route_binding["provider"]
+        for row in validated:
+            if row["status"] != "error" and row.get("provider") != expected_provider:
+                raise ValueError("Native result provider does not match its route binding")
     if (
         manifest.get("pass_kind", "translation") == "review"
         and manifest.get("version") == LEGACY_WORKER_SPLIT_MANIFEST_VERSION
@@ -1323,6 +1360,8 @@ def import_native_wave(
 def _native_control_plan_fingerprint(manifest: dict[str, Any]) -> str:
     def bindings() -> Iterable[dict[str, Any]]:
         yield {"pass_kind": manifest.get("pass_kind", "translation")}
+        if manifest.get("route_binding") is not None:
+            yield {"route_binding": manifest["route_binding"]}
         for task in manifest["tasks"]:
             yield {
                 "file": task["file"],
@@ -1364,6 +1403,7 @@ def _write_wave_relay_dispatch(
     unsigned = {
         "schema": NATIVE_WAVE_RELAY_SCHEMA,
         "pass_kind": manifest["pass_kind"],
+        "route_binding": manifest.get("route_binding"),
         "manifest": manifest_path.resolve().relative_to(work_dir.resolve()).as_posix(),
         "manifest_contract_fingerprint": manifest["contract_fingerprint"],
         "plan_fingerprint": plan_fingerprint,
@@ -1514,6 +1554,7 @@ def seal_native_wave_relay(
     fields = {
         "schema",
         "pass_kind",
+        "route_binding",
         "manifest",
         "manifest_contract_fingerprint",
         "plan_fingerprint",
@@ -1528,6 +1569,18 @@ def seal_native_wave_relay(
     if (
         payload.get("schema") != NATIVE_WAVE_RELAY_SCHEMA
         or payload.get("pass_kind") not in PASS_KINDS
+        or (
+            payload.get("route_binding") is not None
+            and (
+                not isinstance(payload["route_binding"], dict)
+                or set(payload["route_binding"]) != {"provider", "attempt"}
+                or not isinstance(payload["route_binding"].get("provider"), str)
+                or not payload["route_binding"]["provider"]
+                or not isinstance(payload["route_binding"].get("attempt"), int)
+                or isinstance(payload["route_binding"]["attempt"], bool)
+                or payload["route_binding"]["attempt"] < 1
+            )
+        )
         or not isinstance(payload.get("wave"), int)
         or isinstance(payload.get("wave"), bool)
         or payload["wave"] < 1
@@ -1628,6 +1681,7 @@ def seal_native_wave_relay(
         "wave": payload["wave"],
         "counts": receipt_unsigned["counts"],
         "issue_codes": issue_codes,
+        "route_binding": payload.get("route_binding"),
         "ended_tasks_recorded": ended_tasks_recorded,
     }
 
@@ -2588,6 +2642,7 @@ def _native_control_step_single(
             "pending_tasks": len(manifest["tasks"]) - imported_tasks,
         },
         "issue_codes": issue_codes,
+        "route_binding": manifest.get("route_binding"),
         "relay": (
             {
                 "dispatch": relay_dispatch,
