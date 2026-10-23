@@ -300,6 +300,14 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **Resolution:** Keep every passed result, generate one v6 residual task with `prepare-native-pass`, and enter it through `native-pass-step`. Run the returned task in one fresh no-history worker and call the step once more to import and aggregate. On capacity or startup failure, preserve that exact task and return; do not create another controller or automatic continuation.
 - **Prevention:** Keep `residual_direct_records=32`, `job_local_controller_allowed=false`, `automatic_capacity_restart_allowed=false`, `max_unchanged_progress_observations=1`, and `max_control_actions_without_progress=2`. Report only at wave boundaries or blockers. Semantic quality checks and the existing two-round review limit still apply; only orchestration churn is removed.
 
+## An approved bulk pass immediately reports its elapsed budget exhausted
+
+- **Symptom:** The pilot completed, the job waited for the user's budget decision, and the first `native-pass-step` after approval returns `E_NATIVE_ELAPSED_BUDGET_EXHAUSTED` without dispatching new work.
+- **General cause:** A legacy control state measured elapsed time from pass-state creation, so the approval wait was charged to a limit that did not yet exist.
+- **Diagnosis:** Check metadata only. If the reported elapsed duration includes the interval between `E_BULK_EXECUTION_BUDGET_REQUIRED` and the manifest that first records `bulk_budget_gate.user_approved=true`, the timer binding is invalid.
+- **Resolution:** Keep the pilot checkpoint and cumulative token/cost usage, regenerate the approved manifest, and resume with a current core. State v1/v2 is migrated so a newly bound elapsed budget starts at approval; an already-approved legacy state retains its original start.
+- **Prevention:** Persist `budget_started_at_epoch` independently from pass creation, start it only when approval is first bound, and carry it through review split children without resetting it.
+
 ## A short API fallback target consumes tens of thousands of input tokens
 
 - **Symptom:** Source strings are short, but each compatible-provider request is extremely large, many targets reuse nearly identical input, or provider input usage dwarfs output by several orders of magnitude.

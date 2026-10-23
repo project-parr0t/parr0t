@@ -1692,6 +1692,15 @@ class NativePassTests(unittest.TestCase):
                 usage_event_id="pilot",
                 input_tokens=100,
             )
+            state_path = root / stopped["state"]
+            legacy_state = json.loads(state_path.read_text(encoding="utf-8"))
+            legacy_state["schema"] = "parr0t.native-control-state.v2"
+            legacy_state.pop("budget_started_at_epoch")
+            legacy_state["created_at_epoch"] -= 5 * 60 * 60
+            state_path.write_text(
+                json.dumps(legacy_state, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
             prepare_native_tasks(
                 root,
                 source,
@@ -1715,6 +1724,43 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(resumed["wave"], 2)
         self.assertEqual(resumed["counts"]["imported_waves"], 1)
         self.assertEqual(resumed["usage"]["input_tokens"], 100)
+        self.assertLess(resumed["usage"]["elapsed_minutes"], 1)
+
+    def test_v2_approved_state_preserves_existing_elapsed_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            prepare_native_tasks(
+                root,
+                source,
+                [Segment("fixture-1", "SOURCE")],
+                tasks,
+                max_elapsed_minutes=1,
+                max_input_tokens=1_000,
+                provider_cost_unmetered=True,
+                user_approved_budget=True,
+            )
+            first = native_control_step(root, tasks / "manifest.json", results)
+            state_path = root / first["state"]
+            legacy_state = json.loads(state_path.read_text(encoding="utf-8"))
+            legacy_state["schema"] = "parr0t.native-control-state.v2"
+            legacy_state.pop("budget_started_at_epoch")
+            legacy_state["created_at_epoch"] -= 2 * 60
+            state_path.write_text(
+                json.dumps(legacy_state, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            stopped = native_control_step(root, tasks / "manifest.json", results)
+
+        self.assertEqual(stopped["action"], "checkpoint_and_stop")
+        self.assertEqual(
+            stopped["issue_codes"], ["E_NATIVE_ELAPSED_BUDGET_EXHAUSTED"]
+        )
+        self.assertGreaterEqual(stopped["usage"]["elapsed_minutes"], 2)
 
     def test_native_control_step_imports_completed_wave_before_budget_stop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
