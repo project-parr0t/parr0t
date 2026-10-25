@@ -17,6 +17,11 @@ from .control_plane import (
     initial_control_plane_state,
 )
 from .errors import ConfigurationError
+from .language_policy import (
+    LANGUAGE_POLICY_PATH,
+    LANGUAGE_POLICY_SCHEMA,
+    require_target_language_policy,
+)
 from .privacy import require_external_workdir, scan_tools
 from .provider_policy import (
     CODEX_APP_EXTERNAL_ROLES,
@@ -204,6 +209,12 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "rotate_after_leak": True,
         **CONTROL_OBSERVATION_POLICY,
     },
+    "image_localization": {
+        "default_policy": "disabled",
+        "explicit_user_request_required": True,
+        "definite_player_visible_ui_binding_required": True,
+        "recursive_ocr_allowed": False,
+    },
     "coverage": {
         "require_independent_inventory": True,
         "separate_static_and_runtime_completion": True,
@@ -236,7 +247,7 @@ CONFIG_TEMPLATE: dict[str, Any] = {
 
 AGENTS_TEXT = """# AGENTS.md — Game localization workspace
 
-This private workspace contains game data and localization artifacts. Resolve the Parr0t repository from `game-l10n.json`; keep the source game root read-only and keep every generated artifact here.
+This private workspace contains game data. Resolve Parr0t from `game-l10n.json`; keep game roots read-only and generated artifacts here.
 
 ## First action
 
@@ -248,14 +259,14 @@ This private workspace contains game data and localization artifacts. Resolve th
 ## Core contract
 
 - Apply the repository `skills/request-scope-guard/SKILL.md` after every scope-changing user message and before optional or external effects. Git, provider, installation, launch, and publication permissions are separate; never infer one from access or another approval.
-- This is a text-localization workspace. Do not inspect images for text, run OCR, plan image translation, or create image tooling unless the user specifically requests image translation.
+- Do not inspect images for text or run OCR unless the user requests image translation. Then record `image-localization-policy`, read `docs/image-localization.md`, and process only definitively bound player-visible UI text; never scan all images.
 - Select and activate the exact engine/version SDK before data-plane work. A different SDK may be a bound `reference` for `derive-new`; generated pass-through tools are not an adapter.
 - Require two independent complete ordered inventories, typed context analysis, primary translation, translation fallback for failures only, complete low-cost triage, selective strong review for flags/risk/sample, flagged-only rewrite, review fallback for failures only, deterministic validation, then packing. Do not shrink scope or reorder barriers.
 - The top-level agent is text-free. It may observe only core CLI metadata, validated `parr0t.control-envelope.v2`/receipt paths, and direct-relay categorical lifecycle. Never inspect session transcripts/logs, agent trees, nested-worker status/output, or semantic-worker logs. Usage comes only from core ledgers/receipts. Run `game-l10n validate-control-envelope`; forbidden detail requires rotation.
 - Existing-locale discovery, inventory, gap reconciliation, and context analysis use only the relay from `prepare-data-plane-task`; seal it with `seal-data-plane-task`. The parent never assigns a data worker directly, opens game content, calls a direct native-mode provider, or requests an exception. Retry or repair non-success through the next status action even when a partial artifact exists.
 - If private text or semantic/refusal prose reaches the parent, run `game-l10n record-control-plane-leak` and stop. The contaminated agent cannot resume. A fresh control plane uses only the canonical receipt with `--fresh-session-confirmed --contracts-read --source-unopened`; prose handoffs are invalid.
 - Normalize every refusal to `fallback_required` / “폴백 처리 필요”. It is a routing event, never an exclusion, batch cancellation, or content decision. `source_preserved` requires route evidence that every configured route was attempted and exhausted.
-- Translate each target with its relevant narrative/voice, functional/UI, knowledge/prerequisite, adjacent, glossary, and immutable evidence. Preserve meaning, function, natural tone, character voice, terminology, allusions, placeholders, markup, control codes, conditions, units, and order.
+- Use the locked target language (default: Korean). Another language requires `target-language-policy --user-requested`. Preserve relevant context, meaning, function, natural tone, voice, terminology, allusions, placeholders, markup, control codes, conditions, units, and order.
 - Provider roles are fixed by the selected preset. An API key does not select or alter a mode. Fresh native workers use no parent history and return metadata only. Manual/fallback handoff uses only `parr0t.translation-exchange/v1`.
 - Send external fallback requests only through the configured provider adapter. Do not create a job-local API loop, embed a context pack inside segment metadata, or resend an unchanged successful target. The adapter enforces focused per-target input budgets; `budget_exhausted` queues that exact target without a network call or scope reduction.
 - Build and validate recoverable output here. Never mutate or launch the real game during automated validation. Real install, update, remove/restore, and launch each require their own explicit one-shot authorization.
@@ -272,7 +283,7 @@ This private workspace contains game data and localization artifacts. Resolve th
 - Inventory/review: `docs/coverage-gates.md` and `docs/review-pipeline.md`.
 - Control plane/native workers: `docs/control-plane-contract.md`, `docs/execution-budget.md`, and `docs/detail-contract.md`.
 - Manual/API handoff: `docs/translation-exchange.md`.
-- Existing release or game update: `docs/release-checkpoint.md`; exact approved wording fix: `docs/minimal-corrections.md`; composed UI: `docs/segment-metadata.md`.
+- Existing release or game update: `docs/release-checkpoint.md`; exact approved wording fix: `docs/minimal-corrections.md`; composed UI: `docs/segment-metadata.md`; requested UI images: `docs/image-localization.md`.
 - Runtime mutation: `docs/runtime-approval.md` only after the exact user request.
 - Windows package: `docs/installer-contract.md` plus `docs/filesystem-packaging.md` or `docs/steam-packaging.md`.
 - Steam integration: `docs/steam-faq.md` and `docs/wrapper-executable.md` only when requested.
@@ -1269,6 +1280,23 @@ def _apply_control_plane_defaults(config: dict[str, Any]) -> None:
         control_plane.setdefault(key, json.loads(json.dumps(value)))
 
 
+def _apply_image_localization_defaults(config: dict[str, Any]) -> None:
+    policy = config.setdefault("image_localization", {})
+    if not isinstance(policy, dict):
+        raise ConfigurationError("Workspace image_localization policy must be an object")
+    for key, value in CONFIG_TEMPLATE["image_localization"].items():
+        policy.setdefault(key, value)
+    if (
+        policy.get("default_policy") != "disabled"
+        or policy.get("explicit_user_request_required") is not True
+        or policy.get("definite_player_visible_ui_binding_required") is not True
+        or policy.get("recursive_ocr_allowed") is not False
+    ):
+        raise ConfigurationError(
+            "Workspace image-localization defaults cannot enable implicit image inspection or OCR"
+        )
+
+
 def initialize_workspace(
     work_dir: Path,
     sdk_root: Path,
@@ -1398,6 +1426,16 @@ def initialize_workspace(
         CONTROL_ENTRY_PATH: json.dumps(
             initial_control_plane_entry_state(), ensure_ascii=False, indent=2
         ) + "\n",
+        LANGUAGE_POLICY_PATH: json.dumps(
+            {
+                "schema": LANGUAGE_POLICY_SCHEMA,
+                "target_language": "ko",
+                "revision": 0,
+                "authorization": "default_korean",
+            },
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
         "AGENTS.md": AGENTS_TEXT,
         ".gitignore": GITIGNORE_TEXT,
         "context/glossary.json": "[]\n",
@@ -1424,6 +1462,8 @@ def load_config(work_dir: Path) -> dict[str, Any]:
     _apply_review_routing_defaults(config)
     _apply_translation_retry_defaults(config)
     _apply_control_plane_defaults(config)
+    _apply_image_localization_defaults(config)
+    require_target_language_policy(work_dir, config)
     lock_path = work_dir / MODE_LOCK_PATH
     mode_lock = (
         json.loads(lock_path.read_text(encoding="utf-8"))

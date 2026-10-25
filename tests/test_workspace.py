@@ -51,6 +51,26 @@ from game_l10n.workspace import (
 )
 
 
+def default_language_completion() -> dict:
+    return {
+        "enforced": True,
+        "binding": {
+            "source_language": "ja",
+            "target_language": "ko",
+            "policy_revision": 0,
+            "policy_digest": stable_hash(
+                {
+                    "target_language": "ko",
+                    "revision": 0,
+                    "authorization": "default_korean",
+                }
+            ),
+        },
+        "complete": True,
+        "mismatch_count": 0,
+    }
+
+
 def write_verified_inventory(work: Path) -> tuple[Path, dict]:
     rows = [{"id": "fixture-1", "source": "SOURCE"}]
     primary = work / "inputs" / "primary.json"
@@ -1263,9 +1283,10 @@ class WorkspaceTests(unittest.TestCase):
             (state_root / "completion-attestation.json").write_text(
                 json.dumps(
                     {
-                        "schema": "parr0t.completion-attestation.v2",
+                        "schema": "parr0t.completion-attestation.v3",
                         "target_completion": True,
                         "static_completion": True,
+                        "target_language": default_language_completion(),
                         "result_artifact": {
                             "path": str(bound.resolve()),
                             "sha256": hashlib.sha256(body).hexdigest(),
@@ -1299,9 +1320,10 @@ class WorkspaceTests(unittest.TestCase):
             (state_root / "completion-attestation.json").write_text(
                 json.dumps(
                     {
-                        "schema": "parr0t.completion-attestation.v2",
+                        "schema": "parr0t.completion-attestation.v3",
                         "target_completion": True,
                         "static_completion": True,
+                        "target_language": default_language_completion(),
                         "result_artifact": {
                             "path": str(result.resolve()),
                             "sha256": hashlib.sha256(result_body).hexdigest(),
@@ -1796,7 +1818,7 @@ class WorkspaceTests(unittest.TestCase):
             (state_root / "completion-attestation.json").write_text(
                 json.dumps(
                     {
-                        "schema": "parr0t.completion-attestation.v2",
+                        "schema": "parr0t.completion-attestation.v3",
                         "source_inventory": {
                             "fingerprint": inventory_fingerprint,
                             "status": "static_verified",
@@ -1810,6 +1832,7 @@ class WorkspaceTests(unittest.TestCase):
                             "terminal_unresolved_count": 0,
                             "failed_count": 1,
                         },
+                        "target_language": default_language_completion(),
                         "accounting_complete": False,
                         "semantic_completion": False,
                         "target_completion": False,
@@ -1828,7 +1851,7 @@ class WorkspaceTests(unittest.TestCase):
             (state_root / "completion-attestation.json").write_text(
                 json.dumps(
                     {
-                        "schema": "parr0t.completion-attestation.v2",
+                        "schema": "parr0t.completion-attestation.v3",
                         "source_inventory": {
                             "fingerprint": inventory_fingerprint,
                             "status": "static_verified",
@@ -1842,6 +1865,7 @@ class WorkspaceTests(unittest.TestCase):
                             "terminal_unresolved_count": 0,
                             "failed_count": 0,
                         },
+                        "target_language": default_language_completion(),
                         "accounting_complete": True,
                         "semantic_completion": True,
                         "target_completion": True,
