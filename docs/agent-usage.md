@@ -14,7 +14,7 @@ Resolve these locations before acting:
 - game root: read-only input;
 - workspace: all private and generated data.
 
-Text translation is default; never consider OCR or image translation unless requested.
+Text-only default: images require `image-localization.md` policy; target language stays Korean unless the user explicitly changes it through `target-language-policy`.
 
 For a new job:
 
@@ -71,6 +71,7 @@ Use the routing table in repository `AGENTS.md`. Common short paths are:
 - dialogue/reference flag without a stable ID: use `minimal-corrections.md` and its local correction UI once; accept its frozen export and never repeat a global inventory, text, or vector search;
 - prior release, game update, or selective continuation: `release-checkpoint.md`;
 - composed UI slots: `segment-metadata.md`;
+- explicitly requested UI-image translation: `image-localization.md`;
 - real runtime action: `runtime-approval.md` only after the matching explicit request;
 - Windows delivery: `installer-contract.md` plus the selected Steam or filesystem packaging contract;
 - publication: `instance-release.md` only after the user commands publication;
@@ -99,7 +100,7 @@ game-l10n seal-data-plane-task --workspace <external-workspace> --relay <relay-p
 game-l10n native-pass-step --workspace <external-workspace> --manifest <private-manifest> --results-dir <private-wave-results>
 ```
 
-These are agent boundaries. A non-success data-plane receipt remains executable work: run status again and dispatch its reported retry or SDK-identity repair. Never verify a failed worker's placeholder artifact merely because the file exists. Portable inventory requires an authenticated connector or immutable commit archive; never invent branch or commit. Configure OpenCodex proxies separately and keep their credentials outside this repository.
+These are agent boundaries. A non-success receipt remains executable work: run status and dispatch its reported retry or SDK-identity repair. Never verify a failed worker's placeholder artifact because it exists. Portable inventory requires an authenticated connector or immutable commit archive; never invent branch or commit. Keep proxy credentials outside this repository.
 
 ## Completion
 

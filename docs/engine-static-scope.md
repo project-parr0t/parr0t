@@ -28,7 +28,7 @@ Candidate count equals included plus proven-unused. Conservative targets are inc
 1. Start from format-defined runtime entry points and active registries, not recursive filename discovery alone.
 2. Follow fixed control-flow and resource references. Keep every conditional branch unless the format itself proves it impossible.
 3. Treat computed IDs, variables, reflection, eval, plugin calls, script dataflow, missing resources, and unsupported commands as conservative retention for the affected category.
-4. Do not launch the game, run scripts, inspect images, or use OCR. Runtime observation remains separately user-authorized.
+4. Do not launch the game or run scripts. Static text scope never inspects images or uses OCR. Only a separately user-requested image task may follow `docs/image-localization.md`; it cannot satisfy static text coverage or runtime observation.
 5. Preserve source order and stable target IDs for included targets. Store the excluded-ID ledger only in the private workspace.
 6. Raw-equal strings remain separate occurrences. An SDK may fan out one translation only when it emits an explicit canonical display binding and proves identical semantic context, UI slot contract, validation constraints, and source payload.
 

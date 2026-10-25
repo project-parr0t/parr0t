@@ -84,7 +84,11 @@ An SDK marks a target `metadata.blocking_on_failure=true` when leaving that targ
 
 ## Result-to-patch binding
 
-Finalization writes the result artifact first, records its absolute workspace path, SHA-256 digest, and byte length in the completion attestation, and never rewrites it after attestation. Packing accepts only that exact bound artifact. The pack cache also binds the completion-attestation digest, input digest, tool fingerprint, and output digest. A changed result, completion record, tool, or patch invalidates `local_patch_ready` and requires only the affected stage to run again.
+Finalization writes the result artifact first, records its absolute workspace path, SHA-256 digest, byte length, and current target-language policy binding in the completion attestation, and never rewrites it after attestation. Wrong-language accepted output blocks completion. Packing accepts only that exact bound artifact under the unchanged language policy. The pack cache also binds the completion-attestation digest, input digest, tool fingerprint, and output digest. A changed result, language policy, completion record, tool, or patch invalidates `local_patch_ready` and requires only the affected stage to run again.
+
+The selected SDK must also account for each translated target at the application boundary. A target is either a direct display-safe replacement or an evidenced display projection that preserves any shared lookup, index, condition, animation, or script value. Unmapped display bindings and translated control values are blocking application defects even when inventory alignment and semantic review are complete. Compare original/patched functional groups and the actual package replacement set; file count or a successful pack command is not application evidence.
+
+When the user explicitly requests image translation, the separate gates in `docs/image-localization.md` run before packing. Text completion does not authorize OCR, and an image result cannot satisfy or weaken text inventory/review coverage.
 
 ## Runtime observations
 
