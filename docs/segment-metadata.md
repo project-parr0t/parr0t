@@ -12,6 +12,12 @@ All fields are optional and belong in `Segment.metadata`. Emit them only from st
 - `ui_render_pattern`: a structural description such as `{label}: {value}`. Keep private strings out of it.
 - `ui_fixed_target_prefix` and `ui_fixed_target_suffix`: immutable target-locale text rendered outside this slot. These allow deterministic duplicate-affix checks.
 - `ui_max_chars`: a nonnegative hard character limit only when the engine or resource format supplies one. Pixel width and dynamic layout remain SDK-specific validation.
+- `storage_role`: `display_only`, `shared_control_value`, `lookup_key`, `index`, or `script_operand`, from engine/call-site evidence.
+- `display_projection_required`: `true` when the stored source value also controls lookup, indexing, branching, animation, or another non-display behavior and therefore must not be replaced in storage.
+- `display_binding_id`: the stable render-boundary binding where a translated display value may be projected without changing the stored control value.
+- `functional_group_ids`: stable IDs whose selection, description, index, state, animation, or return value must remain aligned with this target.
+- `target_language_exception`: only `proper_name`, `immutable_identifier`, `acronym`, `control_token`, or `required_foreign_text`, when the displayed value must intentionally remain outside the target script.
+- `target_language_exception_evidence_sha256`: SHA-256 of SDK/call-site evidence supporting that exact exception. Without both fields, foreign-language prose remains a blocking target-language defect.
 
 Example with synthetic values:
 
@@ -72,6 +78,9 @@ reviewed, source-preserved, complete, or releasable.
 3. Keep labels and values as separate targets when the runtime does; do not merge them merely to make translation easier.
 4. Do not add fixed target affixes until their target-locale form is known and stable. Without explicit affixes, semantic review still checks the render pattern but deterministic duplicate detection cannot claim certainty.
 5. Treat `ui_state_semantics` as meaning evidence, not as target text. The target wording still follows locale, style, glossary, and space constraints.
+6. Never apply a translated candidate over `shared_control_value`, `lookup_key`, `index`, or `script_operand` storage. Require an evidenced `display_binding_id` and preserve the source storage value byte-for-byte.
+7. Before packing, an engine SDK must account for every translated target as a direct display-safe replacement or an evidenced display projection. Inventory coverage alone does not prove application coverage.
+8. Validate each `functional_group_ids` relationship against the original and patched structures. A translated label may not shift an item-description index, selection result, state producer/consumer, animation reference, or exception/return behavior.
 
 ## Strong-review selection fields
 
