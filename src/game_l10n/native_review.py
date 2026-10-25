@@ -22,6 +22,7 @@ from .native_pass import _load_task_manifest, _require_candidate_bindings, merge
 from .orchestrator import LocalizationOrchestrator
 from .review_selection import (
     DEFAULT_STRONG_REVIEW_CATEGORIES, review_category, strong_review_selection_reasons,
+    target_language_review_reasons,
 )
 from .store import stable_hash
 from .validators import validate_integrity
@@ -32,7 +33,7 @@ REVIEW_STATE_KEY = "_parr0t_review_state"
 def collect_reviewed_candidates(
     work_dir: Path, source: Path, result_paths: list[Path], destination: Path,
     *, glossary: list[Any] | None = None, extra_patterns: list[str] | None = None,
-    max_length_ratio: float = 4.0,
+    max_length_ratio: float = 4.0, target_language: str = "",
 ) -> dict[str, Any]:
     """Join disjoint approved results in the original order, without reviewing again."""
     require_control_plane_ready(work_dir)
@@ -62,6 +63,9 @@ def collect_reviewed_candidates(
                     result.source != source_segment.source or result.status != "reviewed" or
                     result.acceptance_authority != "reviewer" or not approved or
                     result.candidate_digest != stable_hash(result.text) or
+                    target_language_review_reasons(
+                        result.text, target_language, source_segment.metadata
+                    ) or
                     validate_integrity(source_segment, result.text, glossary or [],
                         extra_patterns=extra_patterns, max_length_ratio=max_length_ratio)):
                 raise ValueError("E_NATIVE_REVIEW_ACCEPTED_RESULT_INVALID")
@@ -83,6 +87,7 @@ def materialize_delivery_candidates(
     translation_failures: Path, output: Path, *, include_unreviewed: bool = False,
     report: Path | None = None, glossary: list[Any] | None = None,
     extra_patterns: list[str] | None = None, max_length_ratio: float = 4.0,
+    target_language: str = "",
 ) -> dict[str, Any]:
     """Copy explicitly requested candidates for delivery without approving them.
 
@@ -158,10 +163,17 @@ def materialize_delivery_candidates(
             extra_patterns=extra_patterns,
             max_length_ratio=max_length_ratio,
         )
-        if not issues:
+        language_issues = target_language_review_reasons(
+            result.text, target_language, segment.metadata
+        )
+        if not issues and not language_issues:
             safe_results[segment.id] = result
             continue
-        codes = list(dict.fromkeys(issue.code for issue in issues))
+        codes = list(
+            dict.fromkeys(
+                [issue.code for issue in issues] + language_issues
+            )
+        )
         integrity_rejections.append({"target_id": segment.id, "issue_codes": codes})
         for code in codes:
             issue_counts[code] = issue_counts.get(code, 0) + 1
@@ -249,6 +261,7 @@ def _pending_segment(segment: Segment, result: TranslationResult) -> Segment:
         "errors": result.errors,
         "metadata": {key: result.metadata[key] for key in (
             "review_tier", "review_category", "strong_review_reasons", "rewrite_issues",
+            "target_language_risk",
         ) if key in result.metadata},
     }
     return replace(segment, metadata={**segment.metadata, REVIEW_STATE_KEY: state})
@@ -258,6 +271,7 @@ def collect_native_review(
     work_dir: Path, source: Path, manifest_path: Path, output: Path, *, tier: str,
     sample_percent: float = 5.0,
     high_risk_categories: list[str] | tuple[str, ...] = DEFAULT_STRONG_REVIEW_CATEGORIES,
+    target_language: str = "",
     glossary: list[Any] | None = None, extra_patterns: list[str] | None = None,
     max_length_ratio: float = 4.0,
 ) -> dict[str, Any]:
@@ -326,6 +340,12 @@ def collect_native_review(
             reasons = strong_review_selection_reasons(
                 segment, sample_percent=sample_percent, high_risk_categories=high_risk_categories,
             )
+            language_reasons = target_language_review_reasons(
+                result.text, target_language, segment.metadata
+            )
+            if language_reasons:
+                result.metadata["target_language_risk"] = language_reasons
+                reasons.extend(language_reasons)
             if verdict is None or verdict.verdict in {ReviewVerdict.ERROR, ReviewVerdict.REFUSED}:
                 reasons.insert(0, "triage_unresolved")
             elif verdict.verdict is ReviewVerdict.REWRITE:
@@ -341,7 +361,17 @@ def collect_native_review(
             result.metadata["review_tier"] = "strong_pending"
             fallback.append(_pending_segment(segment, result))
             continue
-        elif verdict.verdict is ReviewVerdict.REWRITE or integrity:
+        language_reasons = target_language_review_reasons(
+            result.text, target_language, segment.metadata
+        )
+        if language_reasons:
+            result.metadata["target_language_risk"] = language_reasons
+        if tier == "strong" and language_reasons:
+            result.metadata["review_tier"] = "strong_pending"
+            result.metadata["rewrite_issues"] = ["fluency"]
+            rewrite.append(_pending_segment(segment, result))
+            continue
+        if verdict.verdict is ReviewVerdict.REWRITE or integrity:
             result.metadata["review_tier"] = "strong_pending"
             deterministic_issues = (["terminology"] if any(
                 item.code == "glossary-missing" for item in integrity) else ["formatting"])
