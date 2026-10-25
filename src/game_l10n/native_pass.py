@@ -14,6 +14,7 @@ from .control_plane import (
     require_control_plane_ready,
     review_control_contract,
 )
+from .language_policy import DEFAULT_TARGET_LANGUAGE, language_policy_digest
 from .models import Segment
 from .native_followup import CANDIDATE_METADATA_KEY
 from .store import stable_hash, stable_hash_sequence
@@ -53,7 +54,52 @@ NATIVE_WAVE_RELAY_SCHEMA = "parr0t.native-wave-relay.v1"
 NATIVE_WAVE_RELAY_RECEIPT_SCHEMA = "parr0t.native-wave-relay-receipt.v1"
 NATIVE_REVIEW_SPLIT_CHAIN_SCHEMA = "parr0t.native-review-split-chain.v1"
 USAGE_EVENT = re.compile(r"^[a-zA-Z0-9._-]{1,128}$")
-RESULT_VALIDATION_REVISION = 2
+RESULT_VALIDATION_REVISION = 3
+LANGUAGE_TAG = re.compile(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*")
+
+
+def _normalized_language_binding(binding: dict[str, Any] | None) -> dict[str, Any]:
+    if binding is None:
+        default_policy = {
+            "target_language": DEFAULT_TARGET_LANGUAGE,
+            "revision": 0,
+            "authorization": "default_korean",
+        }
+        return {
+            "source_language": "und",
+            "target_language": DEFAULT_TARGET_LANGUAGE,
+            "policy_revision": 0,
+            "policy_digest": language_policy_digest(default_policy),
+        }
+    required = {
+        "source_language",
+        "target_language",
+        "policy_revision",
+        "policy_digest",
+    }
+    if not isinstance(binding, dict) or set(binding) != required:
+        raise ValueError("E_TARGET_LANGUAGE_BINDING_INVALID")
+    source = str(binding.get("source_language", "")).strip().casefold().replace("_", "-")
+    target = str(binding.get("target_language", "")).strip().casefold().replace("_", "-")
+    revision = binding.get("policy_revision")
+    digest = binding.get("policy_digest")
+    if (
+        not LANGUAGE_TAG.fullmatch(source)
+        or not LANGUAGE_TAG.fullmatch(target)
+        or not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 0
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ValueError("E_TARGET_LANGUAGE_BINDING_INVALID")
+    return {
+        "source_language": source,
+        "target_language": target,
+        "policy_revision": revision,
+        "policy_digest": digest,
+    }
 
 
 def _failure_split_contract(
@@ -116,6 +162,8 @@ def _worker_contract(
         "max_prompt_artifacts_per_task": 1,
         "task_payload_schema": TASK_PAYLOAD_SCHEMA,
         "task_payload_contains_bound_segments": True,
+        "target_language_source": "task_row.language_binding.target_language",
+        "target_language_change_allowed": False,
         "full_source_artifact_access": "validation_only",
         "single_batched_result_required": True,
         "max_parent_progress_messages": 0,
@@ -162,6 +210,7 @@ def _detail_contract(
             "manifest_budgets",
             "authorization_boundaries",
             "checkpoint_reuse",
+            "target_language_binding",
         ],
         "conflict_action": "reject_before_dispatch",
         "pass_kind": pass_kind,
@@ -440,6 +489,11 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
         detail_contract = payload.get("detail_contract")
         execution_contract = payload.get("execution_contract")
         route_binding = payload.get("route_binding")
+        language_binding = (
+            _normalized_language_binding(payload.get("language_binding"))
+            if version >= TASK_MANIFEST_VERSION
+            else None
+        )
         if route_binding is not None and (
             not isinstance(route_binding, dict)
             or set(route_binding) != {"provider", "attempt"}
@@ -458,6 +512,8 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
         }
         if route_binding is not None:
             fingerprint_payload["route_binding"] = route_binding
+        if language_binding is not None:
+            fingerprint_payload["language_binding"] = language_binding
         expected_fingerprint = stable_hash(fingerprint_payload)
         if (
             worker_contract
@@ -558,6 +614,11 @@ def _validate_manifest_task_file(
         require_payload=(
             manifest.get("version", 0) >= LEGACY_WORKER_SPLIT_MANIFEST_VERSION
         ),
+        language_binding=(
+            manifest.get("language_binding")
+            if manifest.get("version", 0) >= TASK_MANIFEST_VERSION
+            else None
+        ),
     )
     if len(target_ids) != task["records"]:
         raise ValueError("Native task record count does not match its manifest binding")
@@ -631,7 +692,12 @@ def _write_wave_receipt(
     return path
 
 
-def _task_target_ids(task_path: Path, *, require_payload: bool = False) -> list[str]:
+def _task_target_ids(
+    task_path: Path,
+    *,
+    require_payload: bool = False,
+    language_binding: dict[str, Any] | None = None,
+) -> list[str]:
     rows = _read_jsonl(task_path)
     ids: list[str] = []
     for row in rows:
@@ -655,6 +721,8 @@ def _task_target_ids(task_path: Path, *, require_payload: bool = False) -> list[
                 raise ValueError("Native task file contains an invalid segment payload") from None
             if segment.id != target_id:
                 raise ValueError("Native task segment payload does not match its target binding")
+        if language_binding is not None and row.get("language_binding") != language_binding:
+            raise ValueError("Native task target language binding is missing or changed")
         ids.append(target_id)
     if len(ids) != len(set(ids)):
         raise ValueError("Native task file contains duplicate target bindings")
@@ -726,11 +794,13 @@ def prepare_native_tasks(
     max_root_input_tokens_per_turn: int | None = None,
     control_turn_budget_user_approved: bool = False,
     route_binding: dict[str, Any] | None = None,
+    language_binding: dict[str, Any] | None = None,
     _review_split: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     require_control_plane_ready(work_dir)
     if pass_kind not in PASS_KINDS:
         raise ValueError(f"pass_kind must be one of: {', '.join(sorted(PASS_KINDS))}")
+    language_binding = _normalized_language_binding(language_binding)
     if route_binding is not None and (
         pass_kind != "translation"
         or set(route_binding) != {"provider", "attempt"}
@@ -884,6 +954,7 @@ def prepare_native_tasks(
             == task_max_material_tokens
             and manifest.get("review_split") == review_split
             and manifest.get("route_binding") == route_binding
+            and manifest.get("language_binding") == language_binding
             and manifest.get("task_payload_schema") == TASK_PAYLOAD_SCHEMA
         ):
             task_rows = manifest.get("tasks", [])
@@ -913,6 +984,7 @@ def prepare_native_tasks(
                         if route_binding is not None
                         else {}
                     ),
+                    "language_binding": language_binding,
                 }
             )
             valid = (
@@ -1007,6 +1079,7 @@ def prepare_native_tasks(
                 "target_id": segment.id,
                 "ordinal": ordinal,
                 "segment": asdict(segment),
+                "language_binding": language_binding,
             }
             for ordinal, segment, _ in batch
         ]
@@ -1060,6 +1133,7 @@ def prepare_native_tasks(
             "detail_contract": detail_contract,
             "execution_contract": execution_contract,
             **({"route_binding": route_binding} if route_binding is not None else {}),
+            "language_binding": language_binding,
         }
     )
     manifest = {
@@ -1077,6 +1151,7 @@ def prepare_native_tasks(
         "records": len(segments),
         "review_split": review_split,
         "route_binding": route_binding,
+        "language_binding": language_binding,
         "worker_contract": worker_contract,
         "detail_contract": detail_contract,
         "execution_contract": execution_contract,
@@ -2279,6 +2354,7 @@ def _prepare_review_split_child(
             .as_posix(),
             "root_source_fingerprint": split["root_source_fingerprint"],
         },
+        language_binding=current_manifest.get("language_binding"),
     )
     child_manifest_path = child_tasks / "manifest.json"
     child_manifest = _load_task_manifest(work_dir, child_manifest_path)

@@ -32,6 +32,12 @@ Run Parr0t with <provider-config>. Map providers to context analyzer, primary tr
 Do not start a new translation pass. Read Parr0t instructions, inspect the recorded workspace state at <external-workspace>, verify that <patch-path> is recoverable and does not modify <source-root>, and run the selected SDK's structure, placeholder, markup, control-code, glossary, packing, and provenance checks. Report metadata and actionable issue codes only.
 ```
 
+## Explicitly request UI-image translation
+
+```text
+In addition to the normal text patch, translate player-visible UI text embedded in images. Record my explicit request with `image-localization-policy`, then follow `docs/image-localization.md`. Start only from definite engine UI/atlas bindings or assets I identify; do not recursively OCR all images. If no image has both a definite player-visible UI binding and visually confirmed text regions, keep the image route empty and continue the text-only patch. Preserve format, dimensions, alpha, atlas/animation layout, and every pixel outside confirmed text regions, and keep unreviewed or failed images visibly separate.
+```
+
 ## Promote reusable tooling after success
 
 ```text

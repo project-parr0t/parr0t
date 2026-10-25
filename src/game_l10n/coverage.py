@@ -7,10 +7,11 @@ from typing import Any, Iterable
 
 from .errors import ConfigurationError
 from .models import Segment, TranslationResult
+from .review_selection import target_language_review_reasons
 from .store import stable_hash
 
 
-COMPLETION_SCHEMA = "parr0t.completion-attestation.v2"
+COMPLETION_SCHEMA = "parr0t.completion-attestation.v3"
 
 
 INVENTORY_SCHEMA = "parr0t.source-inventory.v1"
@@ -610,6 +611,8 @@ def completion_attestation(
     inventory: dict[str, Any],
     runtime: dict[str, Any],
     review_required: bool,
+    target_language: str = "",
+    language_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     rows = list(results)
     segment_by_id = {item.id: item for item in segments}
@@ -667,6 +670,17 @@ def completion_attestation(
     source_preserved = [item for item in rows if item.status == "source_preserved"]
     accepted_unreviewed = [item for item in rows if item.status == "accepted_unreviewed"]
     failed = [item for item in rows if item.status == "failed"]
+    target_language_mismatches = [
+        item
+        for item in rows
+        if item.status not in {"failed", "source_preserved"}
+        and target_language
+        and target_language_review_reasons(
+            item.text,
+            target_language=target_language,
+            metadata=segment_by_id.get(item.segment_id, Segment("", "")).metadata,
+        )
+    ]
     terminal_unresolved = [*source_preserved, *accepted_unreviewed]
     unresolved_ids = {item.segment_id for item in terminal_unresolved}
     failed_ids = {item.segment_id for item in failed}
@@ -698,6 +712,8 @@ def completion_attestation(
         issue_codes.append("SOURCE_PRESERVED_AFTER_ROUTE_EXHAUSTION")
     if accepted_unreviewed:
         issue_codes.append("USER_ACCEPTED_UNREVIEWED_AFTER_ROUTE_EXHAUSTION")
+    if target_language_mismatches:
+        issue_codes.append("TARGET_LANGUAGE_MISMATCH")
     issue_codes.extend(runtime.get("issue_codes", []))
     blocking_unresolved = sum(
         item.segment_id in unresolved_ids
@@ -705,7 +721,13 @@ def completion_attestation(
         for item in rows
         if item.segment_id in source_by_id
     )
-    accounting_complete = bool(alignment_complete and review_complete and not failed)
+    target_language_complete = not target_language_mismatches
+    accounting_complete = bool(
+        alignment_complete
+        and review_complete
+        and not failed
+        and target_language_complete
+    )
     target_completion = bool(
         accounting_complete and blocking_unresolved == 0
     )
@@ -741,6 +763,12 @@ def completion_attestation(
             "terminal_unresolved_count": len(terminal_unresolved),
             "blocking_unresolved_count": blocking_unresolved,
             "failed_count": len(failed),
+        },
+        "target_language": {
+            "enforced": language_binding is not None,
+            "binding": language_binding,
+            "complete": target_language_complete,
+            "mismatch_count": len(target_language_mismatches),
         },
         "runtime_coverage": runtime,
         "accounting_complete": accounting_complete,
