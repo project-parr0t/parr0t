@@ -73,12 +73,17 @@ class ProfileTests(unittest.TestCase):
 
     def test_pack_records_only_current_core_bound_results(self):
         from game_l10n.coverage import COMPLETION_SCHEMA
+        from game_l10n.store import stable_hash
         from game_l10n.tooling import cached_tool_state
         path=self.results()
         control=self.workspace/'.game-l10n'
         control.mkdir()
         sdk.write_json(control/'completion-attestation.json',dict(schema=COMPLETION_SCHEMA,
-            target_completion=True,static_completion=True,result_artifact=dict(path=str(path.resolve()),
+            target_completion=True,static_completion=True,target_language=dict(enforced=True,
+            binding=dict(source_language='ja',target_language='ko',policy_revision=0,
+            policy_digest=stable_hash(dict(target_language='ko',revision=0,
+            authorization='default_korean'))),complete=True,mismatch_count=0),
+            result_artifact=dict(path=str(path.resolve()),
             size=path.stat().st_size,sha256=sdk.digest(path.read_bytes()))))
         output=self.workspace/'payload'
         self.assertEqual(sdk.build_payload(path,output)['status'],'verified')
