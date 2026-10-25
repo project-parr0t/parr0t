@@ -41,6 +41,7 @@ from .review_selection import (
     DEFAULT_STRONG_REVIEW_SAMPLE_PERCENT,
     review_category,
     strong_review_selection_reasons,
+    target_language_review_reasons,
 )
 from .store import AuditLog, ResultStore, stable_hash
 from .validators import validate_integrity
@@ -831,12 +832,18 @@ class LocalizationOrchestrator:
             self._set_candidate(result, working)
         return ReviewEnvelope(ReviewDecision.ERROR, text=working)
 
-    def _strong_review_reasons(self, segment: Segment) -> list[str]:
-        return strong_review_selection_reasons(
+    def _strong_review_reasons(self, segment: Segment, candidate: str) -> list[str]:
+        reasons = strong_review_selection_reasons(
             segment,
             sample_percent=self.config.strong_review_sample_percent,
             high_risk_categories=self.config.strong_review_high_risk_categories,
         )
+        reasons.extend(
+            target_language_review_reasons(
+                candidate, self.project.target_language, segment.metadata
+            )
+        )
+        return list(dict.fromkeys(reasons))
 
     def _mark_triage_approved(
         self,
@@ -895,7 +902,7 @@ class LocalizationOrchestrator:
             ReviewVerdict.ERROR,
         }:
             return "unresolved"
-        reasons = self._strong_review_reasons(segment)
+        reasons = self._strong_review_reasons(segment, candidate)
         if verdict.verdict is ReviewVerdict.REWRITE:
             reasons.insert(0, "triage_flagged")
         if verdict.text and verdict.text != candidate:
@@ -930,6 +937,12 @@ class LocalizationOrchestrator:
                 ReviewDecision.REFUSED,
                 ReviewDecision.ERROR,
             }:
+                continue
+            language_risk = target_language_review_reasons(
+                candidate, self.project.target_language, segment.metadata
+            )
+            if language_risk:
+                result.metadata["target_language_risk"] = language_risk
                 continue
             result.text = candidate
             result.status = "reviewed"
@@ -968,8 +981,15 @@ class LocalizationOrchestrator:
         if not candidate:
             result.errors.append("All translation routes were exhausted")
         elif not self.config.require_review:
-            result.text = candidate
-            result.status = "translated"
+            language_risk = target_language_review_reasons(
+                candidate, self.project.target_language, segment.metadata
+            )
+            if language_risk:
+                result.metadata["target_language_risk"] = language_risk
+                result.errors.append("Candidate violates the locked target language")
+            else:
+                result.text = candidate
+                result.status = "translated"
         else:
             needs_strong_review = self._triage_requires_strong_review(
                 result, segment, candidate, anchors
@@ -980,7 +1000,7 @@ class LocalizationOrchestrator:
                 )
             if result.status != "reviewed":
                 result.errors.append("All review routes were exhausted")
-                self._accept_after_review_refusal(result, candidate)
+                self._accept_after_review_refusal(result, segment, candidate)
 
         if result.status in {"translated", "reviewed", "accepted_unreviewed"}:
             self.store.put(cache_key, result)
@@ -1066,7 +1086,7 @@ class LocalizationOrchestrator:
             return result
 
         result.errors.append("All review routes were exhausted for existing candidate")
-        if self._accept_after_review_refusal(result, candidate):
+        if self._accept_after_review_refusal(result, segment, candidate):
             return result
         return self._preserve_or_fail_existing(segment, result)
 
@@ -1106,7 +1126,7 @@ class LocalizationOrchestrator:
         ]
 
     def _accept_after_review_refusal(
-        self, result: TranslationResult, candidate: str
+        self, result: TranslationResult, segment: Segment, candidate: str
     ) -> bool:
         refused = any(
             item.stage.startswith("review")
@@ -1116,6 +1136,12 @@ class LocalizationOrchestrator:
             for item in result.attempts
         )
         if not refused or self.config.review_refusal_policy != "accept_candidate_unreviewed":
+            return False
+        language_risk = target_language_review_reasons(
+            candidate, self.project.target_language, segment.metadata
+        )
+        if language_risk:
+            result.metadata["target_language_risk"] = language_risk
             return False
         result.text = candidate
         result.status = "accepted_unreviewed"
@@ -1468,6 +1494,15 @@ class LocalizationOrchestrator:
                     reviewed_text, review_outcome = reviewed
                     self._set_candidate(result, reviewed_text)
                     candidates[index] = reviewed_text
+                    language_risk = target_language_review_reasons(
+                        reviewed_text,
+                        self.project.target_language,
+                        items[index].metadata,
+                    )
+                    if language_risk:
+                        result.metadata["target_language_risk"] = language_risk
+                        next_pending.append(index)
+                        continue
                     result.text = reviewed_text
                     result.status = "reviewed"
                     result.reviewer = reviewer_name
@@ -1513,7 +1548,9 @@ class LocalizationOrchestrator:
             accepted_unreviewed = (
                 index in failed_review
                 and index in candidates
-                and self._accept_after_review_refusal(result, candidates[index])
+                and self._accept_after_review_refusal(
+                    result, items[index], candidates[index]
+                )
             )
             if not accepted_unreviewed and (
                 self.config.preserve_source_on_failure

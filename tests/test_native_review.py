@@ -198,6 +198,18 @@ class NativeReviewTests(unittest.TestCase):
             self.assertEqual(summary["unresolved"], 1)
             with patch("game_l10n.native_review.require_inventory_attestation"):
                 self.assertEqual(collect_reviewed_candidates(*args), summary)
+            result.text = "English prose remains here"
+            result.candidate_digest = stable_hash(result.text)
+            write_results(root / "wrong-language.json", [result])
+            with patch("game_l10n.native_review.require_inventory_attestation"):
+                with self.assertRaisesRegex(ValueError, "ACCEPTED_RESULT_INVALID"):
+                    collect_reviewed_candidates(
+                        root,
+                        source,
+                        [root / "wrong-language.json"],
+                        root / "wrong-language-output.json",
+                        target_language="ko",
+                    )
             result.candidate_generation = 2
             write_results(root / "stale.json", [result])
             with patch("game_l10n.native_review.require_inventory_attestation"):
