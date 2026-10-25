@@ -57,6 +57,18 @@ from .formats import (
     read_translation_results,
     write_results,
 )
+from .image_localization import (
+    public_image_localization_state,
+    record_image_localization_policy,
+    record_image_unreviewed_acceptance,
+    verify_image_localization_results,
+    verify_image_ui_inventory,
+)
+from .language_policy import (
+    language_binding,
+    public_target_language_policy,
+    record_target_language_policy,
+)
 from .filesystem_package import build_filesystem_package, validate_filesystem_package
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext
 from .native_followup import collect_native_followup, prepare_native_followup
@@ -201,6 +213,16 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
         "docs/coverage-gates.md",
         "docs/execution-budget.md",
     ),
+    "verify_requested_ui_image_scope": (
+        "docs/image-localization.md",
+        "docs/control-plane-contract.md",
+        "skills/request-scope-guard/SKILL.md",
+    ),
+    "run_requested_ui_image_localization": (
+        "docs/image-localization.md",
+        "docs/control-plane-contract.md",
+        "docs/execution-budget.md",
+    ),
     "local_patch_ready": (),
 }
 
@@ -210,6 +232,8 @@ STATUS_DATA_PLANE_ROLES = {
     "extract_independent_source_inventory": "independent_inventory",
     "resolve_source_inventory_gaps": "inventory_reconciler",
     "analyze_complete_script_context": "context_analyzer",
+    "verify_requested_ui_image_scope": "image_ui_inventory",
+    "run_requested_ui_image_localization": "image_localizer",
 }
 
 
@@ -359,6 +383,7 @@ def _completion_state_valid(payload: dict[str, Any]) -> bool:
     result_alignment = payload.get("result_alignment")
     target_scope = payload.get("target_scope")
     semantic_review = payload.get("semantic_review")
+    target_language = payload.get("target_language")
     result_artifact = payload.get("result_artifact")
     structure_valid = bool(
         isinstance(source_inventory, dict)
@@ -377,6 +402,12 @@ def _completion_state_valid(payload: dict[str, Any]) -> bool:
         and semantic_review.get("terminal_unresolved_count", -1) >= 0
         and isinstance(semantic_review.get("failed_count"), int)
         and semantic_review.get("failed_count", -1) >= 0
+        and isinstance(target_language, dict)
+        and target_language.get("enforced") is True
+        and isinstance(target_language.get("binding"), dict)
+        and isinstance(target_language.get("complete"), bool)
+        and isinstance(target_language.get("mismatch_count"), int)
+        and target_language.get("mismatch_count", -1) >= 0
         and isinstance(payload.get("accounting_complete"), bool)
         and isinstance(payload.get("semantic_completion"), bool)
         and isinstance(payload.get("target_completion"), bool)
@@ -401,6 +432,7 @@ def _completion_state_valid(payload: dict[str, Any]) -> bool:
         result_alignment["complete"]
         and semantic_review["complete"]
         and semantic_review["failed_count"] == 0
+        and target_language["complete"]
     )
     if accounting_complete != expected_accounting:
         return False
@@ -606,6 +638,7 @@ def _finalize_translation_results(
     destination: Path,
     inventory_state: dict[str, Any],
     review_required: bool,
+    language_binding_state: dict[str, Any],
 ) -> tuple[dict[str, Any], int]:
     queue = update_failure_queue(
         work_dir,
@@ -627,6 +660,8 @@ def _finalize_translation_results(
         inventory=inventory_state,
         runtime=runtime,
         review_required=review_required,
+        target_language=language_binding_state["target_language"],
+        language_binding=language_binding_state,
     )
     completion["result_artifact"] = _result_artifact_binding(work_dir, result_artifact)
     completion_path = save_completion_attestation(work_dir, completion)
@@ -725,6 +760,67 @@ def cmd_policy(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_image_localization_policy(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    state = record_image_localization_policy(
+        work_dir,
+        requested=args.mode == "requested",
+        user_requested=bool(args.user_requested),
+        requested_scope=args.scope,
+    )
+    print(json.dumps(state, ensure_ascii=False))
+    return 0
+
+
+def cmd_target_language_policy(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    state = record_target_language_policy(
+        work_dir,
+        target_language=args.target_language,
+        user_requested=bool(args.user_requested),
+    )
+    print(json.dumps(state, ensure_ascii=False))
+    return 0
+
+
+def cmd_verify_image_ui_inventory(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
+    result = verify_image_ui_inventory(
+        work_dir,
+        _path_in_workspace(work_dir, args.inventory, must_exist=True),
+        game_roots=[Path(item) for item in config.get("game_roots", [])],
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_accept_unreviewed_images(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    result = record_image_unreviewed_acceptance(
+        work_dir,
+        asset_ids=list(args.asset_id),
+        user_requested=bool(args.user_requested),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_verify_image_localization_results(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
+    result = verify_image_localization_results(
+        work_dir,
+        _path_in_workspace(work_dir, args.inventory, must_exist=True),
+        _path_in_workspace(work_dir, args.results, must_exist=True),
+        game_roots=[Path(item) for item in config.get("game_roots", [])],
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def cmd_translate(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
@@ -761,6 +857,7 @@ def cmd_translate(args: argparse.Namespace) -> int:
         destination=destination,
         inventory_state=inventory_state,
         review_required=bool(config.get("routing", {}).get("require_review", True)),
+        language_binding_state=language_binding(work_dir, config),
     )
     summary.update(
         {
@@ -810,6 +907,7 @@ def cmd_review_existing(args: argparse.Namespace) -> int:
         destination=destination,
         inventory_state=inventory_state,
         review_required=True,
+        language_binding_state=language_binding(work_dir, config),
     )
     summary.update(
         {
@@ -875,6 +973,7 @@ def cmd_resume_failures(args: argparse.Namespace) -> int:
         destination=destination,
         inventory_state=inventory_state,
         review_required=bool(config.get("routing", {}).get("require_review", True)),
+        language_binding_state=language_binding(work_dir, config),
     )
     summary.update(
         {
@@ -1343,6 +1442,7 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
         max_root_input_tokens_per_turn=max_root_input_tokens_per_turn,
         control_turn_budget_user_approved=control_turn_budget_user_approved,
         route_binding=route_binding,
+        language_binding=language_binding(work_dir, config),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -1468,6 +1568,7 @@ def cmd_materialize_delivery_candidates(args: argparse.Namespace) -> int:
         _path_in_workspace(work_dir, args.translation_failures, must_exist=True),
         _path_in_workspace(work_dir, args.output), include_unreviewed=args.include_unreviewed,
         report=_path_in_workspace(work_dir, args.report) if args.report else None,
+        target_language=str(config.get("project", {}).get("target_language", "")),
         **_native_review_integrity_options(work_dir, config),
     )
     print(json.dumps(result, ensure_ascii=False))
@@ -1502,6 +1603,7 @@ def cmd_collect_native_review(args: argparse.Namespace) -> int:
         _path_in_workspace(work_dir, args.output), tier=args.tier,
         sample_percent=routing.get("strong_review_sample_percent", 5.0),
         high_risk_categories=routing.get("strong_review_high_risk_categories", []),
+        target_language=str(config.get("project", {}).get("target_language", "")),
         **_native_review_integrity_options(work_dir, config),
     )
     print(json.dumps(result, ensure_ascii=False))
@@ -1554,6 +1656,7 @@ def cmd_collect_reviewed_candidates(args: argparse.Namespace) -> int:
         work_dir, _path_in_workspace(work_dir, args.input, must_exist=True),
         [_path_in_workspace(work_dir, path, must_exist=True) for path in args.results],
         _path_in_workspace(work_dir, args.output),
+        target_language=str(config.get("project", {}).get("target_language", "")),
         **_native_review_integrity_options(work_dir, config),
     )
     print(json.dumps(result, ensure_ascii=False))
@@ -1742,6 +1845,8 @@ def cmd_seal_translation_exchange(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
+    target_language_policy = public_target_language_policy(work_dir, config)
+    image_localization = public_image_localization_state(work_dir)
     contract_base = config.get("sdk_root")
     control_state = control_plane_state(work_dir)
     if control_state["status"] == "rotation_required":
@@ -1988,6 +2093,13 @@ def cmd_status(args: argparse.Namespace) -> int:
                                 "COMPLETION_ATTESTATION_STRUCTURE_INVALID"
                             )
                             action = "repair_invalid_workspace_state"
+                        elif completion["target_language"].get("binding") != language_binding(
+                            work_dir, config
+                        ):
+                            state_issue_codes.append(
+                                "COMPLETION_TARGET_LANGUAGE_POLICY_STALE"
+                            )
+                            action = "rebuild_current_inventory_translation_attestation"
                         elif completion["source_inventory"].get("fingerprint") != (
                             inventory_state.get("primary_fingerprint")
                         ):
@@ -1999,15 +2111,27 @@ def cmd_status(args: argparse.Namespace) -> int:
                         elif completion.get("static_completion") is not True:
                             action = "resolve_translation_review_gaps"
                         else:
-                            local_artifact = cached_tool_state(work_dir, "pack")
-                            action = (
-                                "local_patch_ready"
-                                if local_artifact.get("status") == "valid"
-                                else "validate_and_pack_recoverable_patch"
-                            )
-                            issue_code = local_artifact.get("issue_code")
-                            if isinstance(issue_code, str):
-                                state_issue_codes.append(issue_code)
+                            image_status = image_localization.get("status")
+                            if image_status == "invalid":
+                                state_issue_codes.extend(
+                                    str(item)
+                                    for item in image_localization.get("issue_codes", [])
+                                )
+                                action = "repair_invalid_workspace_state"
+                            elif image_status == "scope_required":
+                                action = "verify_requested_ui_image_scope"
+                            elif image_status == "localization_required":
+                                action = "run_requested_ui_image_localization"
+                            else:
+                                local_artifact = cached_tool_state(work_dir, "pack")
+                                action = (
+                                    "local_patch_ready"
+                                    if local_artifact.get("status") == "valid"
+                                    else "validate_and_pack_recoverable_patch"
+                                )
+                                issue_code = local_artifact.get("issue_code")
+                                if isinstance(issue_code, str):
+                                    state_issue_codes.append(issue_code)
     action = action or "run_primary_translation_review_pipeline"
     print(
         json.dumps(
@@ -2024,6 +2148,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "sdk_activation": sdk_activation,
                 "execution": config.get("execution", {}),
                 "runtime": config.get("runtime", {"default_policy": "deny"}),
+                "target_language_policy": target_language_policy,
+                "image_localization": image_localization,
                 "control_plane": public_control_plane_state(control_state),
                 "entry_gate": public_control_plane_entry_state(entry_state),
                 "local_artifact": local_artifact,
@@ -2351,6 +2477,75 @@ def build_parser() -> argparse.ArgumentParser:
     )
     policy.add_argument("--publish-approved", choices=["yes", "no"])
     policy.set_defaults(func=cmd_policy)
+
+    image_policy = sub.add_parser(
+        "image-localization-policy",
+        help="Record an explicit user request to enable or disable the optional UI-image route",
+    )
+    image_policy.add_argument("--workspace", required=True)
+    image_policy.add_argument("--mode", choices=["requested", "disabled"], required=True)
+    image_policy.add_argument(
+        "--scope",
+        default="player_visible_ui_text_assets",
+        help="User-requested image-localization scope; ignored when disabled",
+    )
+    image_policy.add_argument(
+        "--user-requested",
+        action="store_true",
+        required=True,
+        help="Assert that the user explicitly requested this image-localization policy change",
+    )
+    image_policy.set_defaults(func=cmd_image_localization_policy)
+
+    language_policy = sub.add_parser(
+        "target-language-policy",
+        help="Change the locked target language only after an explicit user request",
+    )
+    language_policy.add_argument("--workspace", required=True)
+    language_policy.add_argument("--target-language", required=True)
+    language_policy.add_argument(
+        "--user-requested",
+        action="store_true",
+        required=True,
+        help="Assert that the user explicitly requested this exact target language",
+    )
+    language_policy.set_defaults(func=cmd_target_language_policy)
+
+    image_inventory = sub.add_parser(
+        "verify-image-ui-inventory",
+        help="Verify that every optional image target is definite player-visible UI text",
+    )
+    image_inventory.add_argument("--workspace", required=True)
+    image_inventory.add_argument("--inventory", required=True)
+    image_inventory.set_defaults(func=cmd_verify_image_ui_inventory)
+
+    image_acceptance = sub.add_parser(
+        "accept-unreviewed-images",
+        help="Record explicit user acceptance for exact unreviewed UI-image assets",
+    )
+    image_acceptance.add_argument("--workspace", required=True)
+    image_acceptance.add_argument(
+        "--asset-id",
+        action="append",
+        required=True,
+        help="Exact verified image asset ID; repeat for each accepted asset",
+    )
+    image_acceptance.add_argument(
+        "--user-requested",
+        action="store_true",
+        required=True,
+        help="Assert that the user explicitly accepted these exact unreviewed assets",
+    )
+    image_acceptance.set_defaults(func=cmd_accept_unreviewed_images)
+
+    image_results = sub.add_parser(
+        "verify-image-localization-results",
+        help="Bind localized UI images to their verified scope and integrity evidence",
+    )
+    image_results.add_argument("--workspace", required=True)
+    image_results.add_argument("--inventory", required=True)
+    image_results.add_argument("--results", required=True)
+    image_results.set_defaults(func=cmd_verify_image_localization_results)
 
     translate = sub.add_parser("translate", help="Translate and independently review segment data")
     translate.add_argument("--workspace", required=True)

@@ -16,6 +16,14 @@ from .control_plane import (
 from .coverage import require_inventory_attestation
 from .errors import ConfigurationError, ProviderError
 from .formats import read_segments
+from .image_localization import (
+    SCOPE_PATH as IMAGE_SCOPE_PATH,
+    public_image_localization_state,
+    require_image_localization_requested,
+    verify_image_localization_results,
+    verify_image_ui_inventory,
+)
+from .language_policy import language_binding
 from .models import ContextMode, ContextPack
 from .privacy import is_within
 from .store import stable_hash
@@ -49,6 +57,16 @@ DATA_PLANE_PROFILES: dict[str, dict[str, str]] = {
     "context_analyzer": {
         "stage": "context",
         "artifact": "context/context-pack.json",
+        "counterpart": "",
+    },
+    "image_ui_inventory": {
+        "stage": "image_inventory",
+        "artifact": "inputs/image-ui-inventory.json",
+        "counterpart": "",
+    },
+    "image_localizer": {
+        "stage": "image_localization",
+        "artifact": "translations/image-ui-results.json",
         "counterpart": "",
     },
 }
@@ -159,6 +177,18 @@ def prepare_data_plane_task(
         raise ConfigurationError(
             "E_DATA_PLANE_TASK_SDK_ACTIVATION: data-plane tasks require an active SDK"
         )
+    if worker_role in {"image_ui_inventory", "image_localizer"}:
+        require_image_localization_requested(work_dir)
+        image_state = public_image_localization_state(work_dir)
+        required_state = (
+            "scope_required"
+            if worker_role == "image_ui_inventory"
+            else "localization_required"
+        )
+        if image_state.get("status") != required_state:
+            raise ConfigurationError(
+                "E_IMAGE_TASK_STATE: image data-plane task is not the next required action"
+            )
 
     artifact_relative = profile["artifact"]
     if worker_role == "context_analyzer":
@@ -193,6 +223,7 @@ def prepare_data_plane_task(
         "sdk_root": str(Path(config.get("sdk_root", "")).resolve()),
         "sdk_inventory_fingerprint": selection.get("inventory_fingerprint", ""),
         "sdk_activation": sdk_activation or {},
+        "language_binding": language_binding(work_dir, config),
         "output_artifact": _relative(work_dir, artifact),
         "output_envelope": _relative(work_dir, envelope),
         "counterpart_inventory_forbidden": (
@@ -200,7 +231,11 @@ def prepare_data_plane_task(
         ),
         "requirements": [
             "source_roots_are_read_only",
-            "no_install_launch_ocr_or_publication",
+            (
+                "no_install_launch_or_publication"
+                if worker_role in {"image_ui_inventory", "image_localizer"}
+                else "no_install_launch_ocr_or_publication"
+            ),
             "write_private_artifacts_only_inside_workspace",
             "return_only_control_envelope_path_to_relay",
             "relay_returns_only_core_receipt_path_to_parent",
@@ -276,6 +311,25 @@ def prepare_data_plane_task(
                 },
             }
         )
+    if worker_role == "image_localizer":
+        scope_path = work_dir / IMAGE_SCOPE_PATH
+        if not scope_path.is_file():
+            raise ConfigurationError(
+                "E_IMAGE_SCOPE_REQUIRED: image localization requires a verified UI-image scope"
+            )
+        scope = json.loads(scope_path.read_text(encoding="utf-8"))
+        inventory_path = (work_dir / str(scope.get("inventory_path", ""))).resolve()
+        if not is_within(inventory_path, work_dir) or not inventory_path.is_file():
+            raise ConfigurationError(
+                "E_IMAGE_SCOPE_REQUIRED: verified UI-image inventory is unavailable"
+            )
+        private_payload.update(
+            {
+                "input_image_inventory": _relative(work_dir, inventory_path),
+                "input_image_inventory_sha256": _digest(inventory_path),
+                "output_image_root": "localized/image-ui",
+            }
+        )
     if worker_role in {"primary_inventory", "independent_inventory"}:
         private_payload["requirements"].extend(
             [
@@ -308,6 +362,31 @@ def prepare_data_plane_task(
                 "preserve_evidence_line_ids_for_every_required_domain",
                 "on_partial_or_operational_failure_record_resumable_private_progress",
                 "do_not_translate_review_apply_pack_install_launch_or_delegate",
+            ]
+        )
+    elif worker_role == "image_ui_inventory":
+        private_payload["requirements"].extend(
+            [
+                "user_request_is_recorded_but_does_not_prove_any_image_is_a_target",
+                "start_from_engine_ui_bindings_or_user_identified_ui_assets",
+                "do_not_recursively_ocr_all_images",
+                "use_ocr_only_on_bounded_ui_candidates_and_confirm_each_text_region_visually",
+                "include_only_player_visible_images_with_definite_ui_binding_and_text",
+                "keep_uncertain_images_out_of_scope_and_account_for_them_without_guessing",
+                "preserve_source_asset_paths_hashes_dimensions_regions_and_atlas_evidence",
+                "do_not_translate_edit_apply_pack_install_launch_or_delegate",
+            ]
+        )
+    elif worker_role == "image_localizer":
+        private_payload["requirements"].extend(
+            [
+                "read_only_assets_and_regions_bound_by_input_image_inventory",
+                "do_not_scan_or_ocr_any_unlisted_image",
+                "translate_only_confirmed_text_regions_into_project_target_language",
+                "preserve_format_dimensions_alpha_atlas_layout_and_pixels_outside_text_regions",
+                "record_independent_visual_review_or_explicit_user_acceptance_for_each_asset",
+                "write_localized_assets_only_under_output_image_root",
+                "do_not_apply_pack_install_launch_publish_or_delegate",
             ]
         )
     else:
@@ -537,6 +616,28 @@ def seal_data_plane_task(work_dir: Path, relay_path: Path) -> dict[str, Any]:
                 "E_DATA_PLANE_RESULT_INVALID: context state path left the workspace"
             )
         _atomic_json(state_path, context_state)
+    elif result["worker_role"] == "image_ui_inventory" and result["status"] == "success":
+        verify_image_ui_inventory(
+            work_dir,
+            artifact_path,
+            game_roots=[Path(item) for item in task.get("source_roots", [])],
+        )
+    elif result["worker_role"] == "image_localizer" and result["status"] == "success":
+        inventory_path = (work_dir / str(task.get("input_image_inventory", ""))).resolve()
+        if (
+            not is_within(inventory_path, work_dir)
+            or not inventory_path.is_file()
+            or _digest(inventory_path) != task.get("input_image_inventory_sha256")
+        ):
+            raise ConfigurationError(
+                "E_DATA_PLANE_RESULT_INVALID: bound image inventory changed"
+            )
+        verify_image_localization_results(
+            work_dir,
+            inventory_path,
+            artifact_path,
+            game_roots=[Path(item) for item in task.get("source_roots", [])],
+        )
     receipt = {
         "schema": DATA_PLANE_RECEIPT_SCHEMA,
         "task_id": relay["task_id"],

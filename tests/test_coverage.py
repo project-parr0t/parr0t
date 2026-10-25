@@ -21,6 +21,20 @@ from game_l10n.models import AttemptRecord, Segment, TranslationResult
 from game_l10n.store import stable_hash
 
 
+DEFAULT_LANGUAGE_BINDING = {
+    "source_language": "en",
+    "target_language": "ko",
+    "policy_revision": 0,
+    "policy_digest": stable_hash(
+        {
+            "target_language": "ko",
+            "revision": 0,
+            "authorization": "default_korean",
+        }
+    ),
+}
+
+
 def write_inventory(
     path: Path,
     method: str,
@@ -495,6 +509,46 @@ class CoverageTests(unittest.TestCase):
             loaded["terminal_entries"][0]["retryable_on_user_resume"]
         )
 
+    def test_completion_rejects_reviewed_output_in_the_wrong_language(self) -> None:
+        segment = Segment("dialogue-1", "Original source dialogue")
+        result = TranslationResult(
+            segment_id=segment.id,
+            source=segment.source,
+            text="This remains untranslated English prose.",
+            status="reviewed",
+            acceptance_authority="reviewer",
+            candidate_generation=1,
+            candidate_digest=stable_hash("This remains untranslated English prose."),
+            attempts=[
+                AttemptRecord(
+                    stage="review",
+                    provider="synthetic-reviewer",
+                    status="approved",
+                    candidate_generation=1,
+                )
+            ],
+        )
+        state = completion_attestation(
+            [segment],
+            [result],
+            inventory_segments=[segment],
+            inventory={
+                "status": "static_verified",
+                "static_complete": True,
+                "primary_segments": 1,
+                "primary_fingerprint": "fixture",
+            },
+            runtime={"runtime_complete": False, "issue_codes": []},
+            review_required=True,
+            target_language="ko",
+            language_binding=DEFAULT_LANGUAGE_BINDING,
+        )
+
+        self.assertFalse(state["target_language"]["complete"])
+        self.assertEqual(state["target_language"]["mismatch_count"], 1)
+        self.assertFalse(state["target_completion"])
+        self.assertIn("TARGET_LANGUAGE_MISMATCH", state["issue_codes"])
+
     def test_blocking_failure_emits_checkpoint_but_no_patch(self) -> None:
         segment = Segment(
             "synthetic-critical",
@@ -533,6 +587,7 @@ class CoverageTests(unittest.TestCase):
                 destination=destination,
                 inventory_state=inventory,
                 review_required=True,
+                language_binding_state=DEFAULT_LANGUAGE_BINDING,
             )
 
             self.assertFalse(destination.exists())
@@ -575,6 +630,7 @@ class CoverageTests(unittest.TestCase):
                 destination=destination,
                 inventory_state=inventory,
                 review_required=True,
+                language_binding_state=DEFAULT_LANGUAGE_BINDING,
             )
             queue = json.loads(
                 (root / ".game-l10n" / "failure-queue.json").read_text(

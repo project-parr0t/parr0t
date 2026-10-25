@@ -16,7 +16,7 @@ Use `game-l10n` as the execution boundary. Read the repository `AGENTS.md`, `doc
 
 ## Run
 
-1. Resolve three separate locations: Parr0t repository, read-only game root, and writable external workspace. Do not perform OCR or image translation unless the user requested it.
+1. Resolve three separate locations: Parr0t repository, read-only game root, and writable external workspace. Images require a user request, recorded policy, and `docs/image-localization.md`; never scan all images.
 2. If the workspace does not exist, run `game-l10n init-workspace`. Ask once whether Git is allowed for this game task and record the answer with `game-l10n policy`.
 3. Run `game-l10n status`. Before data-plane work, follow `docs/sdk-selection.md`; derive the actual engine/version identity, inspect plausible `sdk-*` contracts, select `reuse`, `extend`, `derive-new`, or `private-new`, and activate the exact executing implementation without broadening compatibility claims.
 4. Use the selected SDK to create two independent complete ordered inventories and run `game-l10n verify-inventory`. Keep all user-visible unresolved scope visible. Static alignment never proves runtime coverage.

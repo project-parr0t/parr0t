@@ -9,6 +9,7 @@ from typing import Any
 
 from .errors import ToolExecutionError
 from .coverage import COMPLETION_SCHEMA
+from .language_policy import language_policy_digest, target_language_policy
 from .store import stable_hash
 
 
@@ -66,6 +67,21 @@ def _require_pack_input_binding(work_dir: Path, input_path: Path) -> None:
         or completion.get("static_completion") is not True
     ):
         raise ToolExecutionError("Pack input has not passed static completion")
+    target_language = completion.get("target_language")
+    policy = target_language_policy(work_dir)
+    binding = target_language.get("binding") if isinstance(target_language, dict) else None
+    if (
+        not isinstance(target_language, dict)
+        or target_language.get("enforced") is not True
+        or target_language.get("complete") is not True
+        or not isinstance(binding, dict)
+        or binding.get("target_language") != policy["target_language"]
+        or binding.get("policy_revision") != policy["revision"]
+        or binding.get("policy_digest") != language_policy_digest(policy)
+    ):
+        raise ToolExecutionError(
+            "Pack input is not bound to the current target-language policy"
+        )
     binding = completion.get("result_artifact")
     if not isinstance(binding, dict):
         raise ToolExecutionError("Completion attestation has no bound result artifact")
