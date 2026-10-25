@@ -157,7 +157,7 @@ class NativePassTests(unittest.TestCase):
             state = json.loads(state_path.read_text())
             state["control_steps_in_wave"] = 100
             state_path.write_text(json.dumps(state), encoding="utf-8")
-            with patch.object(module, "RESULT_VALIDATION_REVISION", 3):
+            with patch.object(module, "RESULT_VALIDATION_REVISION", 4):
                 resumed = native_control_step(root, tasks / "manifest.json", results)
 
             self.assertEqual(first["action"], "dispatch_isolated_wave_relay")
@@ -912,6 +912,7 @@ class NativePassTests(unittest.TestCase):
                 for task in sorted(output.glob("task-*.jsonl"))
                 for line in task.read_text(encoding="utf-8").splitlines()
             ]
+            manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
 
         self.assertFalse(first["cached"])
         self.assertTrue(second["cached"])
@@ -926,6 +927,10 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(
             [row["segment"]["id"] for row in task_rows],
             [row["target_id"] for row in task_rows],
+        )
+        self.assertEqual(manifest["language_binding"]["target_language"], "ko")
+        self.assertTrue(
+            all(row["language_binding"] == manifest["language_binding"] for row in task_rows)
         )
 
     def test_legacy_v5_id_only_manifest_remains_readable(self) -> None:
@@ -1655,6 +1660,7 @@ class NativePassTests(unittest.TestCase):
                     "worker_contract": manifest["worker_contract"],
                     "detail_contract": manifest["detail_contract"],
                     "execution_contract": contract,
+                    "language_binding": manifest["language_binding"],
                 }
             )
             manifest_path.write_text(
