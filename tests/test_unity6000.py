@@ -15,6 +15,7 @@ from unittest.mock import patch
 from game_l10n.coverage import COMPLETION_SCHEMA
 from game_l10n.formats import write_results
 from game_l10n.models import TranslationResult
+from game_l10n.store import stable_hash
 from game_l10n.tooling import cached_tool_state
 from game_l10n.unity6000 import assets, discovery, fonts, managed, package, tables, workflow
 from game_l10n.unity6000.contracts import AdapterError, digest, get_leaf, leaves, output_path, relative_path, sha, target_id, validate_text
@@ -300,7 +301,31 @@ class FormatAdapterTests(unittest.TestCase):
         self.assertEqual(run("pack", "--prepared", "prepared", "--results", "results.json", "--output", "unbound.zip"), 2)
         self.assertEqual(cached_tool_state(self.work, "pack")["status"], "missing")
         completion = self.work / ".game-l10n/completion-attestation.json"; completion.parent.mkdir(parents=True, exist_ok=True)
-        completion.write_text(json.dumps({"schema": COMPLETION_SCHEMA, "target_completion": True, "static_completion": True, "result_artifact": {"path": str(results.resolve()), "sha256": sha(results.read_bytes()), "size": results.stat().st_size}}))
+        completion.write_text(json.dumps({
+            "schema": COMPLETION_SCHEMA,
+            "target_completion": True,
+            "static_completion": True,
+            "target_language": {
+                "enforced": True,
+                "binding": {
+                    "source_language": "ja",
+                    "target_language": "ko",
+                    "policy_revision": 0,
+                    "policy_digest": stable_hash({
+                        "target_language": "ko",
+                        "revision": 0,
+                        "authorization": "default_korean",
+                    }),
+                },
+                "complete": True,
+                "mismatch_count": 0,
+            },
+            "result_artifact": {
+                "path": str(results.resolve()),
+                "sha256": sha(results.read_bytes()),
+                "size": results.stat().st_size,
+            },
+        }))
         self.assertEqual(run("pack", "--prepared", "prepared", "--results", "results.json", "--output", "bound.zip"), 0)
         self.assertEqual(cached_tool_state(self.work, "pack")["status"], "valid")
         self.assertEqual((self.root / self.relative).read_bytes(), self.blob)
