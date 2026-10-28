@@ -41,6 +41,7 @@ from .corrections import apply_user_corrections
 from .correction_ui import CorrectionWorkspace, serve_correction_ui
 from .data_plane_task import (
     DATA_PLANE_PROFILES,
+    DATA_PLANE_RELAY_SCHEMA,
     current_data_plane_receipt,
     prepare_data_plane_task,
     seal_data_plane_task,
@@ -99,6 +100,7 @@ from .native_pass import (
 )
 from .orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from .privacy import is_within, require_external_workdir
+from .progress_ui import live_processing_ui
 from .providers import ProviderRegistry
 from .provider_policy import (
     CODEX_APP_EXECUTION_MODE,
@@ -244,14 +246,17 @@ def _status_data_plane_task(action: str) -> dict[str, Any] | None:
     return {
         "worker_role": role,
         "stage": DATA_PLANE_PROFILES[role]["stage"],
+        "relay_schema": DATA_PLANE_RELAY_SCHEMA,
+        "relay_role": "isolated_data_plane_relay",
         "prepare_command": (
             "game-l10n prepare-data-plane-task --workspace <workspace> "
             f"--worker-role {role}"
         ),
         "seal_command": (
             "game-l10n seal-data-plane-task --workspace <workspace> "
-            "--relay <relay-path>"
+            "--relay <relay-path> --worker-ended"
         ),
+        "parent_response": "receipt_path_only",
         "dispatch": "fresh_isolated_relay_only",
     }
 
@@ -521,7 +526,12 @@ def _load_dataclass_list(path: Path, cls: type) -> list[Any]:
     return [cls(**{key: value for key, value in row.items() if key in allowed}) for row in payload]
 
 
-def _orchestrator(work_dir: Path, context_pack: ContextPack) -> LocalizationOrchestrator:
+def _orchestrator(
+    work_dir: Path,
+    context_pack: ContextPack,
+    *,
+    progress_callback: Any | None = None,
+) -> LocalizationOrchestrator:
     config = load_config(work_dir)
     require_direct_provider_pipeline(config, "direct translation/review orchestration")
     sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
@@ -596,7 +606,51 @@ def _orchestrator(work_dir: Path, context_pack: ContextPack) -> LocalizationOrch
         characters=characters,
         context_pack=context_pack,
         work_dir=work_dir,
+        progress_callback=progress_callback,
     )
+
+
+def _initial_provider_routes(config: dict[str, Any]) -> set[str]:
+    routing = config.get("routing", {})
+    if not isinstance(routing, dict):
+        return set()
+    initial: set[str] = set()
+    for role in (
+        "context_analyzers",
+        "translators",
+        "review_triagers",
+        "reviewers",
+    ):
+        chain = routing.get(role, [])
+        if isinstance(chain, list) and chain and isinstance(chain[0], str):
+            initial.add(chain[0])
+    return initial
+
+
+def _provider_credential(config: dict[str, Any], provider_name: str) -> tuple[str, bool]:
+    provider = next(
+        (
+            item
+            for item in config.get("providers", [])
+            if isinstance(item, dict) and item.get("name") == provider_name
+        ),
+        None,
+    )
+    if provider is None:
+        raise ConfigurationError(f"E_PROVIDER_MODE_DRIFT: provider {provider_name!r} is unavailable")
+    env_name = provider.get("api_key_env")
+    if not isinstance(env_name, str) or not env_name:
+        return "", True
+    return env_name, bool(os.environ.get(env_name))
+
+
+def _require_provider_credential(config: dict[str, Any], provider_name: str) -> None:
+    env_name, present = _provider_credential(config, provider_name)
+    if not present:
+        raise ConfigurationError(
+            f"E_PROVIDER_CREDENTIAL_REQUIRED: {env_name} is required now because "
+            f"the {provider_name} fallback queue contains executable work"
+        )
 
 
 def _analyze_context(
@@ -840,32 +894,40 @@ def cmd_translate(args: argparse.Namespace) -> int:
     inventory_segments = (
         segments if context_source == source else read_segments(context_source)
     )
-    context_pack, context_cached = _analyze_context(
-        work_dir,
-        inventory_segments,
-        source_inventory_fingerprint=inventory_state["primary_fingerprint"],
-        force=args.force_context,
-        context_mode=args.context_mode,
-    )
-    orchestrator = _orchestrator(work_dir, context_pack)
-    results = orchestrator.translate_many(segments, force=args.force)
-    summary, exit_code = _finalize_translation_results(
-        work_dir=work_dir,
-        target_segments=segments,
-        inventory_segments=inventory_segments,
-        results=results,
-        destination=destination,
-        inventory_state=inventory_state,
-        review_required=bool(config.get("routing", {}).get("require_review", True)),
-        language_binding_state=language_binding(work_dir, config),
-    )
-    summary.update(
-        {
-            "cached": sum(item.from_cache for item in results),
-            "context_cached": context_cached,
-            "context_mode": context_pack.context_mode,
-        }
-    )
+    with live_processing_ui(
+        operation="translation_pipeline", total_records=len(segments)
+    ) as progress:
+        progress.update(stage="context")
+        context_pack, context_cached = _analyze_context(
+            work_dir,
+            inventory_segments,
+            source_inventory_fingerprint=inventory_state["primary_fingerprint"],
+            force=args.force_context,
+            context_mode=args.context_mode,
+        )
+        progress.update(stage="translation")
+        orchestrator = _orchestrator(
+            work_dir, context_pack, progress_callback=progress.apply_event
+        )
+        results = orchestrator.translate_many(segments, force=args.force)
+        progress.update(stage="finalizing")
+        summary, exit_code = _finalize_translation_results(
+            work_dir=work_dir,
+            target_segments=segments,
+            inventory_segments=inventory_segments,
+            results=results,
+            destination=destination,
+            inventory_state=inventory_state,
+            review_required=bool(config.get("routing", {}).get("require_review", True)),
+            language_binding_state=language_binding(work_dir, config),
+        )
+        summary.update(
+            {
+                "cached": sum(item.from_cache for item in results),
+                "context_cached": context_cached,
+                "context_mode": context_pack.context_mode,
+            }
+        )
     print(json.dumps(summary))
     return exit_code
 
@@ -890,32 +952,40 @@ def cmd_review_existing(args: argparse.Namespace) -> int:
     inventory_segments = (
         segments if context_source == source else read_segments(context_source)
     )
-    context_pack, context_cached = _analyze_context(
-        work_dir,
-        inventory_segments,
-        source_inventory_fingerprint=inventory_state["primary_fingerprint"],
-        force=args.force_context,
-        context_mode=args.context_mode,
-    )
-    candidates = read_existing_translations(existing_path)
-    results = _orchestrator(work_dir, context_pack).review_existing_many(segments, candidates)
-    summary, exit_code = _finalize_translation_results(
-        work_dir=work_dir,
-        target_segments=segments,
-        inventory_segments=inventory_segments,
-        results=results,
-        destination=destination,
-        inventory_state=inventory_state,
-        review_required=True,
-        language_binding_state=language_binding(work_dir, config),
-    )
-    summary.update(
-        {
-            "mode": "full_existing_candidate_review",
-            "context_cached": context_cached,
-            "context_mode": context_pack.context_mode,
-        }
-    )
+    with live_processing_ui(
+        operation="review_pipeline", total_records=len(segments)
+    ) as progress:
+        progress.update(stage="context")
+        context_pack, context_cached = _analyze_context(
+            work_dir,
+            inventory_segments,
+            source_inventory_fingerprint=inventory_state["primary_fingerprint"],
+            force=args.force_context,
+            context_mode=args.context_mode,
+        )
+        candidates = read_existing_translations(existing_path)
+        progress.update(stage="review")
+        results = _orchestrator(
+            work_dir, context_pack, progress_callback=progress.apply_event
+        ).review_existing_many(segments, candidates)
+        progress.update(stage="finalizing")
+        summary, exit_code = _finalize_translation_results(
+            work_dir=work_dir,
+            target_segments=segments,
+            inventory_segments=inventory_segments,
+            results=results,
+            destination=destination,
+            inventory_state=inventory_state,
+            review_required=True,
+            language_binding_state=language_binding(work_dir, config),
+        )
+        summary.update(
+            {
+                "mode": "full_existing_candidate_review",
+                "context_cached": context_cached,
+                "context_mode": context_pack.context_mode,
+            }
+        )
     print(json.dumps(summary))
     return exit_code
 
@@ -954,35 +1024,43 @@ def cmd_resume_failures(args: argparse.Namespace) -> int:
     inventory_segments = (
         segments if context_source == source else read_segments(context_source)
     )
-    context_pack, context_cached = _analyze_context(
-        work_dir,
-        inventory_segments,
-        source_inventory_fingerprint=inventory_state["primary_fingerprint"],
-        force=args.force_context,
-        context_mode=args.context_mode,
-    )
     retry_segments = [item for item in segments if item.id in retry_ids]
-    retried = _orchestrator(work_dir, context_pack).translate_many(retry_segments, force=True)
-    previous.update({item.segment_id: item for item in retried})
-    merged = [previous[item.id] for item in segments]
-    summary, exit_code = _finalize_translation_results(
-        work_dir=work_dir,
-        target_segments=segments,
-        inventory_segments=inventory_segments,
-        results=merged,
-        destination=destination,
-        inventory_state=inventory_state,
-        review_required=bool(config.get("routing", {}).get("require_review", True)),
-        language_binding_state=language_binding(work_dir, config),
-    )
-    summary.update(
-        {
-            "mode": "failure_queue_resume",
-            "retried": len(retried),
-            "context_cached": context_cached,
-            "context_mode": context_pack.context_mode,
-        }
-    )
+    with live_processing_ui(
+        operation="failure_queue_resume", total_records=len(retry_segments)
+    ) as progress:
+        progress.update(stage="context")
+        context_pack, context_cached = _analyze_context(
+            work_dir,
+            inventory_segments,
+            source_inventory_fingerprint=inventory_state["primary_fingerprint"],
+            force=args.force_context,
+            context_mode=args.context_mode,
+        )
+        progress.update(stage="translation")
+        retried = _orchestrator(
+            work_dir, context_pack, progress_callback=progress.apply_event
+        ).translate_many(retry_segments, force=True)
+        previous.update({item.segment_id: item for item in retried})
+        merged = [previous[item.id] for item in segments]
+        progress.update(stage="finalizing")
+        summary, exit_code = _finalize_translation_results(
+            work_dir=work_dir,
+            target_segments=segments,
+            inventory_segments=inventory_segments,
+            results=merged,
+            destination=destination,
+            inventory_state=inventory_state,
+            review_required=bool(config.get("routing", {}).get("require_review", True)),
+            language_binding_state=language_binding(work_dir, config),
+        )
+        summary.update(
+            {
+                "mode": "failure_queue_resume",
+                "retried": len(retried),
+                "context_cached": context_cached,
+                "context_mode": context_pack.context_mode,
+            }
+        )
     print(json.dumps(summary))
     return exit_code
 
@@ -1226,9 +1304,13 @@ def cmd_seal_data_plane_task(args: argparse.Namespace) -> int:
     result = seal_data_plane_task(
         work_dir,
         _path_in_workspace(work_dir, args.relay, must_exist=True),
+        worker_ended=args.worker_ended,
     )
     print(json.dumps(result, ensure_ascii=False))
-    return 0 if result["status"] in {"success", "partial"} else 1
+    # ``--worker-ended`` is a categorical close operation.  An error receipt is
+    # a successfully recorded outcome, not a CLI failure that authorizes a
+    # relay to improvise prose or retry outside the core contract.
+    return 0 if args.worker_ended or result["status"] in {"success", "partial"} else 1
 
 
 def cmd_control_plane_status(args: argparse.Namespace) -> int:
@@ -1629,21 +1711,38 @@ def cmd_process_native_review_followup(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     require_sdk_activation(work_dir, config)
-    # This factory validates the immutable Codex App preset and creates only
-    # its configured DeepSeek adapter. This command never calls translate.
-    orchestrator = _codex_app_fallback_orchestrator(work_dir)
     role = "judge_fallback" if args.operation == "judge" else "selective_rewrite"
     if role not in config["native_workflow"]["external_provider_roles"]:
         raise ConfigurationError("E_PROVIDER_MODE_DRIFT: review role is not authorized")
+    source = _path_in_workspace(work_dir, args.input, must_exist=True)
+    output = _path_in_workspace(work_dir, args.output)
+    total_records = len(read_segments(source))
+    cached_path = output / "results.json"
+    cached_records = (
+        len(read_translation_results(cached_path)) if cached_path.is_file() else 0
+    )
+    if cached_records < total_records:
+        _require_provider_credential(config, "deepseek")
+    # This factory validates the immutable Codex App preset and creates only
+    # its configured DeepSeek adapter. This command never calls translate.
+    orchestrator = _codex_app_fallback_orchestrator(work_dir)
     orchestrator.config.retry_refusals_once = False
     orchestrator.config.grace_retries = 0
-    result = process_native_review_followup(
-        work_dir, _path_in_workspace(work_dir, args.input, must_exist=True),
-        _path_in_workspace(work_dir, args.output), orchestrator,
-        operation=args.operation,
-        deadline_epoch=args.budget_started_at_epoch + args.max_elapsed_minutes * 60,
-        wave_size=args.wave_size,
-    )
+    with live_processing_ui(
+        operation="review_fallback", total_records=total_records
+    ) as progress:
+        progress.update(stage="review_fallback", cached_records=cached_records)
+        result = process_native_review_followup(
+            work_dir,
+            source,
+            output,
+            orchestrator,
+            operation=args.operation,
+            deadline_epoch=args.budget_started_at_epoch
+            + args.max_elapsed_minutes * 60,
+            wave_size=args.wave_size,
+            progress_callback=progress.apply_event,
+        )
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -1778,23 +1877,39 @@ def cmd_process_translation_exchange(args: argparse.Namespace) -> int:
         if args.max_elapsed_minutes is not None
         else execution.get("bulk_max_elapsed_minutes")
     )
-    orchestrator = _codex_app_fallback_orchestrator(work_dir)
-    result = process_translation_exchange(
-        work_dir,
-        _path_in_workspace(work_dir, args.bundle, must_exist=True),
-        lambda segments: orchestrator.translate_many(segments),
-        route="deepseek",
-        retry_failures=bool(args.user_requested_retry),
-        max_input_tokens=int(max_input_tokens) if max_input_tokens is not None else None,
-        baseline_input_tokens=args.usage_baseline_input_tokens,
-        max_elapsed_minutes=(
-            int(max_elapsed_minutes) if max_elapsed_minutes is not None else None
-        ),
-        started_at_epoch=args.budget_started_at_epoch,
-        resolve_uncertain_input_tokens=args.resolve_uncertain_input_tokens,
-        wave_size=min(32, max(1, int(config["routing"].get("max_workers", 1)))),
-        input_tokens_unlimited=unlimited,
+    bundle = _path_in_workspace(work_dir, args.bundle, must_exist=True)
+    preflight = seal_translation_exchange(work_dir, bundle)
+    executable_fallbacks = preflight["pending_count"] + (
+        preflight["failure_count"] if args.user_requested_retry else 0
     )
+    if executable_fallbacks:
+        _require_provider_credential(config, "deepseek")
+    orchestrator = _codex_app_fallback_orchestrator(work_dir)
+    with live_processing_ui(
+        operation="fallback_processing", total_records=executable_fallbacks
+    ) as progress:
+        progress.update(stage="translation_fallback")
+        result = process_translation_exchange(
+            work_dir,
+            bundle,
+            lambda segments: orchestrator.translate_many(segments),
+            route="deepseek",
+            retry_failures=bool(args.user_requested_retry),
+            max_input_tokens=(
+                int(max_input_tokens) if max_input_tokens is not None else None
+            ),
+            baseline_input_tokens=args.usage_baseline_input_tokens,
+            max_elapsed_minutes=(
+                int(max_elapsed_minutes) if max_elapsed_minutes is not None else None
+            ),
+            started_at_epoch=args.budget_started_at_epoch,
+            resolve_uncertain_input_tokens=args.resolve_uncertain_input_tokens,
+            wave_size=min(
+                32, max(1, int(config["routing"].get("max_workers", 1)))
+            ),
+            input_tokens_unlimited=unlimited,
+            progress_callback=progress.apply_event,
+        )
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result["status"] == "complete" else 1
 
@@ -2417,12 +2532,23 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
     require_external_workdir(work_dir, sdk_root)
     issues: list[str] = []
+    deferred_credentials: list[str] = []
+    initial_routes = _initial_provider_routes(config)
     for provider in config.get("providers", []):
         if provider.get("model") == "CHANGE_ME":
             issues.append(f"provider {provider.get('name')}: model is still CHANGE_ME")
         env_name = provider.get("api_key_env")
         if env_name and not os.environ.get(env_name):
-            issues.append(f"provider {provider.get('name')}: environment variable {env_name} is not set")
+            message = (
+                f"provider {provider.get('name')}: environment variable {env_name} "
+                "is not set"
+            )
+            if provider.get("name") in initial_routes:
+                issues.append(message)
+            else:
+                deferred_credentials.append(
+                    message + "; required only when its fallback queue is non-empty"
+                )
         if provider.get("type") == "command":
             executable = (provider.get("command") or [""])[0]
             if executable and not shutil.which(executable):
@@ -2430,7 +2556,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     policy = config.get("repository", {})
     if policy.get("initial_choice") == "pending":
         issues.append("repository: initial Git choice is still pending")
-    print(json.dumps({"ok": not issues, "issues": issues}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "ok": not issues,
+                "issues": issues,
+                "deferred_credentials": deferred_credentials,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 1 if issues else 0
 
 
@@ -3075,6 +3211,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     data_plane_seal.add_argument("--workspace", required=True)
     data_plane_seal.add_argument("--relay", required=True)
+    data_plane_seal.add_argument(
+        "--worker-ended",
+        action="store_true",
+        help=(
+            "Categorically seal a bound worker that ended without a valid result; "
+            "never inspect or forward its response"
+        ),
+    )
     data_plane_seal.set_defaults(func=cmd_seal_data_plane_task)
 
     control_validate = sub.add_parser(
