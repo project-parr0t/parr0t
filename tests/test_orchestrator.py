@@ -13,6 +13,39 @@ from game_l10n.providers import ProviderRegistry, ScriptedProvider
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_deferred_pipeline_reports_counts_without_semantic_content(self) -> None:
+        events: list[dict[str, object]] = []
+        translator = ScriptedProvider(
+            "fixture-translator",
+            lambda **_: {"status": "success", "text": "TARGET", "reason": ""},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            results = LocalizationOrchestrator(
+                registry=ProviderRegistry({translator.name: translator}),
+                config=OrchestratorConfig(
+                    [translator.name],
+                    [],
+                    require_review=False,
+                    defer_fallbacks_until_primary_complete=True,
+                    use_style_memory=False,
+                    max_workers=2,
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                context_pack=ContextPack(story_summary="STORY"),
+                work_dir=Path(directory),
+                progress_callback=events.append,
+            ).translate_many(
+                [Segment("one", "SOURCE_1"), Segment("two", "SOURCE_2")]
+            )
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(events)
+        self.assertEqual(events[-1]["completed_records"], 2)
+        self.assertEqual(events[-1]["translation_completed"], 2)
+        serialized = json.dumps(events)
+        for forbidden in ("SOURCE_1", "TARGET", "segment_id", "target_id"):
+            self.assertNotIn(forbidden, serialized)
+
     def test_route_attempt_caps_retry_refusal_before_advancing(self) -> None:
         calls = {"luna": 0, "sol": 0, "deepseek": 0}
 

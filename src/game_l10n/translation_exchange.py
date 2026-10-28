@@ -579,6 +579,7 @@ def process_translation_exchange(
     resolve_uncertain_input_tokens: int | None = None,
     wave_size: int = 32,
     input_tokens_unlimited: bool = False,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Run a configured fallback adapter without exposing exchange text to the parent."""
 
@@ -641,6 +642,16 @@ def process_translation_exchange(
         sealed = seal_translation_exchange(work_dir, bundle)
         return {**sealed, "processed": 0, "route": route}
 
+    def report_progress(**statistics: int | str) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback({"stage": "translation_fallback", **statistics})
+        except (TypeError, ValueError, OSError):
+            return
+
+    report_progress(completed_records=0, fallback_pending=len(pending_rows), attempts=0)
+
     segments: list[Segment] = []
     requests_by_id: dict[str, dict[str, Any]] = {}
     for row in pending_rows:
@@ -695,6 +706,8 @@ def process_translation_exchange(
         )
 
     processed = 0
+    run_success = 0
+    run_failed = 0
     issue_code = ""
     for offset in range(0, len(segments), wave_size):
         wave = segments[offset : offset + wave_size]
@@ -731,6 +744,7 @@ def process_translation_exchange(
                     "context_sha256": request["context_sha256"],
                 }
                 retained_failures.pop(result.segment_id, None)
+                run_success += 1
                 continue
             failure_code = next(
                 (
@@ -752,6 +766,7 @@ def process_translation_exchange(
                 "context_sha256": request["context_sha256"],
                 "retryable": failure_code in retryable_codes,
             }
+            run_failed += 1
 
         ordered_success = sorted(
             success_by_id.values(), key=lambda row: request_order[row["target_id"]]
@@ -763,6 +778,13 @@ def process_translation_exchange(
         _atomic_bytes(bundle / FAILURE_NAME, _jsonl_bytes(ordered_failure))
         seal_translation_exchange(work_dir, bundle)
         processed += len(results)
+        report_progress(
+            completed_records=processed,
+            translation_completed=run_success,
+            fallback_pending=max(0, len(pending_rows) - processed),
+            failed_records=run_failed,
+            attempts=processed,
+        )
         if usage_state is not None:
             assert usage_path is not None
             usage, complete = _result_usage(results)
