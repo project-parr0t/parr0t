@@ -41,6 +41,7 @@ from .corrections import apply_user_corrections
 from .correction_ui import CorrectionWorkspace, serve_correction_ui
 from .data_plane_task import (
     DATA_PLANE_PROFILES,
+    DATA_PLANE_RELAY_SCHEMA,
     current_data_plane_receipt,
     prepare_data_plane_task,
     seal_data_plane_task,
@@ -244,14 +245,17 @@ def _status_data_plane_task(action: str) -> dict[str, Any] | None:
     return {
         "worker_role": role,
         "stage": DATA_PLANE_PROFILES[role]["stage"],
+        "relay_schema": DATA_PLANE_RELAY_SCHEMA,
+        "relay_role": "isolated_data_plane_relay",
         "prepare_command": (
             "game-l10n prepare-data-plane-task --workspace <workspace> "
             f"--worker-role {role}"
         ),
         "seal_command": (
             "game-l10n seal-data-plane-task --workspace <workspace> "
-            "--relay <relay-path>"
+            "--relay <relay-path> --worker-ended"
         ),
+        "parent_response": "receipt_path_only",
         "dispatch": "fresh_isolated_relay_only",
     }
 
@@ -1226,9 +1230,13 @@ def cmd_seal_data_plane_task(args: argparse.Namespace) -> int:
     result = seal_data_plane_task(
         work_dir,
         _path_in_workspace(work_dir, args.relay, must_exist=True),
+        worker_ended=args.worker_ended,
     )
     print(json.dumps(result, ensure_ascii=False))
-    return 0 if result["status"] in {"success", "partial"} else 1
+    # ``--worker-ended`` is a categorical close operation.  An error receipt is
+    # a successfully recorded outcome, not a CLI failure that authorizes a
+    # relay to improvise prose or retry outside the core contract.
+    return 0 if args.worker_ended or result["status"] in {"success", "partial"} else 1
 
 
 def cmd_control_plane_status(args: argparse.Namespace) -> int:
@@ -3075,6 +3083,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     data_plane_seal.add_argument("--workspace", required=True)
     data_plane_seal.add_argument("--relay", required=True)
+    data_plane_seal.add_argument(
+        "--worker-ended",
+        action="store_true",
+        help=(
+            "Categorically seal a bound worker that ended without a valid result; "
+            "never inspect or forward its response"
+        ),
+    )
     data_plane_seal.set_defaults(func=cmd_seal_data_plane_task)
 
     control_validate = sub.add_parser(

@@ -1593,6 +1593,19 @@ class WorkspaceTests(unittest.TestCase):
             primary_status["data_plane_task"]["worker_role"], "primary_inventory"
         )
         self.assertEqual(
+            primary_status["data_plane_task"]["relay_schema"],
+            "parr0t.data-plane-relay.v2",
+        )
+        self.assertEqual(
+            primary_status["data_plane_task"]["parent_response"],
+            "receipt_path_only",
+        )
+        self.assertTrue(
+            primary_status["data_plane_task"]["seal_command"].endswith(
+                "--worker-ended"
+            )
+        )
+        self.assertEqual(
             independent_status["next_actions"],
             ["extract_independent_source_inventory"],
         )
