@@ -228,6 +228,14 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **Resolution:** Run status again. It must expose the failed inventory role as a new bound attempt, route `sdk_identity_mismatch` through the private source-probe/selection step, or expose `context_analyzer` after a verified inventory. Dispatch and seal that exact relay; `E_NATIVE_WORKFLOW_REQUIRED` ends only the incorrect direct-provider command.
 - **Prevention:** Give every prepared attempt a new task binding, prioritize current non-success receipts over placeholder files, and let only the core seal create context state.
 
+## A data-plane relay forwards a worker explanation to the control plane
+
+- **Symptom:** A discovery, inventory, reconciliation, context, or UI-image worker ends without a valid envelope and its disposable relay sends a content classification, refusal explanation, or free-form failure summary to the root.
+- **General cause:** The relay had a success-only seal path, so it improvised a parent-facing explanation when the bound worker produced no valid result.
+- **Diagnosis:** Use only the relay lifecycle category and the core receipt. Do not read, quote, summarize, or classify the child response. If it already reached the root, record the fixed leak and rotate.
+- **Resolution:** On every child terminal state, run the bound `seal-data-plane-task --worker-ended` exactly once. Return only the resulting receipt path, then follow status to a fresh attempt. A valid envelope is still accepted; an absent or malformed envelope becomes a categorical core receipt.
+- **Prevention:** Require `parr0t.data-plane-relay.v2`, preserve its immutable child-response policy, and keep legacy v1 sealing only for existing checkpoints.
+
 ## A transient provider failure leaves a patch partly usable
 
 - **Symptom:** Capacity, timeout, quota, rate-limit, authentication, or malformed-output failure preserves source text and the workflow proceeds as if the patch were complete.

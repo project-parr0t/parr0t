@@ -139,6 +139,7 @@ class TranslationExchangeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             bundle = workspace / "exchange"
+            progress_events: list[dict[str, object]] = []
             prepare_translation_exchange(
                 workspace,
                 [
@@ -175,7 +176,11 @@ class TranslationExchangeTests(unittest.TestCase):
                 ]
 
             result = process_translation_exchange(
-                workspace, bundle, translate, route="fallback-provider"
+                workspace,
+                bundle,
+                translate,
+                route="fallback-provider",
+                progress_callback=progress_events.append,
             )
             second = process_translation_exchange(
                 workspace, bundle, translate, route="fallback-provider"
@@ -198,6 +203,10 @@ class TranslationExchangeTests(unittest.TestCase):
         self.assertEqual(success_rows[0]["target_id"], "line-1")
         self.assertEqual(failure_rows[0]["failure_code"], "timeout")
         self.assertTrue(failure_rows[0]["retryable"])
+        self.assertEqual(progress_events[-1]["completed_records"], 2)
+        self.assertEqual(progress_events[-1]["translation_completed"], 1)
+        self.assertEqual(progress_events[-1]["failed_records"], 1)
+        self.assertNotIn("target_id", json.dumps(progress_events))
 
     def test_partial_exchange_routes_only_metadata_to_control_plane(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
