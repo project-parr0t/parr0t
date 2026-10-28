@@ -100,7 +100,7 @@ game-l10n seal-data-plane-task --workspace <external-workspace> --relay <relay-p
 game-l10n native-pass-step --workspace <external-workspace> --manifest <private-manifest> --results-dir <private-wave-results>
 ```
 
-These are agent boundaries. A non-success receipt remains executable work: run status and dispatch its reported retry or SDK-identity repair. Never verify a failed worker's placeholder artifact because it exists. Portable inventory requires an authenticated connector or immutable commit archive; never invent branch or commit. Keep proxy credentials outside this repository.
+A data-plane relay never reads or forwards child responses. At termination it runs its bound `seal-data-plane-task --worker-ended` once and returns only the receipt path. Core seals output or records failure; status schedules retries. Never trust placeholder artifacts. Portable inventory requires an authenticated connector or immutable commit archive; never invent branch or commit. Keep proxy credentials external.
 
 ## Completion
 

@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .control_plane import require_control_plane_ready
 from .coverage import require_inventory_attestation
@@ -480,6 +480,7 @@ def collect_native_rewrite(
 def process_native_review_followup(
     work_dir: Path, source: Path, output: Path, orchestrator: Any, *, operation: str,
     deadline_epoch: float, wave_size: int = 8,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Run only the locked external review role, with durable per-wave results.
 
@@ -570,6 +571,21 @@ def process_native_review_followup(
 
     pending = [item for item in prepared if item[0].id not in cached]
     executed = 0
+    if progress_callback is not None:
+        try:
+            progress_callback(
+                {
+                    "stage": "review_fallback",
+                    "completed_records": len(saved),
+                    "review_completed": sum(
+                        item.status == "reviewed" for item in saved
+                    ),
+                    "fallback_pending": len(pending),
+                    "attempts": 0,
+                }
+            )
+        except (TypeError, ValueError, OSError):
+            pass
     for offset in range(0, len(pending), wave_size):
         if time.time() >= deadline_epoch:
             break
@@ -581,6 +597,24 @@ def process_native_review_followup(
         executed += len(completed)
         _atomic_json(results_path, {"results": [cached[s.id].to_dict() for s in segments
                                                 if s.id in cached]})
+        if progress_callback is not None:
+            try:
+                progress_callback(
+                    {
+                        "stage": "review_fallback",
+                        "completed_records": len(saved) + executed,
+                        "review_completed": sum(
+                            item.status == "reviewed" for item in cached.values()
+                        ),
+                        "fallback_pending": max(0, len(pending) - executed),
+                        "failed_records": sum(
+                            item.status == "failed" for item in cached.values()
+                        ),
+                        "attempts": executed,
+                    }
+                )
+            except (TypeError, ValueError, OSError):
+                pass
     accepted, rewrite, confirmation, unresolved = [], [], [], []
     for segment, initial, _ in prepared:
         result = cached.get(segment.id)
