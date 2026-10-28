@@ -18,6 +18,8 @@ from dataclasses import asdict
 from game_l10n.cli import (
     _completion_state_valid,
     _context_state_valid,
+    _require_provider_credential,
+    cmd_doctor,
     cmd_init,
     cmd_policy,
     cmd_status,
@@ -102,6 +104,68 @@ def activate_workspace_adapter(work: Path, *, reference_checkout: Path | None = 
 
 
 class WorkspaceTests(unittest.TestCase):
+    def test_doctor_defers_deepseek_key_until_fallback_is_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {}, clear=True
+        ):
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            initialize_workspace(
+                work,
+                sdk,
+                git_choice="disabled",
+                provider_preset="codex-app-deepseek",
+            )
+            output = StringIO()
+            with redirect_stdout(output):
+                exit_code = cmd_doctor(SimpleNamespace(workspace=str(work)))
+            report = json.loads(output.getvalue())
+            config = load_config(work)
+
+            with self.assertRaisesRegex(
+                ConfigurationError, "E_PROVIDER_CREDENTIAL_REQUIRED"
+            ):
+                _require_provider_credential(config, "deepseek")
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["issues"], [])
+        self.assertEqual(len(report["deferred_credentials"]), 1)
+        self.assertIn("DEEPSEEK_API_KEY", report["deferred_credentials"][0])
+
+    def test_doctor_still_requires_primary_api_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {}, clear=True
+        ):
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            initialize_workspace(
+                work,
+                sdk,
+                git_choice="disabled",
+                provider_preset="openai-deepseek",
+            )
+            output = StringIO()
+            with redirect_stdout(output):
+                exit_code = cmd_doctor(SimpleNamespace(workspace=str(work)))
+            report = json.loads(output.getvalue())
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(report["ok"])
+        self.assertTrue(
+            any("OPENAI_API_KEY" in issue for issue in report["issues"])
+        )
+        self.assertTrue(
+            any(
+                "DEEPSEEK_API_KEY" in issue
+                for issue in report["deferred_credentials"]
+            )
+        )
+
     def test_cli_cannot_infer_the_initial_game_workspace_git_choice(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1591,6 +1655,19 @@ class WorkspaceTests(unittest.TestCase):
 
         self.assertEqual(
             primary_status["data_plane_task"]["worker_role"], "primary_inventory"
+        )
+        self.assertEqual(
+            primary_status["data_plane_task"]["relay_schema"],
+            "parr0t.data-plane-relay.v2",
+        )
+        self.assertEqual(
+            primary_status["data_plane_task"]["parent_response"],
+            "receipt_path_only",
+        )
+        self.assertTrue(
+            primary_status["data_plane_task"]["seal_command"].endswith(
+                "--worker-ended"
+            )
         )
         self.assertEqual(
             independent_status["next_actions"],

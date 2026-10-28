@@ -30,7 +30,9 @@ from .store import stable_hash
 
 
 DATA_PLANE_TASK_SCHEMA = "parr0t.data-plane-task.v1"
-DATA_PLANE_RELAY_SCHEMA = "parr0t.data-plane-relay.v1"
+LEGACY_DATA_PLANE_RELAY_SCHEMA = "parr0t.data-plane-relay.v1"
+DATA_PLANE_RELAY_SCHEMA = "parr0t.data-plane-relay.v2"
+DATA_PLANE_RELAY_CONTRACT_SCHEMA = "parr0t.data-plane-relay-contract.v1"
 DATA_PLANE_RECEIPT_SCHEMA = "parr0t.data-plane-receipt.v1"
 
 DATA_PLANE_PROFILES: dict[str, dict[str, str]] = {
@@ -413,6 +415,18 @@ def prepare_data_plane_task(
         "relay_authority": "exact_dispatch_only",
         "worker_history": "none",
         "worker_delegation_allowed": False,
+        "relay_contract": {
+            "schema": DATA_PLANE_RELAY_CONTRACT_SCHEMA,
+            "role": "isolated_data_plane_relay",
+            "authority": "exact_dispatch_and_categorical_seal_only",
+            "child_response_policy": "never_read_interpret_summarize_or_forward",
+            "worker_terminal_action": "seal_data_plane_task_with_worker_ended",
+            "parent_response": "receipt_path_only",
+            "terminal_seal_command": (
+                "game-l10n seal-data-plane-task --workspace <workspace> "
+                "--relay <relay-path> --worker-ended"
+            ),
+        },
     }
     relay_path = output_dir / "relay.json"
     _atomic_json(relay_path, relay)
@@ -427,8 +441,10 @@ def prepare_data_plane_task(
     }
 
 
-def seal_data_plane_task(work_dir: Path, relay_path: Path) -> dict[str, Any]:
-    """Validate one exact data-plane result and emit a metadata-only receipt."""
+def _load_bound_data_plane_relay(
+    work_dir: Path, relay_path: Path
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate immutable relay/task bindings before result collection."""
 
     require_control_plane_ready(work_dir)
     require_control_plane_entry(work_dir)
@@ -436,7 +452,7 @@ def seal_data_plane_task(work_dir: Path, relay_path: Path) -> dict[str, Any]:
     if not is_within(resolved_relay, work_dir) or not resolved_relay.is_file():
         raise ConfigurationError("E_DATA_PLANE_RELAY_INVALID: relay must be a workspace file")
     relay = json.loads(resolved_relay.read_text(encoding="utf-8"))
-    required_relay = {
+    legacy_relay_fields = {
         "schema",
         "task_id",
         "task_path",
@@ -449,10 +465,48 @@ def seal_data_plane_task(work_dir: Path, relay_path: Path) -> dict[str, Any]:
         "worker_history",
         "worker_delegation_allowed",
     }
+    relay_fields = legacy_relay_fields | {"relay_contract"}
+    relay_schema = relay.get("schema") if isinstance(relay, dict) else None
+    relay_contract = relay.get("relay_contract") if isinstance(relay, dict) else None
+    valid_contract = (
+        isinstance(relay_contract, dict)
+        and set(relay_contract)
+        == {
+            "schema",
+            "role",
+            "authority",
+            "child_response_policy",
+            "worker_terminal_action",
+            "parent_response",
+            "terminal_seal_command",
+        }
+        and relay_contract.get("schema") == DATA_PLANE_RELAY_CONTRACT_SCHEMA
+        and relay_contract.get("role") == "isolated_data_plane_relay"
+        and relay_contract.get("authority")
+        == "exact_dispatch_and_categorical_seal_only"
+        and relay_contract.get("child_response_policy")
+        == "never_read_interpret_summarize_or_forward"
+        and relay_contract.get("worker_terminal_action")
+        == "seal_data_plane_task_with_worker_ended"
+        and relay_contract.get("parent_response") == "receipt_path_only"
+        and relay_contract.get("terminal_seal_command")
+        == (
+            "game-l10n seal-data-plane-task --workspace <workspace> "
+            "--relay <relay-path> --worker-ended"
+        )
+    )
     if (
         not isinstance(relay, dict)
-        or set(relay) != required_relay
-        or relay.get("schema") != DATA_PLANE_RELAY_SCHEMA
+        or (
+            relay_schema == LEGACY_DATA_PLANE_RELAY_SCHEMA
+            and set(relay) != legacy_relay_fields
+        )
+        or (
+            relay_schema == DATA_PLANE_RELAY_SCHEMA
+            and (set(relay) != relay_fields or not valid_contract)
+        )
+        or relay_schema
+        not in {LEGACY_DATA_PLANE_RELAY_SCHEMA, DATA_PLANE_RELAY_SCHEMA}
         or relay.get("max_workers") != 1
         or relay.get("relay_authority") != "exact_dispatch_only"
         or relay.get("worker_history") != "none"
@@ -482,6 +536,14 @@ def seal_data_plane_task(work_dir: Path, relay_path: Path) -> dict[str, Any]:
         != int(control_plane_state(work_dir).get("generation", 0))
     ):
         raise ConfigurationError("E_DATA_PLANE_RELAY_INVALID: task binding is invalid")
+
+    return relay, task
+
+
+def _seal_bound_data_plane_task(
+    work_dir: Path, relay: dict[str, Any], task: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate one exact bound result and emit its metadata-only receipt."""
 
     envelope_path = (work_dir / str(relay["expected_envelope"])).resolve()
     result = validate_control_envelope(
@@ -667,3 +729,76 @@ def seal_data_plane_task(work_dir: Path, relay_path: Path) -> dict[str, Any]:
         "issue_codes": receipt["issue_codes"],
         "receipt_path": _relative(work_dir, receipt_path),
     }
+
+
+def _seal_ended_data_plane_task(
+    work_dir: Path,
+    relay: dict[str, Any],
+    *,
+    issue_code: str,
+) -> dict[str, Any]:
+    """Close an ended worker categorically without interpreting its response."""
+
+    receipt = {
+        "schema": DATA_PLANE_RECEIPT_SCHEMA,
+        "task_id": relay["task_id"],
+        "worker_role": relay["worker_role"],
+        "stage": relay["stage"],
+        "status": "error",
+        "counts": {"total": 1, "success": 0, "error": 1, "pending": 1},
+        "issue_codes": [issue_code],
+        "artifact_paths": [],
+        "queue_transitions": [],
+        "control_generation": int(control_plane_state(work_dir).get("generation", 0)),
+    }
+    receipt_path = (
+        work_dir
+        / ".game-l10n"
+        / "data-plane"
+        / str(relay["worker_role"])
+        / "receipt.json"
+    )
+    _atomic_json(receipt_path, receipt)
+    return {
+        "schema": DATA_PLANE_RECEIPT_SCHEMA,
+        "status": receipt["status"],
+        "worker_role": receipt["worker_role"],
+        "stage": receipt["stage"],
+        "counts": receipt["counts"],
+        "issue_codes": receipt["issue_codes"],
+        "receipt_path": _relative(work_dir, receipt_path),
+    }
+
+
+def seal_data_plane_task(
+    work_dir: Path,
+    relay_path: Path,
+    *,
+    worker_ended: bool = False,
+) -> dict[str, Any]:
+    """Seal one data-plane task, including a worker ending without valid output."""
+
+    relay, task = _load_bound_data_plane_relay(work_dir, relay_path)
+    try:
+        return _seal_bound_data_plane_task(work_dir, relay, task)
+    except (
+        ConfigurationError,
+        ProviderError,
+        OSError,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        AttributeError,
+        KeyError,
+        json.JSONDecodeError,
+    ):
+        if not worker_ended:
+            raise
+        envelope_path = (work_dir / str(relay["expected_envelope"])).resolve()
+        return _seal_ended_data_plane_task(
+            work_dir,
+            relay,
+            issue_code=(
+                "malformed_response" if envelope_path.is_file() else "task_incomplete"
+            ),
+        )
