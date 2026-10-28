@@ -6,11 +6,10 @@ For native Luna/Sol workers supplied by the signed-in desktop app plus DeepSeek 
 
 ## Ready-to-run setup
 
-Set both keys in the agent environment, then initialize a workspace:
+Set the primary OpenAI key, then initialize a workspace. The DeepSeek key is optional until a verified fallback queue is non-empty:
 
 ```powershell
 $env:OPENAI_API_KEY = "<openai-api-key>"
-$env:DEEPSEEK_API_KEY = "<deepseek-api-key>"
 
 game-l10n init-workspace <agent-workspace> `
   --provider-preset openai-deepseek `
@@ -19,9 +18,13 @@ game-l10n init-workspace <agent-workspace> `
 game-l10n doctor --workspace <agent-workspace>
 ```
 
+`doctor` reports a missing fallback-only credential under `deferred_credentials` without blocking primary translation or review. Set `DEEPSEEK_API_KEY` only when status or a sealed exchange proves that DeepSeek fallback work exists. `process-translation-exchange` checks the key immediately before the first executable DeepSeek fallback and never demands it for an empty or already completed bundle.
+
 The preset uses the current public API model identifiers `gpt-6-luna`, `deepseek-flash`, and `gpt-6.1-sol`. DeepSeek uses its OpenAI-compatible endpoint with JSON Object output for text-bearing transformations and the compact plain contract for judge verdicts. Model names remain editable in the private workspace configuration if account availability changes.
 
-Selecting this preset and supplying its key environment variables authorizes its configured automatic provider calls. The agent must not pause for a second approval whenever an individual segment enters fallback. Keys remain in environment variables and are never written into the SDK, workspace configuration, audit log, or prompts.
+Selecting this preset authorizes its configured automatic provider calls. Supplying a key makes only its already configured route executable; key presence never selects a mode. The agent must not pause for a second approval whenever an individual segment enters fallback. Keys remain in environment variables and are never written into the SDK, workspace configuration, audit log, or prompts.
+
+Long-running direct translation, review, resume, and DeepSeek fallback commands start a loopback processing UI on an operating-system-selected free port. The URL is printed as metadata when processing begins and the server closes when processing ends. The page exposes aggregate counts, stage, percentage, and elapsed time only—never source text, translated text, target IDs, prompts, or refusal explanations. See [processing progress UI](progress-ui.md).
 
 ## Ordered routing
 
