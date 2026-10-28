@@ -97,6 +97,7 @@ class LocalizationOrchestrator:
         characters: list[CharacterProfile] | None = None,
         context_pack: ContextPack | None = None,
         work_dir: Path,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ):
         if not config.translator_chain:
             raise ValueError("translator_chain must not be empty")
@@ -141,6 +142,25 @@ class LocalizationOrchestrator:
         self.audit = AuditLog(self.work_dir / ".game-l10n" / "audit.jsonl")
         self._style_memory: dict[str, list[dict[str, str]]] = {}
         self._memory_lock = threading.Lock()
+        self._progress_callback = progress_callback
+        self._progress_lock = threading.Lock()
+        self._progress_total = 0
+        self._progress_attempts = 0
+
+    def _emit_progress(self, stage: str, **statistics: int) -> None:
+        if self._progress_callback is None:
+            return
+        try:
+            self._progress_callback({"stage": stage, **statistics})
+        except (TypeError, ValueError, OSError):
+            # Progress reporting is observational and must never corrupt work.
+            return
+
+    def _progress_attempt(self, stage: str) -> None:
+        with self._progress_lock:
+            self._progress_attempts += 1
+            attempts = self._progress_attempts
+        self._emit_progress(stage, attempts=attempts)
 
     def _character(self, speaker: str) -> CharacterProfile | None:
         if speaker in self.characters:
@@ -1120,10 +1140,20 @@ class LocalizationOrchestrator:
                     f"Existing candidate source does not match current inventory: {segment.id}"
                 )
         # Ordered execution lets later targets reuse only freshly approved style anchors.
-        return [
-            self.review_existing_one(segment, candidates[segment.id]["text"])
-            for segment in items
-        ]
+        results: list[TranslationResult] = []
+        for segment in items:
+            result = self.review_existing_one(segment, candidates[segment.id]["text"])
+            results.append(result)
+            completed = len(results)
+            self._emit_progress(
+                "review",
+                completed_records=completed,
+                review_completed=sum(item.status == "reviewed" for item in results),
+                failed_records=sum(item.status == "failed" for item in results),
+                source_preserved=sum(item.status == "source_preserved" for item in results),
+                attempts=completed,
+            )
+        return results
 
     def _accept_after_review_refusal(
         self, result: TranslationResult, segment: Segment, candidate: str
@@ -1151,12 +1181,17 @@ class LocalizationOrchestrator:
         return True
 
     def _run_deferred_stage(
-        self, indexes: list[int], operation: Callable[[int], T]
+        self, indexes: list[int], operation: Callable[[int], T], *, stage: str
     ) -> list[tuple[int, T]]:
+        def observed(index: int) -> T:
+            value = operation(index)
+            self._progress_attempt(stage)
+            return value
+
         if self.config.max_workers <= 1 or len(indexes) <= 1:
-            return [(index, operation(index)) for index in indexes]
+            return [(index, observed(index)) for index in indexes]
         with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
-            futures = {index: pool.submit(operation, index) for index in indexes}
+            futures = {index: pool.submit(observed, index) for index in indexes}
             return [(index, futures[index].result()) for index in indexes]
 
     def _deferred_batch_key(self, items: list[Segment]) -> str:
@@ -1238,6 +1273,8 @@ class LocalizationOrchestrator:
         translations finish before the next translator runs, and all primary reviews
         finish before the next reviewer runs.
         """
+        self._progress_total = len(items)
+        self._progress_attempts = 0
         batch_key = self._deferred_batch_key(items)
         state_path = self.work_dir / ".game-l10n" / "deferred" / f"{batch_key}.json"
         if force:
@@ -1311,6 +1348,15 @@ class LocalizationOrchestrator:
             else:
                 pending_translation.append(index)
 
+        cached_count = sum(item is not None and item.from_cache for item in results)
+        self._emit_progress(
+            "translation",
+            cached_records=cached_count,
+            translation_completed=len(candidates) + cached_count,
+            fallback_pending=len(pending_translation),
+            attempts=0,
+        )
+
         for route_index, translator_name in enumerate(self.config.translator_chain):
             if not pending_translation:
                 break
@@ -1330,7 +1376,10 @@ class LocalizationOrchestrator:
                 return envelope.text
 
             next_pending: list[int] = []
-            for index, candidate in self._run_deferred_stage(pending_translation, translate_at):
+            stage = "translation" if route_index == 0 else "translation_fallback"
+            for index, candidate in self._run_deferred_stage(
+                pending_translation, translate_at, stage=stage
+            ):
                 result = results[index]
                 assert result is not None
                 if candidate is None:
@@ -1340,6 +1389,12 @@ class LocalizationOrchestrator:
                 self._set_candidate(result, candidate)
                 candidates[index] = candidate
             pending_translation = next_pending
+            self._emit_progress(
+                stage,
+                translation_completed=len(candidates) + cached_count,
+                fallback_pending=len(pending_translation),
+                attempts=self._progress_attempts,
+            )
             completed_translators.add(translator_name)
             if pending_translation and route_index + 1 < len(self.config.translator_chain):
                 next_provider = self.config.translator_chain[route_index + 1]
@@ -1418,9 +1473,13 @@ class LocalizationOrchestrator:
                         )
                     else:
                         triaged_items = iter(
-                            self._run_deferred_stage(triage_pending, triage_at)
+                            self._run_deferred_stage(
+                                triage_pending, triage_at, stage="review"
+                            )
                         )
                     for index, outcome in triaged_items:
+                        if self.config.use_style_memory:
+                            self._progress_attempt("review")
                         result = results[index]
                         assert result is not None
                         if outcome == "unresolved":
@@ -1483,9 +1542,17 @@ class LocalizationOrchestrator:
                     )
                 else:
                     reviewed_items = iter(
-                        self._run_deferred_stage(pending_review, review_at)
+                        self._run_deferred_stage(
+                            pending_review,
+                            review_at,
+                            stage=("review" if route_index == 0 else "review_fallback"),
+                        )
                     )
                 for index, reviewed in reviewed_items:
+                    if self.config.use_style_memory:
+                        self._progress_attempt(
+                            "review" if route_index == 0 else "review_fallback"
+                        )
                     result = results[index]
                     assert result is not None
                     if reviewed is None:
@@ -1512,6 +1579,16 @@ class LocalizationOrchestrator:
                     self.store.put(cache_keys[index], result)
                     self._remember(items[index], result.text)
                 pending_review = next_pending
+                completed_review = sum(
+                    result is not None and result.status == "reviewed"
+                    for result in results
+                )
+                self._emit_progress(
+                    "review" if route_index == 0 else "review_fallback",
+                    review_completed=completed_review,
+                    fallback_pending=len(pending_review),
+                    attempts=self._progress_attempts,
+                )
                 completed_reviewers.add(reviewer_name)
                 if pending_review and route_index + 1 < len(self.config.reviewer_chain):
                     next_provider = self.config.reviewer_chain[route_index + 1]
@@ -1572,14 +1649,70 @@ class LocalizationOrchestrator:
             self.store.put(cache_keys[index], result)
 
         state_path.unlink(missing_ok=True)
-        return [result for result in results if result is not None]
+        final_results = [result for result in results if result is not None]
+        self._emit_progress(
+            "finalizing",
+            completed_records=len(final_results),
+            translation_completed=len(candidates) + cached_count,
+            review_completed=sum(item.status == "reviewed" for item in final_results),
+            fallback_pending=0,
+            failed_records=sum(item.status == "failed" for item in final_results),
+            source_preserved=sum(
+                item.status == "source_preserved" for item in final_results
+            ),
+            cached_records=cached_count,
+            attempts=self._progress_attempts,
+        )
+        return final_results
 
     def translate_many(self, segments: Iterable[Segment], *, force: bool = False) -> list[TranslationResult]:
         items = list(segments)
         if self.config.defer_fallbacks_until_primary_complete:
             return self._translate_many_deferred(items, force=force)
+        self._progress_total = len(items)
+        self._progress_attempts = 0
+
+        completed = 0
+        translated = 0
+        reviewed = 0
+        failed = 0
+        source_preserved = 0
+        cached = 0
+        attempts = 0
+        completed_lock = threading.Lock()
+
+        def translate_observed(item: Segment) -> TranslationResult:
+            nonlocal completed, translated, reviewed, failed
+            nonlocal source_preserved, cached, attempts
+            result = self.translate_one(item, force=force)
+            with completed_lock:
+                completed += 1
+                translated += bool(result.translator)
+                reviewed += result.status == "reviewed"
+                failed += result.status == "failed"
+                source_preserved += result.status == "source_preserved"
+                cached += result.from_cache
+                attempts += len(result.attempts)
+                current = completed
+                translated_count = translated
+                reviewed_count = reviewed
+                failed_count = failed
+                preserved_count = source_preserved
+                cached_count = cached
+                attempt_count = attempts
+            self._emit_progress(
+                "review" if self.config.require_review else "translation",
+                completed_records=current,
+                translation_completed=translated_count,
+                review_completed=reviewed_count,
+                failed_records=failed_count,
+                source_preserved=preserved_count,
+                cached_records=cached_count,
+                attempts=attempt_count,
+            )
+            return result
         # Style anchors are causal: later lines should see previously approved lines in script order.
         if self.config.max_workers <= 1 or self.config.use_style_memory:
-            return [self.translate_one(item, force=force) for item in items]
+            return [translate_observed(item) for item in items]
         with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
-            return list(pool.map(lambda item: self.translate_one(item, force=force), items))
+            return list(pool.map(translate_observed, items))
