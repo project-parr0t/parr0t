@@ -7,6 +7,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
 from game_l10n.cli import build_parser, main
 from game_l10n.control_plane import (
@@ -480,6 +481,38 @@ class ControlPlaneContractTests(unittest.TestCase):
             args.ended_task,
             ["task-0002.jsonl", "task-0003.jsonl"],
         )
+
+    def test_native_relay_seal_accepts_terminal_relay_state(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "seal-native-wave-relay",
+                "--workspace",
+                "fixture-workspace",
+                "--dispatch",
+                "relay.json",
+                "--relay-ended",
+            ]
+        )
+
+        self.assertTrue(args.relay_ended)
+
+    def test_native_relay_cli_rejects_missing_terminal_state(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "seal-native-wave-relay",
+                "--workspace",
+                "fixture-workspace",
+                "--dispatch",
+                "relay.json",
+            ]
+        )
+
+        with (
+            patch("game_l10n.cli.load_config", return_value={}),
+            patch("game_l10n.cli.require_sdk_activation"),
+            self.assertRaisesRegex(ValueError, "E_NATIVE_RELAY_TERMINAL_STATE_REQUIRED"),
+        ):
+            args.func(args)
 
     def test_review_control_contract_is_deterministic_and_text_free(self) -> None:
         contract = review_control_contract()

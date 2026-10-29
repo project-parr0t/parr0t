@@ -691,7 +691,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertTrue(config["execution"]["aggregate_once_per_wave"])
         self.assertEqual(
             config["execution"]["progress_report_mode"],
-            "wave_boundary_or_blocker_only",
+            "completion_checkpoint_or_blocker_only",
         )
         self.assertEqual(
             config["control_plane"]["envelope_schema"],
@@ -792,7 +792,8 @@ class WorkspaceTests(unittest.TestCase):
             "disposable isolated relay per authorized wave",
             "status.contract_set.digest",
             "must not auto-restart the root turn",
-            "report progress only at a wave boundary or blocker",
+            "keep transitions silent",
+            "report only pass/checkpoint completion or blockers",
         ):
             self.assertIn(required, generated_agents)
         self.assertLess(
@@ -1653,6 +1654,26 @@ class WorkspaceTests(unittest.TestCase):
                 cmd_status(SimpleNamespace(workspace=str(work)))
             gap_status = json.loads(gap_output.getvalue())
 
+            independent_namespace_rows = [
+                {"id": "secondary-first", "source": "SOURCE_ONE"},
+                {"id": "secondary-second", "source": "SOURCE_TWO"},
+            ]
+            (inputs / "independent-inventory.json").write_text(
+                json.dumps(
+                    inventory_payload("independent", independent_namespace_rows)
+                ),
+                encoding="utf-8",
+            )
+            save_inventory_attestation(
+                work,
+                inputs / "primary-inventory.json",
+                inputs / "independent-inventory.json",
+            )
+            namespace_output = StringIO()
+            with redirect_stdout(namespace_output):
+                cmd_status(SimpleNamespace(workspace=str(work)))
+            namespace_status = json.loads(namespace_output.getvalue())
+
         self.assertEqual(
             primary_status["data_plane_task"]["worker_role"], "primary_inventory"
         )
@@ -1687,6 +1708,14 @@ class WorkspaceTests(unittest.TestCase):
         )
         self.assertTrue(gap_status["inventory_gate"]["continuation_required"])
         self.assertFalse(gap_status["inventory_gate"]["reconciliation"]["terminal"])
+        self.assertEqual(
+            namespace_status["next_actions"],
+            ["reconcile_inventory_identity_namespace"],
+        )
+        self.assertEqual(
+            namespace_status["inventory_gate"]["identity_gate"]["status"],
+            "namespace_mismatch",
+        )
 
     def test_status_retries_a_sealed_inventory_failure_instead_of_verifying_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
