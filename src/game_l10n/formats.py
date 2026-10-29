@@ -142,7 +142,10 @@ def read_existing_translations(path: Path) -> dict[str, dict[str, str]]:
         text = row.get("text", row.get("translation"))
         if not isinstance(target_id, str) or not target_id:
             raise ValueError(f"Prior result row {index} requires a target ID")
-        if not isinstance(source, str) or not isinstance(text, str) or not text.strip():
+        valid_text = isinstance(source, str) and isinstance(text, str) and (
+            bool(text.strip()) or (not source.strip() and text == source)
+        )
+        if not valid_text:
             raise ValueError(f"Prior result {target_id!r} requires source and non-empty text")
         if target_id in candidates:
             raise ValueError(f"Prior result contains duplicate target ID: {target_id}")

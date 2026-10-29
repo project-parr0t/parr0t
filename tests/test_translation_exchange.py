@@ -25,6 +25,36 @@ def _digest(value: str) -> str:
 
 
 class TranslationExchangeTests(unittest.TestCase):
+    def test_default_fallback_has_no_whole_job_limit_and_preserves_whitespace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "exchange"
+            prepare_translation_exchange(
+                root,
+                [Segment("spacing", "  \t")],
+                bundle,
+                exchange_id="whitespace-fixture",
+                mode="fallback",
+                source_queue="translation_fallback_pending",
+            )
+
+            result = process_translation_exchange(
+                root,
+                bundle,
+                lambda segments: [
+                    TranslationResult(
+                        segment_id=segments[0].id,
+                        source=segments[0].source,
+                        text=segments[0].source,
+                        status="translated",
+                    )
+                ],
+                route="deepseek",
+            )
+
+        self.assertEqual(result["success_count"], 1)
+        self.assertIsNone(result["budget"])
+
     def test_explicit_unlimited_policy_preserves_uncertain_history_and_cached_success(self):
         from game_l10n.translation_exchange import _fallback_usage_state
         with tempfile.TemporaryDirectory() as directory:
