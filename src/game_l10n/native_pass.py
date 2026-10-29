@@ -42,6 +42,11 @@ DEFAULT_REVIEW_INITIAL_RECORDS = 256
 DEFAULT_REVIEW_INITIAL_MATERIAL_TOKENS = 65_536
 DEFAULT_REVIEW_SPLIT_MAX_DEPTH = 11
 DEFAULT_REVIEW_SPLIT_MAX_CALLS = 16
+# The serialized v7 worker contract keeps the older compatibility ceiling above.
+# Deterministic orchestration applies these tighter cost guards without invalidating
+# already prepared manifests or successful checkpoints.
+CORE_REVIEW_SPLIT_EFFECTIVE_MAX_DEPTH = 3
+CORE_REVIEW_SPLIT_MAX_RECORD_AMPLIFICATION = 2.0
 DEFAULT_MAX_WORKERS = 8
 DEFAULT_BULK_BUDGET_GATE_RECORDS = 4_096
 PASS_KINDS = {"translation", "review", "rewrite"}
@@ -274,7 +279,6 @@ def _execution_contract(
     max_root_input_tokens_per_turn: int | None,
     control_turn_budget_user_approved: bool,
 ) -> dict[str, Any]:
-    bulk_gate_active = record_count >= bulk_budget_gate_records
     budget_complete = (
         isinstance(max_elapsed_minutes, int)
         and max_elapsed_minutes > 0
@@ -290,6 +294,9 @@ def _execution_contract(
         )
     )
     budget_approved = bool(user_approved_budget and budget_complete)
+    # A size threshold is not user authority to invent a time/token/cost limit.
+    # Explicit complete bounds apply at any inventory size once the user approves them.
+    bulk_gate_active = budget_approved
     control_turn_budget_active = bool(
         control_turn_budget_user_approved
         and any(
@@ -331,7 +338,7 @@ def _execution_contract(
         "max_root_input_tokens_per_turn": (
             max_root_input_tokens_per_turn if control_turn_budget_active else None
         ),
-        "max_root_progress_messages_per_wave": 1,
+        "max_root_progress_messages_per_wave": 0,
         "max_worker_model_calls_per_task": (
             24 if pass_kind == "review" else 16
         ),
@@ -349,7 +356,7 @@ def _execution_contract(
         "task_replanning_allowed": False,
         "new_proof_layers_allowed": False,
         "aggregate_once_per_wave": True,
-        "progress_reporting": "wave_boundary_or_blocker_only",
+        "progress_reporting": "completion_checkpoint_or_blocker_only",
         "max_unchanged_progress_observations": 1,
         "max_control_actions_without_progress": 2,
         "capacity_failure_action": "defer_task_and_end_worker_attempt",
@@ -358,13 +365,13 @@ def _execution_contract(
         "bulk_budget_gate": {
             "active": bulk_gate_active,
             "activation_records": bulk_budget_gate_records,
-            "pilot_waves_without_approved_budget": 1,
+            "pilot_waves_without_approved_budget": 0,
             "user_approved": budget_approved,
             "max_elapsed_minutes": max_elapsed_minutes,
             "max_input_tokens": max_input_tokens,
             "max_provider_cost_usd": max_provider_cost_usd,
             "provider_cost_unmetered": provider_cost_unmetered,
-            "missing_budget_action": "checkpoint_and_request_user_limit",
+            "missing_budget_action": "continue_without_inferred_limit",
         },
     }
 
@@ -753,15 +760,14 @@ def _require_candidate_bindings(segments: list[Segment], pass_kind: str) -> None
         text = candidate.get("text")
         generation = candidate.get("generation")
         digest = candidate.get("digest")
-        valid_empty = (
+        valid_nonprinting = (
             isinstance(text, str)
-            and text == ""
-            and segment.metadata.get("ui_empty_target") is not None
+            and not text.strip()
             and not validate_integrity(segment, text, [])
         )
         if (
             not isinstance(text, str)
-            or (not text.strip() and not valid_empty)
+            or (not text.strip() and not valid_nonprinting)
             or not isinstance(generation, int)
             or isinstance(generation, bool)
             or generation < 1
@@ -802,7 +808,7 @@ def prepare_native_tasks(
         raise ValueError(f"pass_kind must be one of: {', '.join(sorted(PASS_KINDS))}")
     language_binding = _normalized_language_binding(language_binding)
     if route_binding is not None and (
-        pass_kind != "translation"
+        pass_kind not in {"translation", "review"}
         or set(route_binding) != {"provider", "attempt"}
         or not isinstance(route_binding.get("provider"), str)
         or not route_binding["provider"]
@@ -810,7 +816,9 @@ def prepare_native_tasks(
         or isinstance(route_binding["attempt"], bool)
         or route_binding["attempt"] < 1
     ):
-        raise ValueError("route_binding is valid only for a bound translation pass")
+        raise ValueError(
+            "route_binding is valid only for a bound translation or review pass"
+        )
     if max_records is None:
         max_records = (
             DEFAULT_REVIEW_MAX_RECORDS
@@ -1199,7 +1207,7 @@ def _validate_row(row: dict[str, Any], *, segment: Segment | None = None) -> dic
         raise ValueError(f"Native shard {target_id!r} text must be a string")
     if status == "success" and not text.strip():
         if (
-            segment is None or segment.id != target_id or text != ""
+            segment is None or segment.id != target_id
             or validate_integrity(segment, text, [])
         ):
             raise ValueError(f"Native shard {target_id!r} reports success without text")
@@ -1373,18 +1381,6 @@ def import_native_wave(
         raise ValueError("Native wave result directory does not exist")
 
     manifest = _load_task_manifest(work_dir, manifest_path)
-    if manifest.get("version", 0) >= LEGACY_WORKER_SPLIT_MANIFEST_VERSION:
-        budget_gate = manifest["execution_contract"].get("bulk_budget_gate", {})
-        pilot_waves = budget_gate.get("pilot_waves_without_approved_budget", 0)
-        if (
-            budget_gate.get("active") is True
-            and budget_gate.get("user_approved") is not True
-            and wave > pilot_waves
-        ):
-            raise ValueError(
-                "E_BULK_EXECUTION_BUDGET_REQUIRED: checkpoint after the pilot wave and "
-                "bind user-approved elapsed, input-token, and cost-or-unmetered limits"
-            )
     tasks = [task for task in manifest["tasks"] if task["wave"] == wave]
     if not tasks:
         raise ValueError("Native task manifest does not contain the requested wave")
@@ -1496,6 +1492,10 @@ def _write_wave_relay_dispatch(
             "route_change_allowed": False,
             "raw_child_response_forwarding_allowed": False,
             "child_leak_action": "quarantine_relay_and_return_categorical_receipt",
+            "terminal_seal_command": (
+                "game-l10n seal-native-wave-relay --workspace <workspace> "
+                "--dispatch <relay-path> --relay-ended"
+            ),
             "final_response": "workspace_relative_relay_receipt_path_only",
         },
     }
@@ -1612,6 +1612,7 @@ def seal_native_wave_relay(
     dispatch_path: Path,
     *,
     ended_tasks: tuple[str, ...] = (),
+    relay_ended: bool = False,
 ) -> dict[str, Any]:
     """Seal one relay and deterministically queue workers that ended without output."""
 
@@ -1669,9 +1670,21 @@ def seal_native_wave_relay(
         != "dispatch_exact_bindings_only"
         or payload["relay_contract"].get("raw_child_response_forwarding_allowed")
         is not False
+        or payload["relay_contract"].get("terminal_seal_command")
+        not in {
+            None,
+            (
+                "game-l10n seal-native-wave-relay --workspace <workspace> "
+                "--dispatch <relay-path> --relay-ended"
+            ),
+        }
     ):
         raise ValueError("E_NATIVE_RELAY_INVALID: dispatch binding is invalid")
 
+    if relay_ended and ended_tasks:
+        raise ValueError(
+            "E_NATIVE_RELAY_INVALID: relay-ended and explicit ended tasks are mutually exclusive"
+        )
     if len(set(ended_tasks)) != len(ended_tasks):
         raise ValueError("E_NATIVE_RELAY_INVALID: ended tasks must be unique")
 
@@ -1709,12 +1722,22 @@ def seal_native_wave_relay(
             raise ValueError("E_NATIVE_RELAY_INVALID: task names must be unique")
         bindings_by_name[task_name] = (task, result, binding["records"])
 
-    unknown_ended = [name for name in ended_tasks if name not in bindings_by_name]
+    effective_ended_tasks = ended_tasks
+    if relay_ended:
+        effective_ended_tasks = tuple(
+            name
+            for name, (task, result, _) in bindings_by_name.items()
+            if _read_structurally_bound_result(task, result) is None
+        )
+
+    unknown_ended = [
+        name for name in effective_ended_tasks if name not in bindings_by_name
+    ]
     if unknown_ended:
         raise ValueError("E_NATIVE_RELAY_INVALID: ended task is not bound to this wave")
 
     ended_tasks_recorded = 0
-    for name in ended_tasks:
+    for name in effective_ended_tasks:
         task, result, expected_records = bindings_by_name[name]
         ended_tasks_recorded += int(
             _complete_ended_task_result(
@@ -1983,7 +2006,7 @@ def _load_native_control_state(
     ):
         raise ValueError("E_NATIVE_CONTROL_STATE_INVALID: state values are invalid")
     # A regenerated manifest may bind an approved budget without changing the task plan.
-    # Preserve pilot usage and imported checkpoints, but start a new decision generation.
+    # Preserve prior usage and imported checkpoints, but start a new decision generation.
     if contract_changed:
         state["active_wave"] = 0
         state["control_steps_in_wave"] = 0
@@ -2138,12 +2161,6 @@ def _native_budget_issue(
     execution_contract: dict[str, Any], state: dict[str, Any], next_wave: int
 ) -> str:
     gate = execution_contract.get("bulk_budget_gate", {})
-    if (
-        gate.get("active") is True
-        and gate.get("user_approved") is not True
-        and next_wave > gate.get("pilot_waves_without_approved_budget", 0)
-    ):
-        return "E_BULK_EXECUTION_BUDGET_REQUIRED"
     if gate.get("user_approved") is not True:
         return ""
     max_elapsed = gate.get("max_elapsed_minutes")
@@ -2169,6 +2186,17 @@ def _native_budget_elapsed_minutes(state: dict[str, Any]) -> float:
     if not isinstance(started_at, (int, float)) or isinstance(started_at, bool):
         return 0.0
     return max(0.0, (time.time() - float(started_at)) / 60.0)
+
+
+def _native_task_dispatch_allowed(
+    manifest: dict[str, Any], task: dict[str, Any]
+) -> bool:
+    if task.get("dispatch_authorized") is True:
+        return True
+    gate = manifest.get("execution_contract", {}).get("bulk_budget_gate", {})
+    # Older manifests may contain framework-inferred pilot locks.  They are not
+    # user authority and must not strand a valid inherited checkpoint.
+    return gate.get("active") is True and gate.get("user_approved") is not True
 
 
 def _review_split_chain_path(
@@ -2280,6 +2308,9 @@ def _prepare_review_split_child(
     current_manifest: dict[str, Any],
     failed: list[Segment],
     root_plan_fingerprint: str,
+    *,
+    attempted_records: int,
+    root_records: int,
 ) -> tuple[Path, Path] | None:
     split = current_manifest["review_split"]
     parent_task_records = int(
@@ -2290,11 +2321,11 @@ def _prepare_review_split_child(
             "task_max_material_tokens", current_manifest["max_material_tokens"]
         )
     )
-    if (
-        len(failed) <= 1
-        or parent_task_records <= 1
-        or split["depth"] >= DEFAULT_REVIEW_SPLIT_MAX_DEPTH
-        or split["semantic_passes"] >= DEFAULT_REVIEW_SPLIT_MAX_CALLS
+    if _review_split_stop_reason(
+        current_manifest,
+        failed,
+        attempted_records=attempted_records,
+        root_records=root_records,
     ):
         return None
     next_depth = split["depth"] + 1
@@ -2361,6 +2392,36 @@ def _prepare_review_split_child(
     _inherit_native_control_usage(work_dir, current_manifest, child_manifest)
     child_results.mkdir(parents=True, exist_ok=True)
     return child_manifest_path, child_results
+
+
+def _review_split_stop_reason(
+    current_manifest: dict[str, Any],
+    failed: list[Segment],
+    *,
+    attempted_records: int,
+    root_records: int,
+) -> str:
+    split = current_manifest["review_split"]
+    parent_task_records = int(
+        current_manifest.get("task_max_records", current_manifest["max_records"])
+    )
+    if len(failed) <= 1:
+        return "smallest_safe_record_isolated"
+    if parent_task_records <= 1:
+        return "single_record_tasks_reached"
+    if split["depth"] >= min(
+        DEFAULT_REVIEW_SPLIT_MAX_DEPTH, CORE_REVIEW_SPLIT_EFFECTIVE_MAX_DEPTH
+    ):
+        return "effective_split_depth_limit"
+    if split["semantic_passes"] >= DEFAULT_REVIEW_SPLIT_MAX_CALLS:
+        return "semantic_pass_limit"
+    projected_attempts = attempted_records + len(failed)
+    if root_records < 1 or (
+        projected_attempts / root_records
+        > CORE_REVIEW_SPLIT_MAX_RECORD_AMPLIFICATION
+    ):
+        return "record_amplification_limit"
+    return ""
 
 
 def _load_review_split_chain(
@@ -2610,9 +2671,6 @@ def _native_control_step_single(
         if relay_issue:
             action = "checkpoint_and_stop"
             issue_codes = [relay_issue]
-        elif budget_issue == "E_BULK_EXECUTION_BUDGET_REQUIRED":
-            action = "checkpoint_and_stop"
-            issue_codes = [budget_issue]
         elif budget_issue and ready_results != len(tasks):
             action = "checkpoint_and_stop"
             issue_codes = [budget_issue]
@@ -2662,7 +2720,8 @@ def _native_control_step_single(
                         action = "checkpoint_and_stop"
                         issue_codes = [budget_issue]
                     elif not all(
-                        task["dispatch_authorized"] for task in next_tasks
+                        _native_task_dispatch_allowed(manifest, task)
+                        for task in next_tasks
                     ):
                         action = "checkpoint_and_stop"
                         issue_codes = ["E_NATIVE_DISPATCH_NOT_AUTHORIZED"]
@@ -2672,7 +2731,9 @@ def _native_control_step_single(
         elif ready_results:
             action = "wait_for_active_wave"
             issue_codes = ["E_NATIVE_WAVE_INCOMPLETE"]
-        elif not all(task["dispatch_authorized"] for task in tasks):
+        elif not all(
+            _native_task_dispatch_allowed(manifest, task) for task in tasks
+        ):
             action = "checkpoint_and_stop"
             issue_codes = ["E_NATIVE_DISPATCH_NOT_AUTHORIZED"]
         else:
@@ -2706,6 +2767,16 @@ def _native_control_step_single(
         if selected_tasks and next_wave is not None
         else ""
     )
+    imported_material_tokens = sum(
+        int(task.get("estimated_material_tokens", 0))
+        for wave in imported_waves
+        for task in wave_tasks[wave]
+    )
+    planned_material_tokens = sum(
+        int(task.get("estimated_material_tokens", 0))
+        for task in manifest["tasks"]
+    )
+    usage_events = len(state["usage_event_ids"])
     return {
         "schema": NATIVE_CONTROL_STEP_SCHEMA,
         "action": action,
@@ -2732,8 +2803,18 @@ def _native_control_step_single(
             else None
         ),
         "usage": {
-            "events": len(state["usage_event_ids"]),
+            "events": usage_events,
             "input_tokens": state["input_tokens"],
+            "input_tokens_known": usage_events > 0,
+            "telemetry_status": (
+                "measured"
+                if usage_events > 0
+                else "unmeasured"
+                if imported_tasks > 0
+                else "pending"
+            ),
+            "estimated_material_tokens_imported": imported_material_tokens,
+            "estimated_material_tokens_planned": planned_material_tokens,
             "provider_cost_usd": state["provider_cost_usd"],
             "elapsed_minutes": round(
                 _native_budget_elapsed_minutes(state),
@@ -2806,6 +2887,14 @@ def native_control_step(
         current_results_dir = (work_dir / chain["current_results"]).resolve()
 
     current_manifest = _load_task_manifest(work_dir, current_manifest_path)
+    root_records = int(root_manifest["records"])
+    record_attempts = root_records
+    for relative in chain["manifests"][1:-1]:
+        record_attempts += int(
+            _load_task_manifest(work_dir, (work_dir / relative).resolve())["records"]
+        )
+    if len(chain["manifests"]) > 1:
+        record_attempts += int(current_manifest["records"])
     step = _native_control_step_single(
         work_dir,
         current_manifest_path,
@@ -2821,6 +2910,13 @@ def native_control_step(
         "semantic_passes": split["semantic_passes"],
         "failed_records": None,
         "chain_complete": chain["complete"],
+        "record_attempts": record_attempts,
+        "record_amplification_ratio": round(record_attempts / root_records, 6),
+        "max_record_amplification_ratio": (
+            CORE_REVIEW_SPLIT_MAX_RECORD_AMPLIFICATION
+        ),
+        "effective_max_depth": CORE_REVIEW_SPLIT_EFFECTIVE_MAX_DEPTH,
+        "terminal_reason": "",
     }
     if step["action"] != "aggregate_completed_pass":
         _atomic_json(chain_path, chain)
@@ -2830,16 +2926,25 @@ def native_control_step(
         work_dir, current_manifest_path, current_manifest
     )
     split_summary["failed_records"] = len(failed)
+    stop_reason = _review_split_stop_reason(
+        current_manifest,
+        failed,
+        attempted_records=record_attempts,
+        root_records=root_records,
+    )
     child = _prepare_review_split_child(
         work_dir,
         current_manifest_path,
         current_manifest,
         failed,
         root_plan_fingerprint,
+        attempted_records=record_attempts,
+        root_records=root_records,
     )
     if child is None:
         chain["complete"] = True
         split_summary["chain_complete"] = True
+        split_summary["terminal_reason"] = stop_reason
         _atomic_json(chain_path, chain)
         return {**step, "review_split": split_summary}
 
@@ -2867,6 +2972,15 @@ def native_control_step(
             "semantic_passes": child_split["semantic_passes"],
             "failed_records": len(failed),
             "chain_complete": False,
+            "record_attempts": record_attempts + len(failed),
+            "record_amplification_ratio": round(
+                (record_attempts + len(failed)) / root_records, 6
+            ),
+            "max_record_amplification_ratio": (
+                CORE_REVIEW_SPLIT_MAX_RECORD_AMPLIFICATION
+            ),
+            "effective_max_depth": CORE_REVIEW_SPLIT_EFFECTIVE_MAX_DEPTH,
+            "terminal_reason": "",
         },
     }
 

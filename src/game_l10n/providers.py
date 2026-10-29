@@ -442,13 +442,25 @@ class CompatibleChatProvider(ModelProvider):
         if message.get("refusal") or choice.get("finish_reason") == "content_filter":
             return _with_usage(_refusal_payload(schema_name), data)
         if choice.get("finish_reason") == "length":
-            raise ProviderFailure("malformed_response", retryable=True)
+            raise ProviderFailure(
+                "malformed_response",
+                retryable=True,
+                usage=_normalized_usage(data),
+            )
         if choice.get("finish_reason") in {"insufficient_system_resource", "aborted"}:
-            raise ProviderFailure("provider_error", retryable=True)
+            raise ProviderFailure(
+                "provider_error",
+                retryable=True,
+                usage=_normalized_usage(data),
+            )
         try:
             return _with_usage(json.loads(message.get("content") or ""), data)
         except json.JSONDecodeError as exc:
-            raise ProviderFailure("malformed_response", retryable=True) from exc
+            raise ProviderFailure(
+                "malformed_response",
+                retryable=True,
+                usage=_normalized_usage(data),
+            ) from exc
 
     def fingerprint(self) -> dict[str, Any]:
         return {
@@ -498,10 +510,27 @@ class CompatibleChatProvider(ModelProvider):
         if message.get("refusal") or choice.get("finish_reason") == "content_filter":
             return _with_usage(_refusal_payload(schema_name), data)
         if choice.get("finish_reason") == "length":
-            raise ProviderFailure("malformed_response", retryable=True)
+            raise ProviderFailure(
+                "malformed_response",
+                retryable=True,
+                usage=_normalized_usage(data),
+            )
         if choice.get("finish_reason") in {"insufficient_system_resource", "aborted"}:
-            raise ProviderFailure("provider_error", retryable=True)
-        return _with_usage(_parse_plain_review_verdict(message.get("content") or ""), data)
+            raise ProviderFailure(
+                "provider_error",
+                retryable=True,
+                usage=_normalized_usage(data),
+            )
+        try:
+            verdict = _parse_plain_review_verdict(message.get("content") or "")
+        except ProviderFailure as exc:
+            raise ProviderFailure(
+                exc.code,
+                retryable=exc.retryable,
+                status_code=exc.status_code,
+                usage=_normalized_usage(data),
+            ) from exc
+        return _with_usage(verdict, data)
 
 
 class CommandProvider(ModelProvider):

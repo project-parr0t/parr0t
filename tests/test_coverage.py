@@ -345,6 +345,74 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(state["missing_from_independent_count"], 0)
         self.assertFalse(state["order_mismatch"])
 
+    def test_disjoint_id_namespaces_are_not_counted_as_whole_content_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            primary_rows = [
+                {"id": f"primary-{index}", "source": f"SOURCE_{index}"}
+                for index in range(10)
+            ]
+            independent_rows = [
+                {"id": f"secondary-{index}", "source": f"SOURCE_{index}"}
+                for index in range(10)
+            ]
+            write_inventory(primary, "synthetic-ast", primary_rows)
+            write_inventory(independent, "synthetic-table", independent_rows)
+
+            state = verify_inventory_pair(primary, independent)
+
+        self.assertFalse(state["static_complete"])
+        self.assertIn(
+            "INVENTORY_IDENTITY_NAMESPACE_MISMATCH", state["issue_codes"]
+        )
+        self.assertEqual(state["identity_gate"]["status"], "namespace_mismatch")
+        self.assertEqual(state["identity_gate"]["raw_id_overlap_count"], 0)
+        self.assertTrue(
+            state["identity_gate"]["source_multiset_overlap_measured"]
+        )
+        self.assertEqual(
+            state["identity_gate"]["source_multiset_overlap_ratio"], 1.0
+        )
+        self.assertEqual(state["gap_score"], 2)
+
+    def test_saved_primary_identity_is_append_only_across_handoffs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            rows = [
+                {"id": "stable-1", "source": "SOURCE_ONE"},
+                {"id": "stable-2", "source": "SOURCE_TWO"},
+            ]
+            write_inventory(primary, "synthetic-ast", rows)
+            write_inventory(independent, "synthetic-table", rows)
+            first = save_inventory_attestation(root, primary, independent)
+
+            extended = [*rows, {"id": "stable-3", "source": "SOURCE_THREE"}]
+            write_inventory(primary, "synthetic-ast", extended)
+            write_inventory(independent, "synthetic-table", extended)
+            second = save_inventory_attestation(root, primary, independent)
+
+            rewritten = [
+                {"id": "replacement-1", "source": "SOURCE_ONE"},
+                {"id": "replacement-2", "source": "SOURCE_TWO"},
+                {"id": "replacement-3", "source": "SOURCE_THREE"},
+            ]
+            write_inventory(primary, "synthetic-ast", rewritten)
+            write_inventory(independent, "synthetic-table", rewritten)
+            with self.assertRaisesRegex(
+                ConfigurationError, "E_INVENTORY_PRIMARY_IDENTITY_DRIFT"
+            ):
+                save_inventory_attestation(root, primary, independent)
+
+        self.assertEqual(
+            first["primary_identity_binding"]["policy"],
+            "append_only_preserve_existing_id_order",
+        )
+        self.assertEqual(second["primary_identity_binding"]["records"], 3)
+
     def test_inventory_comparison_keys_must_be_unique(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

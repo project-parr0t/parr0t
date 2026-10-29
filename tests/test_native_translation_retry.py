@@ -6,6 +6,7 @@ import unittest
 from dataclasses import asdict
 from pathlib import Path
 
+from game_l10n.formats import read_segments
 from game_l10n.models import Segment
 from game_l10n.native_translation_retry import (
     STATE_NAME,
@@ -34,6 +35,39 @@ def _result(target_id: str, status: str, text: str = "", provider: str = "native
 
 
 class NativeTranslationRetryTests(unittest.TestCase):
+    def test_resume_reads_the_original_json_source_format(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.json"
+            source.write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {"id": "a", "source": "A"},
+                            {"id": "b", "source": "B"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            segments = read_segments(source)
+            first = root / "first.jsonl"
+            _write_jsonl(
+                first,
+                [_result("a", "success", "TA"), _result("b", "error")],
+            )
+            state_dir = root / "retry"
+            start_native_translation_retries(
+                root, source, segments, first, state_dir
+            )
+            retry = root / "retry.jsonl"
+            _write_jsonl(retry, [_result("b", "success", "TB")])
+
+            state = advance_native_translation_retries(root, state_dir, retry)
+
+        self.assertEqual(state["next_action"], "complete")
+        self.assertEqual(state["pending_count"], 0)
+
     def test_failed_only_luna_then_sol_attempts_gate_external_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
