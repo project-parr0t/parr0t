@@ -470,7 +470,11 @@ def seal_translation_exchange(work_dir: Path, bundle: Path) -> dict[str, Any]:
         request = requests.get(target_id)
         if request is None or target_id in resolved:
             raise TranslationExchangeError("Success target is unknown or duplicated")
-        if row["status"] != "success" or not isinstance(row["text"], str) or not row["text"].strip():
+        valid_success_text = isinstance(row["text"], str) and (
+            bool(row["text"].strip())
+            or (not request["source"].strip() and row["text"] == request["source"])
+        )
+        if row["status"] != "success" or not valid_success_text:
             raise TranslationExchangeError("Success rows require non-empty translated text")
         if not isinstance(row["route"], str) or not row["route"] or len(row["route"]) > 120:
             raise TranslationExchangeError("Success route is invalid")
@@ -733,7 +737,13 @@ def process_translation_exchange(
             request = requests_by_id[result.segment_id]
             prior_attempt = int(prior_failures.get(result.segment_id, {}).get("attempt", 0))
             attempt = prior_attempt + 1
-            if result.status in {"translated", "reviewed", "accepted_unreviewed"} and result.text.strip():
+            valid_success_text = bool(result.text.strip()) or (
+                not request["source"].strip() and result.text == request["source"]
+            )
+            if (
+                result.status in {"translated", "reviewed", "accepted_unreviewed"}
+                and valid_success_text
+            ):
                 success_by_id[result.segment_id] = {
                     "target_id": result.segment_id,
                     "status": "success",
