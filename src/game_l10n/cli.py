@@ -163,6 +163,7 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
     "unpack_and_extract_ordered_script": ("docs/coverage-gates.md",),
     "extract_independent_source_inventory": ("docs/coverage-gates.md",),
     "verify_independent_source_inventory": ("docs/coverage-gates.md",),
+    "reconcile_inventory_identity_namespace": ("docs/coverage-gates.md",),
     "resolve_source_inventory_gaps": ("docs/coverage-gates.md",),
     "analyze_complete_script_context": (
         "docs/coverage-gates.md",
@@ -232,6 +233,7 @@ STATUS_DATA_PLANE_ROLES = {
     "record_target_identity_evaluate_and_select_sdk": "source_probe",
     "unpack_and_extract_ordered_script": "primary_inventory",
     "extract_independent_source_inventory": "independent_inventory",
+    "reconcile_inventory_identity_namespace": "inventory_reconciler",
     "resolve_source_inventory_gaps": "inventory_reconciler",
     "analyze_complete_script_context": "context_analyzer",
     "verify_requested_ui_image_scope": "image_ui_inventory",
@@ -288,6 +290,10 @@ def _public_inventory_gate(state: dict[str, Any] | None) -> dict[str, Any]:
         "independent_segments": state.get("independent_segments", 0),
         "gap_score": state.get("gap_score", 0),
         "issue_codes": list(state.get("issue_codes", [])),
+        "identity_gate": dict(state.get("identity_gate", {})),
+        "primary_identity_binding": dict(
+            state.get("primary_identity_binding", {})
+        ),
         "continuation_required": state.get("static_complete") is not True,
         "reconciliation": {
             "generation": reconciliation.get("generation", 0),
@@ -1259,10 +1265,16 @@ def cmd_native_pass_step(args: argparse.Namespace) -> int:
 def cmd_seal_native_wave_relay(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     require_sdk_activation(work_dir, load_config(work_dir))
+    if not args.relay_ended and not args.ended_task:
+        raise ValueError(
+            "E_NATIVE_RELAY_TERMINAL_STATE_REQUIRED: use --relay-ended after "
+            "the relay lifecycle ends, or name legacy ended tasks explicitly"
+        )
     result = seal_native_wave_relay(
         work_dir,
         _path_in_workspace(work_dir, args.dispatch, must_exist=True),
         ended_tasks=tuple(args.ended_task or ()),
+        relay_ended=bool(args.relay_ended),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -1385,21 +1397,45 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
     execution = config.get("execution", {})
     pass_kind = args.pass_kind
     route_binding = None
-    if pass_kind == "translation" and effective_execution_mode(config) == CODEX_APP_EXECUTION_MODE:
+    codex_app_mode = effective_execution_mode(config) == CODEX_APP_EXECUTION_MODE
+    if pass_kind == "translation" and codex_app_mode:
         plan = _native_translation_route_plan(config)
         provider = args.native_provider or plan[0]["provider"]
-        limits = {
-            item["provider"]: 1 + item["max_retries"] for item in plan
-        }
+        limits = {item["provider"]: 1 + item["max_retries"] for item in plan}
         attempt = args.route_attempt or 1
         if provider not in limits or not 1 <= attempt <= limits[provider]:
             raise ConfigurationError(
                 "Native translation provider/attempt is outside the configured route plan"
             )
         route_binding = {"provider": provider, "attempt": attempt}
-    elif args.native_provider is not None or args.route_attempt is not None:
+    elif pass_kind == "review" and codex_app_mode:
+        tier = args.review_tier
+        if tier not in {"triage", "strong"}:
+            raise ConfigurationError(
+                "Codex App review passes require --review-tier triage or strong"
+            )
+        route_key = "review_triagers" if tier == "triage" else "reviewers"
+        configured_routes = config.get("routing", {}).get(route_key, [])
+        provider = next(
+            (
+                item
+                for item in configured_routes
+                if isinstance(item, str) and item.startswith("native-")
+            ),
+            "",
+        )
+        if not provider:
+            raise ConfigurationError(
+                f"Codex App {tier} review has no configured native route"
+            )
+        route_binding = {"provider": provider, "attempt": 1}
+    elif (
+        args.native_provider is not None
+        or args.route_attempt is not None
+        or args.review_tier is not None
+    ):
         raise ConfigurationError(
-            "Native provider and route attempt apply only to Codex App translation passes"
+            "Native provider/attempt and review tier must match a Codex App native pass"
         )
     stored_records = execution.get("native_shard_records")
     stored_material = execution.get("native_shard_material_tokens")
@@ -1865,10 +1901,10 @@ def cmd_process_translation_exchange(args: argparse.Namespace) -> int:
         if args.max_input_tokens is not None or args.usage_baseline_input_tokens is not None:
             raise ConfigurationError("E_FALLBACK_UNLIMITED_POLICY_INVALID")
         max_input_tokens = None
-    elif max_input_tokens is None:
-        raise ConfigurationError("E_FALLBACK_BUDGET_REQUIRED")
     if (
-        not unlimited and not (work_dir / FALLBACK_USAGE_RELATIVE).is_file()
+        not unlimited
+        and max_input_tokens is not None
+        and not (work_dir / FALLBACK_USAGE_RELATIVE).is_file()
         and args.usage_baseline_input_tokens is None
     ):
         raise ConfigurationError("E_FALLBACK_BUDGET_BASELINE_REQUIRED")
@@ -2092,7 +2128,12 @@ def cmd_status(args: argparse.Namespace) -> int:
                     and inventory_state.get("primary_path")
                 )
                 if not inventory_verified:
-                    action = "resolve_source_inventory_gaps"
+                    action = (
+                        "reconcile_inventory_identity_namespace"
+                        if "INVENTORY_IDENTITY_NAMESPACE_MISMATCH"
+                        in inventory_state.get("issue_codes", [])
+                        else "resolve_source_inventory_gaps"
+                    )
                 else:
                     try:
                         inventory_state = require_inventory_attestation(
@@ -2864,6 +2905,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Bind a Codex App translation pass to its configured attempt ordinal",
     )
+    native_prepare.add_argument(
+        "--review-tier",
+        choices=["triage", "strong"],
+        help=(
+            "Bind a Codex App review pass to the configured Luna triage or Sol "
+            "strong-review route"
+        ),
+    )
     native_prepare.add_argument("--max-records", type=int)
     native_prepare.add_argument(
         "--min-records",
@@ -2959,6 +3008,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Record a bound worker that ended without a result as an operational "
             "failure; never overwrite an existing result"
+        ),
+    )
+    native_relay.add_argument(
+        "--relay-ended",
+        action="store_true",
+        help=(
+            "Seal every still-missing bound task as an operational failure after "
+            "the isolated relay lifecycle has ended"
         ),
     )
     native_relay.set_defaults(func=cmd_seal_native_wave_relay)
