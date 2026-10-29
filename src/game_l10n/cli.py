@@ -163,6 +163,7 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
     "unpack_and_extract_ordered_script": ("docs/coverage-gates.md",),
     "extract_independent_source_inventory": ("docs/coverage-gates.md",),
     "verify_independent_source_inventory": ("docs/coverage-gates.md",),
+    "reconcile_inventory_identity_namespace": ("docs/coverage-gates.md",),
     "resolve_source_inventory_gaps": ("docs/coverage-gates.md",),
     "analyze_complete_script_context": (
         "docs/coverage-gates.md",
@@ -232,6 +233,7 @@ STATUS_DATA_PLANE_ROLES = {
     "record_target_identity_evaluate_and_select_sdk": "source_probe",
     "unpack_and_extract_ordered_script": "primary_inventory",
     "extract_independent_source_inventory": "independent_inventory",
+    "reconcile_inventory_identity_namespace": "inventory_reconciler",
     "resolve_source_inventory_gaps": "inventory_reconciler",
     "analyze_complete_script_context": "context_analyzer",
     "verify_requested_ui_image_scope": "image_ui_inventory",
@@ -288,6 +290,10 @@ def _public_inventory_gate(state: dict[str, Any] | None) -> dict[str, Any]:
         "independent_segments": state.get("independent_segments", 0),
         "gap_score": state.get("gap_score", 0),
         "issue_codes": list(state.get("issue_codes", [])),
+        "identity_gate": dict(state.get("identity_gate", {})),
+        "primary_identity_binding": dict(
+            state.get("primary_identity_binding", {})
+        ),
         "continuation_required": state.get("static_complete") is not True,
         "reconciliation": {
             "generation": reconciliation.get("generation", 0),
@@ -2092,7 +2098,12 @@ def cmd_status(args: argparse.Namespace) -> int:
                     and inventory_state.get("primary_path")
                 )
                 if not inventory_verified:
-                    action = "resolve_source_inventory_gaps"
+                    action = (
+                        "reconcile_inventory_identity_namespace"
+                        if "INVENTORY_IDENTITY_NAMESPACE_MISMATCH"
+                        in inventory_state.get("issue_codes", [])
+                        else "resolve_source_inventory_gaps"
+                    )
                 else:
                     try:
                         inventory_state = require_inventory_attestation(

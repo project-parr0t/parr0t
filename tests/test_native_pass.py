@@ -350,6 +350,69 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(rows[2]["status"], "success")
         self.assertEqual(rows[3]["status"], "refused")
 
+    def test_review_split_stops_at_two_times_record_amplification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            segments = [review_segment(f"fixture-{index}") for index in range(4)]
+            prepare_native_tasks(
+                root,
+                source,
+                segments,
+                tasks,
+                pass_kind="review",
+                max_records=4,
+                max_workers=8,
+            )
+
+            root_step = native_control_step(root, tasks / "manifest.json", results)
+            root_relay = json.loads((root / root_step["relay"]["dispatch"]).read_text())
+            for binding in root_relay["task_bindings"]:
+                rows = [
+                    json.loads(line)
+                    for line in (root / binding["task"]).read_text().splitlines()
+                ]
+                self._write_rows(
+                    root / binding["result"],
+                    [
+                        {"target_id": row["target_id"], "status": "refused", "text": ""}
+                        for row in rows
+                    ],
+                )
+
+            child_step = native_control_step(root, tasks / "manifest.json", results)
+            child_relay = json.loads(
+                (root / child_step["relay"]["dispatch"]).read_text()
+            )
+            for binding in child_relay["task_bindings"]:
+                rows = [
+                    json.loads(line)
+                    for line in (root / binding["task"]).read_text().splitlines()
+                ]
+                self._write_rows(
+                    root / binding["result"],
+                    [
+                        {"target_id": row["target_id"], "status": "refused", "text": ""}
+                        for row in rows
+                    ],
+                )
+
+            completed = native_control_step(root, tasks / "manifest.json", results)
+
+        self.assertEqual(completed["action"], "aggregate_completed_pass")
+        self.assertTrue(completed["review_split"]["chain_complete"])
+        self.assertEqual(completed["review_split"]["record_attempts"], 8)
+        self.assertEqual(
+            completed["review_split"]["record_amplification_ratio"], 2.0
+        )
+        self.assertEqual(
+            completed["review_split"]["terminal_reason"],
+            "record_amplification_limit",
+        )
+
     def test_review_split_rejects_changed_failed_subset_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1122,7 +1185,11 @@ class NativePassTests(unittest.TestCase):
         )
         self.assertEqual(
             manifest["execution_contract"]["progress_reporting"],
-            "wave_boundary_or_blocker_only",
+            "completion_checkpoint_or_blocker_only",
+        )
+        self.assertEqual(
+            manifest["execution_contract"]["max_root_progress_messages_per_wave"],
+            0,
         )
         self.assertTrue(
             all(task["records"] == 1 for task in manifest["tasks"])
@@ -1382,6 +1449,9 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(step["counts"]["imported_waves"], 2)
         self.assertEqual(step["usage"]["events"], 2)
         self.assertEqual(step["usage"]["input_tokens"], 200)
+        self.assertTrue(step["usage"]["input_tokens_known"])
+        self.assertEqual(step["usage"]["telemetry_status"], "measured")
+        self.assertGreater(step["usage"]["estimated_material_tokens_imported"], 0)
         self.assertNotIn("SOURCE", json.dumps(step))
         self.assertNotIn("TARGET", json.dumps(step))
 

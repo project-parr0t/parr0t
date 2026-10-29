@@ -56,9 +56,9 @@ Do not reorder barriers. Failures affect only their target and route; they canno
 - Presets fix provider roles. Keys do not change mode, role, or service. Parent sees only `fallback_required`, never rationale.
 - Recommended presets retry failed Luna targets 5 times, then Sol targets 3 times, before DeepSeek. Counts exclude each route's first attempt; authentication/quota exhaustion advances immediately.
 - Translation is faithful transformation, not content generation. Independent review checks meaning, omission, voice, tone, function, conditions, units, terminology, allusions, placeholders, markup, control codes, ordering, and material layout risk.
-- Build new outputs in the workspace. Automated checks use synthetic targets and never install or launch the real game.
+- Build only in the workspace; synthetic checks never install or launch games.
 - Apply proportional verification and stop after the changed layer passes. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.
-- Native passes are root-to-relay. Dispatch only the fresh relay path from `native-pass-step`. Review ceiling: 2,048; initial tasks: 256 records/65,536 tokens. Core alone emits failed-only child manifests.
+- Native: dispatch only `native-pass-step`'s fresh relay. Review limits: 2,048 ceiling; 256 records/65,536 tokens initially; failed-only core splits; depth 3; 2.0x attempts. Missing token telemetry is unknown.
 
 ## Status-driven routes
 

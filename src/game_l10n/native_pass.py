@@ -42,6 +42,11 @@ DEFAULT_REVIEW_INITIAL_RECORDS = 256
 DEFAULT_REVIEW_INITIAL_MATERIAL_TOKENS = 65_536
 DEFAULT_REVIEW_SPLIT_MAX_DEPTH = 11
 DEFAULT_REVIEW_SPLIT_MAX_CALLS = 16
+# The serialized v7 worker contract keeps the older compatibility ceiling above.
+# Deterministic orchestration applies these tighter cost guards without invalidating
+# already prepared manifests or successful checkpoints.
+CORE_REVIEW_SPLIT_EFFECTIVE_MAX_DEPTH = 3
+CORE_REVIEW_SPLIT_MAX_RECORD_AMPLIFICATION = 2.0
 DEFAULT_MAX_WORKERS = 8
 DEFAULT_BULK_BUDGET_GATE_RECORDS = 4_096
 PASS_KINDS = {"translation", "review", "rewrite"}
@@ -331,7 +336,7 @@ def _execution_contract(
         "max_root_input_tokens_per_turn": (
             max_root_input_tokens_per_turn if control_turn_budget_active else None
         ),
-        "max_root_progress_messages_per_wave": 1,
+        "max_root_progress_messages_per_wave": 0,
         "max_worker_model_calls_per_task": (
             24 if pass_kind == "review" else 16
         ),
@@ -349,7 +354,7 @@ def _execution_contract(
         "task_replanning_allowed": False,
         "new_proof_layers_allowed": False,
         "aggregate_once_per_wave": True,
-        "progress_reporting": "wave_boundary_or_blocker_only",
+        "progress_reporting": "completion_checkpoint_or_blocker_only",
         "max_unchanged_progress_observations": 1,
         "max_control_actions_without_progress": 2,
         "capacity_failure_action": "defer_task_and_end_worker_attempt",
@@ -2280,6 +2285,9 @@ def _prepare_review_split_child(
     current_manifest: dict[str, Any],
     failed: list[Segment],
     root_plan_fingerprint: str,
+    *,
+    attempted_records: int,
+    root_records: int,
 ) -> tuple[Path, Path] | None:
     split = current_manifest["review_split"]
     parent_task_records = int(
@@ -2290,11 +2298,11 @@ def _prepare_review_split_child(
             "task_max_material_tokens", current_manifest["max_material_tokens"]
         )
     )
-    if (
-        len(failed) <= 1
-        or parent_task_records <= 1
-        or split["depth"] >= DEFAULT_REVIEW_SPLIT_MAX_DEPTH
-        or split["semantic_passes"] >= DEFAULT_REVIEW_SPLIT_MAX_CALLS
+    if _review_split_stop_reason(
+        current_manifest,
+        failed,
+        attempted_records=attempted_records,
+        root_records=root_records,
     ):
         return None
     next_depth = split["depth"] + 1
@@ -2361,6 +2369,36 @@ def _prepare_review_split_child(
     _inherit_native_control_usage(work_dir, current_manifest, child_manifest)
     child_results.mkdir(parents=True, exist_ok=True)
     return child_manifest_path, child_results
+
+
+def _review_split_stop_reason(
+    current_manifest: dict[str, Any],
+    failed: list[Segment],
+    *,
+    attempted_records: int,
+    root_records: int,
+) -> str:
+    split = current_manifest["review_split"]
+    parent_task_records = int(
+        current_manifest.get("task_max_records", current_manifest["max_records"])
+    )
+    if len(failed) <= 1:
+        return "smallest_safe_record_isolated"
+    if parent_task_records <= 1:
+        return "single_record_tasks_reached"
+    if split["depth"] >= min(
+        DEFAULT_REVIEW_SPLIT_MAX_DEPTH, CORE_REVIEW_SPLIT_EFFECTIVE_MAX_DEPTH
+    ):
+        return "effective_split_depth_limit"
+    if split["semantic_passes"] >= DEFAULT_REVIEW_SPLIT_MAX_CALLS:
+        return "semantic_pass_limit"
+    projected_attempts = attempted_records + len(failed)
+    if root_records < 1 or (
+        projected_attempts / root_records
+        > CORE_REVIEW_SPLIT_MAX_RECORD_AMPLIFICATION
+    ):
+        return "record_amplification_limit"
+    return ""
 
 
 def _load_review_split_chain(
@@ -2706,6 +2744,16 @@ def _native_control_step_single(
         if selected_tasks and next_wave is not None
         else ""
     )
+    imported_material_tokens = sum(
+        int(task.get("estimated_material_tokens", 0))
+        for wave in imported_waves
+        for task in wave_tasks[wave]
+    )
+    planned_material_tokens = sum(
+        int(task.get("estimated_material_tokens", 0))
+        for task in manifest["tasks"]
+    )
+    usage_events = len(state["usage_event_ids"])
     return {
         "schema": NATIVE_CONTROL_STEP_SCHEMA,
         "action": action,
@@ -2732,8 +2780,18 @@ def _native_control_step_single(
             else None
         ),
         "usage": {
-            "events": len(state["usage_event_ids"]),
+            "events": usage_events,
             "input_tokens": state["input_tokens"],
+            "input_tokens_known": usage_events > 0,
+            "telemetry_status": (
+                "measured"
+                if usage_events > 0
+                else "unmeasured"
+                if imported_tasks > 0
+                else "pending"
+            ),
+            "estimated_material_tokens_imported": imported_material_tokens,
+            "estimated_material_tokens_planned": planned_material_tokens,
             "provider_cost_usd": state["provider_cost_usd"],
             "elapsed_minutes": round(
                 _native_budget_elapsed_minutes(state),
@@ -2806,6 +2864,14 @@ def native_control_step(
         current_results_dir = (work_dir / chain["current_results"]).resolve()
 
     current_manifest = _load_task_manifest(work_dir, current_manifest_path)
+    root_records = int(root_manifest["records"])
+    record_attempts = root_records
+    for relative in chain["manifests"][1:-1]:
+        record_attempts += int(
+            _load_task_manifest(work_dir, (work_dir / relative).resolve())["records"]
+        )
+    if len(chain["manifests"]) > 1:
+        record_attempts += int(current_manifest["records"])
     step = _native_control_step_single(
         work_dir,
         current_manifest_path,
@@ -2821,6 +2887,13 @@ def native_control_step(
         "semantic_passes": split["semantic_passes"],
         "failed_records": None,
         "chain_complete": chain["complete"],
+        "record_attempts": record_attempts,
+        "record_amplification_ratio": round(record_attempts / root_records, 6),
+        "max_record_amplification_ratio": (
+            CORE_REVIEW_SPLIT_MAX_RECORD_AMPLIFICATION
+        ),
+        "effective_max_depth": CORE_REVIEW_SPLIT_EFFECTIVE_MAX_DEPTH,
+        "terminal_reason": "",
     }
     if step["action"] != "aggregate_completed_pass":
         _atomic_json(chain_path, chain)
@@ -2830,16 +2903,25 @@ def native_control_step(
         work_dir, current_manifest_path, current_manifest
     )
     split_summary["failed_records"] = len(failed)
+    stop_reason = _review_split_stop_reason(
+        current_manifest,
+        failed,
+        attempted_records=record_attempts,
+        root_records=root_records,
+    )
     child = _prepare_review_split_child(
         work_dir,
         current_manifest_path,
         current_manifest,
         failed,
         root_plan_fingerprint,
+        attempted_records=record_attempts,
+        root_records=root_records,
     )
     if child is None:
         chain["complete"] = True
         split_summary["chain_complete"] = True
+        split_summary["terminal_reason"] = stop_reason
         _atomic_json(chain_path, chain)
         return {**step, "review_split": split_summary}
 
@@ -2867,6 +2949,15 @@ def native_control_step(
             "semantic_passes": child_split["semantic_passes"],
             "failed_records": len(failed),
             "chain_complete": False,
+            "record_attempts": record_attempts + len(failed),
+            "record_amplification_ratio": round(
+                (record_attempts + len(failed)) / root_records, 6
+            ),
+            "max_record_amplification_ratio": (
+                CORE_REVIEW_SPLIT_MAX_RECORD_AMPLIFICATION
+            ),
+            "effective_max_depth": CORE_REVIEW_SPLIT_EFFECTIVE_MAX_DEPTH,
+            "terminal_reason": "",
         },
     }
 

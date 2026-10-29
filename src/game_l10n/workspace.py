@@ -178,7 +178,7 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "max_root_model_calls_per_wave": None,
         "max_root_model_calls_per_turn": None,
         "max_root_input_tokens_per_turn": None,
-        "max_root_progress_messages_per_wave": 1,
+        "max_root_progress_messages_per_wave": 0,
         "max_worker_model_calls_per_task": 16,
         "max_semantic_model_calls_per_task": 1,
         "per_record_semantic_call_loop_allowed": False,
@@ -198,7 +198,7 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "max_unchanged_progress_observations": 1,
         "max_control_actions_without_progress": 2,
         "aggregate_once_per_wave": True,
-        "progress_report_mode": "wave_boundary_or_blocker_only",
+        "progress_report_mode": "completion_checkpoint_or_blocker_only",
     },
     "control_plane": {
         "envelope_schema": "parr0t.control-envelope.v2",
@@ -274,7 +274,7 @@ This private workspace contains game data. Resolve Parr0t from `game-l10n.json`;
 - Keep publication dormant and unmentioned until the user requests it. SDK promotion also requires confirmed patch success and the original exact target identity. Its separate engine-only commit must pass `game-l10n verify-sdk-promotion`; never mix a `main`-owned path into that commit.
 - Native orchestration uses one disposable isolated relay per authorized wave. Give it only the `native-pass-step` artifact; it cannot inspect payloads, plan, retry, split, route, or forward raw responses. Wait once on that direct relay, then step. Reload prose only when `status.contract_set.digest` or the control generation changes.
 - V7 tasks embed bound segments; never open the full source. Review starts at 256 records/65,536 estimated tokens or less (hard ceilings: 2,048/262,144). One semantic call ends the worker; core locks successes and emits smaller failed-only manifests.
-- Use proportional checks and stop after the required layer passes. For large inventory, scan once per method and continue bounded cached gap work while the core gap score improves; incomplete inventory is not terminal. Once a semantic pass leaves no more than `execution.residual_direct_records`, use one fresh worker on one cached residual task; do not create a job-local scheduler or supplemental evidence pack. A native capacity failure enters resumable state and must not auto-restart the root turn. Aggregate once per wave, report progress only at a wave boundary or blocker, and stop only after the configured unchanged limit.
+- Use proportional checks and stop after the required layer passes. For large inventory, scan once per method and continue bounded cached gap work while the core gap score improves; incomplete inventory is not terminal. Once a semantic pass leaves no more than `execution.residual_direct_records`, use one fresh worker on one cached residual task; do not create a job-local scheduler or supplemental evidence pack. A native capacity failure enters resumable state and must not auto-restart the root turn. Aggregate per wave; keep transitions silent; report only pass/checkpoint completion or blockers; stop at the configured unchanged limit.
 - Only user-set turn limits recorded in the manifest apply; never infer them.
 
 ## Status routes
