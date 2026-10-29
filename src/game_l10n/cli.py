@@ -1265,10 +1265,16 @@ def cmd_native_pass_step(args: argparse.Namespace) -> int:
 def cmd_seal_native_wave_relay(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     require_sdk_activation(work_dir, load_config(work_dir))
+    if not args.relay_ended and not args.ended_task:
+        raise ValueError(
+            "E_NATIVE_RELAY_TERMINAL_STATE_REQUIRED: use --relay-ended after "
+            "the relay lifecycle ends, or name legacy ended tasks explicitly"
+        )
     result = seal_native_wave_relay(
         work_dir,
         _path_in_workspace(work_dir, args.dispatch, must_exist=True),
         ended_tasks=tuple(args.ended_task or ()),
+        relay_ended=bool(args.relay_ended),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -2970,6 +2976,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Record a bound worker that ended without a result as an operational "
             "failure; never overwrite an existing result"
+        ),
+    )
+    native_relay.add_argument(
+        "--relay-ended",
+        action="store_true",
+        help=(
+            "Seal every still-missing bound task as an operational failure after "
+            "the isolated relay lifecycle has ended"
         ),
     )
     native_relay.set_defaults(func=cmd_seal_native_wave_relay)

@@ -1235,7 +1235,7 @@ class NativePassTests(unittest.TestCase):
             contract["budget_exhaustion_action"], "checkpoint_and_return_control"
         )
 
-    def test_bulk_pass_stops_after_pilot_until_user_budget_is_bound(self) -> None:
+    def test_bulk_pass_does_not_infer_a_limit_from_inventory_size(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "fixture-source.jsonl"
@@ -1250,6 +1250,9 @@ class NativePassTests(unittest.TestCase):
                 max_records=2,
                 max_workers=1,
                 bulk_budget_gate_records=4,
+            )
+            manifest = json.loads(
+                (tasks / "manifest.json").read_text(encoding="utf-8")
             )
             results = root / "results"
             results.mkdir()
@@ -1271,24 +1274,13 @@ class NativePassTests(unittest.TestCase):
                 ],
             )
 
-            with self.assertRaisesRegex(ValueError, "E_BULK_EXECUTION_BUDGET_REQUIRED"):
-                import_native_wave(root, tasks / "manifest.json", results, 2)
-
-            prepare_native_tasks(
-                root,
-                source,
-                segments,
-                tasks,
-                max_records=2,
-                max_workers=1,
-                bulk_budget_gate_records=4,
-                max_elapsed_minutes=60,
-                max_input_tokens=1_000_000,
-                provider_cost_unmetered=True,
-                user_approved_budget=True,
-            )
             summary = import_native_wave(root, tasks / "manifest.json", results, 2)
 
+        self.assertFalse(manifest["execution_contract"]["bulk_budget_gate"]["active"])
+        self.assertFalse(
+            manifest["execution_contract"]["bulk_budget_gate"]["user_approved"]
+        )
+        self.assertTrue(all(task["dispatch_authorized"] for task in manifest["tasks"]))
         self.assertEqual(summary["wave"], 2)
         self.assertEqual(summary["records"], 2)
 
@@ -1554,6 +1546,70 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(resumed["action"], "aggregate_completed_pass")
         self.assertEqual(resumed["imported_wave"]["success"], 1)
         self.assertEqual(resumed["imported_wave"]["failed"], 1)
+
+    def test_native_wave_relay_terminal_seal_closes_every_missing_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            prepare_native_tasks(
+                root,
+                source,
+                [Segment("fixture-1", "SOURCE_1"), Segment("fixture-2", "SOURCE_2")],
+                tasks,
+                max_records=1,
+                max_workers=2,
+            )
+            step = native_control_step(root, tasks / "manifest.json", results)
+            dispatch = root / step["relay"]["dispatch"]
+            first_row = json.loads(
+                (tasks / "task-0001.jsonl").read_text(encoding="utf-8").splitlines()[0]
+            )
+            self._write_rows(
+                results / "task-0001.jsonl",
+                [
+                    {
+                        "target_id": first_row["target_id"],
+                        "status": "success",
+                        "text": "TARGET",
+                    }
+                ],
+            )
+
+            sealed = seal_native_wave_relay(root, dispatch, relay_ended=True)
+            resumed = native_control_step(
+                root,
+                tasks / "manifest.json",
+                results,
+                require_relay_receipt=True,
+            )
+
+        self.assertEqual(sealed["counts"]["ready_tasks"], 2)
+        self.assertEqual(sealed["counts"]["pending_tasks"], 0)
+        self.assertEqual(sealed["ended_tasks_recorded"], 1)
+        self.assertEqual(resumed["action"], "aggregate_completed_pass")
+        self.assertEqual(resumed["imported_wave"]["success"], 1)
+        self.assertEqual(resumed["imported_wave"]["failed"], 1)
+
+    def test_native_wave_relay_rejects_mixed_terminal_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            prepare_native_tasks(root, source, [Segment("fixture-1", "SOURCE")], tasks)
+            step = native_control_step(root, tasks / "manifest.json", results)
+
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                seal_native_wave_relay(
+                    root,
+                    root / step["relay"]["dispatch"],
+                    ended_tasks=("task-0001.jsonl",),
+                    relay_ended=True,
+                )
 
     def test_native_wave_relay_rejects_unbound_ended_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1833,7 +1889,7 @@ class NativePassTests(unittest.TestCase):
         self.assertNotIn("wrong-target", json.dumps(stopped))
         self.assertEqual(recovered["action"], "aggregate_completed_pass")
 
-    def test_native_control_step_preserves_pilot_across_budget_binding(self) -> None:
+    def test_native_control_step_releases_legacy_inferred_pilot_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source.jsonl"
@@ -1849,6 +1905,26 @@ class NativePassTests(unittest.TestCase):
                 max_records=2,
                 max_workers=1,
                 bulk_budget_gate_records=4,
+            )
+            manifest_path = tasks / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            gate = manifest["execution_contract"]["bulk_budget_gate"]
+            gate["active"] = True
+            gate["pilot_waves_without_approved_budget"] = 1
+            gate["missing_budget_action"] = "checkpoint_and_request_user_limit"
+            for task in manifest["tasks"]:
+                task["dispatch_authorized"] = task["wave"] <= 1
+            manifest["contract_fingerprint"] = stable_hash(
+                {
+                    "worker_contract": manifest["worker_contract"],
+                    "detail_contract": manifest["detail_contract"],
+                    "execution_contract": manifest["execution_contract"],
+                    "language_binding": manifest["language_binding"],
+                }
+            )
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
             )
             native_control_step(root, tasks / "manifest.json", results)
             task_path = tasks / "task-0001.jsonl"
@@ -1867,46 +1943,19 @@ class NativePassTests(unittest.TestCase):
                     for row in rows
                 ],
             )
-            stopped = native_control_step(
+            resumed = native_control_step(
                 root,
                 tasks / "manifest.json",
                 results,
                 usage_event_id="pilot",
                 input_tokens=100,
             )
-            state_path = root / stopped["state"]
-            legacy_state = json.loads(state_path.read_text(encoding="utf-8"))
-            legacy_state["schema"] = "parr0t.native-control-state.v2"
-            legacy_state.pop("budget_started_at_epoch")
-            legacy_state["created_at_epoch"] -= 5 * 60 * 60
-            state_path.write_text(
-                json.dumps(legacy_state, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            prepare_native_tasks(
-                root,
-                source,
-                segments,
-                tasks,
-                max_records=2,
-                max_workers=1,
-                bulk_budget_gate_records=4,
-                max_elapsed_minutes=60,
-                max_input_tokens=1_000,
-                provider_cost_unmetered=True,
-                user_approved_budget=True,
-            )
-            resumed = native_control_step(root, tasks / "manifest.json", results)
 
-        self.assertEqual(stopped["action"], "checkpoint_and_stop")
-        self.assertEqual(
-            stopped["issue_codes"], ["E_BULK_EXECUTION_BUDGET_REQUIRED"]
-        )
         self.assertEqual(resumed["action"], "dispatch_isolated_wave_relay")
         self.assertEqual(resumed["wave"], 2)
         self.assertEqual(resumed["counts"]["imported_waves"], 1)
         self.assertEqual(resumed["usage"]["input_tokens"], 100)
-        self.assertLess(resumed["usage"]["elapsed_minutes"], 1)
+        self.assertEqual(resumed["issue_codes"], [])
 
     def test_v2_approved_state_preserves_existing_elapsed_budget(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

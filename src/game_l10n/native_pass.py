@@ -279,7 +279,6 @@ def _execution_contract(
     max_root_input_tokens_per_turn: int | None,
     control_turn_budget_user_approved: bool,
 ) -> dict[str, Any]:
-    bulk_gate_active = record_count >= bulk_budget_gate_records
     budget_complete = (
         isinstance(max_elapsed_minutes, int)
         and max_elapsed_minutes > 0
@@ -295,6 +294,9 @@ def _execution_contract(
         )
     )
     budget_approved = bool(user_approved_budget and budget_complete)
+    # A size threshold is not user authority to invent a time/token/cost limit.
+    # Explicit complete bounds apply at any inventory size once the user approves them.
+    bulk_gate_active = budget_approved
     control_turn_budget_active = bool(
         control_turn_budget_user_approved
         and any(
@@ -363,13 +365,13 @@ def _execution_contract(
         "bulk_budget_gate": {
             "active": bulk_gate_active,
             "activation_records": bulk_budget_gate_records,
-            "pilot_waves_without_approved_budget": 1,
+            "pilot_waves_without_approved_budget": 0,
             "user_approved": budget_approved,
             "max_elapsed_minutes": max_elapsed_minutes,
             "max_input_tokens": max_input_tokens,
             "max_provider_cost_usd": max_provider_cost_usd,
             "provider_cost_unmetered": provider_cost_unmetered,
-            "missing_budget_action": "checkpoint_and_request_user_limit",
+            "missing_budget_action": "continue_without_inferred_limit",
         },
     }
 
@@ -1378,18 +1380,6 @@ def import_native_wave(
         raise ValueError("Native wave result directory does not exist")
 
     manifest = _load_task_manifest(work_dir, manifest_path)
-    if manifest.get("version", 0) >= LEGACY_WORKER_SPLIT_MANIFEST_VERSION:
-        budget_gate = manifest["execution_contract"].get("bulk_budget_gate", {})
-        pilot_waves = budget_gate.get("pilot_waves_without_approved_budget", 0)
-        if (
-            budget_gate.get("active") is True
-            and budget_gate.get("user_approved") is not True
-            and wave > pilot_waves
-        ):
-            raise ValueError(
-                "E_BULK_EXECUTION_BUDGET_REQUIRED: checkpoint after the pilot wave and "
-                "bind user-approved elapsed, input-token, and cost-or-unmetered limits"
-            )
     tasks = [task for task in manifest["tasks"] if task["wave"] == wave]
     if not tasks:
         raise ValueError("Native task manifest does not contain the requested wave")
@@ -1501,6 +1491,10 @@ def _write_wave_relay_dispatch(
             "route_change_allowed": False,
             "raw_child_response_forwarding_allowed": False,
             "child_leak_action": "quarantine_relay_and_return_categorical_receipt",
+            "terminal_seal_command": (
+                "game-l10n seal-native-wave-relay --workspace <workspace> "
+                "--dispatch <relay-path> --relay-ended"
+            ),
             "final_response": "workspace_relative_relay_receipt_path_only",
         },
     }
@@ -1617,6 +1611,7 @@ def seal_native_wave_relay(
     dispatch_path: Path,
     *,
     ended_tasks: tuple[str, ...] = (),
+    relay_ended: bool = False,
 ) -> dict[str, Any]:
     """Seal one relay and deterministically queue workers that ended without output."""
 
@@ -1674,9 +1669,21 @@ def seal_native_wave_relay(
         != "dispatch_exact_bindings_only"
         or payload["relay_contract"].get("raw_child_response_forwarding_allowed")
         is not False
+        or payload["relay_contract"].get("terminal_seal_command")
+        not in {
+            None,
+            (
+                "game-l10n seal-native-wave-relay --workspace <workspace> "
+                "--dispatch <relay-path> --relay-ended"
+            ),
+        }
     ):
         raise ValueError("E_NATIVE_RELAY_INVALID: dispatch binding is invalid")
 
+    if relay_ended and ended_tasks:
+        raise ValueError(
+            "E_NATIVE_RELAY_INVALID: relay-ended and explicit ended tasks are mutually exclusive"
+        )
     if len(set(ended_tasks)) != len(ended_tasks):
         raise ValueError("E_NATIVE_RELAY_INVALID: ended tasks must be unique")
 
@@ -1714,12 +1721,22 @@ def seal_native_wave_relay(
             raise ValueError("E_NATIVE_RELAY_INVALID: task names must be unique")
         bindings_by_name[task_name] = (task, result, binding["records"])
 
-    unknown_ended = [name for name in ended_tasks if name not in bindings_by_name]
+    effective_ended_tasks = ended_tasks
+    if relay_ended:
+        effective_ended_tasks = tuple(
+            name
+            for name, (task, result, _) in bindings_by_name.items()
+            if _read_structurally_bound_result(task, result) is None
+        )
+
+    unknown_ended = [
+        name for name in effective_ended_tasks if name not in bindings_by_name
+    ]
     if unknown_ended:
         raise ValueError("E_NATIVE_RELAY_INVALID: ended task is not bound to this wave")
 
     ended_tasks_recorded = 0
-    for name in ended_tasks:
+    for name in effective_ended_tasks:
         task, result, expected_records = bindings_by_name[name]
         ended_tasks_recorded += int(
             _complete_ended_task_result(
@@ -1988,7 +2005,7 @@ def _load_native_control_state(
     ):
         raise ValueError("E_NATIVE_CONTROL_STATE_INVALID: state values are invalid")
     # A regenerated manifest may bind an approved budget without changing the task plan.
-    # Preserve pilot usage and imported checkpoints, but start a new decision generation.
+    # Preserve prior usage and imported checkpoints, but start a new decision generation.
     if contract_changed:
         state["active_wave"] = 0
         state["control_steps_in_wave"] = 0
@@ -2143,12 +2160,6 @@ def _native_budget_issue(
     execution_contract: dict[str, Any], state: dict[str, Any], next_wave: int
 ) -> str:
     gate = execution_contract.get("bulk_budget_gate", {})
-    if (
-        gate.get("active") is True
-        and gate.get("user_approved") is not True
-        and next_wave > gate.get("pilot_waves_without_approved_budget", 0)
-    ):
-        return "E_BULK_EXECUTION_BUDGET_REQUIRED"
     if gate.get("user_approved") is not True:
         return ""
     max_elapsed = gate.get("max_elapsed_minutes")
@@ -2174,6 +2185,17 @@ def _native_budget_elapsed_minutes(state: dict[str, Any]) -> float:
     if not isinstance(started_at, (int, float)) or isinstance(started_at, bool):
         return 0.0
     return max(0.0, (time.time() - float(started_at)) / 60.0)
+
+
+def _native_task_dispatch_allowed(
+    manifest: dict[str, Any], task: dict[str, Any]
+) -> bool:
+    if task.get("dispatch_authorized") is True:
+        return True
+    gate = manifest.get("execution_contract", {}).get("bulk_budget_gate", {})
+    # Older manifests may contain framework-inferred pilot locks.  They are not
+    # user authority and must not strand a valid inherited checkpoint.
+    return gate.get("active") is True and gate.get("user_approved") is not True
 
 
 def _review_split_chain_path(
@@ -2648,9 +2670,6 @@ def _native_control_step_single(
         if relay_issue:
             action = "checkpoint_and_stop"
             issue_codes = [relay_issue]
-        elif budget_issue == "E_BULK_EXECUTION_BUDGET_REQUIRED":
-            action = "checkpoint_and_stop"
-            issue_codes = [budget_issue]
         elif budget_issue and ready_results != len(tasks):
             action = "checkpoint_and_stop"
             issue_codes = [budget_issue]
@@ -2700,7 +2719,8 @@ def _native_control_step_single(
                         action = "checkpoint_and_stop"
                         issue_codes = [budget_issue]
                     elif not all(
-                        task["dispatch_authorized"] for task in next_tasks
+                        _native_task_dispatch_allowed(manifest, task)
+                        for task in next_tasks
                     ):
                         action = "checkpoint_and_stop"
                         issue_codes = ["E_NATIVE_DISPATCH_NOT_AUTHORIZED"]
@@ -2710,7 +2730,9 @@ def _native_control_step_single(
         elif ready_results:
             action = "wait_for_active_wave"
             issue_codes = ["E_NATIVE_WAVE_INCOMPLETE"]
-        elif not all(task["dispatch_authorized"] for task in tasks):
+        elif not all(
+            _native_task_dispatch_allowed(manifest, task) for task in tasks
+        ):
             action = "checkpoint_and_stop"
             issue_codes = ["E_NATIVE_DISPATCH_NOT_AUTHORIZED"]
         else:

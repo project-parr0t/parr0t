@@ -58,7 +58,7 @@ Do not reorder barriers. Failures affect only their target and route; they canno
 - Translation is faithful transformation, not content generation. Independent review checks meaning, omission, voice, tone, function, conditions, units, terminology, allusions, placeholders, markup, control codes, ordering, and material layout risk.
 - Build only in the workspace; synthetic checks never install or launch games.
 - Apply proportional verification and stop after the changed layer passes. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.
-- Native: dispatch only `native-pass-step`'s fresh relay. Review limits: 2,048 ceiling; 256 records/65,536 tokens initially; failed-only core splits; depth 3; 2.0x attempts. Missing token telemetry is unknown.
+- Native: use only the `native-pass-step` relay; when it ends, seal with `--relay-ended` so core queues missing tasks. Review: 2,048 ceiling; initial 256/65,536; failed-only splits; depth 3; 2.0x attempts. Only user-set limits apply.
 
 ## Status-driven routes
 
