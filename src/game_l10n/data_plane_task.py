@@ -256,6 +256,14 @@ def prepare_data_plane_task(
             "independent_path": attestation.get("independent_path"),
             "primary_fingerprint": attestation.get("primary_fingerprint"),
             "independent_fingerprint": attestation.get("independent_fingerprint"),
+            "primary_id_fingerprint": attestation.get("primary_id_fingerprint"),
+            "independent_id_fingerprint": attestation.get(
+                "independent_id_fingerprint"
+            ),
+            "primary_identity_binding": attestation.get(
+                "primary_identity_binding", {}
+            ),
+            "identity_gate": attestation.get("identity_gate", {}),
             "gap_score": attestation.get("gap_score"),
             "issue_codes": attestation.get("issue_codes", []),
             "reconciliation_generation": reconciliation.get("generation", 0),
@@ -349,6 +357,11 @@ def prepare_data_plane_task(
                 "do_not_repeat_full_source_scans",
                 "resolve_only_reported_gap_categories",
                 "use_inventory_comparison_key_for_proven_method_specific_aliases",
+                "treat_global_id_disagreement_as_identity_namespace_reconciliation_not_content_loss",
+                "never_rename_remove_or_reorder_checkpoint_bound_primary_ids",
+                "preserve_primary_ids_as_downstream_canonical_identity",
+                "repair_method_specific_aliases_on_the_independent_inventory_with_deterministic_evidence",
+                "do_not_match_duplicate_source_text_without_occurrence_or_location_evidence",
                 "retain_unresolved_player_visible_candidates",
                 "run_core_verify_inventory_and_bind_current_attestation",
                 "incomplete_with_measured_progress_requires_another_bounded_step",
@@ -595,6 +608,36 @@ def _seal_bound_data_plane_task(
         if current_generation <= prior_generation:
             raise ConfigurationError(
                 "E_DATA_PLANE_RESULT_INVALID: reconciliation did not run core verification"
+            )
+        prior_identity_binding = task.get("inventory_gate", {}).get(
+            "primary_identity_binding", {}
+        )
+        current_identity_binding = attestation.get("primary_identity_binding", {})
+        prior_identity_records = (
+            prior_identity_binding.get("records", 0)
+            if isinstance(prior_identity_binding, dict)
+            else 0
+        )
+        current_identity_records = (
+            current_identity_binding.get("records", 0)
+            if isinstance(current_identity_binding, dict)
+            else 0
+        )
+        if (
+            not isinstance(current_identity_binding, dict)
+            or not isinstance(prior_identity_records, int)
+            or isinstance(prior_identity_records, bool)
+            or not isinstance(current_identity_records, int)
+            or isinstance(current_identity_records, bool)
+            or current_identity_binding.get("policy")
+            != "append_only_preserve_existing_id_order"
+            or current_identity_binding.get("id_fingerprint")
+            != attestation.get("primary_id_fingerprint")
+            or current_identity_records < prior_identity_records
+        ):
+            raise ConfigurationError(
+                "E_DATA_PLANE_RESULT_INVALID: reconciliation violated canonical "
+                "primary ID lineage"
             )
         if result["status"] == "success" and (
             attestation.get("status") != "static_verified"

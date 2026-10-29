@@ -8,9 +8,8 @@ description: Run Parr0t's context-first, fallback-routed game translation and pa
 Review control is a deterministic router: follow only validated status and
 manifest actions. Do not inspect review text, invent a plan or file format,
 repair/rebind the SDK, change model/batch/budget choices, or resume a halted
-review autonomously. An unknown or incomplete state must be checkpointed and
-stopped. Continuation neither fills missing budget fields nor replaces a
-regenerated, validated manifest.
+review autonomously. Checkpoint unknown or incomplete state. Never invent a
+budget or replace a manifest; only user-set limits execute.
 
 Use `game-l10n` as the execution boundary. Read the repository `AGENTS.md`, `docs/agent-usage.md`, and the workspace `AGENTS.md`; afterward resolve only the status response's `required_contracts` against its `contract_base`.
 
@@ -30,7 +29,7 @@ Use `game-l10n` as the execution boundary. Read the repository `AGENTS.md`, `doc
 - Provider refusal is `fallback_required`, not an exclusion or semantic decision. Finish the primary pass before fallback. Preserve source only after all configured routes are proven exhausted.
 - Each target retains relevant narrative/voice, functional/UI, or knowledge/prerequisite context even though provider calls isolate failures per target.
 - Native workers start fresh with no parent history and return only a `parr0t.control-envelope.v2` path. The parent must not receive source, candidates, results, refusal prose, or semantic review details. Follow `docs/control-plane-contract.md`.
-- The native v6 manifest is the executable detail contract. Translation/rewrite uses one batch; review allows only bounded failed-subset splitting. Never create per-record prompts or loops. Follow `docs/detail-contract.md`; stop after an unapproved bulk pilot.
+- Native v7 is executable; v6 is completion-only. Use one batch per task. Review splitting is core-only (depth 3, 2.0x attempts). Use `native-pass-step` and terminal `--relay-ended`; core queues missing tasks. Never run per-record loops, infer limits, enumerate workers, or poll. Follow `docs/detail-contract.md`.
 - Manual/fallback handoff uses only `parr0t.translation-exchange/v1`; the parent neither opens the text-bearing bundle nor invents another format.
 - Operational failures remain in the resumable metadata queue. Retry after a later explicit user request; if `metadata.blocking_on_failure=true`, hold the complete patch.
 - A configured preset fixes provider roles. API-key presence cannot select or alter it. For `codex-app-deepseek`, follow `docs/codex-app-deepseek.md`.

@@ -28,6 +28,8 @@ UI_COMPOSITION_FIELDS = (
 )
 UI_SLOT_ROLES = {"standalone", "label", "value", "state_value", "template_fragment"}
 INVENTORY_COMPARISON_KEY = "inventory_comparison_key"
+PRIMARY_IDENTITY_SCHEMA = "parr0t.primary-inventory-identity.v1"
+PRIMARY_IDENTITY_PATH = Path(".game-l10n/inventory-primary-identity.json")
 
 
 def _static_scope_tracking(coverage: dict[str, Any]) -> dict[str, Any] | None:
@@ -279,6 +281,111 @@ def inventory_fingerprint(payload: dict[str, Any]) -> str:
     )
 
 
+def _inventory_target_ids(payload: dict[str, Any]) -> list[str]:
+    return [str(row["id"]) for row in payload["segments"]]
+
+
+def _inventory_id_fingerprint(payload: dict[str, Any]) -> str:
+    """Bind downstream identity without copying game text into control metadata."""
+
+    return stable_hash(_inventory_target_ids(payload))
+
+
+def _comparison_key_coverage(payload: dict[str, Any]) -> int:
+    return sum(
+        1
+        for row in payload["segments"]
+        if isinstance(row.get("metadata"), dict)
+        and isinstance(row["metadata"].get(INVENTORY_COMPARISON_KEY), str)
+        and row["metadata"][INVENTORY_COMPARISON_KEY].strip()
+    )
+
+
+def _source_multiset_overlap(
+    primary_rows: dict[str, str], independent_rows: dict[str, str]
+) -> tuple[int, float]:
+    overlap = sum(
+        (Counter(primary_rows.values()) & Counter(independent_rows.values())).values()
+    )
+    denominator = min(len(primary_rows), len(independent_rows))
+    return overlap, (overlap / denominator if denominator else 0.0)
+
+
+def _write_primary_identity_binding(
+    work_dir: Path,
+    primary_path: Path,
+    primary_payload: dict[str, Any],
+    previous_attestation: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Preserve canonical IDs across handoffs while allowing additive extraction.
+
+    Existing IDs must remain in their original relative order.  Reconciliation may add
+    newly proven targets, but it cannot rename, remove, or reorder IDs that downstream
+    checkpoints already reference.
+    """
+
+    binding_path = work_dir / PRIMARY_IDENTITY_PATH
+    current_ids = _inventory_target_ids(primary_payload)
+    existing_binding: dict[str, Any] | None = None
+    if binding_path.is_file():
+        try:
+            existing_binding = json.loads(binding_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise ConfigurationError(
+                "E_INVENTORY_PRIMARY_IDENTITY_INVALID: canonical ID binding is unreadable"
+            ) from exc
+        previous_ids = (
+            existing_binding.get("ids")
+            if isinstance(existing_binding, dict)
+            else None
+        )
+        if (
+            not isinstance(existing_binding, dict)
+            or existing_binding.get("schema") != PRIMARY_IDENTITY_SCHEMA
+            or not isinstance(previous_ids, list)
+            or not all(isinstance(item, str) and item for item in previous_ids)
+        ):
+            raise ConfigurationError(
+                "E_INVENTORY_PRIMARY_IDENTITY_INVALID: canonical ID binding is invalid"
+            )
+        current_positions = {target_id: index for index, target_id in enumerate(current_ids)}
+        missing = [target_id for target_id in previous_ids if target_id not in current_positions]
+        retained_positions = [
+            current_positions[target_id]
+            for target_id in previous_ids
+            if target_id in current_positions
+        ]
+        if missing or retained_positions != sorted(retained_positions):
+            raise ConfigurationError(
+                "E_INVENTORY_PRIMARY_IDENTITY_DRIFT: reconciliation cannot rename, "
+                "remove, or reorder checkpoint-bound primary IDs"
+            )
+    elif previous_attestation is not None:
+        previous_fingerprint = previous_attestation.get("primary_fingerprint")
+        if previous_fingerprint != inventory_fingerprint(primary_payload):
+            raise ConfigurationError(
+                "E_INVENTORY_IDENTITY_LINEAGE_UNAVAILABLE: an inherited primary inventory "
+                "changed before canonical ID lineage was bound"
+            )
+
+    binding = {
+        "schema": PRIMARY_IDENTITY_SCHEMA,
+        "primary_path": str(primary_path.resolve()),
+        "records": len(current_ids),
+        "id_fingerprint": stable_hash(current_ids),
+        "ids": current_ids,
+    }
+    if existing_binding != binding:
+        _atomic_json(binding_path, binding)
+    return {
+        "schema": PRIMARY_IDENTITY_SCHEMA,
+        "path": PRIMARY_IDENTITY_PATH.as_posix(),
+        "records": binding["records"],
+        "id_fingerprint": binding["id_fingerprint"],
+        "policy": "append_only_preserve_existing_id_order",
+    }
+
+
 def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[str, Any]:
     primary = _inventory_document(primary_path)
     independent = _inventory_document(independent_path)
@@ -289,6 +396,8 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
 
     primary_rows = _segment_map(primary, use_comparison_key=True)
     independent_rows = _segment_map(independent, use_comparison_key=True)
+    primary_raw_rows = _segment_map(primary)
+    independent_raw_rows = _segment_map(independent)
     primary_ui_contracts = _ui_contract_map(primary, use_comparison_key=True)
     independent_ui_contracts = _ui_contract_map(
         independent, use_comparison_key=True
@@ -297,6 +406,23 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
     independent_order = list(independent_rows)
     primary_ids = set(primary_rows)
     independent_ids = set(independent_rows)
+    raw_id_overlap_count = len(set(primary_raw_rows) & set(independent_raw_rows))
+    raw_id_overlap_ratio = raw_id_overlap_count / max(
+        1, min(len(primary_raw_rows), len(independent_raw_rows))
+    )
+    source_overlap_measured = raw_id_overlap_ratio < 0.05
+    if source_overlap_measured:
+        source_overlap_count, source_overlap_ratio = _source_multiset_overlap(
+            primary_raw_rows, independent_raw_rows
+        )
+    else:
+        source_overlap_count, source_overlap_ratio = 0, 0.0
+    primary_comparison_key_count = _comparison_key_coverage(primary)
+    independent_comparison_key_count = _comparison_key_coverage(independent)
+    comparison_keys_complete = (
+        primary_comparison_key_count == len(primary_raw_rows)
+        and independent_comparison_key_count == len(independent_raw_rows)
+    )
     missing_from_primary = independent_ids - primary_ids
     missing_from_independent = primary_ids - independent_ids
     source_mismatches = {
@@ -319,6 +445,13 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
     primary_scope = _static_scope_tracking(primary["coverage"])
     independent_scope = _static_scope_tracking(independent["coverage"])
     scope_tracking_mismatch = primary_scope != independent_scope
+    namespace_mismatch = bool(
+        primary_ids
+        and independent_ids
+        and raw_id_overlap_ratio < 0.05
+        and source_overlap_ratio >= 0.90
+        and (primary_ids != independent_ids)
+    )
     declared_complete = all(
         payload["coverage"]["declared_complete"] for payload in (primary, independent)
     )
@@ -333,6 +466,8 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
         or not declared_complete
     )
     issue_codes: list[str] = []
+    if namespace_mismatch:
+        issue_codes.append("INVENTORY_IDENTITY_NAMESPACE_MISMATCH")
     if missing_from_primary:
         issue_codes.append("INDEPENDENT_INVENTORY_FOUND_UNEXTRACTED_TARGETS")
     if missing_from_independent:
@@ -349,9 +484,13 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
         issue_codes.append("STATIC_SCOPE_TRACKING_MISMATCH")
     if not declared_complete:
         issue_codes.append("INVENTORY_NOT_DECLARED_COMPLETE")
+    missing_gap_score = (
+        1
+        if namespace_mismatch
+        else len(missing_from_primary) + len(missing_from_independent)
+    )
     gap_score = (
-        len(missing_from_primary)
-        + len(missing_from_independent)
+        missing_gap_score
         + len(source_mismatches)
         + len(ui_contract_mismatches)
         + len(visible_exclusions)
@@ -372,6 +511,8 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
         ],
         "primary_fingerprint": inventory_fingerprint(primary),
         "independent_fingerprint": inventory_fingerprint(independent),
+        "primary_id_fingerprint": _inventory_id_fingerprint(primary),
+        "independent_id_fingerprint": _inventory_id_fingerprint(independent),
         "primary_segments": len(primary_rows),
         "independent_segments": len(independent_rows),
         "missing_from_primary_count": len(missing_from_primary),
@@ -386,6 +527,25 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
         "issue_codes": issue_codes,
         "gap_score": gap_score,
         "continuation_required": not complete,
+        "identity_gate": {
+            "status": (
+                "namespace_mismatch"
+                if namespace_mismatch
+                else "comparison_keys_bound"
+                if comparison_keys_complete
+                else "stable"
+            ),
+            "raw_id_overlap_count": raw_id_overlap_count,
+            "raw_id_overlap_ratio": round(raw_id_overlap_ratio, 6),
+            "source_multiset_overlap_count": source_overlap_count,
+            "source_multiset_overlap_ratio": round(source_overlap_ratio, 6),
+            "source_multiset_overlap_measured": source_overlap_measured,
+            "primary_comparison_key_count": primary_comparison_key_count,
+            "independent_comparison_key_count": independent_comparison_key_count,
+            "comparison_keys_complete": comparison_keys_complete,
+            "requires_identity_alias_evidence": namespace_mismatch,
+            "primary_ids_are_canonical": True,
+        },
         "file_bindings": {
             "primary": _file_binding(primary_path),
             "independent": _file_binding(independent_path),
@@ -396,7 +556,6 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
 def save_inventory_attestation(
     work_dir: Path, primary_path: Path, independent_path: Path
 ) -> dict[str, Any]:
-    attestation = verify_inventory_pair(primary_path, independent_path)
     state_path = work_dir / ".game-l10n" / "inventory-attestation.json"
     previous: dict[str, Any] | None = None
     if state_path.is_file():
@@ -409,6 +568,14 @@ def save_inventory_attestation(
                 previous = candidate
         except (OSError, ValueError, json.JSONDecodeError):
             previous = None
+
+    # Validate both inventory documents before advancing canonical ID lineage.
+    attestation = verify_inventory_pair(primary_path, independent_path)
+    primary_payload = _inventory_document(primary_path)
+    identity_binding = _write_primary_identity_binding(
+        work_dir, primary_path, primary_payload, previous
+    )
+    attestation["primary_identity_binding"] = identity_binding
 
     previous_reconciliation = (
         previous.get("reconciliation", {}) if isinstance(previous, dict) else {}

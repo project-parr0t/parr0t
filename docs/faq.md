@@ -106,7 +106,7 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **General cause:** Target-level failure isolation was misread as a requirement for target-level requests, or a job-local coordinator contract overrode the batch intent.
 - **Diagnosis:** Compare pass kind, task count, record count, prompt artifacts, and semantic call count. Translation/rewrite permits one semantic request. A v7 review worker also permits one semantic request; only deterministic core code may emit failed-subset child manifests. Any worker-local split, per-record loop, or successful-row retry violates the detail contract.
 - **Resolution:** Preserve completed shards, discard only the conflicting local execution instructions, and regenerate the remaining v7 manifest. Load shared context once, produce one ordered batched verdict set, and let `native-pass-step` retain successes and schedule only failures. If the provider truly accepts one target, repartition before dispatch.
-- **Prevention:** Treat `parr0t.detail-contract.v1` as supplemental-only, reject free-form execution contracts, and enforce the bulk pilot/budget gate before later waves.
+- **Prevention:** Treat `parr0t.detail-contract.v1` as supplemental-only, reject free-form execution contracts, and enforce only explicit user-approved whole-pass limits. Inventory size alone never creates a pilot stop.
 
 ## A semantically accurate title or short line still reads like a literal translation
 
@@ -308,12 +308,12 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **Resolution:** Keep every passed result, generate one v6 residual task with `prepare-native-pass`, and enter it through `native-pass-step`. Run the returned task in one fresh no-history worker and call the step once more to import and aggregate. On capacity or startup failure, preserve that exact task and return; do not create another controller or automatic continuation.
 - **Prevention:** Keep `residual_direct_records=32`, `job_local_controller_allowed=false`, `automatic_capacity_restart_allowed=false`, `max_unchanged_progress_observations=1`, and `max_control_actions_without_progress=2`. Report only at wave boundaries or blockers. Semantic quality checks and the existing two-round review limit still apply; only orchestration churn is removed.
 
-## An approved bulk pass immediately reports its elapsed budget exhausted
+## A newly approved whole-pass limit immediately reports elapsed budget exhausted
 
-- **Symptom:** The pilot completed, the job waited for the user's budget decision, and the first `native-pass-step` after approval returns `E_NATIVE_ELAPSED_BUDGET_EXHAUSTED` without dispatching new work.
+- **Symptom:** Work began without a user limit, the user later bound one, and the first `native-pass-step` under that limit returns `E_NATIVE_ELAPSED_BUDGET_EXHAUSTED` without dispatching new work.
 - **General cause:** A legacy control state measured elapsed time from pass-state creation, so the approval wait was charged to a limit that did not yet exist.
-- **Diagnosis:** Check metadata only. If the reported elapsed duration includes the interval between `E_BULK_EXECUTION_BUDGET_REQUIRED` and the manifest that first records `bulk_budget_gate.user_approved=true`, the timer binding is invalid.
-- **Resolution:** Keep the pilot checkpoint and cumulative token/cost usage, regenerate the approved manifest, and resume with a current core. State v1/v2 is migrated so a newly bound elapsed budget starts at approval; an already-approved legacy state retains its original start.
+- **Diagnosis:** Check metadata only. If the reported elapsed duration includes time before the manifest first records `bulk_budget_gate.user_approved=true`, the timer binding is invalid. Inventory size alone must not have created a pilot stop.
+- **Resolution:** Keep every checkpoint and cumulative token/cost observation, bind the approved manifest, and resume with a current core. State v1/v2 is migrated so a newly bound elapsed budget starts at approval; an already-approved legacy state retains its original start.
 - **Prevention:** Persist `budget_started_at_epoch` independently from pass creation, start it only when approval is first bound, and carry it through review split children without resetting it.
 
 ## A short API fallback target consumes tens of thousands of input tokens

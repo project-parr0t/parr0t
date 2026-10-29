@@ -107,13 +107,7 @@ def _candidate_segment(segment: Segment, row: dict[str, Any]) -> Segment:
     if (
         row.get("status") != "success"
         or not isinstance(text, str)
-        or (
-            not text.strip()
-            and (
-                segment.metadata.get("ui_empty_target") is None
-                or bool(validate_integrity(segment, text, []))
-            )
-        )
+        or (not text.strip() and bool(validate_integrity(segment, text, [])))
         or not isinstance(generation, int)
         or isinstance(generation, bool)
         or generation < 1

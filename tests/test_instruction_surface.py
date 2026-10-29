@@ -98,6 +98,24 @@ class InstructionSurfaceTests(unittest.TestCase):
         self.assertIn("Missing telemetry is unknown", budget)
         self.assertIn("never reconstruct it from `.codex/sessions`", budget)
 
+    def test_whole_job_usage_limits_are_user_opt_in_and_not_a_startup_gate(self) -> None:
+        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        contract = (ROOT / "docs/control-plane-contract.md").read_text(
+            encoding="utf-8"
+        )
+        budget = (ROOT / "docs/execution-budget.md").read_text(encoding="utf-8")
+        exchange = (ROOT / "docs/translation-exchange.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("Never solicit limits", agents)
+        self.assertIn("must not ask the user to invent such a ceiling", contract)
+        self.assertIn("including as\na startup", contract)
+        self.assertIn("Never ask the user to create one as a prerequisite", budget)
+        self.assertIn("This is the only automatic usage guard", budget)
+        self.assertIn("No whole-job usage limit is required by default", exchange)
+        self.assertIn("before fallback or as a condition of starting the job", exchange)
+
     def test_public_entry_prompts_keep_the_parent_out_of_game_content(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         prompts = (ROOT / "docs/prompt-examples.md").read_text(encoding="utf-8")
@@ -121,7 +139,8 @@ class InstructionSurfaceTests(unittest.TestCase):
         self.assertIn("supplemental-only", detail)
         self.assertIn("only executable detail contract", detail)
         self.assertIn("one semantic batch", detail)
-        self.assertIn("E_BULK_EXECUTION_BUDGET_REQUIRED", detail)
+        self.assertIn("record count alone never activates a pilot stop", detail)
+        self.assertIn("--relay-ended", execution)
         self.assertIn("one semantic model/API batch call", execution)
         self.assertIn("must not create or submit one prompt per candidate", review)
         self.assertIn("must not open the full ordered `source_artifact`", detail)
