@@ -760,15 +760,14 @@ def _require_candidate_bindings(segments: list[Segment], pass_kind: str) -> None
         text = candidate.get("text")
         generation = candidate.get("generation")
         digest = candidate.get("digest")
-        valid_empty = (
+        valid_nonprinting = (
             isinstance(text, str)
-            and text == ""
-            and segment.metadata.get("ui_empty_target") is not None
+            and not text.strip()
             and not validate_integrity(segment, text, [])
         )
         if (
             not isinstance(text, str)
-            or (not text.strip() and not valid_empty)
+            or (not text.strip() and not valid_nonprinting)
             or not isinstance(generation, int)
             or isinstance(generation, bool)
             or generation < 1
@@ -809,7 +808,7 @@ def prepare_native_tasks(
         raise ValueError(f"pass_kind must be one of: {', '.join(sorted(PASS_KINDS))}")
     language_binding = _normalized_language_binding(language_binding)
     if route_binding is not None and (
-        pass_kind != "translation"
+        pass_kind not in {"translation", "review"}
         or set(route_binding) != {"provider", "attempt"}
         or not isinstance(route_binding.get("provider"), str)
         or not route_binding["provider"]
@@ -817,7 +816,9 @@ def prepare_native_tasks(
         or isinstance(route_binding["attempt"], bool)
         or route_binding["attempt"] < 1
     ):
-        raise ValueError("route_binding is valid only for a bound translation pass")
+        raise ValueError(
+            "route_binding is valid only for a bound translation or review pass"
+        )
     if max_records is None:
         max_records = (
             DEFAULT_REVIEW_MAX_RECORDS
@@ -1206,7 +1207,7 @@ def _validate_row(row: dict[str, Any], *, segment: Segment | None = None) -> dic
         raise ValueError(f"Native shard {target_id!r} text must be a string")
     if status == "success" and not text.strip():
         if (
-            segment is None or segment.id != target_id or text != ""
+            segment is None or segment.id != target_id
             or validate_integrity(segment, text, [])
         ):
             raise ValueError(f"Native shard {target_id!r} reports success without text")

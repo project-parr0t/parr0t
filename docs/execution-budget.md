@@ -51,7 +51,7 @@ Before every commit or push, enumerate the outgoing commits and changed paths ag
 - Do not create a second verifier for a property already covered by a deterministic validator.
 - Do not retranslate, re-review, recompile, or repackage unchanged inputs merely for reassurance.
 
-Configured translation retries are fresh failed-only tasks, not extra calls hidden inside one semantic worker. Their provider and ordinal are manifest-bound, successful rows are immutable, and cumulative usage carries across the Luna, Sol, and external-fallback stages. The preset's five Luna retries and three Sol retries are explicit route limits, not permission for the control plane to invent more attempts; each count is in addition to the route's first call. Existing whole-job time, token, and cost gates apply to the combined chain.
+Configured translation retries are fresh failed-only tasks, not extra calls hidden inside one semantic worker. Their provider and ordinal are manifest-bound, successful rows are immutable, and cumulative usage telemetry carries across the Luna, Sol, and external-fallback stages. The preset's five Luna retries and three Sol retries are explicit route semantics, not whole-job usage ceilings and not permission for the control plane to invent more attempts; each count is in addition to the route's first call. No whole-job time, token, call, or cost gate exists unless the user stated it first and the manifest records it. Never ask the user to create one as a prerequisite.
 
 ## Delegation budget
 
@@ -127,7 +127,7 @@ The DeepSeek presets cap the combined system-and-user character count at 24,000 
 
 Record provider-reported total input, cached input, cache-miss input, output, and reasoning usage when available. A cache hit is useful telemetry, not permission to send redundant context. Do not create a job-local API loop that bypasses the configured adapter and these limits.
 
-The fixed translation-fallback processor binds every fallback bundle in the workspace to one core-owned usage ledger and the same whole-job ceiling. Its first call requires a confirmed pre-fallback input-token baseline and, when elapsed time is bounded, the original job start. Missing telemetry is not zero. The processor checkpoints fixed exchange rows after each bounded wave, records provider-reported usage once, and stops before starting another wave when the ceiling is already exhausted. An interrupted event with uncertain usage blocks later bundles until that exact event is reconciled; the control plane must not guess a value, reset the ledger, or create a replacement counter.
+The fixed translation-fallback processor always uses the DeepSeek preset's per-request input preflight. This is the only automatic usage guard. A whole-job ceiling and its core-owned usage ledger are optional and exist only when the user stated the ceiling first. In that opt-in case, the first call requires a confirmed pre-fallback input-token baseline and, when elapsed time is bounded, the original job start. Missing telemetry is not zero. The processor checkpoints fixed exchange rows after each wave, records provider-reported usage once, and stops before another wave only when that user-set ceiling is exhausted. An interrupted metered event with uncertain usage blocks later bundles until that exact event is reconciled; the control plane must not guess a value, reset the ledger, or create a replacement counter.
 
 ## Proportional safety baseline
 

@@ -1397,21 +1397,45 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
     execution = config.get("execution", {})
     pass_kind = args.pass_kind
     route_binding = None
-    if pass_kind == "translation" and effective_execution_mode(config) == CODEX_APP_EXECUTION_MODE:
+    codex_app_mode = effective_execution_mode(config) == CODEX_APP_EXECUTION_MODE
+    if pass_kind == "translation" and codex_app_mode:
         plan = _native_translation_route_plan(config)
         provider = args.native_provider or plan[0]["provider"]
-        limits = {
-            item["provider"]: 1 + item["max_retries"] for item in plan
-        }
+        limits = {item["provider"]: 1 + item["max_retries"] for item in plan}
         attempt = args.route_attempt or 1
         if provider not in limits or not 1 <= attempt <= limits[provider]:
             raise ConfigurationError(
                 "Native translation provider/attempt is outside the configured route plan"
             )
         route_binding = {"provider": provider, "attempt": attempt}
-    elif args.native_provider is not None or args.route_attempt is not None:
+    elif pass_kind == "review" and codex_app_mode:
+        tier = args.review_tier
+        if tier not in {"triage", "strong"}:
+            raise ConfigurationError(
+                "Codex App review passes require --review-tier triage or strong"
+            )
+        route_key = "review_triagers" if tier == "triage" else "reviewers"
+        configured_routes = config.get("routing", {}).get(route_key, [])
+        provider = next(
+            (
+                item
+                for item in configured_routes
+                if isinstance(item, str) and item.startswith("native-")
+            ),
+            "",
+        )
+        if not provider:
+            raise ConfigurationError(
+                f"Codex App {tier} review has no configured native route"
+            )
+        route_binding = {"provider": provider, "attempt": 1}
+    elif (
+        args.native_provider is not None
+        or args.route_attempt is not None
+        or args.review_tier is not None
+    ):
         raise ConfigurationError(
-            "Native provider and route attempt apply only to Codex App translation passes"
+            "Native provider/attempt and review tier must match a Codex App native pass"
         )
     stored_records = execution.get("native_shard_records")
     stored_material = execution.get("native_shard_material_tokens")
@@ -1877,10 +1901,10 @@ def cmd_process_translation_exchange(args: argparse.Namespace) -> int:
         if args.max_input_tokens is not None or args.usage_baseline_input_tokens is not None:
             raise ConfigurationError("E_FALLBACK_UNLIMITED_POLICY_INVALID")
         max_input_tokens = None
-    elif max_input_tokens is None:
-        raise ConfigurationError("E_FALLBACK_BUDGET_REQUIRED")
     if (
-        not unlimited and not (work_dir / FALLBACK_USAGE_RELATIVE).is_file()
+        not unlimited
+        and max_input_tokens is not None
+        and not (work_dir / FALLBACK_USAGE_RELATIVE).is_file()
         and args.usage_baseline_input_tokens is None
     ):
         raise ConfigurationError("E_FALLBACK_BUDGET_BASELINE_REQUIRED")
@@ -2880,6 +2904,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--route-attempt",
         type=int,
         help="Bind a Codex App translation pass to its configured attempt ordinal",
+    )
+    native_prepare.add_argument(
+        "--review-tier",
+        choices=["triage", "strong"],
+        help=(
+            "Bind a Codex App review pass to the configured Luna triage or Sol "
+            "strong-review route"
+        ),
     )
     native_prepare.add_argument("--max-records", type=int)
     native_prepare.add_argument(

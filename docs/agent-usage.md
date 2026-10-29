@@ -50,7 +50,7 @@ Do not reorder barriers. Failures affect only their target and route; they canno
 
 - Select and activate before data-plane work. Bind exact matches to a Git checkout/worktree or authenticated portable snapshot. Portable activation records the full commit ID and verifies normalized content. Other identities are read-only `derive-new` references, never promotion targets. Pass-through tools are placeholders.
 - Inventory completeness requires two independent ordered manifests. Alignment, review, and runtime observation are separate claims.
-- At 10,000+ records, scan once per method. Continue cached gap-only reconciliation while the core gap score falls; stop only for a status-proven blocker, an applicable deterministic gate, or the configured unchanged-progress limit. A root call/token turn limit is applicable only when the user explicitly requested its value and the manifest records that approval. Never rescan or infer a limit from elapsed time, context pressure, or model judgment.
+- At 10,000+ records, scan once per method. Continue cached gap-only reconciliation while the gap score falls; stop only for a proven blocker, deterministic gate, or unchanged-progress rule. Never infer a root limit from size, elapsed time, context pressure, or model judgment.
 - Keep relevant narrative/voice, functional/UI, knowledge, adjacency, glossary, and immutable evidence target-scoped.
 - The text-free parent handles only IDs, counts, states, queues, paths, and codes. It dispatches only core relays and never inspects game-root contents; a missing SDK changes nothing.
 - Presets fix provider roles. Keys do not change mode, role, or service. Parent sees only `fallback_required`, never rationale.
@@ -58,7 +58,7 @@ Do not reorder barriers. Failures affect only their target and route; they canno
 - Translation is faithful transformation, not content generation. Independent review checks meaning, omission, voice, tone, function, conditions, units, terminology, allusions, placeholders, markup, control codes, ordering, and material layout risk.
 - Build only in the workspace; synthetic checks never install or launch games.
 - Apply proportional verification and stop after the changed layer passes. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.
-- Native: use only the `native-pass-step` relay; when it ends, seal with `--relay-ended` so core queues missing tasks. Review: 2,048 ceiling; initial 256/65,536; failed-only splits; depth 3; 2.0x attempts. Only user-set limits apply.
+- Native uses only the `native-pass-step` relay and `--relay-ended`. Review's 2,048/262,144 ceiling, initial 256/65,536 packing, failed-only splits, depth 3, and 2.0x attempts shape batches; they are not whole-job limits. Never solicit a usage ceiling. None applies unless the user states it first. Only reached DeepSeek fallback requests receive the automatic input preflight.
 
 ## Status-driven routes
 

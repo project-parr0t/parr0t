@@ -956,10 +956,55 @@ class NativePassTests(unittest.TestCase):
                     }
                 ],
             )
-            summary = import_native_wave(root, tasks / "manifest.json", results, 1)
+
+            summary = import_native_wave(
+                root, tasks / "manifest.json", results, 1
+            )
 
         self.assertEqual(summary["success"], 1)
         self.assertEqual(summary["failed"], 0)
+
+    def test_review_route_binding_rejects_a_result_from_another_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "review.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            segment = Segment(
+                "fixture-1",
+                "SOURCE",
+                metadata={
+                    "_parr0t_candidate": {
+                        "text": "TARGET",
+                        "generation": 1,
+                        "digest": stable_hash("TARGET"),
+                    }
+                },
+            )
+            tasks = root / "tasks"
+            results = root / "results"
+            results.mkdir()
+            prepare_native_tasks(
+                root,
+                source,
+                [segment],
+                tasks,
+                pass_kind="review",
+                route_binding={"provider": "native-sol", "attempt": 1},
+            )
+            self._write_rows(
+                results / "task-0001.jsonl",
+                [
+                    {
+                        "target_id": "fixture-1",
+                        "status": "success",
+                        "text": "TARGET",
+                        "provider": "native-luna",
+                    }
+                ],
+            )
+
+            with self.assertRaisesRegex(ValueError, "^E_NATIVE_WAVE_RESULT_INVALID:"):
+                import_native_wave(root, tasks / "manifest.json", results, 1)
 
     def test_native_tasks_are_exclusive_and_cached(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

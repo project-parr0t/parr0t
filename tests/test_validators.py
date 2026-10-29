@@ -33,6 +33,14 @@ def optional_slot_fixture(
 
 
 class ValidatorTests(unittest.TestCase):
+    def test_exact_whitespace_source_is_preserved_but_not_rewritten(self) -> None:
+        segment = Segment("fixture-whitespace", "  \t")
+        self.assertEqual(validate_integrity(segment, "  \t", []), [])
+        self.assertEqual(
+            [item.code for item in validate_integrity(segment, " ", [])],
+            ["empty"],
+        )
+
     def test_empty_stays_rejected_by_default_and_boolean_flags(self) -> None:
         for metadata in ({}, {"allow_empty": True}, {"ui_empty_target": True}):
             self.assertEqual(

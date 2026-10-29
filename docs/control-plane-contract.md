@@ -33,6 +33,11 @@ waits, or a model's estimate of a nearby limit is not an unknown state or a
 budget signal. A root call/token ceiling exists only when the user requested a
 concrete value and the validated manifest records that approval; otherwise the
 control plane must continue until a terminal state or actionable blocker.
+The control plane must not ask the user to invent such a ceiling, including as
+a startup, large-inventory, translation, or review prerequisite. Absence is the
+complete policy: no whole-job ceiling applies. The only automatic usage guard
+is the configured per-request input preflight inside an external DeepSeek
+fallback adapter, and it is irrelevant until that fallback route is reached.
 
 Every native review manifest embeds `parr0t.review-control-contract.v1` inside
 its immutable detail contract. Changing or removing it invalidates the
