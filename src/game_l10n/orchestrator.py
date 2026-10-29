@@ -224,8 +224,6 @@ class LocalizationOrchestrator:
         reason = raw.get("reason", "")
         if not isinstance(text, str) or not isinstance(reason, str):
             raise ProviderError("Translator response fields have invalid types")
-        if status is AgentStatus.SUCCESS and not text.strip():
-            raise ProviderError("Translator reported success with empty text")
         return AgentEnvelope(status=status, text=text, reason=reason, raw=raw)
 
     @staticmethod
@@ -292,6 +290,12 @@ class LocalizationOrchestrator:
             for key, value in usage.items()
             if isinstance(value, int) and value >= 0
         }
+
+    @staticmethod
+    def _failure_usage(exc: Exception) -> dict[str, int]:
+        if not isinstance(exc, ProviderFailure):
+            return {}
+        return dict(exc.usage)
 
     def _record(self, result: TranslationResult, record: AttemptRecord) -> None:
         # The parent/orchestration plane receives categorical control metadata only.
@@ -517,6 +521,7 @@ class LocalizationOrchestrator:
                         model=self._provider_model(provider),
                         issue_code=code,
                         candidate_generation=result.candidate_generation,
+                        usage=self._failure_usage(exc),
                     ),
                 )
                 if retryable and (
@@ -645,6 +650,7 @@ class LocalizationOrchestrator:
                         model=self._provider_model(provider),
                         issue_code=code,
                         candidate_generation=result.candidate_generation,
+                        usage=self._failure_usage(exc),
                     ),
                 )
                 if retryable and self._can_grace_retry(code, ordinal):
@@ -716,6 +722,7 @@ class LocalizationOrchestrator:
                         model=self._provider_model(provider),
                         issue_code=code,
                         candidate_generation=result.candidate_generation,
+                        usage=self._failure_usage(exc),
                     ),
                 )
                 if retryable and self._can_grace_retry(code, ordinal):

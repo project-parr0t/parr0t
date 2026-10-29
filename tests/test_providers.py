@@ -10,6 +10,46 @@ from game_l10n.providers import CompatibleChatProvider, OpenAIResponsesProvider
 
 
 class CompatibleProviderTests(unittest.TestCase):
+    def test_malformed_response_preserves_provider_usage(self) -> None:
+        def fake_post(_url, _headers, _payload, _timeout):
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": ""},
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 321,
+                    "completion_tokens": 17,
+                    "total_tokens": 338,
+                },
+            }
+
+        provider = CompatibleChatProvider(
+            "deepseek",
+            "fixture-model",
+            api_key_env="FIXTURE_API_KEY",
+            base_url="https://fixture.invalid",
+            response_format="json_object",
+        )
+        with patch.dict(os.environ, {"FIXTURE_API_KEY": "fixture-key"}), patch(
+            "game_l10n.providers._post_json", side_effect=fake_post
+        ):
+            with self.assertRaises(ProviderFailure) as raised:
+                provider.generate_json(
+                    system="Translate.",
+                    user='{"translation_target":{"source":"S"}}',
+                    schema={"type": "object"},
+                    schema_name="game_translation",
+                )
+
+        self.assertEqual(raised.exception.code, "malformed_response")
+        self.assertEqual(
+            raised.exception.usage,
+            {"input_tokens": 321, "output_tokens": 17, "total_tokens": 338},
+        )
+
     def test_plain_review_verdict_uses_tiny_contract_without_json_format(self) -> None:
         captured = {}
 
