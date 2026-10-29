@@ -89,7 +89,13 @@ def validate_integrity(
     max_length_ratio: float = 4.0,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
-    if not candidate.strip() and not (candidate == "" and empty_target_allowed(segment)):
+    exact_nonprinting_source = (
+        not segment.source.strip() and candidate == segment.source
+    )
+    if not candidate.strip() and not (
+        exact_nonprinting_source
+        or (candidate == "" and empty_target_allowed(segment))
+    ):
         return [ValidationIssue("empty", "Translation is empty")]
 
     source_tokens = protected_tokens(segment.source, extra_patterns)

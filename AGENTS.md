@@ -9,7 +9,7 @@ Parr0t is engine-neutral. Keep all game, credential, title, and job data in an e
 3. Run `game-l10n status --workspace <workspace>`. For `establish_text_free_control_plane`, read its contracts and run `game-l10n enter-control-plane --workspace <workspace> --contracts-read --source-unopened` before other work.
 4. Resolve each `required_contracts` entry against `contract_base`; read only those contracts. For other user-requested routes, use the table.
 
-Only `local_patch_ready` is terminal; it requires current static completion and an unchanged packed artifact bound to its attestation.
+Only `local_patch_ready` is terminal; it requires static completion and an unchanged packed artifact bound to its attestation.
 
 ## Non-negotiable rules
 
@@ -23,12 +23,12 @@ Only `local_patch_ready` is terminal; it requires current static completion and 
 8. **Keep source and runtime immutable by default.** Build in the workspace. Inspection or testing never authorizes install, update, restore/remove, launch, cleanup, or execution. Each runtime action needs explicit `docs/runtime-approval.md` approval.
 9. **Select and activate before implementing.** Follow `docs/sdk-selection.md`. Bind exact matches only to an inventoried Git checkout/worktree or authenticated snapshot with matching full-content fingerprint. Game-workspace Git choice is unrelated. Other identities are `derive-new`; pass-through tools are not adapters and `main` stays engine-neutral.
 10. **Publication is dormant.** Do not propose, prepare, mention, commit, push, tag, publish, deploy, or create a release unless the user first requests that exact external action. SDK promotion requires confirmed patch success. Its engine-only commit must not touch `main` paths; check paths with `game-l10n verify-sdk-promotion --working-tree`, pin its base, and verify the final commit before packaging. Per-game publication requires `docs/instance-release.md` and its release gate.
-11. **Keep review control deterministic.** Only `native-pass-step` advances waves. Translation/rewrite uses one semantic batch. Review hard ceilings are 2,048 records/262,144 estimated tokens; initial tasks cap at 256/65,536. Workers make one semantic call. Core locks successes and emits smaller failed-only manifests. V7 workers never read full source. Root sees metadata only; no model controllers or worker delegation. Unknown state stops.
+11. **Keep review control deterministic.** Only `native-pass-step` advances waves; relay termination runs `--relay-ended`. Translation/rewrite uses one batch. Review starts at 256/65,536 within structural ceilings of 2,048/262,144. One call/worker. Core locks successes and emits smaller failed-only manifests; no model controllers or worker delegation. V7 workers never read full source; root sees metadata only.
 12. **Keep provider mode fixed.** A selected preset defines the authorized providers and roles. A key does not change mode or promote a fallback. Native App workers and API providers are distinct; never emulate a native worker with another Codex process or silently replace the locked route.
 13. **Bind every write to the current work lane.** Before writing, bind the turn to game, supervision, core, or SDK work and resolve its checkout and branch anew. Supervision and inspection stay read-only unless the current request names the mutation. Never inherit another lane's checkout or push plan; reject outgoing commits unrelated to the current request.
-14. **Start large jobs linearly.** At 10,000+ records, scan once per inventory method. Reconcile cached outputs and continue only reported gaps. Never repeat full scans or create per-record startup artifacts or speculative tooling.
+14. **Start large jobs linearly.** At 10,000+ records, scan once per method, reconcile cached outputs, and continue reported gaps. Never repeat full scans or create per-record startup artifacts.
 15. **Use the branch updater.** Run `scripts/update_branches.py`; never manually merge a hold. Fix its cause and replan.
-16. **Root turn limits are opt-in.** Only user-set manifest values apply.
+16. **Never solicit limits.** No whole-job usage ceiling applies unless the user states it first and the manifest records it; telemetry cannot stop work. Only reached DeepSeek fallback requests receive the automatic input preflight.
 
 ## Standard job sequence
 

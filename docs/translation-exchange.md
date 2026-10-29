@@ -121,7 +121,9 @@ game-l10n process-translation-exchange --workspace <workspace> --bundle <bundle>
 
 The command validates the unchanged request and any completed rows, invokes only the preset's configured `translation_fallback` compatible adapter, preserves completed successes, writes the same fixed success/failure rows, and seals the bundle. It never promotes DeepSeek to a primary role or performs review. Previously recorded failures are not called again unless a later user request is represented by `--user-requested-retry`.
 
-Bulk API fallback also requires the whole-job budget binding. On the first bundle, provide the user-approved ceiling and a confirmed cumulative baseline:
+No whole-job usage limit is required by default. The configured DeepSeek adapter still applies its focused per-request input preflight automatically. Do not ask the user to choose a token, time, call, or cost ceiling before fallback or as a condition of starting the job.
+
+If the user independently requested a whole-job limit, bind that optional limit on the first bundle with its confirmed cumulative baseline:
 
 ```text
 game-l10n process-translation-exchange \
@@ -133,6 +135,6 @@ game-l10n process-translation-exchange \
   --budget-started-at-epoch <original-job-start>
 ```
 
-The core records provider-reported usage in `.game-l10n/provider-usage/translation-fallback.json`, processes bounded waves, and seals each wave before continuing. Later bundles reuse that ledger, so omit `--usage-baseline-input-tokens`; keep the same ceilings. If prior usage is absent or unverified, stop with `E_FALLBACK_BUDGET_BASELINE_REQUIRED` rather than treating it as zero. A provider event interrupted before usage can be proven stops with `E_FALLBACK_BUDGET_ACCOUNTING_UNCERTAIN`; reconcile that one event only with the exact provider-reported value and `--resolve-uncertain-input-tokens`. Never estimate either value from text length, task size, elapsed time, or an empty counter.
+Only in that opt-in mode, the core records provider-reported usage in `.game-l10n/provider-usage/translation-fallback.json`, processes waves, and seals each wave before continuing. Later bundles reuse that ledger, so omit `--usage-baseline-input-tokens`; keep the same user-set ceilings. If prior usage is absent or unverified, stop with `E_FALLBACK_BUDGET_BASELINE_REQUIRED` rather than treating it as zero. A provider event interrupted before usage can be proven stops with `E_FALLBACK_BUDGET_ACCOUNTING_UNCERTAIN`; reconcile that one event only with the exact provider-reported value and `--resolve-uncertain-input-tokens`. Never estimate either value from text length, task size, elapsed time, or an empty counter.
 
-When the ceiling is reached, already sealed successes remain cached, untouched targets remain pending in the same exchange, and no further provider call starts. This budget checkpoint is not permission to narrow scope, preserve source early, or open a new format.
+When an explicitly requested ceiling is reached, already sealed successes remain cached, untouched targets remain pending in the same exchange, and no further provider call starts. This budget checkpoint is not permission to narrow scope, preserve source early, or open a new format.

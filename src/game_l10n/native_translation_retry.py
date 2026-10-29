@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
 
+from .formats import read_segments
 from .models import Segment
 from .privacy import is_within
 from .store import stable_hash, stable_hash_sequence
@@ -146,7 +147,11 @@ def _validate_result_rows(
             raise NativeTranslationRetryError(
                 "Native semantic result provider does not match the bound route"
             )
-        if status == "success" and isinstance(text, str) and text.strip():
+        valid_success_text = isinstance(text, str) and (
+            bool(text.strip())
+            or (not segment.source.strip() and text == segment.source)
+        )
+        if status == "success" and valid_success_text:
             row["candidate_generation"] = 1
             row["candidate_digest"] = stable_hash(text)
             successes.append(row)
@@ -366,7 +371,22 @@ def advance_native_translation_retries(
     state = _load_state(work_dir, state_dir)
     if state["next_action"] != "native_retry":
         raise NativeTranslationRetryError("No native translation retry is pending")
-    source_segments = [Segment(**row) for row in _read_jsonl(work_dir / state["source"])]
+    source_path = work_dir / state["source"]
+    try:
+        source_segments = read_segments(source_path)
+        if source_path.suffix.casefold() == ".jsonl":
+            legacy_segments = [
+                Segment(**row) for row in _read_jsonl(source_path)
+            ]
+            legacy_fingerprint = stable_hash_sequence(
+                asdict(segment) for segment in legacy_segments
+            )
+            if legacy_fingerprint == state["source_fingerprint"]:
+                source_segments = legacy_segments
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise NativeTranslationRetryError(
+            "Native translation retry source is unreadable"
+        ) from exc
     if (
         stable_hash_sequence(asdict(segment) for segment in source_segments)
         != state["source_fingerprint"]

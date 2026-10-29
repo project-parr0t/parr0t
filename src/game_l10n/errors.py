@@ -18,11 +18,17 @@ class ProviderFailure(ProviderError):
         *,
         retryable: bool,
         status_code: int | None = None,
+        usage: dict[str, int] | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
         self.retryable = retryable
         self.status_code = status_code
+        self.usage = {
+            str(key): int(value)
+            for key, value in (usage or {}).items()
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        }
 
 
 class ConfigurationError(GameL10nError):
