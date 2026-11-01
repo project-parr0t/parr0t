@@ -236,20 +236,26 @@ def prepare_data_plane_task(
             if valid_previous_attempt and receipt_closes_previous:
                 attempt = previous_attempt + 1
             elif valid_previous_attempt:
-                previous_relay_path = output_dir / "relay.json"
-                previous_relay, bound_task = _load_bound_data_plane_relay(
-                    work_dir, previous_relay_path
-                )
-                if bound_task.get("task_id") == previous_task.get("task_id"):
-                    return {
-                        "schema": previous_relay["schema"],
-                        "status": "ready",
-                        "worker_role": worker_role,
-                        "stage": profile["stage"],
-                        "relay_path": _relative(work_dir, previous_relay_path),
-                        "task_id": previous_task["task_id"],
-                        "control_generation": control_generation,
-                    }
+                if previous_task.get("control_generation") != control_generation:
+                    # A recorded parent leak invalidates only the old control-plane
+                    # binding. Preserve the stage attempt and private progress while
+                    # issuing a fresh relay bound to the new generation.
+                    attempt = previous_attempt
+                else:
+                    previous_relay_path = output_dir / "relay.json"
+                    previous_relay, bound_task = _load_bound_data_plane_relay(
+                        work_dir, previous_relay_path
+                    )
+                    if bound_task.get("task_id") == previous_task.get("task_id"):
+                        return {
+                            "schema": previous_relay["schema"],
+                            "status": "ready",
+                            "worker_role": worker_role,
+                            "stage": profile["stage"],
+                            "relay_path": _relative(work_dir, previous_relay_path),
+                            "task_id": previous_task["task_id"],
+                            "control_generation": control_generation,
+                        }
         except (OSError, json.JSONDecodeError):
             attempt = 1
     worker_route = ""

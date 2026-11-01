@@ -382,6 +382,40 @@ class ControlPlaneContractTests(unittest.TestCase):
         self.assertEqual(first["task_id"], second["task_id"])
         self.assertEqual(task["attempt"], 1)
 
+    def test_rotation_rebinds_open_data_plane_task_without_losing_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            work = root / "work"
+            sdk = root / "sdk"
+            game.mkdir()
+            work.mkdir()
+            sdk.mkdir()
+            (work / "game-l10n.json").write_text("{}", encoding="utf-8")
+            establish_control_plane_entry(work)
+            config = {
+                "game_roots": [str(game)],
+                "sdk_root": str(sdk),
+                "sdk_selection": {"inventory_fingerprint": "fixture-inventory"},
+            }
+            output = work / ".game-l10n" / "data-plane" / "source_probe"
+            first = prepare_data_plane_task(
+                work, output, worker_role="source_probe", config=config
+            )
+            record_control_plane_leak(work, "parent_opened_data_plane")
+            acknowledge_control_plane_rotation(work, work / CONTROL_HANDOFF_PATH)
+            establish_control_plane_entry(work)
+
+            rebound = prepare_data_plane_task(
+                work, output, worker_role="source_probe", config=config
+            )
+            task = json.loads((output / "task.json").read_text(encoding="utf-8"))
+
+        self.assertNotEqual(first["task_id"], rebound["task_id"])
+        self.assertEqual(rebound["control_generation"], 2)
+        self.assertEqual(task["control_generation"], 2)
+        self.assertEqual(task["attempt"], 1)
+
     def test_native_context_worker_is_sealed_into_core_context_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
