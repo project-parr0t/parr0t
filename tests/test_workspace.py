@@ -931,7 +931,10 @@ class WorkspaceTests(unittest.TestCase):
             set(config["providers"][0]["allowed_roles"]),
             {"translation_fallback", "selective_rewrite", "judge_fallback"},
         )
-        self.assertEqual(config["routing"]["context_analyzers"], ["native-sol"])
+        self.assertEqual(
+            config["routing"]["context_analyzers"],
+            ["native-sol", "native-luna"],
+        )
         self.assertEqual(
             config["routing"]["translators"],
             ["native-luna", "native-sol", "deepseek"],
@@ -1679,7 +1682,7 @@ class WorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(
             primary_status["data_plane_task"]["relay_schema"],
-            "parr0t.data-plane-relay.v2",
+            "parr0t.data-plane-relay.v3",
         )
         self.assertEqual(
             primary_status["data_plane_task"]["parent_response"],
@@ -1809,6 +1812,15 @@ class WorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(status["data_plane_task"]["worker_role"], "context_analyzer")
         self.assertEqual(status["data_plane_task"]["stage"], "context")
+        self.assertFalse(status["data_plane_task"]["job_terminal"])
+        self.assertEqual(
+            status["data_plane_task"]["failure_action"],
+            "seal_then_follow_status",
+        )
+        self.assertEqual(
+            status["data_plane_task"]["unchanged_progress_limit_scope"],
+            "native_pass_wave_only",
+        )
 
     def test_status_exit_code_matches_the_immediate_action(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

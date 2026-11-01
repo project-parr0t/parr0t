@@ -31,9 +31,13 @@ from .store import stable_hash
 
 DATA_PLANE_TASK_SCHEMA = "parr0t.data-plane-task.v1"
 LEGACY_DATA_PLANE_RELAY_SCHEMA = "parr0t.data-plane-relay.v1"
-DATA_PLANE_RELAY_SCHEMA = "parr0t.data-plane-relay.v2"
-DATA_PLANE_RELAY_CONTRACT_SCHEMA = "parr0t.data-plane-relay-contract.v1"
+LEGACY_DATA_PLANE_RELAY_V2_SCHEMA = "parr0t.data-plane-relay.v2"
+DATA_PLANE_RELAY_SCHEMA = "parr0t.data-plane-relay.v3"
+LEGACY_DATA_PLANE_RELAY_CONTRACT_SCHEMA = "parr0t.data-plane-relay-contract.v1"
+DATA_PLANE_RELAY_CONTRACT_SCHEMA = "parr0t.data-plane-relay-contract.v2"
 DATA_PLANE_RECEIPT_SCHEMA = "parr0t.data-plane-receipt.v1"
+
+MIN_CONTEXT_CHUNK_CHARS = 2048
 
 DATA_PLANE_PROFILES: dict[str, dict[str, str]] = {
     "source_probe": {
@@ -210,10 +214,46 @@ def prepare_data_plane_task(
         try:
             previous_task = json.loads(previous_task_path.read_text(encoding="utf-8"))
             previous_attempt = previous_task.get("attempt", 0)
-            if isinstance(previous_attempt, int) and not isinstance(previous_attempt, bool):
-                attempt = max(previous_attempt + 1, 2)
+            valid_previous_attempt = (
+                isinstance(previous_attempt, int)
+                and not isinstance(previous_attempt, bool)
+                and previous_attempt >= 1
+            )
+            previous_receipt_path = output_dir / "receipt.json"
+            previous_receipt = (
+                json.loads(previous_receipt_path.read_text(encoding="utf-8"))
+                if previous_receipt_path.is_file()
+                else None
+            )
+            receipt_closes_previous = (
+                isinstance(previous_receipt, dict)
+                and previous_receipt.get("schema") == DATA_PLANE_RECEIPT_SCHEMA
+                and previous_receipt.get("task_id") == previous_task.get("task_id")
+                and previous_receipt.get("worker_role") == worker_role
+                and previous_receipt.get("stage") == profile["stage"]
+                and previous_receipt.get("control_generation") == control_generation
+            )
+            if valid_previous_attempt and receipt_closes_previous:
+                attempt = previous_attempt + 1
+            elif valid_previous_attempt:
+                previous_relay_path = output_dir / "relay.json"
+                previous_relay, bound_task = _load_bound_data_plane_relay(
+                    work_dir, previous_relay_path
+                )
+                if bound_task.get("task_id") == previous_task.get("task_id"):
+                    return {
+                        "schema": previous_relay["schema"],
+                        "status": "ready",
+                        "worker_role": worker_role,
+                        "stage": profile["stage"],
+                        "relay_path": _relative(work_dir, previous_relay_path),
+                        "task_id": previous_task["task_id"],
+                        "control_generation": control_generation,
+                    }
         except (OSError, json.JSONDecodeError):
-            attempt = 2
+            attempt = 1
+    worker_route = ""
+    worker_model_family = ""
     private_payload: dict[str, Any] = {
         "schema": DATA_PLANE_TASK_SCHEMA,
         "worker_role": worker_role,
@@ -280,18 +320,53 @@ def prepare_data_plane_task(
         context_mode = str(
             config.get("project", {}).get("context_mode", ContextMode.AUTO.value)
         )
+        context_routes = list(config.get("routing", {}).get("context_analyzers", []))
+        if not context_routes or not all(
+            isinstance(item, str) and item.strip() for item in context_routes
+        ):
+            raise ConfigurationError(
+                "E_DATA_PLANE_TASK_ROUTE: context analysis requires configured routes"
+            )
+        route_index = (attempt - 1) % len(context_routes)
+        route_cycle = (attempt - 1) // len(context_routes)
+        worker_route = context_routes[route_index]
+        worker_model_family = (
+            worker_route.removeprefix("native-")
+            if worker_route.startswith("native-")
+            else "external"
+        )
+        base_context_chunk_chars = int(
+            config.get("routing", {}).get("context_chunk_chars", 30000)
+        )
+        if base_context_chunk_chars <= 0:
+            raise ConfigurationError(
+                "E_DATA_PLANE_TASK_ROUTE: context chunk size must be positive"
+            )
+        context_chunk_chars = max(
+            MIN_CONTEXT_CHUNK_CHARS,
+            base_context_chunk_chars // (2**route_cycle),
+        )
         private_payload.update(
             {
                 "input_inventory": _relative(work_dir, primary_path),
                 "source_inventory_fingerprint": verified["primary_fingerprint"],
                 "output_state": ".game-l10n/context-state.json",
                 "context_mode": context_mode,
-                "context_routes": list(
-                    config.get("routing", {}).get("context_analyzers", [])
-                ),
-                "context_chunk_chars": int(
-                    config.get("routing", {}).get("context_chunk_chars", 30000)
-                ),
+                "context_routes": context_routes,
+                "context_route": worker_route,
+                "context_route_index": route_index,
+                "context_route_attempt": route_cycle + 1,
+                "context_base_chunk_chars": base_context_chunk_chars,
+                "context_chunk_chars": context_chunk_chars,
+                "context_recovery": {
+                    "resume_private_progress": True,
+                    "retry_scope": "smallest_unfinished_context_chunk",
+                    "route_selection": "core_round_robin",
+                    "chunk_reduction": "halve_after_each_complete_route_cycle",
+                    "minimum_chunk_chars": MIN_CONTEXT_CHUNK_CHARS,
+                    "sealed_failure_is_job_terminal": False,
+                    "unchanged_progress_limit_applies": False,
+                },
                 "context_pack_fields": [item.name for item in fields(ContextPack)],
                 "context_pack_contract": {
                     "string_fields": [
@@ -372,10 +447,14 @@ def prepare_data_plane_task(
             [
                 "read_only_the_verified_primary_inventory_and_existing_context_metadata",
                 "analyze_complete_flow_character_voice_tone_terminology_and_references",
-                "process_bounded_context_chunks_without_returning_text_to_parent",
+                "use_only_the_core_bound_context_route_for_this_attempt",
+                "never_send_the_whole_inventory_in_one_semantic_request",
+                "process_deterministic_bounded_context_chunks_without_returning_text_to_parent",
                 "write_one_merged_context_pack_using_exact_context_pack_fields",
                 "preserve_evidence_line_ids_for_every_required_domain",
                 "on_partial_or_operational_failure_record_resumable_private_progress",
+                "continue_unaffected_chunks_when_one_chunk_requires_fallback",
+                "never_treat_context_refusal_or_unchanged_progress_as_whole_job_terminal",
                 "do_not_translate_review_apply_pack_install_launch_or_delegate",
             ]
         )
@@ -428,6 +507,10 @@ def prepare_data_plane_task(
         "relay_authority": "exact_dispatch_only",
         "worker_history": "none",
         "worker_delegation_allowed": False,
+        "worker_route": worker_route,
+        "worker_model_family": worker_model_family,
+        "attempt": attempt,
+        "sealed_failure_is_job_terminal": False,
         "relay_contract": {
             "schema": DATA_PLANE_RELAY_CONTRACT_SCHEMA,
             "role": "isolated_data_plane_relay",
@@ -435,6 +518,9 @@ def prepare_data_plane_task(
             "child_response_policy": "never_read_interpret_summarize_or_forward",
             "worker_terminal_action": "seal_data_plane_task_with_worker_ended",
             "parent_response": "receipt_path_only",
+            "route_policy": "dispatch_exact_core_bound_worker_route",
+            "failure_policy": "seal_then_return_to_status_nonterminal",
+            "private_artifact_policy": "parent_must_not_open_task_or_artifacts",
             "terminal_seal_command": (
                 "game-l10n seal-data-plane-task --workspace <workspace> "
                 "--relay <relay-path> --worker-ended"
@@ -478,10 +564,16 @@ def _load_bound_data_plane_relay(
         "worker_history",
         "worker_delegation_allowed",
     }
-    relay_fields = legacy_relay_fields | {"relay_contract"}
+    v2_relay_fields = legacy_relay_fields | {"relay_contract"}
+    relay_fields = v2_relay_fields | {
+        "worker_route",
+        "worker_model_family",
+        "attempt",
+        "sealed_failure_is_job_terminal",
+    }
     relay_schema = relay.get("schema") if isinstance(relay, dict) else None
     relay_contract = relay.get("relay_contract") if isinstance(relay, dict) else None
-    valid_contract = (
+    valid_legacy_contract = (
         isinstance(relay_contract, dict)
         and set(relay_contract)
         == {
@@ -493,7 +585,7 @@ def _load_bound_data_plane_relay(
             "parent_response",
             "terminal_seal_command",
         }
-        and relay_contract.get("schema") == DATA_PLANE_RELAY_CONTRACT_SCHEMA
+        and relay_contract.get("schema") == LEGACY_DATA_PLANE_RELAY_CONTRACT_SCHEMA
         and relay_contract.get("role") == "isolated_data_plane_relay"
         and relay_contract.get("authority")
         == "exact_dispatch_and_categorical_seal_only"
@@ -508,6 +600,42 @@ def _load_bound_data_plane_relay(
             "--relay <relay-path> --worker-ended"
         )
     )
+    valid_contract = (
+        isinstance(relay_contract, dict)
+        and set(relay_contract)
+        == {
+            "schema",
+            "role",
+            "authority",
+            "child_response_policy",
+            "worker_terminal_action",
+            "parent_response",
+            "route_policy",
+            "failure_policy",
+            "private_artifact_policy",
+            "terminal_seal_command",
+        }
+        and relay_contract.get("schema") == DATA_PLANE_RELAY_CONTRACT_SCHEMA
+        and relay_contract.get("role") == "isolated_data_plane_relay"
+        and relay_contract.get("authority")
+        == "exact_dispatch_and_categorical_seal_only"
+        and relay_contract.get("child_response_policy")
+        == "never_read_interpret_summarize_or_forward"
+        and relay_contract.get("worker_terminal_action")
+        == "seal_data_plane_task_with_worker_ended"
+        and relay_contract.get("parent_response") == "receipt_path_only"
+        and relay_contract.get("route_policy")
+        == "dispatch_exact_core_bound_worker_route"
+        and relay_contract.get("failure_policy")
+        == "seal_then_return_to_status_nonterminal"
+        and relay_contract.get("private_artifact_policy")
+        == "parent_must_not_open_task_or_artifacts"
+        and relay_contract.get("terminal_seal_command")
+        == (
+            "game-l10n seal-data-plane-task --workspace <workspace> "
+            "--relay <relay-path> --worker-ended"
+        )
+    )
     if (
         not isinstance(relay, dict)
         or (
@@ -515,11 +643,28 @@ def _load_bound_data_plane_relay(
             and set(relay) != legacy_relay_fields
         )
         or (
+            relay_schema == LEGACY_DATA_PLANE_RELAY_V2_SCHEMA
+            and (set(relay) != v2_relay_fields or not valid_legacy_contract)
+        )
+        or (
             relay_schema == DATA_PLANE_RELAY_SCHEMA
-            and (set(relay) != relay_fields or not valid_contract)
+            and (
+                set(relay) != relay_fields
+                or not valid_contract
+                or not isinstance(relay.get("attempt"), int)
+                or isinstance(relay.get("attempt"), bool)
+                or relay.get("attempt", 0) < 1
+                or not isinstance(relay.get("worker_route"), str)
+                or not isinstance(relay.get("worker_model_family"), str)
+                or relay.get("sealed_failure_is_job_terminal") is not False
+            )
         )
         or relay_schema
-        not in {LEGACY_DATA_PLANE_RELAY_SCHEMA, DATA_PLANE_RELAY_SCHEMA}
+        not in {
+            LEGACY_DATA_PLANE_RELAY_SCHEMA,
+            LEGACY_DATA_PLANE_RELAY_V2_SCHEMA,
+            DATA_PLANE_RELAY_SCHEMA,
+        }
         or relay.get("max_workers") != 1
         or relay.get("relay_authority") != "exact_dispatch_only"
         or relay.get("worker_history") != "none"
