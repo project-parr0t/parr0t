@@ -93,7 +93,7 @@ class ControlPlaneContractTests(unittest.TestCase):
                 work, output, worker_role="source_probe", config=config
             )
 
-        self.assertEqual(relay_payload["schema"], "parr0t.data-plane-relay.v2")
+        self.assertEqual(relay_payload["schema"], "parr0t.data-plane-relay.v3")
         self.assertEqual(
             relay_payload["relay_contract"]["child_response_policy"],
             "never_read_interpret_summarize_or_forward",
@@ -205,6 +205,56 @@ class ControlPlaneContractTests(unittest.TestCase):
             payload = json.loads(relay.read_text(encoding="utf-8"))
             payload["schema"] = "parr0t.data-plane-relay.v1"
             payload.pop("relay_contract")
+            for field in (
+                "worker_route",
+                "worker_model_family",
+                "attempt",
+                "sealed_failure_is_job_terminal",
+            ):
+                payload.pop(field)
+            relay.write_text(json.dumps(payload), encoding="utf-8")
+
+            sealed = seal_data_plane_task(work, relay, worker_ended=True)
+
+        self.assertEqual(sealed["status"], "error")
+        self.assertEqual(sealed["issue_codes"], ["task_incomplete"])
+
+    def test_legacy_v2_data_plane_relay_remains_sealable_for_checkpoint_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            work = root / "work"
+            sdk = root / "sdk"
+            game.mkdir()
+            work.mkdir()
+            sdk.mkdir()
+            (work / "game-l10n.json").write_text("{}", encoding="utf-8")
+            establish_control_plane_entry(work)
+            prepared = prepare_data_plane_task(
+                work,
+                work / ".game-l10n" / "data-plane" / "source_probe",
+                worker_role="source_probe",
+                config={
+                    "game_roots": [str(game)],
+                    "sdk_root": str(sdk),
+                    "sdk_selection": {"inventory_fingerprint": "fixture-inventory"},
+                },
+            )
+            relay = work / prepared["relay_path"]
+            payload = json.loads(relay.read_text(encoding="utf-8"))
+            payload["schema"] = "parr0t.data-plane-relay.v2"
+            for field in (
+                "worker_route",
+                "worker_model_family",
+                "attempt",
+                "sealed_failure_is_job_terminal",
+            ):
+                payload.pop(field)
+            contract = payload["relay_contract"]
+            contract["schema"] = "parr0t.data-plane-relay-contract.v1"
+            contract.pop("route_policy")
+            contract.pop("failure_policy")
+            contract.pop("private_artifact_policy")
             relay.write_text(json.dumps(payload), encoding="utf-8")
 
             sealed = seal_data_plane_task(work, relay, worker_ended=True)
@@ -304,7 +354,64 @@ class ControlPlaneContractTests(unittest.TestCase):
         self.assertEqual(sealed["stage"], "discovery")
         self.assertTrue(sealed["receipt_path"].endswith("receipt.json"))
 
-    def test_reprepared_data_plane_task_gets_a_new_bound_attempt(self) -> None:
+    def test_new_attempt_cannot_reseal_a_previous_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game, work, sdk = (root / name for name in ("game", "work", "sdk"))
+            for path in (game, work, sdk):
+                path.mkdir()
+            (work / "game-l10n.json").write_text("{}", encoding="utf-8")
+            establish_control_plane_entry(work)
+            config = {
+                "game_roots": [str(game)],
+                "sdk_root": str(sdk),
+                "sdk_selection": {"inventory_fingerprint": "fixture-inventory"},
+            }
+            output = work / ".game-l10n" / "data-plane" / "source_probe"
+            first = prepare_data_plane_task(
+                work, output, worker_role="source_probe", config=config
+            )
+            relay = work / first["relay_path"]
+            first_relay = json.loads(relay.read_text(encoding="utf-8"))
+            first_envelope = work / first_relay["expected_envelope"]
+            envelope_body = json.dumps(
+                {
+                    "schema": "parr0t.control-envelope.v2",
+                    "worker_role": "source_probe",
+                    "stage": "discovery",
+                    "status": "error",
+                    "target_ids": [],
+                    "counts": {"total": 1, "success": 0, "error": 1},
+                    "issue_codes": ["provider_error"],
+                    "artifact_paths": ["game-l10n.json"],
+                    "queue_transitions": [],
+                    "route_evidence_path": "",
+                }
+            )
+            first_envelope.write_text(envelope_body, encoding="utf-8")
+            seal_data_plane_task(work, relay)
+
+            second = prepare_data_plane_task(
+                work, output, worker_role="source_probe", config=config
+            )
+            second_relay = json.loads(relay.read_text(encoding="utf-8"))
+            second_envelope = work / second_relay["expected_envelope"]
+
+            self.assertNotEqual(first["task_id"], second["task_id"])
+            self.assertNotEqual(first_envelope, second_envelope)
+            self.assertEqual(first_envelope.read_text(encoding="utf-8"), envelope_body)
+            self.assertFalse(second_envelope.exists())
+            missing = seal_data_plane_task(work, relay, worker_ended=True)
+            self.assertEqual(missing["issue_codes"], ["task_incomplete"])
+            self.assertEqual(first_envelope.read_text(encoding="utf-8"), envelope_body)
+
+            second_envelope.write_text(envelope_body, encoding="utf-8")
+            self.assertEqual(
+                seal_data_plane_task(work, relay)["issue_codes"],
+                ["provider_error"],
+            )
+
+    def test_reprepared_open_data_plane_task_reuses_the_bound_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             game = root / "game"
@@ -329,8 +436,60 @@ class ControlPlaneContractTests(unittest.TestCase):
             )
             task = json.loads((output / "task.json").read_text(encoding="utf-8"))
 
-        self.assertNotEqual(first["task_id"], second["task_id"])
-        self.assertEqual(task["attempt"], 2)
+        self.assertEqual(first["task_id"], second["task_id"])
+        self.assertEqual(task["attempt"], 1)
+
+    def test_rotation_rebinds_open_data_plane_task_without_losing_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            work = root / "work"
+            sdk = root / "sdk"
+            game.mkdir()
+            work.mkdir()
+            sdk.mkdir()
+            (work / "game-l10n.json").write_text("{}", encoding="utf-8")
+            establish_control_plane_entry(work)
+            config = {
+                "game_roots": [str(game)],
+                "sdk_root": str(sdk),
+                "sdk_selection": {"inventory_fingerprint": "fixture-inventory"},
+            }
+            output = work / ".game-l10n" / "data-plane" / "source_probe"
+            first = prepare_data_plane_task(
+                work, output, worker_role="source_probe", config=config
+            )
+            first_relay = json.loads(
+                (work / first["relay_path"]).read_text(encoding="utf-8")
+            )
+            first_envelope = work / first_relay["expected_envelope"]
+            first_envelope.write_text("{prior output", encoding="utf-8")
+            record_control_plane_leak(work, "parent_opened_data_plane")
+            acknowledge_control_plane_rotation(work, work / CONTROL_HANDOFF_PATH)
+            establish_control_plane_entry(work)
+
+            rebound = prepare_data_plane_task(
+                work, output, worker_role="source_probe", config=config
+            )
+            task = json.loads((output / "task.json").read_text(encoding="utf-8"))
+            rebound_relay = json.loads(
+                (work / rebound["relay_path"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                first_envelope.read_text(encoding="utf-8"), "{prior output"
+            )
+            sealed = seal_data_plane_task(
+                work, work / rebound["relay_path"], worker_ended=True
+            )
+            self.assertEqual(sealed["issue_codes"], ["task_incomplete"])
+
+        self.assertNotEqual(first["task_id"], rebound["task_id"])
+        self.assertEqual(rebound["control_generation"], 2)
+        self.assertEqual(task["control_generation"], 2)
+        self.assertEqual(task["attempt"], 1)
+        self.assertNotEqual(
+            first_relay["expected_envelope"], rebound_relay["expected_envelope"]
+        )
 
     def test_native_context_worker_is_sealed_into_core_context_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -371,7 +530,10 @@ class ControlPlaneContractTests(unittest.TestCase):
                 "sdk_selection": {"inventory_fingerprint": "fixture-sdk"},
                 "files": {"context_pack": "context/context-pack.json"},
                 "project": {"context_mode": "auto"},
-                "routing": {"context_analyzers": ["native-sol"]},
+                "routing": {
+                    "context_analyzers": ["native-sol"],
+                    "max_workers": 8,
+                },
             }
             prepared = prepare_data_plane_task(
                 work,
@@ -382,6 +544,9 @@ class ControlPlaneContractTests(unittest.TestCase):
             )
             relay = work / prepared["relay_path"]
             relay_payload = json.loads(relay.read_text(encoding="utf-8"))
+            private_task = json.loads(
+                (work / relay_payload["task_path"]).read_text(encoding="utf-8")
+            )
             context_path = work / "context" / "context-pack.json"
             context_path.parent.mkdir()
             context_path.write_text(
@@ -426,11 +591,128 @@ class ControlPlaneContractTests(unittest.TestCase):
             )
 
         self.assertEqual(sealed["status"], "success")
+        self.assertEqual(relay_payload["max_workers"], 6)
+        self.assertTrue(relay_payload["worker_delegation_allowed"])
+        self.assertEqual(private_task["context_parallelism"]["max_workers"], 6)
+        self.assertEqual(
+            private_task["context_parallelism"]["shared_artifact_writer"],
+            "single_fresh_finalizer_after_wave",
+        )
         self.assertEqual(state["status"], "success")
         self.assertEqual(
             state["source_inventory_fingerprint"], verified["primary_fingerprint"]
         )
         self.assertTrue(state["attestation"]["functional_coverage"]["complete"])
+
+    def test_context_recovery_rotates_routes_and_reduces_private_chunk_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            work = root / "work"
+            sdk = root / "sdk"
+            game.mkdir()
+            work.mkdir()
+            sdk.mkdir()
+            establish_control_plane_entry(work)
+            inputs = work / "inputs"
+            inputs.mkdir()
+            inventory = {
+                "schema": "parr0t.source-inventory.v1",
+                "method": "fixture",
+                "implementation_fingerprint": "fixture-implementation",
+                "coverage": {"declared_complete": True, "exclusions": []},
+                "segments": [{"id": "fixture-1", "source": "SOURCE"}],
+            }
+            primary = inputs / "primary-inventory.json"
+            independent = inputs / "independent-inventory.json"
+            primary.write_text(json.dumps(inventory), encoding="utf-8")
+            independent.write_text(
+                json.dumps(
+                    {
+                        **inventory,
+                        "method": "fixture-independent",
+                        "implementation_fingerprint": "fixture-independent-implementation",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            save_inventory_attestation(work, primary, independent)
+            config = {
+                "game_roots": [str(game)],
+                "sdk_root": str(sdk),
+                "sdk_selection": {"inventory_fingerprint": "fixture-sdk"},
+                "files": {"context_pack": "context/context-pack.json"},
+                "project": {"context_mode": "auto"},
+                "routing": {
+                    "context_analyzers": ["native-sol", "native-luna"],
+                    "context_chunk_chars": 30000,
+                },
+            }
+            output = work / ".game-l10n" / "data-plane" / "context_analyzer"
+            observed = []
+            for _ in range(3):
+                prepared = prepare_data_plane_task(
+                    work,
+                    output,
+                    worker_role="context_analyzer",
+                    config=config,
+                    sdk_activation={"status": "active"},
+                )
+                relay = json.loads(
+                    (work / prepared["relay_path"]).read_text(encoding="utf-8")
+                )
+                task = json.loads((output / "task.json").read_text(encoding="utf-8"))
+                observed.append(
+                    (
+                        relay["worker_route"],
+                        relay["worker_model_family"],
+                        relay["sealed_failure_is_job_terminal"],
+                        task["context_chunk_chars"],
+                    )
+                )
+                seal_data_plane_task(
+                    work,
+                    work / prepared["relay_path"],
+                    worker_ended=True,
+                )
+            receipt_path = output / "receipt.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["counts"] = {
+                "total": 10,
+                "success": 3,
+                "error": 0,
+                "pending": 7,
+            }
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            prepared = prepare_data_plane_task(
+                work,
+                output,
+                worker_role="context_analyzer",
+                config=config,
+                sdk_activation={"status": "active"},
+            )
+            relay = json.loads(
+                (work / prepared["relay_path"]).read_text(encoding="utf-8")
+            )
+            task = json.loads((output / "task.json").read_text(encoding="utf-8"))
+            observed.append(
+                (
+                    relay["worker_route"],
+                    relay["worker_model_family"],
+                    relay["sealed_failure_is_job_terminal"],
+                    task["context_chunk_chars"],
+                )
+            )
+
+        self.assertEqual(
+            observed,
+            [
+                ("native-sol", "sol", False, 30000),
+                ("native-luna", "luna", False, 30000),
+                ("native-sol", "sol", False, 15000),
+                ("native-luna", "luna", False, 30000),
+            ],
+        )
 
     def test_native_review_pass_kind_is_registered(self) -> None:
         args = build_parser().parse_args(

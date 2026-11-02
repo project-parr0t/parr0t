@@ -119,6 +119,7 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "require_review": True,
         "review_max_rounds": 2,
         "max_workers": 8,
+        "context_max_workers": 6,
         "retry_refusals_once": False,
         "grace_retries": 3,
         "grace_retry_codes": [
@@ -173,6 +174,7 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "native_agent_max_depth": 1,
         "model_controller_allowed": False,
         "worker_delegation_allowed": False,
+        "context_worker_delegation_policy": "bound_data_plane_relay_only",
         "control_turn_budget_policy_version": 2,
         "control_turn_budget_user_approved": False,
         "max_root_model_calls_per_wave": None,
@@ -263,7 +265,7 @@ This private workspace contains game data. Resolve Parr0t from `game-l10n.json`;
 - Select and activate the exact engine/version SDK before data-plane work. A different SDK may be a bound `reference` for `derive-new`; generated pass-through tools are not an adapter.
 - Require two independent complete ordered inventories, typed context analysis, primary translation, translation fallback for failures only, complete low-cost triage, selective strong review for flags/risk/sample, flagged-only rewrite, review fallback for failures only, deterministic validation, then packing. Do not shrink scope or reorder barriers.
 - The top-level agent is text-free. It may observe only core CLI metadata, validated `parr0t.control-envelope.v2`/receipt paths, and direct-relay categorical lifecycle. Never inspect session transcripts/logs, agent trees, nested-worker status/output, or semantic-worker logs. Usage comes only from core ledgers/receipts. Run `game-l10n validate-control-envelope`; forbidden detail requires rotation.
-- Discovery, inventory, reconciliation, and context use only prepared relays. A relay never reads or forwards child responses. At termination it runs bound `seal-data-plane-task --worker-ended` once and returns only the receipt path. Core seals valid output or records failure. The parent never opens game content or assigns data workers directly; follow status for retries.
+- Prepared relays alone own discovery, inventory, reconciliation, and context. Ordinary relays use one worker; a context relay may use only its core-bound ceiling of disjoint workers, slot-owned fragments, and one source-order finalizer. They never forward child output; they seal once and return only the receipt. Parent never opens private data or assigns workers directly. Data-plane receipts and native-pass unchanged limits are nonterminal here.
 - If private text or semantic/refusal prose reaches the parent, run `game-l10n record-control-plane-leak` and stop. The contaminated agent cannot resume. A fresh control plane uses only the canonical receipt with `--fresh-session-confirmed --contracts-read --source-unopened`; prose handoffs are invalid.
 - Normalize every refusal to `fallback_required` / “폴백 처리 필요”. It is a routing event, never an exclusion, batch cancellation, or content decision. `source_preserved` requires route evidence that every configured route was attempted and exhausted.
 - Use the locked target language (default: Korean). Another language requires `target-language-policy --user-requested`. Preserve relevant context, meaning, function, natural tone, voice, terminology, allusions, placeholders, markup, control codes, conditions, units, and order.
@@ -274,7 +276,7 @@ This private workspace contains game data. Resolve Parr0t from `game-l10n.json`;
 - Keep publication dormant and unmentioned until the user requests it. SDK promotion also requires confirmed patch success and the original exact target identity. Its separate engine-only commit must pass `game-l10n verify-sdk-promotion`; never mix a `main`-owned path into that commit.
 - Native orchestration uses one disposable isolated relay per authorized wave. Give it only the `native-pass-step` artifact. It cannot inspect payloads/responses. After termination, run `--relay-ended`; core queues missing tasks without overwriting results. Reload prose only when `status.contract_set.digest` or generation changes.
 - V7 tasks embed bound segments; never open the full source. Review starts at 256 records/65,536 estimated tokens or less (hard ceilings: 2,048/262,144). One semantic call ends the worker; core locks successes and emits smaller failed-only manifests.
-- Use proportional checks and stop after the required layer passes. For large inventory, scan once per method and continue bounded cached gap work while the core gap score improves; incomplete inventory is not terminal. Once a semantic pass leaves no more than `execution.residual_direct_records`, use one fresh worker on one cached residual task; do not create a job-local scheduler or supplemental evidence pack. A native capacity failure enters resumable state and must not auto-restart the root turn. Aggregate per wave; keep transitions silent; report only pass/checkpoint completion or blockers; stop at the configured unchanged limit.
+- Use proportional checks. Large inventories scan once per method and continue cached gap work while score improves. Use one cached residual task under `execution.residual_direct_records`; no local scheduler or supplemental pack. A native capacity failure must not auto-restart the root turn. Aggregate per wave; keep transitions silent; report only pass/checkpoint completion or blockers. Unchanged-observation limits belong only to `native-pass-step` waves, never data-plane stages or the job.
 - Never solicit whole-job usage ceilings. None applies unless user-stated and manifest-recorded; telemetry cannot stop work. Only reached DeepSeek fallback requests receive automatic input preflight.
 
 ## Status routes
@@ -1270,6 +1272,24 @@ def _apply_translation_retry_defaults(config: dict[str, Any]) -> None:
         )
 
 
+def _apply_context_routing_defaults(config: dict[str, Any]) -> None:
+    """Upgrade the known App-native context route without rewriting custom modes."""
+
+    routing = config.setdefault("routing", {})
+    if not isinstance(routing, dict):
+        raise ConfigurationError("Workspace routing policy must be an object")
+    configured_workers = routing.get("max_workers", 1)
+    if isinstance(configured_workers, int) and not isinstance(
+        configured_workers, bool
+    ):
+        routing.setdefault("context_max_workers", min(6, max(1, configured_workers)))
+    if (
+        str(config.get("provider_preset", "")) == CODEX_APP_PRESET
+        and routing.get("context_analyzers") == ["native-sol"]
+    ):
+        routing["context_analyzers"] = ["native-sol", "native-luna"]
+
+
 def _apply_control_plane_defaults(config: dict[str, Any]) -> None:
     """Migrate the fixed observation boundary without weakening explicit drift."""
 
@@ -1334,7 +1354,7 @@ def initialize_workspace(
             "external_provider_roles": sorted(CODEX_APP_EXTERNAL_ROLES),
         }
         config["routing"] = {
-            "context_analyzers": ["native-sol"],
+            "context_analyzers": ["native-sol", "native-luna"],
             "translators": ["native-luna", "native-sol", "deepseek"],
             "translator_retries": {
                 "native-luna": 5,
@@ -1355,6 +1375,7 @@ def initialize_workspace(
             "require_review": True,
             "review_max_rounds": 2,
             "max_workers": 8,
+            "context_max_workers": 6,
             "retry_refusals_once": False,
             "grace_retries": 3,
             "grace_retry_codes": [
@@ -1394,6 +1415,7 @@ def initialize_workspace(
             "require_review": True,
             "review_max_rounds": 2,
             "max_workers": 1,
+            "context_max_workers": 1,
             "retry_refusals_once": True,
             "grace_retries": 0,
             "defer_fallbacks_until_primary_complete": False,
@@ -1461,6 +1483,7 @@ def load_config(work_dir: Path) -> dict[str, Any]:
     _apply_execution_defaults(config)
     _apply_review_routing_defaults(config)
     _apply_translation_retry_defaults(config)
+    _apply_context_routing_defaults(config)
     _apply_control_plane_defaults(config)
     _apply_image_localization_defaults(config)
     require_target_language_policy(work_dir, config)
