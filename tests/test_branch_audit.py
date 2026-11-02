@@ -97,14 +97,33 @@ class BranchAuditTests(unittest.TestCase):
         self.assertEqual(result["executed"], 0)
         self.assertEqual(result["reused"], 2)
 
-    def test_main_change_invalidates_overlay_but_not_unchanged_branch_source(self) -> None:
+    def test_unrelated_main_change_reuses_adapter_impact_proof(self) -> None:
         with patch("scripts.check_branches.run_checks", side_effect=self.passed):
             first = self.audit()
             self.write("core.py", "# changed again\n")
             self.commit("Change fixture core again")
             second = self.audit()
-        self.assertEqual(second["executed"], 2)
+        self.assertEqual(second["executed"], 1)
+        self.assertTrue(second["branches"][1]["cached"])
+        self.assertEqual(second["branches"][1]["cache_scope"], "adapter_impact")
         self.assertNotEqual(first["branches"][1]["validation_key"], second["branches"][1]["validation_key"])
+
+    def test_reachable_main_change_invalidates_adapter_impact_proof(self) -> None:
+        self.git("switch", "sdk-fixture-1.0")
+        self.write(
+            "tests/test_adapter.py",
+            "import core\nimport unittest\nclass Adapter(unittest.TestCase):\n"
+            "    def test_fixture(self): self.assertTrue(core)\n",
+        )
+        self.commit("Bind adapter test to shared core")
+        self.git("switch", "main")
+        with patch("scripts.check_branches.run_checks", side_effect=self.passed):
+            self.audit()
+            self.write("core.py", "# reachable change\n")
+            self.commit("Change reachable fixture core")
+            result = self.audit()
+        self.assertEqual(result["executed"], 2)
+        self.assertFalse(result["branches"][1]["cached"])
 
     def test_adapter_change_invalidates_only_that_adapter(self) -> None:
         with patch("scripts.check_branches.run_checks", side_effect=self.passed):
@@ -149,7 +168,8 @@ class BranchAuditTests(unittest.TestCase):
                 self.assertEqual(self.audit()["executed"], 2)
             with patch("scripts.check_branches.environment_digest", return_value="new-environment"):
                 result = audit_branches(self.repo, self.state, main_ref="main", refs=["sdk-fixture-1.0"], jobs=1)
-                self.assertEqual(result["executed"], 2)
+                self.assertEqual(result["executed"], 1)
+                self.assertEqual(result["branches"][1]["cache_scope"], "adapter_impact")
 
     def test_malformed_cache_and_failed_checks_never_skip_validation(self) -> None:
         self.state.mkdir()
@@ -169,6 +189,8 @@ class BranchAuditTests(unittest.TestCase):
             self.assertEqual(self.audit()["executed"], 2)
         cache = json.loads((self.state / "cache.json").read_text())
         for value in cache["results"].values():
+            value["checks"] = {}
+        for value in cache.get("impact_results", {}).values():
             value["checks"] = {}
         (self.state / "cache.json").write_text(json.dumps(cache))
         with patch("scripts.check_branches.run_checks", side_effect=self.passed):
@@ -336,6 +358,31 @@ class BranchAuditTests(unittest.TestCase):
         self.assertFalse(branch["passed"])
         self.assertEqual(branch["error"], "E_BRANCH_DEPENDENCIES_NOT_PROVISIONED")
 
+    def test_unrelated_core_change_reuses_adapter_without_dependency_provisioning(self) -> None:
+        self.git("switch", "sdk-fixture-1.0")
+        self.write("profiles/fixture-requirements.txt", "# isolated fixture dependency\n")
+        self.commit("Declare cached fixture dependency")
+        self.git("switch", "main")
+        dependency = self.state / "fixture-dependency"
+        dependency.mkdir(parents=True)
+        with patch(
+            "scripts.check_branches.provision_requirements",
+            return_value=([dependency], "fixture-dependency-key"),
+        ) as provision, patch("scripts.check_branches.run_checks", side_effect=self.passed):
+            first = self.audit(provision_dependencies=True)
+        self.assertTrue(first["branches"][1]["passed"])
+        provision.assert_called_once()
+        self.write("core.py", "# unrelated cached change\n")
+        self.commit("Change unrelated core after adapter proof")
+        with patch("scripts.check_branches.provision_requirements") as provision, patch(
+            "scripts.check_branches.run_checks", side_effect=self.passed
+        ) as runner:
+            second = self.audit()
+        provision.assert_not_called()
+        self.assertEqual(runner.call_count, 1)
+        self.assertTrue(second["branches"][1]["cached"])
+        self.assertEqual(second["branches"][1]["dependency_mode"], "cached_evidence")
+
     def test_sdk_external_tools_are_machine_checked_before_adapter_tests(self) -> None:
         self.git("switch", "sdk-fixture-1.0")
         self.write("profiles/sdk-validation.json", json.dumps({
@@ -376,6 +423,31 @@ class BranchAuditTests(unittest.TestCase):
             first["branches"][1]["validation_key"],
             second["branches"][1]["validation_key"],
         )
+
+    def test_missing_external_tool_is_not_requested_for_unaffected_cached_adapter(self) -> None:
+        self.git("switch", "sdk-fixture-1.0")
+        self.write("profiles/sdk-validation.json", json.dumps({
+            "schema": "parr0t.sdk-validation.v1",
+            "required_environment_files": ["PARR0T_FIXTURE_TOOL"],
+        }))
+        self.commit("Declare cached external validator")
+        self.git("switch", "main")
+        tool = self.root / "fixture-tool"
+        tool.write_text("stable", encoding="utf-8")
+        with patch.dict("os.environ", {"PARR0T_FIXTURE_TOOL": str(tool)}), patch(
+            "scripts.check_branches.run_checks", side_effect=self.passed
+        ):
+            self.audit()
+        self.write("core.py", "# unrelated tool-free change\n")
+        self.commit("Change unrelated core without external tool")
+        with patch.dict("os.environ", {}, clear=False), patch(
+            "scripts.check_branches.run_checks", side_effect=self.passed
+        ) as runner:
+            os.environ.pop("PARR0T_FIXTURE_TOOL", None)
+            result = self.audit()
+        self.assertEqual(runner.call_count, 1)
+        self.assertTrue(result["branches"][1]["cached"])
+        self.assertEqual(result["branches"][1]["cache_scope"], "adapter_impact")
 
     def test_sdk_external_tool_change_during_tests_holds_result(self) -> None:
         self.git("switch", "sdk-fixture-1.0")
