@@ -9,6 +9,7 @@ from typing import Any
 from .context_analysis import (
     CONTEXT_PREFLIGHT_POLICY_VERSION,
     CONTEXT_PREFLIGHT_SCHEMA,
+    CONTEXT_STATE_SCHEMA,
     build_context_preflight,
     context_contract_fingerprints,
     context_attestation_for_mode,
@@ -684,6 +685,9 @@ def prepare_data_plane_task(
                 "context_route_attempt": route_cycle + 1,
                 "context_base_chunk_chars": base_context_chunk_chars,
                 "context_chunk_chars": context_chunk_chars,
+                "context_chunk_measurement": (
+                    "serialized_payload_chars_including_ids_source_and_metadata"
+                ),
                 "context_progress_baseline_success": context_progress_baseline,
                 "context_no_progress_attempts": context_no_progress_attempts,
                 "context_parallelism": {
@@ -725,7 +729,7 @@ def prepare_data_plane_task(
                     "reuse_requires_exact_match": [
                         "fragment_source_digest",
                         "fragment_ordered_evidence_ids",
-                        "context_preflight_sha256",
+                        "context_preflight_policy_version",
                         "context_mode",
                         "context_contract_fingerprints",
                     ],
@@ -822,6 +826,7 @@ def prepare_data_plane_task(
                 "analyze_complete_flow_character_voice_tone_terminology_and_references",
                 "use_only_the_core_bound_context_route_for_this_attempt",
                 "never_send_the_whole_inventory_in_one_semantic_request",
+                "measure_chunk_limits_over_the_complete_serialized_request_rows_including_metadata",
                 "process_deterministic_bounded_context_chunks_without_returning_text_to_parent",
                 "write_one_merged_context_pack_using_exact_context_pack_fields",
                 "preserve_evidence_line_ids_for_every_required_domain",
@@ -1536,8 +1541,10 @@ def _seal_bound_data_plane_task(
                 context_pack,
                 context_mode=str(task.get("context_mode", ContextMode.AUTO.value)),
                 analyzer_routes=[
-                    {"name": str(name), "type": "native_collaboration"}
-                    for name in task.get("context_routes", [])
+                    {
+                        "name": str(task.get("context_route", "")),
+                        "type": "native_collaboration",
+                    }
                 ],
                 preflight=expected_preflight,
             )
@@ -1563,6 +1570,7 @@ def _seal_bound_data_plane_task(
         ]
         validated_parts = 1 if semantic_segment_count else 0
         context_state = {
+            "schema": CONTEXT_STATE_SCHEMA,
             "status": "success",
             "fingerprint": stable_hash(
                 {
@@ -1587,7 +1595,7 @@ def _seal_bound_data_plane_task(
                     [
                         {
                             "part": 1,
-                            "provider": "isolated_context_worker",
+                            "provider": str(task.get("context_route", "")),
                             "routes_attempted": 1,
                             "status": "success",
                         }

@@ -399,9 +399,14 @@ class WorkspaceTests(unittest.TestCase):
             self.assertTrue(
                 _context_state_valid(payload, context, None, "inventory-v1")
             )
+            payload["schema"] = "parr0t.context-state.unknown"
+            self.assertFalse(
+                _context_state_valid(payload, context, None, "inventory-v1")
+            )
             self.assertFalse(
                 _context_state_valid(payload, context, None, "inventory-v2")
             )
+            payload["schema"] = "parr0t.context-state.v2"
             payload["source_inventory_fingerprint"] = "inventory-v1"
             payload["execution"] = {
                 "status": "success",

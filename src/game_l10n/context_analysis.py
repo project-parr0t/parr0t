@@ -21,6 +21,7 @@ CONTEXT_DOMAINS = {
 }
 
 CONTEXT_PREFLIGHT_SCHEMA = "parr0t.context-preflight.v1"
+CONTEXT_STATE_SCHEMA = "parr0t.context-state.v2"
 CONTEXT_PREFLIGHT_POLICY_VERSION = 1
 CONTEXT_PROMPT_CONTRACT_VERSION = 1
 CONTEXT_NESTED_SCHEMA_VERSION = 1
@@ -570,7 +571,19 @@ def _chunks(segments: list[Segment], max_chars: int) -> list[list[Segment]]:
     current: list[Segment] = []
     size = 0
     for segment in segments:
-        row_size = len(segment.source) + len(segment.scene) + len(segment.speaker) + 80
+        row_size = len(
+            json.dumps(
+                {
+                    "id": segment.id,
+                    "scene": segment.scene,
+                    "speaker": segment.speaker,
+                    "source": segment.source,
+                    "metadata": segment.metadata,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        ) + 80
         if current and size + row_size > max_chars:
             result.append(current)
             current = []
@@ -1017,6 +1030,7 @@ def _legacy_context_cache_reusable(
     previous = state.get("attestation")
     return bool(
         isinstance(previous, dict)
+        and "schema" not in state
         and "context_preflight" not in previous
         and state.get("status") == "success"
         and state.get("source_segments_digest") == source_segments_digest
@@ -1057,43 +1071,61 @@ def analyze_with_cache(
         }
     )
     if not force and output_path.exists() and state_path.exists():
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        output_body = output_path.read_bytes()
-        if (
-            state.get("source_segments_digest") == source_segments_digest
-            and state.get("output_sha256") == hashlib.sha256(output_body).hexdigest()
-            and state.get("output_size") == len(output_body)
-        ):
-            data = json.loads(output_path.read_text(encoding="utf-8"))
-            context_pack = ContextPack(**data)
-            attestation = context_attestation(
-                segments, context_pack, analyzer, preflight=preflight
-            )
-            require_complete_context(attestation)
-            _require_successful_execution(state.get("execution"))
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            output_body = output_path.read_bytes()
             if (
-                state.get("fingerprint") == fingerprint
-                and state.get("attestation") == attestation
+                state.get("source_segments_digest") == source_segments_digest
+                and state.get("output_sha256")
+                == hashlib.sha256(output_body).hexdigest()
+                and state.get("output_size") == len(output_body)
             ):
+                data = json.loads(output_path.read_text(encoding="utf-8"))
+                context_pack = ContextPack(**data)
+                attestation = context_attestation(
+                    segments, context_pack, analyzer, preflight=preflight
+                )
+                require_complete_context(attestation)
+                _require_successful_execution(state.get("execution"))
                 if (
-                    source_inventory_fingerprint is not None
-                    and state.get("source_inventory_fingerprint")
-                    != source_inventory_fingerprint
+                    state.get("fingerprint") == fingerprint
+                    and state.get("attestation") == attestation
                 ):
-                    state["source_inventory_fingerprint"] = source_inventory_fingerprint
-                    state_temporary = state_path.with_name(f"{state_path.name}.tmp")
-                    state_temporary.write_text(
-                        json.dumps(state, ensure_ascii=False, indent=2) + "\n",
-                        encoding="utf-8",
-                    )
-                    state_temporary.replace(state_path)
-                return context_pack, True
-            if _legacy_context_cache_reusable(
-                state,
-                attestation,
-                source_segments_digest=source_segments_digest,
-            ):
-                return context_pack, True
+                    if (
+                        source_inventory_fingerprint is not None
+                        and state.get("source_inventory_fingerprint")
+                        != source_inventory_fingerprint
+                    ):
+                        state["source_inventory_fingerprint"] = (
+                            source_inventory_fingerprint
+                        )
+                        state_temporary = state_path.with_name(
+                            f"{state_path.name}.tmp"
+                        )
+                        state_temporary.write_text(
+                            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+                            encoding="utf-8",
+                        )
+                        state_temporary.replace(state_path)
+                    return context_pack, True
+                if _legacy_context_cache_reusable(
+                    state,
+                    attestation,
+                    source_segments_digest=source_segments_digest,
+                ):
+                    return context_pack, True
+        except (
+            OSError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+            AttributeError,
+            KeyError,
+            ProviderError,
+        ):
+            # Cache corruption is not semantic failure. Rebuild from the bound
+            # source while preserving the old files until the new result seals.
+            pass
     context_pack = analyzer.analyze(segments, preflight=preflight)
     execution = _require_successful_execution(analyzer.last_execution)
     attestation = context_attestation(
@@ -1110,6 +1142,7 @@ def analyze_with_cache(
     state_temporary.write_text(
         json.dumps(
             {
+                "schema": CONTEXT_STATE_SCHEMA,
                 "status": "success",
                 "fingerprint": fingerprint,
                 "source_segments_digest": source_segments_digest,

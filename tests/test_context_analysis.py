@@ -235,6 +235,29 @@ class ContextAnalysisTests(unittest.TestCase):
             list(range(1, provider.call_count + 1)),
         )
 
+    def test_chunk_limit_counts_serialized_metadata(self) -> None:
+        provider = ScriptedProvider("context", successful_context)
+        analyzer = ContextAnalyzer(
+            ProviderRegistry({"context": provider}),
+            ["context"],
+            max_chunk_chars=300,
+        )
+
+        analyzer.analyze(
+            [
+                Segment(
+                    str(index),
+                    "SOURCE",
+                    speaker="A",
+                    scene="S",
+                    metadata={"structural_evidence": "X" * 220},
+                )
+                for index in range(2)
+            ]
+        )
+
+        self.assertEqual(provider.call_count, 2)
+
     def test_auto_mode_treats_quest_metadata_as_narrative_context(self) -> None:
         self.assertEqual(
             infer_context_mode([Segment("title-1", "SOURCE_TITLE", metadata={"text_type": "quest_title"})]),
@@ -317,6 +340,30 @@ class ContextAnalysisTests(unittest.TestCase):
         self.assertEqual(first.story_summary, second.story_summary)
         self.assertEqual(provider.call_count, 1)
 
+    def test_malformed_context_state_rebuilds_instead_of_stopping(self) -> None:
+        provider = ScriptedProvider("context", successful_context)
+        analyzer = ContextAnalyzer(ProviderRegistry({"context": provider}), ["context"])
+        segments = [Segment("1", "SOURCE", speaker="A", scene="S")]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            analyze_with_cache(
+                analyzer=analyzer,
+                segments=segments,
+                output_path=root / "context.json",
+                state_path=root / "state.json",
+            )
+            (root / "state.json").write_text("{malformed", encoding="utf-8")
+
+            _, cached = analyze_with_cache(
+                analyzer=analyzer,
+                segments=segments,
+                output_path=root / "context.json",
+                state_path=root / "state.json",
+            )
+
+        self.assertFalse(cached)
+        self.assertEqual(provider.call_count, 2)
+
     def test_completed_legacy_context_is_reused_without_state_rewrite(self) -> None:
         provider = ScriptedProvider("context", successful_context)
         analyzer = ContextAnalyzer(ProviderRegistry({"context": provider}), ["context"])
@@ -331,6 +378,7 @@ class ContextAnalysisTests(unittest.TestCase):
             )
             state_path = root / "state.json"
             state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.pop("schema")
             state["fingerprint"] = "legacy-fingerprint"
             state["attestation"].pop("context_preflight")
             state["attestation"].pop("semantic_segment_count")
@@ -349,6 +397,35 @@ class ContextAnalysisTests(unittest.TestCase):
 
         self.assertTrue(cached)
         self.assertEqual(provider.call_count, 1)
+
+    def test_current_context_state_cannot_downgrade_itself_to_legacy(self) -> None:
+        provider = ScriptedProvider("context", successful_context)
+        analyzer = ContextAnalyzer(ProviderRegistry({"context": provider}), ["context"])
+        segments = [Segment("1", "SOURCE", speaker="A", scene="S")]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            analyze_with_cache(
+                analyzer=analyzer,
+                segments=segments,
+                output_path=root / "context.json",
+                state_path=root / "state.json",
+            )
+            state_path = root / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["schema"], "parr0t.context-state.v2")
+            state["fingerprint"] = "tampered-fingerprint"
+            state["attestation"].pop("context_preflight")
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            _, cached = analyze_with_cache(
+                analyzer=analyzer,
+                segments=segments,
+                output_path=root / "context.json",
+                state_path=state_path,
+            )
+
+        self.assertFalse(cached)
+        self.assertEqual(provider.call_count, 2)
 
     def test_parallelism_change_reuses_semantically_identical_context_cache(self) -> None:
         provider = ScriptedProvider("context", successful_context)

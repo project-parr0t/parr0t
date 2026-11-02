@@ -697,6 +697,10 @@ class ControlPlaneContractTests(unittest.TestCase):
         self.assertTrue(sealed["execution"]["finalizer_terminal"])
         self.assertEqual(private_task["context_parallelism"]["max_workers"], 6)
         self.assertEqual(
+            private_task["context_chunk_measurement"],
+            "serialized_payload_chars_including_ids_source_and_metadata",
+        )
+        self.assertEqual(
             context_preflight["schema"], "parr0t.context-preflight.v1"
         )
         self.assertEqual(
@@ -712,6 +716,12 @@ class ControlPlaneContractTests(unittest.TestCase):
             "single_fresh_finalizer_after_wave",
         )
         self.assertEqual(state["status"], "success")
+        self.assertEqual(state["schema"], "parr0t.context-state.v2")
+        self.assertEqual(
+            state["attestation"]["analyzer_routes"],
+            [{"name": "native-sol", "type": "native_collaboration"}],
+        )
+        self.assertEqual(state["execution"]["parts"][0]["provider"], "native-sol")
         self.assertEqual(
             state["source_inventory_fingerprint"], verified["primary_fingerprint"]
         )

@@ -36,7 +36,7 @@ from .coverage import (
     save_completion_attestation,
     save_inventory_attestation,
 )
-from .context_analysis import ContextAnalyzer, analyze_with_cache
+from .context_analysis import CONTEXT_STATE_SCHEMA, ContextAnalyzer, analyze_with_cache
 from .corrections import apply_user_corrections
 from .correction_ui import CorrectionWorkspace, serve_correction_ui
 from .data_plane_task import (
@@ -378,6 +378,8 @@ def _context_state_valid(
     source_segments_digest: str | None,
     source_inventory_fingerprint: str,
 ) -> bool:
+    if payload.get("schema") not in {None, CONTEXT_STATE_SCHEMA}:
+        return False
     execution = payload.get("execution")
     if payload.get("status") != "success" or not isinstance(execution, dict):
         return False
