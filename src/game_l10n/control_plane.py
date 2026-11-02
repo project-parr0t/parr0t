@@ -208,6 +208,7 @@ COMMON_ISSUE_CODES = {
     "budget_exhausted",
     "budget_accounting_uncertain",
     "task_incomplete",
+    "relay_execution_incomplete",
     "missing_artifact",
     "target_mismatch",
 }
