@@ -36,7 +36,7 @@ from .coverage import (
     save_completion_attestation,
     save_inventory_attestation,
 )
-from .context_analysis import ContextAnalyzer, analyze_with_cache
+from .context_analysis import CONTEXT_STATE_SCHEMA, ContextAnalyzer, analyze_with_cache
 from .corrections import apply_user_corrections
 from .correction_ui import CorrectionWorkspace, serve_correction_ui
 from .data_plane_task import (
@@ -378,12 +378,15 @@ def _context_state_valid(
     source_segments_digest: str | None,
     source_inventory_fingerprint: str,
 ) -> bool:
+    if payload.get("schema") not in {None, CONTEXT_STATE_SCHEMA}:
+        return False
     execution = payload.get("execution")
     if payload.get("status") != "success" or not isinstance(execution, dict):
         return False
     total = execution.get("total_parts")
     completed = execution.get("completed_parts")
     parts = execution.get("parts")
+    deterministic_count = execution.get("deterministic_segment_count", 0)
     if not context_path.is_file():
         return False
     output_body = context_path.read_bytes()
@@ -401,7 +404,15 @@ def _context_state_valid(
     return bool(
         execution.get("status") == "success"
         and isinstance(total, int)
-        and total > 0
+        and total >= 0
+        and (
+            total > 0
+            or (
+                isinstance(deterministic_count, int)
+                and not isinstance(deterministic_count, bool)
+                and deterministic_count > 0
+            )
+        )
         and completed == total
         and isinstance(parts, list)
         and len(parts) == total
