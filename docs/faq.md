@@ -234,7 +234,15 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **General cause:** The relay had a success-only seal path, so it improvised a parent-facing explanation when the bound worker produced no valid result.
 - **Diagnosis:** Use only the relay lifecycle category and the core receipt. Do not read, quote, summarize, or classify the child response. If it already reached the root, record the fixed leak and rotate.
 - **Resolution:** On every child terminal state, run the bound `seal-data-plane-task --worker-ended` exactly once. Return only the resulting receipt path, then follow status to a fresh attempt. A valid envelope is still accepted; an absent or malformed envelope becomes a categorical core receipt.
-- **Prevention:** Require `parr0t.data-plane-relay.v2`, preserve its immutable child-response policy, and keep legacy v1 sealing only for existing checkpoints.
+- **Prevention:** Require `parr0t.data-plane-relay.v3`, preserve its immutable child-response and route policies, and keep legacy v1/v2 sealing only for existing checkpoints.
+
+## Context analysis repeatedly returns no verified coverage
+
+- **Symptom:** The inventory is statically complete, but sealed context attempts remain non-successful or produce no new verified scene/character coverage, and the parent proposes stopping the whole job.
+- **General cause:** One large semantic request repeatedly reached the same native model, or the native-pass unchanged-observation rule was incorrectly applied to the separate data-plane context gate.
+- **Diagnosis:** Read only status, the sealed receipt, and the relay's safe route/attempt fields. Never open the source inventory, partial context pack, progress files, or worker response to calculate coverage in the parent; doing so is a control-plane leak even if a script prints counts only.
+- **Resolution:** Return to status and prepare the next exact context relay. It runs up to six fresh workers over disjoint atomically claimed chunks, preserves committed fragments, and uses one fresh source-order finalizer. The core rotates Sol/Luna, restores the base chunk ceiling after measurable progress, and halves it only after a full no-progress route cycle. Seal every ended wave categorically. A receipt is not a terminal job result.
+- **Prevention:** Keep context routing, bounded parallelism, fragment reuse, and adaptive chunking core-owned; label every data-plane failure nonterminal and scope unchanged-observation stopping exclusively to `native-pass-step` wave scheduling.
 
 ## A transient provider failure leaves a patch partly usable
 

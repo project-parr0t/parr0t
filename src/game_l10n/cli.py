@@ -241,11 +241,12 @@ STATUS_DATA_PLANE_ROLES = {
 }
 
 
-def _status_data_plane_task(action: str) -> dict[str, Any] | None:
+def _status_data_plane_task(work_dir: Path, action: str) -> dict[str, Any] | None:
     role = STATUS_DATA_PLANE_ROLES.get(action)
     if role is None:
         return None
-    return {
+    receipt = current_data_plane_receipt(work_dir, role)
+    task: dict[str, Any] = {
         "worker_role": role,
         "stage": DATA_PLANE_PROFILES[role]["stage"],
         "relay_schema": DATA_PLANE_RELAY_SCHEMA,
@@ -259,8 +260,23 @@ def _status_data_plane_task(action: str) -> dict[str, Any] | None:
             "--relay <relay-path> --worker-ended"
         ),
         "parent_response": "receipt_path_only",
-        "dispatch": "fresh_isolated_relay_only",
+        "dispatch": (
+            "fresh_isolated_context_wave_relay"
+            if role == "context_analyzer"
+            else "fresh_isolated_relay_only"
+        ),
+        "job_terminal": False,
+        "failure_action": "seal_then_follow_status",
+        "private_artifact_access": "parent_forbidden_rotate_on_access",
+        "unchanged_progress_limit_scope": "native_pass_wave_only",
     }
+    if role == "context_analyzer":
+        task["parallelism"] = "core_bound_disjoint_chunks_up_to_six_workers"
+        task["merge_policy"] = "single_fresh_finalizer_source_order"
+    if receipt is not None and receipt.get("status") != "success":
+        task["last_receipt"] = receipt
+        task["continuation_required"] = True
+    return task
 
 
 def _failed_inventory_data_plane_action(work_dir: Path) -> str | None:
@@ -676,6 +692,17 @@ def _analyze_context(
         registry,
         chain,
         max_chunk_chars=int(routing.get("context_chunk_chars", 30000)),
+        max_workers=min(
+            6,
+            max(
+                1,
+                int(
+                    routing.get(
+                        "context_max_workers", routing.get("max_workers", 1)
+                    )
+                ),
+            ),
+        ),
         context_mode=context_mode or str(config.get("project", {}).get("context_mode", "auto")),
     )
     context_relative = config.get("files", {}).get("context_pack", "context/context-pack.json")
@@ -2311,7 +2338,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "local_artifact": local_artifact,
                 "inventory_gate": inventory_gate,
                 "state_issue_codes": state_issue_codes,
-                "data_plane_task": _status_data_plane_task(action),
+                "data_plane_task": _status_data_plane_task(work_dir, action),
                 "contract_base": contract_base,
                 "next_actions": [action],
                 "required_contracts": _status_contracts(action),
