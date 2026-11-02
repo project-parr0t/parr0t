@@ -609,6 +609,11 @@ class ControlPlaneContractTests(unittest.TestCase):
             private_task = json.loads(
                 (work / relay_payload["task_path"]).read_text(encoding="utf-8")
             )
+            context_preflight = json.loads(
+                (work / private_task["input_context_preflight"]).read_text(
+                    encoding="utf-8"
+                )
+            )
             context_path = work / "context" / "context-pack.json"
             context_path.parent.mkdir()
             context_path.write_text(
@@ -692,10 +697,31 @@ class ControlPlaneContractTests(unittest.TestCase):
         self.assertTrue(sealed["execution"]["finalizer_terminal"])
         self.assertEqual(private_task["context_parallelism"]["max_workers"], 6)
         self.assertEqual(
+            private_task["context_chunk_measurement"],
+            "serialized_payload_chars_including_ids_source_and_metadata",
+        )
+        self.assertEqual(
+            context_preflight["schema"], "parr0t.context-preflight.v1"
+        )
+        self.assertEqual(
+            context_preflight["counts"]["semantic_required"], 1
+        )
+        self.assertTrue(
+            private_task["context_preflight_contract"][
+                "buttons_are_ui_but_never_prove_deterministic_skip"
+            ]
+        )
+        self.assertEqual(
             private_task["context_parallelism"]["shared_artifact_writer"],
             "single_fresh_finalizer_after_wave",
         )
         self.assertEqual(state["status"], "success")
+        self.assertEqual(state["schema"], "parr0t.context-state.v2")
+        self.assertEqual(
+            state["attestation"]["analyzer_routes"],
+            [{"name": "native-sol", "type": "native_collaboration"}],
+        )
+        self.assertEqual(state["execution"]["parts"][0]["provider"], "native-sol")
         self.assertEqual(
             state["source_inventory_fingerprint"], verified["primary_fingerprint"]
         )
