@@ -13,6 +13,115 @@ from game_l10n.providers import ProviderRegistry, ScriptedProvider
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_unrelated_context_and_parallelism_changes_reuse_target_cache(self) -> None:
+        translator = ScriptedProvider(
+            "fixture-translator",
+            lambda **_: {"status": "success", "text": "TARGET", "reason": ""},
+        )
+        segment = Segment("one", "SOURCE", scene="CURRENT")
+        first_context = ContextPack(
+            story_summary="STORY",
+            global_style_rules=("RULE",),
+            scene_summaries={
+                "CURRENT": {"summary": "CURRENT"},
+                "OTHER": {"summary": "OLD"},
+            },
+        )
+        second_context = ContextPack(
+            story_summary="STORY",
+            global_style_rules=("RULE",),
+            scene_summaries={
+                "CURRENT": {"summary": "CURRENT"},
+                "OTHER": {"summary": "CHANGED"},
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            first = LocalizationOrchestrator(
+                registry=ProviderRegistry({translator.name: translator}),
+                config=OrchestratorConfig(
+                    [translator.name], [], require_review=False, max_workers=1
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                context_pack=first_context,
+                work_dir=work,
+            ).translate_one(segment)
+            second = LocalizationOrchestrator(
+                registry=ProviderRegistry({translator.name: translator}),
+                config=OrchestratorConfig(
+                    [translator.name], [], require_review=False, max_workers=4
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                context_pack=second_context,
+                work_dir=work,
+            ).translate_one(segment)
+
+        self.assertFalse(first.from_cache)
+        self.assertTrue(second.from_cache)
+        self.assertEqual(translator.call_count, 1)
+
+    def test_relevant_context_change_invalidates_target_cache(self) -> None:
+        translator = ScriptedProvider(
+            "fixture-translator",
+            lambda **_: {"status": "success", "text": "TARGET", "reason": ""},
+        )
+        segment = Segment("one", "SOURCE", scene="CURRENT")
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            for summary in ("FIRST", "SECOND"):
+                LocalizationOrchestrator(
+                    registry=ProviderRegistry({translator.name: translator}),
+                    config=OrchestratorConfig(
+                        [translator.name], [], require_review=False
+                    ),
+                    project=ProjectContext("TEST", "src", "dst"),
+                    context_pack=ContextPack(
+                        story_summary="STORY",
+                        global_style_rules=("RULE",),
+                        scene_summaries={"CURRENT": {"summary": summary}},
+                    ),
+                    work_dir=work,
+                ).translate_one(segment)
+
+        self.assertEqual(translator.call_count, 2)
+
+    def test_deferred_pipeline_reuses_focused_target_cache(self) -> None:
+        translator = ScriptedProvider(
+            "fixture-translator",
+            lambda **_: {"status": "success", "text": "TARGET", "reason": ""},
+        )
+        segment = Segment("one", "SOURCE", scene="CURRENT")
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            results = []
+            for unrelated, workers in (("OLD", 1), ("CHANGED", 4)):
+                results.append(
+                    LocalizationOrchestrator(
+                        registry=ProviderRegistry({translator.name: translator}),
+                        config=OrchestratorConfig(
+                            [translator.name],
+                            [],
+                            require_review=False,
+                            defer_fallbacks_until_primary_complete=True,
+                            max_workers=workers,
+                        ),
+                        project=ProjectContext("TEST", "src", "dst"),
+                        context_pack=ContextPack(
+                            story_summary="STORY",
+                            global_style_rules=("RULE",),
+                            scene_summaries={
+                                "CURRENT": {"summary": "CURRENT"},
+                                "OTHER": {"summary": unrelated},
+                            },
+                        ),
+                        work_dir=work,
+                    ).translate_many([segment])[0]
+                )
+
+        self.assertFalse(results[0].from_cache)
+        self.assertTrue(results[1].from_cache)
+        self.assertEqual(translator.call_count, 1)
+
     def test_deferred_pipeline_reports_counts_without_semantic_content(self) -> None:
         events: list[dict[str, object]] = []
         translator = ScriptedProvider(
