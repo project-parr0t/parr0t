@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -88,6 +90,47 @@ def successful_knowledge_context(**kwargs):
 
 
 class ContextAnalysisTests(unittest.TestCase):
+    def test_independent_context_chunks_run_in_parallel_and_merge_in_order(self) -> None:
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+
+        def observed(**kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                time.sleep(0.03)
+                return successful_context(**kwargs)
+            finally:
+                with lock:
+                    active -= 1
+
+        provider = ScriptedProvider("context", observed)
+        analyzer = ContextAnalyzer(
+            ProviderRegistry({"context": provider}),
+            ["context"],
+            max_chunk_chars=100,
+            max_workers=3,
+        )
+        segments = [
+            Segment(str(index), "X" * 45, speaker="A", scene="S")
+            for index in range(6)
+        ]
+
+        pack = analyzer.analyze(segments)
+
+        self.assertGreater(peak, 1)
+        self.assertEqual(
+            pack.character_guides["A"]["evidence_line_ids"],
+            [str(index) for index in range(6)],
+        )
+        self.assertEqual(
+            [part["part"] for part in analyzer.last_execution["parts"]],
+            list(range(1, provider.call_count + 1)),
+        )
+
     def test_auto_mode_treats_quest_metadata_as_narrative_context(self) -> None:
         self.assertEqual(
             infer_context_mode([Segment("title-1", "SOURCE_TITLE", metadata={"text_type": "quest_title"})]),
@@ -168,6 +211,28 @@ class ContextAnalysisTests(unittest.TestCase):
         self.assertFalse(first_cached)
         self.assertTrue(second_cached)
         self.assertEqual(first.story_summary, second.story_summary)
+        self.assertEqual(provider.call_count, 1)
+
+    def test_parallelism_change_reuses_semantically_identical_context_cache(self) -> None:
+        provider = ScriptedProvider("context", successful_context)
+        registry = ProviderRegistry({"context": provider})
+        segments = [Segment("1", "SOURCE", speaker="A", scene="S")]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            analyze_with_cache(
+                analyzer=ContextAnalyzer(registry, ["context"], max_workers=1),
+                segments=segments,
+                output_path=root / "context.json",
+                state_path=root / "state.json",
+            )
+            _, cached = analyze_with_cache(
+                analyzer=ContextAnalyzer(registry, ["context"], max_workers=6),
+                segments=segments,
+                output_path=root / "context.json",
+                state_path=root / "state.json",
+            )
+
+        self.assertTrue(cached)
         self.assertEqual(provider.call_count, 1)
 
     def test_cached_context_adds_inventory_binding_without_model_reanalysis(self) -> None:
