@@ -42,7 +42,10 @@ from .correction_ui import CorrectionWorkspace, serve_correction_ui
 from .data_plane_task import (
     DATA_PLANE_PROFILES,
     DATA_PLANE_RELAY_SCHEMA,
+    claim_context_chunk,
+    commit_context_fragment,
     current_data_plane_receipt,
+    finalize_context_fragments,
     prepare_data_plane_task,
     record_data_plane_relay_event,
     seal_data_plane_task,
@@ -1366,6 +1369,39 @@ def cmd_record_data_plane_relay_event(args: argparse.Namespace) -> int:
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
+
+
+def cmd_claim_context_chunk(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    result = claim_context_chunk(
+        work_dir,
+        _path_in_workspace(work_dir, args.task, must_exist=True),
+        slot=args.slot,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_commit_context_fragment(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    result = commit_context_fragment(
+        work_dir,
+        _path_in_workspace(work_dir, args.task, must_exist=True),
+        _path_in_workspace(work_dir, args.claim, must_exist=True),
+        _path_in_workspace(work_dir, args.result, must_exist=True),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_finalize_context_fragments(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    result = finalize_context_fragments(
+        work_dir,
+        _path_in_workspace(work_dir, args.task, must_exist=True),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["status"] in {"success", "partial"} else 1
 
 
 def cmd_seal_data_plane_task(args: argparse.Namespace) -> int:
@@ -3341,6 +3377,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Required numeric slot for worker events; omitted for finalizer events",
     )
     data_plane_event.set_defaults(func=cmd_record_data_plane_relay_event)
+
+    context_claim = sub.add_parser(
+        "claim-context-chunk",
+        help="Atomically claim one core-bound context-analysis chunk",
+    )
+    context_claim.add_argument("--workspace", required=True)
+    context_claim.add_argument("--task", required=True)
+    context_claim.add_argument("--slot", type=int, required=True)
+    context_claim.set_defaults(func=cmd_claim_context_chunk)
+
+    context_commit = sub.add_parser(
+        "commit-context-fragment",
+        help="Validate and commit one exact context-analysis fragment",
+    )
+    context_commit.add_argument("--workspace", required=True)
+    context_commit.add_argument("--task", required=True)
+    context_commit.add_argument("--claim", required=True)
+    context_commit.add_argument("--result", required=True)
+    context_commit.set_defaults(func=cmd_commit_context_fragment)
+
+    context_finalize = sub.add_parser(
+        "finalize-context-fragments",
+        help="Deterministically merge committed context-analysis fragments",
+    )
+    context_finalize.add_argument("--workspace", required=True)
+    context_finalize.add_argument("--task", required=True)
+    context_finalize.set_defaults(func=cmd_finalize_context_fragments)
 
     data_plane_seal = sub.add_parser(
         "seal-data-plane-task",

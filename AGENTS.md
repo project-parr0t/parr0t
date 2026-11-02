@@ -33,7 +33,7 @@ Only `local_patch_ready` is terminal; it requires static completion and an uncha
 ## Standard job sequence
 
 1. Initialize against the unopened, read-only game root; establish entry and record the user's game-workspace Git choice. Never infer it or apply it to SDK acquisition/activation.
-2. Follow status through discovery, SDK activation, inventories, and context. Prepare, dispatch, and seal its `data_plane_task`. Context relays start every v4 slot before any ends, record slot/finalizer lifecycle through the core, and have no implicit timeout. They bind routes and shrink chunks only after a no-progress cycle. Sealed failures and native-pass unchanged limits never terminate data-plane work or the job.
+2. Follow status through discovery, SDK activation, inventories, and context; prepare, dispatch, and seal its `data_plane_task`. Context uses only bound claim/commit/finalize commands. Start every listed v4 slot before any ends and record slot/finalizer lifecycle; zero slots means finalizer only. No implicit timeout. Shrink chunks only after a no-progress cycle. Sealed failures and unchanged limits never terminate the job.
 3. Translate through failed-only Luna retries, Sol retries, then external fallback. Lock successes. Run compact triage, selective strong review, flagged rewrite, and review fallback. Queue operational failures; blocking failures hold the patch.
 4. Build and verify a recoverable workspace patch without mutating or launching the game. Report states, counts, paths, queues, and next decision.
 
