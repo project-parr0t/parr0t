@@ -29,6 +29,7 @@ from game_l10n.control_plane import (
 from game_l10n.errors import ConfigurationError
 from game_l10n.data_plane_task import (
     prepare_data_plane_task,
+    record_data_plane_relay_event,
     seal_data_plane_task,
 )
 from game_l10n.coverage import save_inventory_attestation
@@ -62,6 +63,23 @@ class ControlPlaneContractTests(unittest.TestCase):
         )
         self.assertTrue(args.worker_ended)
 
+    def test_context_relay_lifecycle_cli_is_registered(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "record-data-plane-relay-event",
+                "--workspace",
+                "fixture-workspace",
+                "--relay",
+                ".game-l10n/data-plane/context_analyzer/relay.json",
+                "--event",
+                "worker-started",
+                "--slot",
+                "1",
+            ]
+        )
+        self.assertEqual(args.func.__name__, "cmd_record_data_plane_relay_event")
+        self.assertEqual(args.slot, 1)
+
     def test_ended_data_plane_worker_is_sealed_without_forwarding_prose(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -93,7 +111,7 @@ class ControlPlaneContractTests(unittest.TestCase):
                 work, output, worker_role="source_probe", config=config
             )
 
-        self.assertEqual(relay_payload["schema"], "parr0t.data-plane-relay.v3")
+        self.assertEqual(relay_payload["schema"], "parr0t.data-plane-relay.v4")
         self.assertEqual(
             relay_payload["relay_contract"]["child_response_policy"],
             "never_read_interpret_summarize_or_forward",
@@ -205,6 +223,7 @@ class ControlPlaneContractTests(unittest.TestCase):
             payload = json.loads(relay.read_text(encoding="utf-8"))
             payload["schema"] = "parr0t.data-plane-relay.v1"
             payload.pop("relay_contract")
+            payload.pop("execution_plan")
             for field in (
                 "worker_route",
                 "worker_model_family",
@@ -243,6 +262,7 @@ class ControlPlaneContractTests(unittest.TestCase):
             relay = work / prepared["relay_path"]
             payload = json.loads(relay.read_text(encoding="utf-8"))
             payload["schema"] = "parr0t.data-plane-relay.v2"
+            payload.pop("execution_plan")
             for field in (
                 "worker_route",
                 "worker_model_family",
@@ -255,11 +275,52 @@ class ControlPlaneContractTests(unittest.TestCase):
             contract.pop("route_policy")
             contract.pop("failure_policy")
             contract.pop("private_artifact_policy")
+            contract.pop("execution_policy")
+            contract.pop("implicit_timeout_policy")
+            contract.pop("completion_evidence_policy")
             relay.write_text(json.dumps(payload), encoding="utf-8")
 
             sealed = seal_data_plane_task(work, relay, worker_ended=True)
 
         self.assertEqual(sealed["status"], "error")
+        self.assertEqual(sealed["issue_codes"], ["task_incomplete"])
+
+    def test_legacy_v3_data_plane_relay_remains_sealable_for_checkpoint_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            work = root / "work"
+            sdk = root / "sdk"
+            game.mkdir()
+            work.mkdir()
+            sdk.mkdir()
+            (work / "game-l10n.json").write_text("{}", encoding="utf-8")
+            establish_control_plane_entry(work)
+            prepared = prepare_data_plane_task(
+                work,
+                work / ".game-l10n" / "data-plane" / "source_probe",
+                worker_role="source_probe",
+                config={
+                    "game_roots": [str(game)],
+                    "sdk_root": str(sdk),
+                    "sdk_selection": {"inventory_fingerprint": "fixture-inventory"},
+                },
+            )
+            relay = work / prepared["relay_path"]
+            payload = json.loads(relay.read_text(encoding="utf-8"))
+            payload["schema"] = "parr0t.data-plane-relay.v3"
+            payload.pop("execution_plan")
+            contract = payload["relay_contract"]
+            contract["schema"] = "parr0t.data-plane-relay-contract.v2"
+            contract.pop("execution_policy")
+            contract.pop("implicit_timeout_policy")
+            contract.pop("completion_evidence_policy")
+            relay.write_text(json.dumps(payload), encoding="utf-8")
+
+            sealed = seal_data_plane_task(work, relay, worker_ended=True)
+
+        self.assertEqual(sealed["status"], "error")
+        self.assertEqual(sealed["schema"], "parr0t.data-plane-receipt.v1")
         self.assertEqual(sealed["issue_codes"], ["task_incomplete"])
 
     def test_data_plane_relay_rejects_a_weakened_child_response_policy(self) -> None:
@@ -350,6 +411,7 @@ class ControlPlaneContractTests(unittest.TestCase):
             sealed = seal_data_plane_task(work, relay, worker_ended=True)
 
         self.assertEqual(sealed["status"], "success")
+        self.assertEqual(sealed["schema"], "parr0t.data-plane-receipt.v2")
         self.assertEqual(sealed["worker_role"], "source_probe")
         self.assertEqual(sealed["stage"], "discovery")
         self.assertTrue(sealed["receipt_path"].endswith("receipt.json"))
@@ -583,6 +645,29 @@ class ControlPlaneContractTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            slots = relay_payload["execution_plan"]["required_worker_slots"]
+            record_data_plane_relay_event(
+                work, relay, event="worker-started", slot=slots[0]
+            )
+            with self.assertRaisesRegex(ConfigurationError, "every required slot"):
+                record_data_plane_relay_event(
+                    work, relay, event="worker-ended", slot=slots[0]
+                )
+            for slot in slots[1:]:
+                record_data_plane_relay_event(
+                    work, relay, event="worker-started", slot=slot
+                )
+            with self.assertRaisesRegex(ConfigurationError, "finalizer requires"):
+                record_data_plane_relay_event(work, relay, event="finalizer-started")
+            with self.assertRaisesRegex(ConfigurationError, "EXECUTION_INCOMPLETE"):
+                seal_data_plane_task(work, relay)
+            for slot in slots:
+                record_data_plane_relay_event(
+                    work, relay, event="worker-ended", slot=slot
+                )
+            record_data_plane_relay_event(work, relay, event="finalizer-started")
+            record_data_plane_relay_event(work, relay, event="finalizer-ended")
+
             sealed = seal_data_plane_task(work, relay)
             state = json.loads(
                 (work / ".game-l10n" / "context-state.json").read_text(
@@ -591,8 +676,20 @@ class ControlPlaneContractTests(unittest.TestCase):
             )
 
         self.assertEqual(sealed["status"], "success")
+        self.assertEqual(sealed["schema"], "parr0t.data-plane-receipt.v2")
         self.assertEqual(relay_payload["max_workers"], 6)
         self.assertTrue(relay_payload["worker_delegation_allowed"])
+        self.assertEqual(
+            relay_payload["execution_plan"]["required_worker_slots"],
+            [1, 2, 3, 4, 5, 6],
+        )
+        self.assertEqual(
+            relay_payload["execution_plan"]["implicit_timeout_policy"],
+            "forbidden",
+        )
+        self.assertTrue(sealed["execution"]["complete"])
+        self.assertEqual(sealed["execution"]["terminal_workers"], 6)
+        self.assertTrue(sealed["execution"]["finalizer_terminal"])
         self.assertEqual(private_task["context_parallelism"]["max_workers"], 6)
         self.assertEqual(
             private_task["context_parallelism"]["shared_artifact_writer"],
@@ -646,6 +743,7 @@ class ControlPlaneContractTests(unittest.TestCase):
                 "routing": {
                     "context_analyzers": ["native-sol", "native-luna"],
                     "context_chunk_chars": 30000,
+                    "context_max_workers": 6,
                 },
             }
             output = work / ".game-l10n" / "data-plane" / "context_analyzer"
@@ -670,10 +768,16 @@ class ControlPlaneContractTests(unittest.TestCase):
                         task["context_chunk_chars"],
                     )
                 )
-                seal_data_plane_task(
+                sealed = seal_data_plane_task(
                     work,
                     work / prepared["relay_path"],
                     worker_ended=True,
+                )
+                self.assertEqual(
+                    sealed["issue_codes"], ["relay_execution_incomplete"]
+                )
+                self.assertEqual(
+                    sealed["execution"]["unstarted_slots"], [1, 2, 3, 4, 5, 6]
                 )
             receipt_path = output / "receipt.json"
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))

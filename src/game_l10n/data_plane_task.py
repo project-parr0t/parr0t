@@ -32,10 +32,15 @@ from .store import stable_hash
 DATA_PLANE_TASK_SCHEMA = "parr0t.data-plane-task.v1"
 LEGACY_DATA_PLANE_RELAY_SCHEMA = "parr0t.data-plane-relay.v1"
 LEGACY_DATA_PLANE_RELAY_V2_SCHEMA = "parr0t.data-plane-relay.v2"
-DATA_PLANE_RELAY_SCHEMA = "parr0t.data-plane-relay.v3"
+LEGACY_DATA_PLANE_RELAY_V3_SCHEMA = "parr0t.data-plane-relay.v3"
+DATA_PLANE_RELAY_SCHEMA = "parr0t.data-plane-relay.v4"
 LEGACY_DATA_PLANE_RELAY_CONTRACT_SCHEMA = "parr0t.data-plane-relay-contract.v1"
-DATA_PLANE_RELAY_CONTRACT_SCHEMA = "parr0t.data-plane-relay-contract.v2"
-DATA_PLANE_RECEIPT_SCHEMA = "parr0t.data-plane-receipt.v1"
+LEGACY_DATA_PLANE_RELAY_CONTRACT_V2_SCHEMA = "parr0t.data-plane-relay-contract.v2"
+DATA_PLANE_RELAY_CONTRACT_SCHEMA = "parr0t.data-plane-relay-contract.v3"
+LEGACY_DATA_PLANE_RECEIPT_SCHEMA = "parr0t.data-plane-receipt.v1"
+DATA_PLANE_RECEIPT_SCHEMA = "parr0t.data-plane-receipt.v2"
+DATA_PLANE_EXECUTION_PLAN_SCHEMA = "parr0t.data-plane-execution-plan.v1"
+DATA_PLANE_RELAY_LIFECYCLE_SCHEMA = "parr0t.data-plane-relay-lifecycle.v1"
 
 MIN_CONTEXT_CHUNK_CHARS = 2048
 MAX_CONTEXT_WORKERS = 6
@@ -100,6 +105,228 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _with_state_fingerprint(payload: dict[str, Any]) -> dict[str, Any]:
+    return {**payload, "state_fingerprint": stable_hash(payload)}
+
+
+def _new_relay_lifecycle(
+    *,
+    task_id: str,
+    control_generation: int,
+    required_worker_slots: list[int],
+    finalizer_required: bool,
+) -> dict[str, Any]:
+    return _with_state_fingerprint(
+        {
+            "schema": DATA_PLANE_RELAY_LIFECYCLE_SCHEMA,
+            "task_id": task_id,
+            "control_generation": control_generation,
+            "required_worker_slots": required_worker_slots,
+            "worker_states": {str(slot): "pending" for slot in required_worker_slots},
+            "finalizer_required": finalizer_required,
+            "finalizer_state": "pending" if finalizer_required else "not_required",
+            "event_count": 0,
+        }
+    )
+
+
+def _execution_plan(
+    *,
+    worker_role: str,
+    max_workers: int,
+    lifecycle_path: str,
+) -> dict[str, Any]:
+    tracking_required = worker_role == "context_analyzer"
+    required_worker_slots = list(range(1, max_workers + 1))
+    finalizer_required = tracking_required
+    return {
+        "schema": DATA_PLANE_EXECUTION_PLAN_SCHEMA,
+        "tracking_required": tracking_required,
+        "strategy": (
+            "fixed_slot_wave_then_finalizer"
+            if tracking_required
+            else "single_worker"
+        ),
+        "required_worker_slots": required_worker_slots,
+        "worker_start_policy": (
+            "start_all_required_slots_once_before_any_worker_end"
+            if max_workers > 1
+            else "start_required_slot_once"
+        ),
+        "worker_terminal_policy": "wait_for_every_required_slot_to_end",
+        "implicit_timeout_policy": "forbidden",
+        "timeout_seconds": None,
+        "finalizer_required": finalizer_required,
+        "finalizer_start_policy": (
+            "after_every_required_worker_slot_ended"
+            if finalizer_required
+            else "not_applicable"
+        ),
+        "completion_policy": (
+            "all_required_slots_ended_and_required_finalizer_ended"
+        ),
+        "lifecycle_path": lifecycle_path,
+        "record_event_command": (
+            "game-l10n record-data-plane-relay-event --workspace <workspace> "
+            "--relay <relay-path> --event <event> [--slot <slot>]"
+            if tracking_required
+            else ""
+        ),
+    }
+
+
+def _valid_execution_plan(relay: dict[str, Any]) -> bool:
+    plan = relay.get("execution_plan")
+    if not isinstance(plan, dict) or set(plan) != {
+        "schema",
+        "tracking_required",
+        "strategy",
+        "required_worker_slots",
+        "worker_start_policy",
+        "worker_terminal_policy",
+        "implicit_timeout_policy",
+        "timeout_seconds",
+        "finalizer_required",
+        "finalizer_start_policy",
+        "completion_policy",
+        "lifecycle_path",
+        "record_event_command",
+    }:
+        return False
+    max_workers = relay.get("max_workers")
+    tracking_required = relay.get("worker_role") == "context_analyzer"
+    required_slots = list(range(1, max_workers + 1)) if isinstance(max_workers, int) else []
+    return (
+        plan.get("schema") == DATA_PLANE_EXECUTION_PLAN_SCHEMA
+        and plan.get("tracking_required") is tracking_required
+        and plan.get("strategy")
+        == ("fixed_slot_wave_then_finalizer" if tracking_required else "single_worker")
+        and plan.get("required_worker_slots") == required_slots
+        and plan.get("worker_start_policy")
+        == (
+            "start_all_required_slots_once_before_any_worker_end"
+            if isinstance(max_workers, int) and max_workers > 1
+            else "start_required_slot_once"
+        )
+        and plan.get("worker_terminal_policy")
+        == "wait_for_every_required_slot_to_end"
+        and plan.get("implicit_timeout_policy") == "forbidden"
+        and plan.get("timeout_seconds") is None
+        and plan.get("finalizer_required") is tracking_required
+        and plan.get("finalizer_start_policy")
+        == (
+            "after_every_required_worker_slot_ended"
+            if tracking_required
+            else "not_applicable"
+        )
+        and plan.get("completion_policy")
+        == "all_required_slots_ended_and_required_finalizer_ended"
+        and isinstance(plan.get("lifecycle_path"), str)
+        and (
+            bool(plan.get("lifecycle_path"))
+            if tracking_required
+            else plan.get("lifecycle_path") == ""
+        )
+        and plan.get("record_event_command")
+        == (
+            "game-l10n record-data-plane-relay-event --workspace <workspace> "
+            "--relay <relay-path> --event <event> [--slot <slot>]"
+            if tracking_required
+            else ""
+        )
+    )
+
+
+def _safe_execution_summary(value: Any) -> dict[str, Any] | None:
+    fields = {
+        "tracking_required",
+        "required_workers",
+        "started_workers",
+        "terminal_workers",
+        "unstarted_slots",
+        "unterminated_slots",
+        "finalizer_required",
+        "finalizer_started",
+        "finalizer_terminal",
+        "implicit_timeout_allowed",
+        "complete",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        return None
+    integer_fields = ("required_workers", "started_workers", "terminal_workers")
+    if any(
+        not isinstance(value.get(key), int) or isinstance(value.get(key), bool)
+        for key in integer_fields
+    ):
+        return None
+    required = value["required_workers"]
+    started = value["started_workers"]
+    terminal = value["terminal_workers"]
+    unstarted = value.get("unstarted_slots")
+    unterminated = value.get("unterminated_slots")
+    if value.get("tracking_required") is False:
+        if (
+            required < 1
+            or required > MAX_CONTEXT_WORKERS
+            or started != 0
+            or terminal != 0
+            or unstarted != []
+            or unterminated != []
+            or value.get("finalizer_required") is not False
+            or value.get("finalizer_started") is not False
+            or value.get("finalizer_terminal") is not False
+            or value.get("implicit_timeout_allowed") is not False
+            or value.get("complete") is not True
+        ):
+            return None
+        return dict(value)
+    if (
+        value["tracking_required"] is not True
+        or value["finalizer_required"] is not True
+        or required < 1
+        or required > MAX_CONTEXT_WORKERS
+        or started < 0
+        or started > required
+        or terminal < 0
+        or terminal > started
+        or not isinstance(unstarted, list)
+        or not isinstance(unterminated, list)
+        or any(
+            not isinstance(slot, int)
+            or isinstance(slot, bool)
+            or slot < 1
+            or slot > required
+            for slot in unstarted + unterminated
+        )
+        or len(set(unstarted + unterminated)) != len(unstarted) + len(unterminated)
+        or started != required - len(unstarted)
+        or terminal != started - len(unterminated)
+        or any(
+            not isinstance(value.get(key), bool)
+            for key in (
+                "tracking_required",
+                "finalizer_required",
+                "finalizer_started",
+                "finalizer_terminal",
+                "implicit_timeout_allowed",
+                "complete",
+            )
+        )
+        or value["implicit_timeout_allowed"] is not False
+        or value["finalizer_terminal"] and not value["finalizer_started"]
+        or value["finalizer_started"] and terminal != required
+        or value["complete"]
+        is not (
+            terminal == required
+            and (
+                not value["finalizer_required"] or value["finalizer_terminal"]
+            )
+        )
+    ):
+        return None
+    return dict(value)
+
+
 def current_data_plane_receipt(
     work_dir: Path, worker_role: str
 ) -> dict[str, Any] | None:
@@ -115,7 +342,7 @@ def current_data_plane_receipt(
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    required = {
+    legacy_required = {
         "schema",
         "task_id",
         "worker_role",
@@ -127,15 +354,27 @@ def current_data_plane_receipt(
         "queue_transitions",
         "control_generation",
     }
+    current_required = legacy_required | {"execution"}
+    schema = payload.get("schema") if isinstance(payload, dict) else None
+    safe_execution = (
+        _safe_execution_summary(payload.get("execution"))
+        if schema == DATA_PLANE_RECEIPT_SCHEMA
+        else None
+    )
     if (
         not isinstance(payload, dict)
-        or set(payload) != required
-        or payload.get("schema") != DATA_PLANE_RECEIPT_SCHEMA
+        or (
+            schema == LEGACY_DATA_PLANE_RECEIPT_SCHEMA
+            and set(payload) != legacy_required
+        )
+        or (schema == DATA_PLANE_RECEIPT_SCHEMA and set(payload) != current_required)
+        or schema not in {LEGACY_DATA_PLANE_RECEIPT_SCHEMA, DATA_PLANE_RECEIPT_SCHEMA}
         or payload.get("worker_role") != worker_role
         or payload.get("stage") != profile["stage"]
         or payload.get("control_generation")
         != int(control_plane_state(work_dir).get("generation", 0))
         or not isinstance(payload.get("issue_codes"), list)
+        or (schema == DATA_PLANE_RECEIPT_SCHEMA and safe_execution is None)
     ):
         return None
     counts = payload.get("counts", {})
@@ -150,6 +389,11 @@ def current_data_plane_receipt(
         "status": payload.get("status"),
         "issue_codes": list(payload["issue_codes"]),
         "counts": safe_counts,
+        **(
+            {"execution": safe_execution}
+            if schema == DATA_PLANE_RECEIPT_SCHEMA and safe_execution is not None
+            else {}
+        ),
     }
 
 
@@ -255,7 +499,8 @@ def prepare_data_plane_task(
                     previous_context_no_progress = max(0, no_progress)
             receipt_closes_previous = (
                 isinstance(previous_receipt, dict)
-                and previous_receipt.get("schema") == DATA_PLANE_RECEIPT_SCHEMA
+                and previous_receipt.get("schema")
+                in {LEGACY_DATA_PLANE_RECEIPT_SCHEMA, DATA_PLANE_RECEIPT_SCHEMA}
                 and previous_receipt.get("task_id") == previous_task.get("task_id")
                 and previous_receipt.get("worker_role") == worker_role
                 and previous_receipt.get("stage") == profile["stage"]
@@ -579,6 +824,27 @@ def prepare_data_plane_task(
     task = {**private_payload, "task_id": task_id}
     task_path = output_dir / "task.json"
     _atomic_json(task_path, task)
+    lifecycle_path = output_dir / "relay-lifecycle.json"
+    lifecycle_relative = (
+        _relative(work_dir, lifecycle_path)
+        if worker_role == "context_analyzer"
+        else ""
+    )
+    execution_plan = _execution_plan(
+        worker_role=worker_role,
+        max_workers=relay_max_workers,
+        lifecycle_path=lifecycle_relative,
+    )
+    if execution_plan["tracking_required"]:
+        _atomic_json(
+            lifecycle_path,
+            _new_relay_lifecycle(
+                task_id=task_id,
+                control_generation=control_generation,
+                required_worker_slots=list(execution_plan["required_worker_slots"]),
+                finalizer_required=bool(execution_plan["finalizer_required"]),
+            ),
+        )
     relay = {
         "schema": DATA_PLANE_RELAY_SCHEMA,
         "task_id": task_id,
@@ -595,6 +861,7 @@ def prepare_data_plane_task(
         "worker_model_family": worker_model_family,
         "attempt": attempt,
         "sealed_failure_is_job_terminal": False,
+        "execution_plan": execution_plan,
         "relay_contract": {
             "schema": DATA_PLANE_RELAY_CONTRACT_SCHEMA,
             "role": "isolated_data_plane_relay",
@@ -605,6 +872,9 @@ def prepare_data_plane_task(
             "route_policy": "dispatch_exact_core_bound_worker_route",
             "failure_policy": "seal_then_return_to_status_nonterminal",
             "private_artifact_policy": "parent_must_not_open_task_or_artifacts",
+            "execution_policy": "follow_execution_plan_exactly",
+            "implicit_timeout_policy": "forbidden_unless_core_plan_binds_one",
+            "completion_evidence_policy": "core_lifecycle_state_required_before_seal",
             "terminal_seal_command": (
                 "game-l10n seal-data-plane-task --workspace <workspace> "
                 "--relay <relay-path> --worker-ended"
@@ -649,12 +919,13 @@ def _load_bound_data_plane_relay(
         "worker_delegation_allowed",
     }
     v2_relay_fields = legacy_relay_fields | {"relay_contract"}
-    relay_fields = v2_relay_fields | {
+    v3_relay_fields = v2_relay_fields | {
         "worker_route",
         "worker_model_family",
         "attempt",
         "sealed_failure_is_job_terminal",
     }
+    relay_fields = v3_relay_fields | {"execution_plan"}
     relay_schema = relay.get("schema") if isinstance(relay, dict) else None
     relay_contract = relay.get("relay_contract") if isinstance(relay, dict) else None
     valid_legacy_contract = (
@@ -684,7 +955,7 @@ def _load_bound_data_plane_relay(
             "--relay <relay-path> --worker-ended"
         )
     )
-    valid_contract = (
+    valid_v2_contract = (
         isinstance(relay_contract, dict)
         and set(relay_contract)
         == {
@@ -699,7 +970,8 @@ def _load_bound_data_plane_relay(
             "private_artifact_policy",
             "terminal_seal_command",
         }
-        and relay_contract.get("schema") == DATA_PLANE_RELAY_CONTRACT_SCHEMA
+        and relay_contract.get("schema")
+        == LEGACY_DATA_PLANE_RELAY_CONTRACT_V2_SCHEMA
         and relay_contract.get("role") == "isolated_data_plane_relay"
         and relay_contract.get("authority")
         == "exact_dispatch_and_categorical_seal_only"
@@ -720,6 +992,50 @@ def _load_bound_data_plane_relay(
             "--relay <relay-path> --worker-ended"
         )
     )
+    valid_contract = (
+        isinstance(relay_contract, dict)
+        and set(relay_contract)
+        == {
+            "schema",
+            "role",
+            "authority",
+            "child_response_policy",
+            "worker_terminal_action",
+            "parent_response",
+            "route_policy",
+            "failure_policy",
+            "private_artifact_policy",
+            "execution_policy",
+            "implicit_timeout_policy",
+            "completion_evidence_policy",
+            "terminal_seal_command",
+        }
+        and relay_contract.get("schema") == DATA_PLANE_RELAY_CONTRACT_SCHEMA
+        and relay_contract.get("role") == "isolated_data_plane_relay"
+        and relay_contract.get("authority")
+        == "exact_dispatch_and_categorical_seal_only"
+        and relay_contract.get("child_response_policy")
+        == "never_read_interpret_summarize_or_forward"
+        and relay_contract.get("worker_terminal_action")
+        == "seal_data_plane_task_with_worker_ended"
+        and relay_contract.get("parent_response") == "receipt_path_only"
+        and relay_contract.get("route_policy")
+        == "dispatch_exact_core_bound_worker_route"
+        and relay_contract.get("failure_policy")
+        == "seal_then_return_to_status_nonterminal"
+        and relay_contract.get("private_artifact_policy")
+        == "parent_must_not_open_task_or_artifacts"
+        and relay_contract.get("execution_policy") == "follow_execution_plan_exactly"
+        and relay_contract.get("implicit_timeout_policy")
+        == "forbidden_unless_core_plan_binds_one"
+        and relay_contract.get("completion_evidence_policy")
+        == "core_lifecycle_state_required_before_seal"
+        and relay_contract.get("terminal_seal_command")
+        == (
+            "game-l10n seal-data-plane-task --workspace <workspace> "
+            "--relay <relay-path> --worker-ended"
+        )
+    )
     if (
         not isinstance(relay, dict)
         or (
@@ -731,10 +1047,24 @@ def _load_bound_data_plane_relay(
             and (set(relay) != v2_relay_fields or not valid_legacy_contract)
         )
         or (
+            relay_schema == LEGACY_DATA_PLANE_RELAY_V3_SCHEMA
+            and (
+                set(relay) != v3_relay_fields
+                or not valid_v2_contract
+                or not isinstance(relay.get("attempt"), int)
+                or isinstance(relay.get("attempt"), bool)
+                or relay.get("attempt", 0) < 1
+                or not isinstance(relay.get("worker_route"), str)
+                or not isinstance(relay.get("worker_model_family"), str)
+                or relay.get("sealed_failure_is_job_terminal") is not False
+            )
+        )
+        or (
             relay_schema == DATA_PLANE_RELAY_SCHEMA
             and (
                 set(relay) != relay_fields
                 or not valid_contract
+                or not _valid_execution_plan(relay)
                 or not isinstance(relay.get("attempt"), int)
                 or isinstance(relay.get("attempt"), bool)
                 or relay.get("attempt", 0) < 1
@@ -747,6 +1077,7 @@ def _load_bound_data_plane_relay(
         not in {
             LEGACY_DATA_PLANE_RELAY_SCHEMA,
             LEGACY_DATA_PLANE_RELAY_V2_SCHEMA,
+            LEGACY_DATA_PLANE_RELAY_V3_SCHEMA,
             DATA_PLANE_RELAY_SCHEMA,
         }
         or not isinstance(relay.get("max_workers"), int)
@@ -791,6 +1122,222 @@ def _load_bound_data_plane_relay(
         raise ConfigurationError("E_DATA_PLANE_RELAY_INVALID: task binding is invalid")
 
     return relay, task
+
+
+def _validated_relay_lifecycle(
+    work_dir: Path, relay: dict[str, Any]
+) -> dict[str, Any] | None:
+    if relay.get("schema") != DATA_PLANE_RELAY_SCHEMA:
+        return None
+    plan = relay["execution_plan"]
+    if plan.get("tracking_required") is not True:
+        return None
+    lifecycle_path = (work_dir / str(plan["lifecycle_path"])).resolve()
+    if not is_within(lifecycle_path, work_dir) or not lifecycle_path.is_file():
+        raise ConfigurationError(
+            "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: lifecycle state is missing"
+        )
+    try:
+        state = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigurationError(
+            "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: lifecycle state is unreadable"
+        ) from exc
+    fields_without_fingerprint = {
+        "schema",
+        "task_id",
+        "control_generation",
+        "required_worker_slots",
+        "worker_states",
+        "finalizer_required",
+        "finalizer_state",
+        "event_count",
+    }
+    if not isinstance(state, dict) or set(state) != fields_without_fingerprint | {
+        "state_fingerprint"
+    }:
+        raise ConfigurationError(
+            "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: lifecycle shape is invalid"
+        )
+    unsigned = {key: state[key] for key in fields_without_fingerprint}
+    required_slots = plan["required_worker_slots"]
+    worker_states = state.get("worker_states")
+    if (
+        state.get("schema") != DATA_PLANE_RELAY_LIFECYCLE_SCHEMA
+        or state.get("task_id") != relay["task_id"]
+        or state.get("control_generation")
+        != int(control_plane_state(work_dir).get("generation", 0))
+        or state.get("required_worker_slots") != required_slots
+        or not isinstance(worker_states, dict)
+        or set(worker_states) != {str(slot) for slot in required_slots}
+        or any(
+            value not in {"pending", "running", "ended"}
+            for value in worker_states.values()
+        )
+        or state.get("finalizer_required") is not plan["finalizer_required"]
+        or state.get("finalizer_state")
+        not in ({"pending", "running", "ended"} if plan["finalizer_required"] else {"not_required"})
+        or not isinstance(state.get("event_count"), int)
+        or isinstance(state.get("event_count"), bool)
+        or state.get("event_count", -1) < 0
+        or state.get("state_fingerprint") != stable_hash(unsigned)
+    ):
+        raise ConfigurationError(
+            "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: lifecycle binding is invalid"
+        )
+    return state
+
+
+def _relay_execution_summary(
+    work_dir: Path, relay: dict[str, Any]
+) -> dict[str, Any]:
+    plan = relay.get("execution_plan", {})
+    tracking_required = (
+        relay.get("schema") == DATA_PLANE_RELAY_SCHEMA
+        and plan.get("tracking_required") is True
+    )
+    if not tracking_required:
+        return {
+            "tracking_required": False,
+            "required_workers": int(relay.get("max_workers", 1)),
+            "started_workers": 0,
+            "terminal_workers": 0,
+            "unstarted_slots": [],
+            "unterminated_slots": [],
+            "finalizer_required": False,
+            "finalizer_started": False,
+            "finalizer_terminal": False,
+            "implicit_timeout_allowed": False,
+            "complete": True,
+        }
+    state = _validated_relay_lifecycle(work_dir, relay)
+    assert state is not None
+    required_slots = list(state["required_worker_slots"])
+    worker_states = state["worker_states"]
+    unstarted = [slot for slot in required_slots if worker_states[str(slot)] == "pending"]
+    unterminated = [slot for slot in required_slots if worker_states[str(slot)] == "running"]
+    terminal_workers = sum(
+        worker_states[str(slot)] == "ended" for slot in required_slots
+    )
+    finalizer_state = state["finalizer_state"]
+    finalizer_required = bool(state["finalizer_required"])
+    complete = (
+        terminal_workers == len(required_slots)
+        and (not finalizer_required or finalizer_state == "ended")
+    )
+    return {
+        "tracking_required": True,
+        "required_workers": len(required_slots),
+        "started_workers": len(required_slots) - len(unstarted),
+        "terminal_workers": terminal_workers,
+        "unstarted_slots": unstarted,
+        "unterminated_slots": unterminated,
+        "finalizer_required": finalizer_required,
+        "finalizer_started": finalizer_state in {"running", "ended"},
+        "finalizer_terminal": finalizer_state == "ended",
+        "implicit_timeout_allowed": False,
+        "complete": complete,
+    }
+
+
+def record_data_plane_relay_event(
+    work_dir: Path,
+    relay_path: Path,
+    *,
+    event: str,
+    slot: int | None = None,
+) -> dict[str, Any]:
+    """Record categorical relay lifecycle without observing semantic output."""
+
+    relay, _ = _load_bound_data_plane_relay(work_dir, relay_path)
+    if relay.get("schema") != DATA_PLANE_RELAY_SCHEMA:
+        raise ConfigurationError(
+            "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: legacy relays do not use lifecycle events"
+        )
+    state = _validated_relay_lifecycle(work_dir, relay)
+    if state is None:
+        raise ConfigurationError(
+            "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: this relay has no tracked lifecycle"
+        )
+    worker_states = dict(state["worker_states"])
+    required_slots = list(state["required_worker_slots"])
+    finalizer_state = str(state["finalizer_state"])
+    if event in {"worker-started", "worker-ended"}:
+        if slot not in required_slots:
+            raise ConfigurationError(
+                "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: worker slot is not bound"
+            )
+        key = str(slot)
+        if event == "worker-started":
+            if worker_states[key] == "pending":
+                worker_states[key] = "running"
+            elif worker_states[key] not in {"running", "ended"}:
+                raise ConfigurationError(
+                    "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: worker start transition is invalid"
+                )
+        else:
+            if any(value == "pending" for value in worker_states.values()):
+                raise ConfigurationError(
+                    "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: every required slot must start before any worker ends"
+                )
+            if worker_states[key] == "running":
+                worker_states[key] = "ended"
+            elif worker_states[key] != "ended":
+                raise ConfigurationError(
+                    "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: worker end transition is invalid"
+                )
+    elif event in {"finalizer-started", "finalizer-ended"}:
+        if slot is not None:
+            raise ConfigurationError(
+                "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: finalizer events do not take a slot"
+            )
+        if state["finalizer_required"] is not True:
+            raise ConfigurationError(
+                "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: finalizer is not bound"
+            )
+        if any(value != "ended" for value in worker_states.values()):
+            raise ConfigurationError(
+                "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: finalizer requires every worker slot to end"
+            )
+        if event == "finalizer-started":
+            if finalizer_state == "pending":
+                finalizer_state = "running"
+            elif finalizer_state not in {"running", "ended"}:
+                raise ConfigurationError(
+                    "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: finalizer start transition is invalid"
+                )
+        else:
+            if finalizer_state == "running":
+                finalizer_state = "ended"
+            elif finalizer_state != "ended":
+                raise ConfigurationError(
+                    "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: finalizer end transition is invalid"
+                )
+    else:
+        raise ConfigurationError(
+            "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: unsupported lifecycle event"
+        )
+
+    updated = _with_state_fingerprint(
+        {
+            "schema": state["schema"],
+            "task_id": state["task_id"],
+            "control_generation": state["control_generation"],
+            "required_worker_slots": required_slots,
+            "worker_states": worker_states,
+            "finalizer_required": state["finalizer_required"],
+            "finalizer_state": finalizer_state,
+            "event_count": int(state["event_count"]) + 1,
+        }
+    )
+    lifecycle_path = (work_dir / relay["execution_plan"]["lifecycle_path"]).resolve()
+    _atomic_json(lifecycle_path, updated)
+    return {
+        "status": "recorded",
+        "event": event,
+        "slot": slot,
+        "execution": _relay_execution_summary(work_dir, relay),
+    }
 
 
 def _seal_bound_data_plane_task(
@@ -983,8 +1530,14 @@ def _seal_bound_data_plane_task(
             artifact_path,
             game_roots=[Path(item) for item in task.get("source_roots", [])],
         )
+    current_relay = relay.get("schema") == DATA_PLANE_RELAY_SCHEMA
+    execution = _relay_execution_summary(work_dir, relay)
     receipt = {
-        "schema": DATA_PLANE_RECEIPT_SCHEMA,
+        "schema": (
+            DATA_PLANE_RECEIPT_SCHEMA
+            if current_relay
+            else LEGACY_DATA_PLANE_RECEIPT_SCHEMA
+        ),
         "task_id": relay["task_id"],
         "worker_role": result["worker_role"],
         "stage": result["stage"],
@@ -994,6 +1547,7 @@ def _seal_bound_data_plane_task(
         "artifact_paths": result["artifact_paths"],
         "queue_transitions": result["queue_transitions"],
         "control_generation": int(control_plane_state(work_dir).get("generation", 0)),
+        **({"execution": execution} if current_relay else {}),
     }
     receipt_path = (
         work_dir
@@ -1004,12 +1558,13 @@ def _seal_bound_data_plane_task(
     )
     _atomic_json(receipt_path, receipt)
     return {
-        "schema": DATA_PLANE_RECEIPT_SCHEMA,
+        "schema": receipt["schema"],
         "status": receipt["status"],
         "worker_role": receipt["worker_role"],
         "stage": receipt["stage"],
         "counts": receipt["counts"],
         "issue_codes": receipt["issue_codes"],
+        **({"execution": execution} if current_relay else {}),
         "receipt_path": _relative(work_dir, receipt_path),
     }
 
@@ -1019,11 +1574,19 @@ def _seal_ended_data_plane_task(
     relay: dict[str, Any],
     *,
     issue_code: str,
+    execution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Close an ended worker categorically without interpreting its response."""
 
+    current_relay = relay.get("schema") == DATA_PLANE_RELAY_SCHEMA
+    if execution is None:
+        execution = _relay_execution_summary(work_dir, relay)
     receipt = {
-        "schema": DATA_PLANE_RECEIPT_SCHEMA,
+        "schema": (
+            DATA_PLANE_RECEIPT_SCHEMA
+            if current_relay
+            else LEGACY_DATA_PLANE_RECEIPT_SCHEMA
+        ),
         "task_id": relay["task_id"],
         "worker_role": relay["worker_role"],
         "stage": relay["stage"],
@@ -1033,6 +1596,7 @@ def _seal_ended_data_plane_task(
         "artifact_paths": [],
         "queue_transitions": [],
         "control_generation": int(control_plane_state(work_dir).get("generation", 0)),
+        **({"execution": execution} if current_relay else {}),
     }
     receipt_path = (
         work_dir
@@ -1043,12 +1607,13 @@ def _seal_ended_data_plane_task(
     )
     _atomic_json(receipt_path, receipt)
     return {
-        "schema": DATA_PLANE_RECEIPT_SCHEMA,
+        "schema": receipt["schema"],
         "status": receipt["status"],
         "worker_role": receipt["worker_role"],
         "stage": receipt["stage"],
         "counts": receipt["counts"],
         "issue_codes": receipt["issue_codes"],
+        **({"execution": execution} if current_relay else {}),
         "receipt_path": _relative(work_dir, receipt_path),
     }
 
@@ -1062,6 +1627,18 @@ def seal_data_plane_task(
     """Seal one data-plane task, including a worker ending without valid output."""
 
     relay, task = _load_bound_data_plane_relay(work_dir, relay_path)
+    execution = _relay_execution_summary(work_dir, relay)
+    if not execution["complete"]:
+        if worker_ended:
+            return _seal_ended_data_plane_task(
+                work_dir,
+                relay,
+                issue_code="relay_execution_incomplete",
+                execution=execution,
+            )
+        raise ConfigurationError(
+            "E_DATA_PLANE_RELAY_EXECUTION_INCOMPLETE: required worker slots or finalizer did not finish"
+        )
     try:
         return _seal_bound_data_plane_task(work_dir, relay, task)
     except (
@@ -1084,4 +1661,5 @@ def seal_data_plane_task(
             issue_code=(
                 "malformed_response" if envelope_path.is_file() else "task_incomplete"
             ),
+            execution=execution,
         )
