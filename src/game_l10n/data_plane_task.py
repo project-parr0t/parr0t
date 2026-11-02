@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import fields
+from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any
 
@@ -11,9 +11,15 @@ from .context_analysis import (
     CONTEXT_PREFLIGHT_SCHEMA,
     CONTEXT_STATE_SCHEMA,
     build_context_preflight,
+    context_chunks,
     context_contract_fingerprints,
     context_attestation_for_mode,
+    infer_context_mode,
+    infer_segment_domains,
+    merge_context_parts,
     require_complete_context,
+    semantic_context_segments,
+    validate_context_part,
 )
 from .control_plane import (
     control_plane_state,
@@ -32,7 +38,7 @@ from .image_localization import (
     verify_image_ui_inventory,
 )
 from .language_policy import language_binding
-from .models import ContextMode, ContextPack
+from .models import ContextMode, ContextPack, Segment
 from .privacy import is_within
 from .store import stable_hash
 
@@ -49,9 +55,273 @@ LEGACY_DATA_PLANE_RECEIPT_SCHEMA = "parr0t.data-plane-receipt.v1"
 DATA_PLANE_RECEIPT_SCHEMA = "parr0t.data-plane-receipt.v2"
 DATA_PLANE_EXECUTION_PLAN_SCHEMA = "parr0t.data-plane-execution-plan.v1"
 DATA_PLANE_RELAY_LIFECYCLE_SCHEMA = "parr0t.data-plane-relay-lifecycle.v1"
+CONTEXT_WORK_MANIFEST_SCHEMA = "parr0t.context-work-manifest.v1"
+CONTEXT_CHUNK_CLAIM_SCHEMA = "parr0t.context-chunk-claim.v1"
+CONTEXT_CHUNK_RESULT_SCHEMA = "parr0t.context-chunk-result.v1"
+CONTEXT_FRAGMENT_SCHEMA = "parr0t.context-fragment.v1"
+CONTEXT_RESULT_ISSUE_CODES = {
+    "fallback_required",
+    "malformed_response",
+    "provider_error",
+    "rate_limited",
+    "quota_exhausted",
+    "authentication_error",
+    "timeout",
+    "capacity_error",
+    "worker_error",
+}
 
 MIN_CONTEXT_CHUNK_CHARS = 2048
 MAX_CONTEXT_WORKERS = 6
+
+
+def _context_row(segment: Segment) -> dict[str, Any]:
+    return {
+        **asdict(segment),
+        "context_domains": sorted(infer_segment_domains(segment)),
+    }
+
+
+def _segment_from_context_row(row: dict[str, Any]) -> Segment:
+    return Segment(
+        id=str(row["id"]),
+        source=str(row["source"]),
+        speaker=str(row.get("speaker", "")),
+        scene=str(row.get("scene", "")),
+        previous=str(row.get("previous", "")),
+        next=str(row.get("next", "")),
+        metadata=dict(row.get("metadata", {})),
+    )
+
+
+def _context_binding(
+    segments: list[Segment],
+    *,
+    source_inventory_fingerprint: str,
+    resolved_context_mode: str,
+    contract_fingerprints: dict[str, Any],
+) -> dict[str, Any]:
+    binding = {
+        "source_inventory_fingerprint": source_inventory_fingerprint,
+        "source_digest": stable_hash([asdict(item) for item in segments]),
+        "ordered_evidence_ids": [item.id for item in segments],
+        "context_preflight_policy_version": CONTEXT_PREFLIGHT_POLICY_VERSION,
+        "context_mode": resolved_context_mode,
+        "context_contract_fingerprints": contract_fingerprints,
+    }
+    return {**binding, "binding_id": stable_hash(binding)}
+
+
+def _context_fragment_index(work_dir: Path) -> dict[str, list[tuple[Path, dict[str, Any]]]]:
+    root = work_dir / ".game-l10n" / "context-progress" / "fragments"
+    indexed: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
+    if not root.is_dir():
+        return indexed
+    for path in sorted(root.glob("*/*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        binding_id = payload.get("binding_id") if isinstance(payload, dict) else None
+        if isinstance(binding_id, str) and binding_id:
+            indexed.setdefault(binding_id, []).append((path, payload))
+    return indexed
+
+
+def _validate_context_fragment(
+    payload: dict[str, Any],
+    *,
+    binding: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema",
+        "binding_id",
+        "result_id",
+        "binding",
+        "provider",
+        "context_part",
+    }:
+        raise ValueError("invalid context fragment")
+    context_part = payload.get("context_part")
+    provider = payload.get("provider")
+    if (
+        payload.get("schema") != CONTEXT_FRAGMENT_SCHEMA
+        or payload.get("binding_id") != binding["binding_id"]
+        or payload.get("binding") != binding
+        or not isinstance(provider, str)
+        or not provider
+        or not isinstance(context_part, dict)
+        or payload.get("result_id")
+        != stable_hash(
+            {"binding": binding, "provider": provider, "context_part": context_part}
+        )
+    ):
+        raise ValueError("invalid context fragment")
+    allowed_ids = set(binding["ordered_evidence_ids"])
+    validate_context_part(
+        context_part,
+        mode=str(binding["context_mode"]),
+        allowed_evidence_ids=allowed_ids,
+    )
+    segments = [_segment_from_context_row(row) for row in rows]
+    pack = merge_context_parts([context_part], str(binding["context_mode"]))
+    attestation = context_attestation_for_mode(
+        segments,
+        pack,
+        context_mode=str(binding["context_mode"]),
+        analyzer_routes=[{"name": provider, "type": "native_collaboration"}],
+        preflight=build_context_preflight(segments),
+    )
+    if pack.context_mode != attestation["context_mode"]:
+        raise ValueError("context fragment mode mismatch")
+    require_complete_context(attestation)
+    return payload
+
+
+def _find_context_fragment(
+    index: dict[str, list[tuple[Path, dict[str, Any]]]],
+    *,
+    binding: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> tuple[Path, dict[str, Any]] | None:
+    for path, payload in index.get(str(binding["binding_id"]), []):
+        try:
+            return path, _validate_context_fragment(
+                payload, binding=binding, rows=rows
+            )
+        except (ValueError, TypeError, KeyError, ProviderError):
+            continue
+    return None
+
+
+def _write_context_manifest(
+    work_dir: Path,
+    *,
+    segments: list[Segment],
+    preflight: dict[str, Any],
+    source_inventory_fingerprint: str,
+    context_mode: str,
+    chunk_chars: int,
+    contract_fingerprints: dict[str, Any],
+) -> tuple[Path, dict[str, Any]]:
+    semantic = semantic_context_segments(segments, preflight)
+    resolved_mode = (
+        infer_context_mode(segments)
+        if context_mode == ContextMode.AUTO.value
+        else context_mode
+    )
+    by_id = {item.id: item for item in semantic}
+    ordered_ids = [item.id for item in semantic]
+    positions = {item_id: index for index, item_id in enumerate(ordered_ids)}
+    fragment_index = _context_fragment_index(work_dir)
+    reusable: list[tuple[int, int, dict[str, Any], list[dict[str, Any]], Path]] = []
+    for binding_id, candidates in fragment_index.items():
+        for _, payload in candidates:
+            binding = payload.get("binding", {}) if isinstance(payload, dict) else {}
+            ids = (
+                binding.get("ordered_evidence_ids", [])
+                if isinstance(binding, dict)
+                else []
+            )
+            if (
+                not isinstance(ids, list)
+                or not ids
+                or any(item_id not in by_id for item_id in ids)
+                or [positions[item_id] for item_id in ids]
+                != list(range(positions[ids[0]], positions[ids[0]] + len(ids)))
+            ):
+                continue
+            chunk = [by_id[item_id] for item_id in ids]
+            expected_binding = _context_binding(
+                chunk,
+                source_inventory_fingerprint=source_inventory_fingerprint,
+                resolved_context_mode=resolved_mode,
+                contract_fingerprints=contract_fingerprints,
+            )
+            if binding_id != expected_binding["binding_id"]:
+                continue
+            rows = [_context_row(item) for item in chunk]
+            found = _find_context_fragment(
+                fragment_index, binding=expected_binding, rows=rows
+            )
+            if found is not None:
+                reusable.append(
+                    (positions[ids[0]], -len(ids), expected_binding, rows, found[0])
+                )
+                break
+    covered: set[str] = set()
+    units: list[dict[str, Any]] = []
+    for source_index, _, binding, rows, fragment_path in sorted(reusable):
+        ids = set(binding["ordered_evidence_ids"])
+        if ids & covered:
+            continue
+        covered.update(ids)
+        units.append(
+            {
+                "source_index": source_index,
+                "binding": binding,
+                "binding_id": binding["binding_id"],
+                "rows": rows,
+                "initial_status": "complete",
+                "fragment_path": _relative(work_dir, fragment_path),
+            }
+        )
+    pending_runs: list[list[Segment]] = []
+    current: list[Segment] = []
+    for segment in semantic:
+        if segment.id in covered:
+            if current:
+                pending_runs.append(current)
+                current = []
+        else:
+            current.append(segment)
+    if current:
+        pending_runs.append(current)
+    for run in pending_runs:
+        for chunk in context_chunks(run, chunk_chars):
+            binding = _context_binding(
+                chunk,
+                source_inventory_fingerprint=source_inventory_fingerprint,
+                resolved_context_mode=resolved_mode,
+                contract_fingerprints=contract_fingerprints,
+            )
+            units.append(
+                {
+                    "source_index": positions[chunk[0].id],
+                    "binding": binding,
+                    "binding_id": binding["binding_id"],
+                    "rows": [_context_row(item) for item in chunk],
+                    "initial_status": "pending",
+                    "fragment_path": "",
+                }
+            )
+    units.sort(key=lambda item: int(item["source_index"]))
+    unsigned = {
+        "schema": CONTEXT_WORK_MANIFEST_SCHEMA,
+        "source_inventory_fingerprint": source_inventory_fingerprint,
+        "source_segments_digest": preflight["source_segments_digest"],
+        "preflight_digest": stable_hash(preflight),
+        "preflight_policy_version": CONTEXT_PREFLIGHT_POLICY_VERSION,
+        "configured_context_mode": context_mode,
+        "resolved_context_mode": resolved_mode,
+        "context_contract_fingerprints": contract_fingerprints,
+        "chunk_chars": chunk_chars,
+        "source_records": len(segments),
+        "semantic_records": len(semantic),
+        "deterministic_records": len(segments) - len(semantic),
+        "chunks": units,
+    }
+    manifest = {**unsigned, "manifest_id": stable_hash(unsigned)}
+    path = (
+        work_dir
+        / ".game-l10n"
+        / "context-progress"
+        / "manifests"
+        / f"{manifest['manifest_id']}.json"
+    )
+    _atomic_json(path, manifest)
+    return path, manifest
 
 DATA_PLANE_PROFILES: dict[str, dict[str, str]] = {
     "source_probe": {
@@ -113,6 +383,433 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _load_context_task(work_dir: Path, task_path: Path) -> dict[str, Any]:
+    resolved = task_path.resolve()
+    if not is_within(resolved, work_dir) or not resolved.is_file():
+        raise ConfigurationError("E_CONTEXT_TASK_INVALID: task must be a workspace file")
+    try:
+        task = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigurationError("E_CONTEXT_TASK_INVALID: task is unreadable") from exc
+    identity = dict(task) if isinstance(task, dict) else {}
+    identity.pop("task_id", None)
+    if (
+        not isinstance(task, dict)
+        or task.get("schema") != DATA_PLANE_TASK_SCHEMA
+        or task.get("worker_role") != "context_analyzer"
+        or task.get("task_id") != stable_hash(identity)
+        or task.get("control_generation")
+        != int(control_plane_state(work_dir).get("generation", 0))
+    ):
+        raise ConfigurationError("E_CONTEXT_TASK_INVALID: task binding is invalid")
+    manifest_path = (work_dir / str(task.get("input_context_manifest", ""))).resolve()
+    if (
+        not is_within(manifest_path, work_dir)
+        or not manifest_path.is_file()
+        or _digest(manifest_path) != task.get("context_manifest_sha256")
+    ):
+        raise ConfigurationError("E_CONTEXT_TASK_INVALID: context manifest is unavailable")
+    return task
+
+
+def _load_context_manifest(
+    work_dir: Path, task: dict[str, Any]
+) -> tuple[Path, dict[str, Any]]:
+    path = (work_dir / str(task["input_context_manifest"])).resolve()
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigurationError("E_CONTEXT_MANIFEST_INVALID: manifest is unreadable") from exc
+    identity = dict(manifest) if isinstance(manifest, dict) else {}
+    manifest_id = identity.pop("manifest_id", None)
+    chunks = manifest.get("chunks") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema") != CONTEXT_WORK_MANIFEST_SCHEMA
+        or manifest_id != stable_hash(identity)
+        or manifest_id != task.get("context_manifest_id")
+        or not isinstance(chunks, list)
+    ):
+        raise ConfigurationError("E_CONTEXT_MANIFEST_INVALID: manifest binding is invalid")
+    return path, manifest
+
+
+def _context_progress(
+    work_dir: Path, manifest: dict[str, Any]
+) -> tuple[list[tuple[dict[str, Any], Path, dict[str, Any]]], list[dict[str, Any]]]:
+    index = _context_fragment_index(work_dir)
+    complete: list[tuple[dict[str, Any], Path, dict[str, Any]]] = []
+    pending: list[dict[str, Any]] = []
+    for chunk in manifest["chunks"]:
+        if not isinstance(chunk, dict):
+            raise ConfigurationError("E_CONTEXT_MANIFEST_INVALID: chunk shape is invalid")
+        binding = chunk.get("binding")
+        rows = chunk.get("rows")
+        if (
+            not isinstance(binding, dict)
+            or chunk.get("binding_id") != binding.get("binding_id")
+            or not isinstance(rows, list)
+            or not rows
+        ):
+            raise ConfigurationError("E_CONTEXT_MANIFEST_INVALID: chunk binding is invalid")
+        found = _find_context_fragment(index, binding=binding, rows=rows)
+        if found is None:
+            pending.append(chunk)
+        else:
+            complete.append((chunk, found[0], found[1]))
+    return complete, pending
+
+
+def _context_safe_counts(
+    work_dir: Path, task: dict[str, Any]
+) -> dict[str, int]:
+    _, manifest = _load_context_manifest(work_dir, task)
+    complete, pending = _context_progress(work_dir, manifest)
+    return {
+        "total": len(manifest["chunks"]),
+        "success": len(complete),
+        "error": 0,
+        "pending": len(pending),
+    }
+
+
+def claim_context_chunk(
+    work_dir: Path, task_path: Path, *, slot: int
+) -> dict[str, Any]:
+    """Atomically claim one unfinished native context chunk for an isolated worker."""
+
+    require_control_plane_ready(work_dir)
+    require_control_plane_entry(work_dir)
+    task = _load_context_task(work_dir, task_path)
+    max_workers = int(task.get("context_parallelism", {}).get("max_workers", 0))
+    if isinstance(slot, bool) or slot < 1 or slot > max_workers:
+        raise ConfigurationError("E_CONTEXT_CLAIM_INVALID: slot is not bound to this task")
+    _, manifest = _load_context_manifest(work_dir, task)
+    claim_root = (
+        work_dir
+        / ".game-l10n"
+        / "context-progress"
+        / "claims"
+        / str(task["task_id"])
+    )
+    slot_state_path = claim_root / "slots" / f"slot-{slot}.json"
+    slot_state = {"cursor": -1, "active_claim_path": ""}
+    if slot_state_path.is_file():
+        try:
+            candidate = json.loads(slot_state_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(candidate, dict)
+                and isinstance(candidate.get("cursor"), int)
+                and not isinstance(candidate.get("cursor"), bool)
+                and isinstance(candidate.get("active_claim_path"), str)
+            ):
+                slot_state = candidate
+        except (OSError, json.JSONDecodeError):
+            pass
+    active_relative = str(slot_state["active_claim_path"])
+    if active_relative:
+        active_path = (work_dir / active_relative).resolve()
+        if is_within(active_path, work_dir) and active_path.is_file():
+            try:
+                existing = json.loads(active_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+            if existing.get("slot") == slot and existing.get("status") == "claimed":
+                return {
+                    "status": "claimed",
+                    "slot": slot,
+                    "claim_path": active_relative,
+                    "record_count": len(existing.get("rows", [])),
+                }
+    chunks = list(manifest["chunks"])
+    start = max(0, int(slot_state["cursor"]) + 1)
+    for ordinal in range(start, len(chunks)):
+        chunk = chunks[ordinal]
+        if chunk.get("initial_status") == "complete":
+            continue
+        claim_dir = claim_root / str(chunk["binding_id"])
+        try:
+            claim_dir.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            continue
+        unsigned = {
+            "schema": CONTEXT_CHUNK_CLAIM_SCHEMA,
+            "task_id": task["task_id"],
+            "manifest_id": manifest["manifest_id"],
+            "binding_id": chunk["binding_id"],
+            "binding": chunk["binding"],
+            "source_index": chunk["source_index"],
+            "slot": slot,
+            "provider": task["context_route"],
+            "rows": chunk["rows"],
+        }
+        claim = {
+            **unsigned,
+            "claim_id": stable_hash(unsigned),
+            "status": "claimed",
+            "issue_code": "",
+            "fragment_path": "",
+        }
+        claim_path = claim_dir / "claim.json"
+        _atomic_json(claim_path, claim)
+        _atomic_json(
+            slot_state_path,
+            {
+                "cursor": ordinal,
+                "active_claim_path": _relative(work_dir, claim_path),
+            },
+        )
+        return {
+            "status": "claimed",
+            "slot": slot,
+            "claim_path": _relative(work_dir, claim_path),
+            "record_count": len(chunk["rows"]),
+        }
+    _atomic_json(
+        slot_state_path,
+        {"cursor": len(chunks), "active_claim_path": ""},
+    )
+    counts = _context_safe_counts(work_dir, task)
+    return {"status": "exhausted", "slot": slot, "claim_path": "", **counts}
+
+
+def commit_context_fragment(
+    work_dir: Path,
+    task_path: Path,
+    claim_path: Path,
+    result_path: Path,
+) -> dict[str, Any]:
+    """Validate one exact worker result and commit a reusable private fragment."""
+
+    require_control_plane_ready(work_dir)
+    require_control_plane_entry(work_dir)
+    task = _load_context_task(work_dir, task_path)
+    resolved_claim = claim_path.resolve()
+    resolved_result = result_path.resolve()
+    if (
+        not is_within(resolved_claim, work_dir)
+        or not resolved_claim.is_file()
+        or not is_within(resolved_result, work_dir)
+        or not resolved_result.is_file()
+    ):
+        raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: claim or result is unavailable")
+    try:
+        claim = json.loads(resolved_claim.read_text(encoding="utf-8"))
+        result = json.loads(resolved_result.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: result is unreadable") from exc
+    claim_unsigned = {
+        key: claim.get(key)
+        for key in (
+            "schema",
+            "task_id",
+            "manifest_id",
+            "binding_id",
+            "binding",
+            "source_index",
+            "slot",
+            "provider",
+            "rows",
+        )
+    }
+    if (
+        not isinstance(claim, dict)
+        or claim.get("schema") != CONTEXT_CHUNK_CLAIM_SCHEMA
+        or claim.get("task_id") != task["task_id"]
+        or claim.get("claim_id") != stable_hash(claim_unsigned)
+        or claim.get("status") != "claimed"
+    ):
+        raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: claim is not active")
+    if not isinstance(result, dict) or set(result) != {
+        "schema",
+        "claim_id",
+        "status",
+        "context_part",
+        "issue_code",
+    }:
+        raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: result shape is invalid")
+    status = result.get("status")
+    issue_code = result.get("issue_code")
+    context_part = result.get("context_part")
+    if result.get("schema") != CONTEXT_CHUNK_RESULT_SCHEMA or result.get(
+        "claim_id"
+    ) != claim.get("claim_id"):
+        raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: result binding is invalid")
+    if status != "success":
+        if (
+            status not in {"fallback_required", "error"}
+            or issue_code not in CONTEXT_RESULT_ISSUE_CODES
+            or context_part != {}
+        ):
+            raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: failure is not categorical")
+        _atomic_json(
+            resolved_claim,
+            {**claim, "status": "failed", "issue_code": issue_code},
+        )
+        return {
+            "status": status,
+            "slot": claim["slot"],
+            "record_count": len(claim["rows"]),
+            "issue_code": issue_code,
+        }
+    if issue_code != "" or not isinstance(context_part, dict):
+        raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: success result is invalid")
+    binding = claim["binding"]
+    provider = str(claim["provider"])
+    fragment = {
+        "schema": CONTEXT_FRAGMENT_SCHEMA,
+        "binding_id": claim["binding_id"],
+        "result_id": stable_hash(
+            {"binding": binding, "provider": provider, "context_part": context_part}
+        ),
+        "binding": binding,
+        "provider": provider,
+        "context_part": context_part,
+    }
+    try:
+        _validate_context_fragment(fragment, binding=binding, rows=claim["rows"])
+    except (ValueError, TypeError, KeyError, ProviderError) as exc:
+        raise ConfigurationError(
+            "E_CONTEXT_FRAGMENT_INVALID: semantic result failed deterministic validation"
+        ) from exc
+    fragment_path = (
+        work_dir
+        / ".game-l10n"
+        / "context-progress"
+        / "fragments"
+        / str(claim["binding_id"])
+        / f"{fragment['result_id']}.json"
+    )
+    _atomic_json(fragment_path, fragment)
+    _atomic_json(
+        resolved_claim,
+        {
+            **claim,
+            "status": "committed",
+            "issue_code": "",
+            "fragment_path": _relative(work_dir, fragment_path),
+        },
+    )
+    return {
+        "status": "committed",
+        "slot": claim["slot"],
+        "record_count": len(claim["rows"]),
+    }
+
+
+def _expected_context_pack_from_fragments(
+    work_dir: Path, task: dict[str, Any]
+) -> tuple[ContextPack, list[tuple[dict[str, Any], Path, dict[str, Any]]], dict[str, Any]]:
+    _, manifest = _load_context_manifest(work_dir, task)
+    complete, pending = _context_progress(work_dir, manifest)
+    if pending:
+        raise ConfigurationError(
+            "E_CONTEXT_FINALIZE_INCOMPLETE: context fragments are still pending"
+        )
+    complete.sort(key=lambda item: int(item[0]["source_index"]))
+    pack = merge_context_parts(
+        [item[2]["context_part"] for item in complete],
+        str(manifest["resolved_context_mode"]),
+    )
+    return pack, complete, manifest
+
+
+def _context_fragment_routes(
+    complete: list[tuple[dict[str, Any], Path, dict[str, Any]]],
+    fallback_route: str,
+) -> list[dict[str, Any]]:
+    providers = list(
+        dict.fromkeys(
+            str(item[2]["provider"])
+            for item in complete
+            if str(item[2].get("provider", ""))
+        )
+    )
+    if not providers and fallback_route:
+        providers = [fallback_route]
+    return [
+        {"name": provider, "type": "native_collaboration"}
+        for provider in providers
+    ]
+
+
+def finalize_context_fragments(
+    work_dir: Path, task_path: Path
+) -> dict[str, Any]:
+    """Deterministically merge committed fragments and write the bound envelope."""
+
+    require_control_plane_ready(work_dir)
+    require_control_plane_entry(work_dir)
+    task = _load_context_task(work_dir, task_path)
+    _, manifest = _load_context_manifest(work_dir, task)
+    complete, pending = _context_progress(work_dir, manifest)
+    envelope_path = (work_dir / str(task["output_envelope"])).resolve()
+    if pending:
+        envelope = {
+            "schema": "parr0t.control-envelope.v2",
+            "worker_role": "context_analyzer",
+            "stage": "context",
+            "status": "partial",
+            "target_ids": [],
+            "counts": {
+                "total": len(manifest["chunks"]),
+                "success": len(complete),
+                "error": 0,
+                "pending": len(pending),
+            },
+            "issue_codes": ["context_execution_incomplete"],
+            "artifact_paths": [],
+            "queue_transitions": [],
+            "route_evidence_path": "",
+        }
+        _atomic_json(envelope_path, envelope)
+        return {"status": "partial", **envelope["counts"]}
+    pack, complete, manifest = _expected_context_pack_from_fragments(work_dir, task)
+    source_path = (work_dir / str(task["input_inventory"])).resolve()
+    segments = read_segments(source_path)
+    expected_preflight = build_context_preflight(segments)
+    attestation = context_attestation_for_mode(
+        segments,
+        pack,
+        context_mode=str(task.get("context_mode", ContextMode.AUTO.value)),
+        analyzer_routes=_context_fragment_routes(
+            complete, str(task.get("context_route", ""))
+        ),
+        preflight=expected_preflight,
+    )
+    if pack.context_mode != attestation["context_mode"]:
+        raise ConfigurationError("E_CONTEXT_FINALIZE_INVALID: context mode changed")
+    try:
+        require_complete_context(attestation)
+    except ProviderError as exc:
+        raise ConfigurationError(
+            "E_CONTEXT_FINALIZE_INVALID: merged context is incomplete"
+        ) from exc
+    artifact_path = (work_dir / str(task["output_artifact"])).resolve()
+    if not is_within(artifact_path, work_dir):
+        raise ConfigurationError("E_CONTEXT_FINALIZE_INVALID: output left the workspace")
+    _atomic_json(artifact_path, asdict(pack))
+    envelope = {
+        "schema": "parr0t.control-envelope.v2",
+        "worker_role": "context_analyzer",
+        "stage": "context",
+        "status": "success",
+        "target_ids": [],
+        "counts": {
+            "total": len(manifest["chunks"]),
+            "success": len(complete),
+            "error": 0,
+            "pending": 0,
+        },
+        "issue_codes": [],
+        "artifact_paths": [str(task["output_artifact"])],
+        "queue_transitions": [],
+        "route_evidence_path": "",
+    }
+    _atomic_json(envelope_path, envelope)
+    return {"status": "success", **envelope["counts"]}
+
+
 def _with_state_fingerprint(payload: dict[str, Any]) -> dict[str, Any]:
     return {**payload, "state_fingerprint": stable_hash(payload)}
 
@@ -147,26 +844,38 @@ def _execution_plan(
     tracking_required = worker_role == "context_analyzer"
     required_worker_slots = list(range(1, max_workers + 1))
     finalizer_required = tracking_required
+    finalizer_only = tracking_required and max_workers == 0
     return {
         "schema": DATA_PLANE_EXECUTION_PLAN_SCHEMA,
         "tracking_required": tracking_required,
         "strategy": (
-            "fixed_slot_wave_then_finalizer"
+            "context_finalizer_only"
+            if finalizer_only
+            else "fixed_slot_wave_then_finalizer"
             if tracking_required
             else "single_worker"
         ),
         "required_worker_slots": required_worker_slots,
         "worker_start_policy": (
+            "no_semantic_workers_pending"
+            if finalizer_only
+            else
             "start_all_required_slots_once_before_any_worker_end"
             if max_workers > 1
             else "start_required_slot_once"
         ),
-        "worker_terminal_policy": "wait_for_every_required_slot_to_end",
+        "worker_terminal_policy": (
+            "no_semantic_workers_pending"
+            if finalizer_only
+            else "wait_for_every_required_slot_to_end"
+        ),
         "implicit_timeout_policy": "forbidden",
         "timeout_seconds": None,
         "finalizer_required": finalizer_required,
         "finalizer_start_policy": (
-            "after_every_required_worker_slot_ended"
+            "start_immediately_without_semantic_workers"
+            if finalizer_only
+            else "after_every_required_worker_slot_ended"
             if finalizer_required
             else "not_applicable"
         ),
@@ -203,27 +912,43 @@ def _valid_execution_plan(relay: dict[str, Any]) -> bool:
         return False
     max_workers = relay.get("max_workers")
     tracking_required = relay.get("worker_role") == "context_analyzer"
+    finalizer_only = tracking_required and max_workers == 0
     required_slots = list(range(1, max_workers + 1)) if isinstance(max_workers, int) else []
     return (
         plan.get("schema") == DATA_PLANE_EXECUTION_PLAN_SCHEMA
         and plan.get("tracking_required") is tracking_required
         and plan.get("strategy")
-        == ("fixed_slot_wave_then_finalizer" if tracking_required else "single_worker")
+        == (
+            "context_finalizer_only"
+            if finalizer_only
+            else "fixed_slot_wave_then_finalizer"
+            if tracking_required
+            else "single_worker"
+        )
         and plan.get("required_worker_slots") == required_slots
         and plan.get("worker_start_policy")
         == (
+            "no_semantic_workers_pending"
+            if finalizer_only
+            else
             "start_all_required_slots_once_before_any_worker_end"
             if isinstance(max_workers, int) and max_workers > 1
             else "start_required_slot_once"
         )
         and plan.get("worker_terminal_policy")
-        == "wait_for_every_required_slot_to_end"
+        == (
+            "no_semantic_workers_pending"
+            if finalizer_only
+            else "wait_for_every_required_slot_to_end"
+        )
         and plan.get("implicit_timeout_policy") == "forbidden"
         and plan.get("timeout_seconds") is None
         and plan.get("finalizer_required") is tracking_required
         and plan.get("finalizer_start_policy")
         == (
-            "after_every_required_worker_slot_ended"
+            "start_immediately_without_semantic_workers"
+            if finalizer_only
+            else "after_every_required_worker_slot_ended"
             if tracking_required
             else "not_applicable"
         )
@@ -291,7 +1016,7 @@ def _safe_execution_summary(value: Any) -> dict[str, Any] | None:
     if (
         value["tracking_required"] is not True
         or value["finalizer_required"] is not True
-        or required < 1
+        or required < 0
         or required > MAX_CONTEXT_WORKERS
         or started < 0
         or started > required
@@ -649,7 +1374,7 @@ def prepare_data_plane_task(
             MIN_CONTEXT_CHUNK_CHARS,
             base_context_chunk_chars // (2**failed_route_cycles),
         )
-        relay_max_workers = min(
+        configured_context_workers = min(
             MAX_CONTEXT_WORKERS,
             max(
                 1,
@@ -661,13 +1386,27 @@ def prepare_data_plane_task(
                 ),
             ),
         )
-        worker_delegation_allowed = relay_max_workers > 1
-        context_preflight = build_context_preflight(read_segments(primary_path))
+        context_segments = read_segments(primary_path)
+        context_preflight = build_context_preflight(context_segments)
         context_fingerprints = context_contract_fingerprints()
         context_preflight_path = (
             work_dir / ".game-l10n" / "context-progress" / "preflight.json"
         )
         _atomic_json(context_preflight_path, context_preflight)
+        context_manifest_path, context_manifest = _write_context_manifest(
+            work_dir,
+            segments=context_segments,
+            preflight=context_preflight,
+            source_inventory_fingerprint=verified["primary_fingerprint"],
+            context_mode=context_mode,
+            chunk_chars=context_chunk_chars,
+            contract_fingerprints=context_fingerprints,
+        )
+        _, pending_context_chunks = _context_progress(work_dir, context_manifest)
+        relay_max_workers = min(
+            configured_context_workers, len(pending_context_chunks)
+        )
+        worker_delegation_allowed = relay_max_workers > 1
         private_payload.update(
             {
                 "input_inventory": _relative(work_dir, primary_path),
@@ -676,6 +1415,11 @@ def prepare_data_plane_task(
                 ),
                 "context_preflight_sha256": _digest(context_preflight_path),
                 "context_contract_fingerprints": context_fingerprints,
+                "input_context_manifest": _relative(
+                    work_dir, context_manifest_path
+                ),
+                "context_manifest_sha256": _digest(context_manifest_path),
+                "context_manifest_id": context_manifest["manifest_id"],
                 "source_inventory_fingerprint": verified["primary_fingerprint"],
                 "output_state": ".game-l10n/context-state.json",
                 "context_mode": context_mode,
@@ -692,6 +1436,9 @@ def prepare_data_plane_task(
                 "context_no_progress_attempts": context_no_progress_attempts,
                 "context_parallelism": {
                     "max_workers": relay_max_workers,
+                    "pending_chunks": len(pending_context_chunks),
+                    "completed_chunks": len(context_manifest["chunks"])
+                    - len(pending_context_chunks),
                     "assignment": "atomic_lowest_unfinished_chunk_claim_loop",
                     "claim_root": ".game-l10n/context-progress/claims",
                     "fragment_root": ".game-l10n/context-progress/fragments",
@@ -701,6 +1448,26 @@ def prepare_data_plane_task(
                     "merge_order": "source_chunk_index",
                     "reuse_completed_fragments": True,
                     "retry_only_unfinished_chunks": True,
+                },
+                "context_protocol": {
+                    "manifest_schema": CONTEXT_WORK_MANIFEST_SCHEMA,
+                    "claim_schema": CONTEXT_CHUNK_CLAIM_SCHEMA,
+                    "result_schema": CONTEXT_CHUNK_RESULT_SCHEMA,
+                    "fragment_schema": CONTEXT_FRAGMENT_SCHEMA,
+                    "claim_command": (
+                        "game-l10n claim-context-chunk --workspace <workspace> "
+                        "--task <task-path> --slot <slot>"
+                    ),
+                    "commit_command": (
+                        "game-l10n commit-context-fragment --workspace <workspace> "
+                        "--task <task-path> --claim <claim-path> --result <result-path>"
+                    ),
+                    "finalize_command": (
+                        "game-l10n finalize-context-fragments --workspace <workspace> "
+                        "--task <task-path>"
+                    ),
+                    "direct_context_pack_write_forbidden": True,
+                    "success_requires_every_manifest_chunk": True,
                 },
                 "context_recovery": {
                     "resume_private_progress": True,
@@ -833,11 +1600,15 @@ def prepare_data_plane_task(
                 "on_partial_or_operational_failure_record_resumable_private_progress",
                 "continue_unaffected_chunks_when_one_chunk_requires_fallback",
                 "relay_assigns_unique_context_worker_slots_from_one_to_max_workers",
-                "each_worker_keeps_at_most_one_atomic_claim_active_at_a_time",
+                "workers_must_use_core_claim_context_chunk_command",
+                "each_worker_keeps_at_most_one_core_atomic_claim_active_at_a_time",
+                "workers_must_write_exact_context_chunk_result_schema",
+                "workers_must_use_core_commit_context_fragment_command",
                 "after_committing_a_fragment_claim_the_next_lowest_unfinished_chunk",
                 "workers_write_only_slot_owned_fragments_never_the_shared_context_pack",
-                "after_the_wave_one_fresh_finalizer_merges_fragments_in_source_order",
+                "after_the_wave_one_fresh_finalizer_runs_core_finalize_context_fragments",
                 "finalizer_reuses_completed_fragments_and_retries_only_missing_chunks",
+                "when_pending_chunks_are_zero_start_no_semantic_workers_and_run_only_the_finalizer",
                 "never_treat_context_refusal_or_unchanged_progress_as_whole_job_terminal",
                 "do_not_translate_review_apply_pack_install_launch_or_delegate",
             ]
@@ -1137,7 +1908,9 @@ def _load_bound_data_plane_relay(
         }
         or not isinstance(relay.get("max_workers"), int)
         or isinstance(relay.get("max_workers"), bool)
-        or relay.get("max_workers", 0) < 1
+        or relay.get("max_workers", 0) < (
+            0 if relay.get("worker_role") == "context_analyzer" else 1
+        )
         or relay.get("max_workers", 0) > MAX_CONTEXT_WORKERS
         or (
             relay.get("worker_role") != "context_analyzer"
@@ -1407,8 +2180,24 @@ def _seal_bound_data_plane_task(
         expected_role=str(relay["worker_role"]),
         expected_stage=str(relay["stage"]),
     )
+    native_context_counts: dict[str, int] | None = None
+    if (
+        result["worker_role"] == "context_analyzer"
+        and "input_context_manifest" in task
+    ):
+        native_context_counts = _context_safe_counts(work_dir, task)
+        expected_status = (
+            "success" if native_context_counts["pending"] == 0 else "partial"
+        )
+        if result["status"] != expected_status or result["counts"] != native_context_counts:
+            raise ConfigurationError(
+                "E_DATA_PLANE_RESULT_INVALID: context envelope is not bound to fragment progress"
+            )
     expected_artifact = str(task["output_artifact"])
-    if expected_artifact not in result["artifact_paths"]:
+    artifact_required = (
+        result["worker_role"] != "context_analyzer" or result["status"] == "success"
+    )
+    if artifact_required and expected_artifact not in result["artifact_paths"]:
         raise ConfigurationError(
             "E_DATA_PLANE_RESULT_INVALID: envelope did not bind the required artifact"
         )
@@ -1489,6 +2278,33 @@ def _seal_bound_data_plane_task(
                 "E_DATA_PLANE_RESULT_INVALID: successful reconciliation is incomplete"
             )
     elif result["worker_role"] == "context_analyzer" and result["status"] == "success":
+        native_manifest_bound = all(
+            key in task
+            for key in (
+                "input_context_manifest",
+                "context_manifest_sha256",
+                "context_manifest_id",
+            )
+        )
+        completed_fragments: list[
+            tuple[dict[str, Any], Path, dict[str, Any]]
+        ] = []
+        expected_native_pack: ContextPack | None = None
+        native_manifest: dict[str, Any] | None = None
+        if native_manifest_bound:
+            expected_native_pack, completed_fragments, native_manifest = (
+                _expected_context_pack_from_fragments(work_dir, task)
+            )
+            expected_counts = {
+                "total": len(native_manifest["chunks"]),
+                "success": len(completed_fragments),
+                "error": 0,
+                "pending": 0,
+            }
+            if result["counts"] != expected_counts:
+                raise ConfigurationError(
+                    "E_DATA_PLANE_RESULT_INVALID: context envelope counts do not match fragments"
+                )
         source_path = (work_dir / str(task.get("input_inventory", ""))).resolve()
         if not is_within(source_path, work_dir) or not source_path.is_file():
             raise ConfigurationError(
@@ -1536,16 +2352,26 @@ def _seal_bound_data_plane_task(
             ):
                 raise ValueError("context fields")
             context_pack = ContextPack(**context_payload)
+            if expected_native_pack is not None and stable_hash(
+                context_payload
+            ) != stable_hash(asdict(expected_native_pack)):
+                raise ValueError("context artifact was not produced from bound fragments")
             attestation = context_attestation_for_mode(
                 segments,
                 context_pack,
                 context_mode=str(task.get("context_mode", ContextMode.AUTO.value)),
-                analyzer_routes=[
-                    {
-                        "name": str(task.get("context_route", "")),
-                        "type": "native_collaboration",
-                    }
-                ],
+                analyzer_routes=(
+                    _context_fragment_routes(
+                        completed_fragments, str(task.get("context_route", ""))
+                    )
+                    if native_manifest_bound
+                    else [
+                        {
+                            "name": str(task.get("context_route", "")),
+                            "type": "native_collaboration",
+                        }
+                    ]
+                ),
                 preflight=expected_preflight,
             )
             if context_pack.context_mode != attestation["context_mode"]:
@@ -1568,7 +2394,11 @@ def _seal_bound_data_plane_task(
         deterministic_segment_count = attestation["context_preflight"]["counts"][
             "deterministic_ui"
         ]
-        validated_parts = 1 if semantic_segment_count else 0
+        validated_parts = (
+            len(completed_fragments)
+            if native_manifest_bound
+            else 1 if semantic_segment_count else 0
+        )
         context_state = {
             "schema": CONTEXT_STATE_SCHEMA,
             "status": "success",
@@ -1585,7 +2415,11 @@ def _seal_bound_data_plane_task(
             "attestation": attestation,
             "execution": {
                 "status": "success",
-                "accounting_basis": "validated_final_artifact_not_provider_call_count",
+                "accounting_basis": (
+                    "validated_bound_fragments"
+                    if native_manifest_bound
+                    else "validated_final_artifact_not_provider_call_count"
+                ),
                 "total_parts": validated_parts,
                 "completed_parts": validated_parts,
                 "fallback_part_count": 0,
@@ -1593,6 +2427,17 @@ def _seal_bound_data_plane_task(
                 "semantic_segment_count": semantic_segment_count,
                 "parts": (
                     [
+                        {
+                            "part": index,
+                            "provider": fragment[2]["provider"],
+                            "routes_attempted": 1,
+                            "status": "success",
+                            "result_id": fragment[2]["result_id"],
+                        }
+                        for index, fragment in enumerate(completed_fragments, start=1)
+                    ]
+                    if native_manifest_bound
+                    else [
                         {
                             "part": 1,
                             "provider": str(task.get("context_route", "")),
@@ -1675,6 +2520,7 @@ def _seal_bound_data_plane_task(
 def _seal_ended_data_plane_task(
     work_dir: Path,
     relay: dict[str, Any],
+    task: dict[str, Any] | None = None,
     *,
     issue_code: str,
     execution: dict[str, Any] | None = None,
@@ -1684,6 +2530,17 @@ def _seal_ended_data_plane_task(
     current_relay = relay.get("schema") == DATA_PLANE_RELAY_SCHEMA
     if execution is None:
         execution = _relay_execution_summary(work_dir, relay)
+    counts = {"total": 1, "success": 0, "error": 1, "pending": 1}
+    if (
+        relay.get("worker_role") == "context_analyzer"
+        and isinstance(task, dict)
+        and "input_context_manifest" in task
+    ):
+        try:
+            counts = _context_safe_counts(work_dir, task)
+            counts["error"] = 1 if counts["pending"] else 0
+        except (ConfigurationError, ValueError, TypeError, KeyError, ProviderError):
+            pass
     receipt = {
         "schema": (
             DATA_PLANE_RECEIPT_SCHEMA
@@ -1694,7 +2551,7 @@ def _seal_ended_data_plane_task(
         "worker_role": relay["worker_role"],
         "stage": relay["stage"],
         "status": "error",
-        "counts": {"total": 1, "success": 0, "error": 1, "pending": 1},
+        "counts": counts,
         "issue_codes": [issue_code],
         "artifact_paths": [],
         "queue_transitions": [],
@@ -1736,6 +2593,7 @@ def seal_data_plane_task(
             return _seal_ended_data_plane_task(
                 work_dir,
                 relay,
+                task,
                 issue_code="relay_execution_incomplete",
                 execution=execution,
             )
@@ -1761,6 +2619,7 @@ def seal_data_plane_task(
         return _seal_ended_data_plane_task(
             work_dir,
             relay,
+            task,
             issue_code=(
                 "malformed_response" if envelope_path.is_file() else "task_incomplete"
             ),
