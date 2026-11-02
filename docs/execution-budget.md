@@ -77,6 +77,8 @@ Semantic cache identity follows the exact focused prompt material a target can c
 
 Read each required contract set once per control-plane generation. `game-l10n status` returns `contract_set.digest`; reread only when that digest or the generation changes. A context state bound to the current independently verified inventory fingerprint is sufficient for status; do not parse the same ordered inventory again merely to reproduce its segment digest. Tool output and worker responses stay in artifacts. The root receives only fixed-size metadata and must not turn each command, wait, shard completion, or unchanged observation into another narrated model turn.
 
+Context startup and resume are manifest-driven. Core partitions only unfinished semantic records, caps active workers by the number of pending chunks, and issues zero semantic slots when none remain. Each slot loops over core atomic claims rather than receiving an invented chunk list. A single deterministic finalizer aggregates once per wave. Do not repeatedly enumerate the inventory, recreate chunk formats, accept a summary as a result fragment, spawn analyzers for already committed work, or merge after every small completion.
+
 Emit one progress update after a complete wave or on an actionable blocker. Per-task, per-small-batch, per-wait, and unchanged status narration is not progress and is outside the control-turn budget.
 
 ## Executable detail-contract budget

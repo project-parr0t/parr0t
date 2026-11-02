@@ -566,6 +566,14 @@ def _semantic_context_segments(
     ]
 
 
+def semantic_context_segments(
+    segments: list[Segment], preflight: dict[str, Any] | None = None
+) -> list[Segment]:
+    """Return the exact records that require semantic context analysis."""
+
+    return _semantic_context_segments(segments, preflight)
+
+
 def _chunks(segments: list[Segment], max_chars: int) -> list[list[Segment]]:
     result: list[list[Segment]] = []
     current: list[Segment] = []
@@ -593,6 +601,12 @@ def _chunks(segments: list[Segment], max_chars: int) -> list[list[Segment]]:
     if current:
         result.append(current)
     return result
+
+
+def context_chunks(segments: list[Segment], max_chars: int) -> list[list[Segment]]:
+    """Partition semantic records with the same serialized-size rule as providers."""
+
+    return _chunks(segments, max_chars)
 
 
 def _payload(
@@ -711,6 +725,78 @@ def _merge(parts: list[dict[str, Any]], mode: str) -> ContextPack:
         knowledge_nodes=knowledge_nodes,
         reference_cues=tuple(reference_cues),
     )
+
+
+def merge_context_parts(parts: list[dict[str, Any]], mode: str) -> ContextPack:
+    """Deterministically merge validated native context fragments."""
+
+    if mode not in _SCHEMAS:
+        raise ValueError("unsupported resolved context mode")
+    return _merge(parts, mode)
+
+
+def validate_context_part(
+    part: dict[str, Any],
+    *,
+    mode: str,
+    allowed_evidence_ids: set[str],
+) -> None:
+    """Validate one native fragment against the provider schema without prose leaks."""
+
+    schema = _SCHEMAS.get(mode)
+    if schema is None or not isinstance(part, dict):
+        raise ValueError("invalid context fragment")
+
+    def validate(value: Any, rule: dict[str, Any]) -> None:
+        expected = rule.get("type")
+        if expected == "object":
+            if not isinstance(value, dict):
+                raise ValueError("invalid context fragment")
+            properties = rule.get("properties", {})
+            required = set(rule.get("required", []))
+            if not required.issubset(value):
+                raise ValueError("invalid context fragment")
+            if rule.get("additionalProperties") is False and not set(value).issubset(
+                properties
+            ):
+                raise ValueError("invalid context fragment")
+            for key, item in value.items():
+                child_rule = properties.get(key)
+                if child_rule is not None:
+                    validate(item, child_rule)
+        elif expected == "array":
+            if not isinstance(value, list):
+                raise ValueError("invalid context fragment")
+            child_rule = rule.get("items", {})
+            for item in value:
+                validate(item, child_rule)
+        elif expected == "string":
+            if not isinstance(value, str):
+                raise ValueError("invalid context fragment")
+        if "enum" in rule and value not in rule["enum"]:
+            raise ValueError("invalid context fragment")
+
+    validate(part, schema)
+    if part.get("status") != "success":
+        raise ValueError("context fragment did not succeed")
+
+    def validate_evidence(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "evidence_line_ids":
+                    if (
+                        not isinstance(item, list)
+                        or any(not isinstance(line_id, str) for line_id in item)
+                        or not set(item).issubset(allowed_evidence_ids)
+                    ):
+                        raise ValueError("context fragment evidence escaped its claim")
+                else:
+                    validate_evidence(item)
+        elif isinstance(value, list):
+            for item in value:
+                validate_evidence(item)
+
+    validate_evidence(part)
 
 
 def _evidence_ids(entries: dict[str, dict[str, Any]]) -> set[str]:
