@@ -234,7 +234,7 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **General cause:** The relay had a success-only seal path, so it improvised a parent-facing explanation when the bound worker produced no valid result.
 - **Diagnosis:** Use only the relay lifecycle category and the core receipt. Do not read, quote, summarize, or classify the child response. If it already reached the root, record the fixed leak and rotate.
 - **Resolution:** On every child terminal state, run the bound `seal-data-plane-task --worker-ended` exactly once. Return only the resulting receipt path, then follow status to a fresh attempt. A valid envelope is still accepted; an absent or malformed envelope becomes a categorical core receipt.
-- **Prevention:** Require `parr0t.data-plane-relay.v3`, preserve its immutable child-response and route policies, and keep legacy v1/v2 sealing only for existing checkpoints.
+- **Prevention:** Require `parr0t.data-plane-relay.v4`, preserve its immutable child-response, route, exact-slot lifecycle, finalizer, and no-implicit-timeout policies, and keep legacy v1/v2/v3 sealing only for existing checkpoints.
 
 ## Context analysis repeatedly returns no verified coverage
 
