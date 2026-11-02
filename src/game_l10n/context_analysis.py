@@ -20,6 +20,67 @@ CONTEXT_DOMAINS = {
     ContextMode.KNOWLEDGE.value,
 }
 
+CONTEXT_PREFLIGHT_SCHEMA = "parr0t.context-preflight.v1"
+CONTEXT_STATE_SCHEMA = "parr0t.context-state.v2"
+CONTEXT_PREFLIGHT_POLICY_VERSION = 1
+CONTEXT_PROMPT_CONTRACT_VERSION = 1
+CONTEXT_NESTED_SCHEMA_VERSION = 1
+CONTEXT_DISPOSITION_DETERMINISTIC_UI = "deterministic_ui"
+CONTEXT_DISPOSITION_SEMANTIC_REQUIRED = "semantic_required"
+CONTEXT_DISPOSITION_UNCERTAIN_UI = "uncertain_ui"
+CONTEXT_DISPOSITIONS = {
+    CONTEXT_DISPOSITION_DETERMINISTIC_UI,
+    CONTEXT_DISPOSITION_SEMANTIC_REQUIRED,
+    CONTEXT_DISPOSITION_UNCERTAIN_UI,
+}
+
+_UI_HINTS = {
+    "ui",
+    "menu",
+    "button",
+    "label",
+    "setting",
+    "option",
+    "tooltip",
+    "hud",
+    "status",
+    "keybind",
+}
+_SUPPORTED_UI_SLOT_ROLES = {
+    "standalone",
+    "label",
+    "value",
+    "state_value",
+    "template_fragment",
+}
+_STRONG_CONTEXT_CATEGORIES = {
+    "allusion",
+    "critical_logic",
+    "parody",
+    "quest_title",
+    "script_sensitive",
+    "wordplay",
+}
+_CONTEXT_SIGNAL_KEYS = {
+    "glossary_key",
+    "term_id",
+    "terminology_key",
+    "speaker_id",
+    "target_id",
+    "quest_id",
+    "tutorial_id",
+}
+_CONTEXT_SIGNAL_FLAGS = {
+    "allusion",
+    "critical_logic",
+    "logic_facing",
+    "parody",
+    "reference_cue",
+    "requires_strong_review",
+    "script_sensitive",
+    "wordplay",
+}
+
 _NARRATIVE_HINTS = {
     "dialogue",
     "narration",
@@ -301,6 +362,17 @@ _SCHEMAS = {
 }
 
 
+def context_contract_fingerprints() -> dict[str, Any]:
+    return {
+        "prompt_contract_version": CONTEXT_PROMPT_CONTRACT_VERSION,
+        "prompt_fingerprint": stable_hash(
+            {"base": _BASE_SYSTEM_PROMPT, "modes": _MODE_SYSTEM_PROMPTS}
+        ),
+        "nested_schema_version": CONTEXT_NESTED_SCHEMA_VERSION,
+        "nested_schema_fingerprint": stable_hash(_SCHEMAS),
+    }
+
+
 def _metadata_tokens(segment: Segment) -> set[str]:
     values: list[str] = []
     for key in (
@@ -361,12 +433,157 @@ def infer_context_mode(segments: list[Segment]) -> str:
     return ContextMode.HYBRID.value
 
 
+def _context_preflight_authority(segment: Segment) -> bool:
+    authority = segment.metadata.get("context_preflight")
+    if not isinstance(authority, dict):
+        return False
+    if set(authority) != {
+        "schema",
+        "disposition",
+        "reason_code",
+        "source_sha256",
+        "evidence_sha256",
+    }:
+        return False
+    return (
+        authority.get("schema") == "parr0t.context-preflight-authority/v1"
+        and authority.get("disposition") == CONTEXT_DISPOSITION_DETERMINISTIC_UI
+        and authority.get("reason_code") == "static_context_free_ui"
+        and authority.get("source_sha256")
+        == hashlib.sha256(segment.source.encode("utf-8")).hexdigest()
+        and isinstance(authority.get("evidence_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", authority["evidence_sha256"]) is not None
+    )
+
+
+def _is_structural_ui(segment: Segment) -> bool:
+    metadata = segment.metadata
+    return (
+        str(metadata.get("ui_slot_role", "")).casefold() in _SUPPORTED_UI_SLOT_ROLES
+        or bool(_metadata_tokens(segment) & _UI_HINTS)
+        or isinstance(metadata.get("context_preflight"), dict)
+    )
+
+
+def _requires_semantic_context(segment: Segment) -> bool:
+    metadata = segment.metadata
+    domains = infer_segment_domains(segment)
+    if segment.speaker or segment.scene:
+        return True
+    if domains & {ContextMode.NARRATIVE.value, ContextMode.KNOWLEDGE.value}:
+        return True
+    review_category = str(metadata.get("review_category", "")).casefold()
+    if review_category in _STRONG_CONTEXT_CATEGORIES:
+        return True
+    if any(metadata.get(key) is True for key in _CONTEXT_SIGNAL_FLAGS):
+        return True
+    if any(metadata.get(key) not in (None, "", []) for key in _CONTEXT_SIGNAL_KEYS):
+        return True
+    storage_role = str(metadata.get("storage_role", "")).casefold()
+    if storage_role and storage_role != "display_only":
+        return True
+    if metadata.get("display_projection_required") is True:
+        return True
+    if metadata.get("ui_state_semantics") not in (None, ""):
+        return True
+    return False
+
+
+def classify_context_disposition(segment: Segment) -> tuple[str, str]:
+    """Classify one record without reading or interpreting its source wording.
+
+    UI and buttons are not context-free by default. The fast path requires an
+    exact adapter/call-site authority object plus display-only storage evidence.
+    Missing or conflicting UI evidence remains visible as uncertain work.
+    """
+
+    if _requires_semantic_context(segment):
+        return CONTEXT_DISPOSITION_SEMANTIC_REQUIRED, "hard_semantic_signal"
+    if not _is_structural_ui(segment):
+        return CONTEXT_DISPOSITION_SEMANTIC_REQUIRED, "non_ui_record"
+    metadata = segment.metadata
+    dependencies = [
+        value
+        for key in ("ui_composed_with_ids", "functional_group_ids")
+        for value in (
+            metadata.get(key, [])
+            if isinstance(metadata.get(key, []), (list, tuple, set))
+            else []
+        )
+        if isinstance(value, str) and value
+    ]
+    if dependencies:
+        return CONTEXT_DISPOSITION_UNCERTAIN_UI, "ui_dependency_requires_resolution"
+    if (
+        _context_preflight_authority(segment)
+        and str(metadata.get("storage_role", "")).casefold() == "display_only"
+        and str(metadata.get("ui_slot_role", "")).casefold() in _SUPPORTED_UI_SLOT_ROLES
+    ):
+        return CONTEXT_DISPOSITION_DETERMINISTIC_UI, "static_context_free_ui"
+    return CONTEXT_DISPOSITION_UNCERTAIN_UI, "ui_context_not_proven"
+
+
+def build_context_preflight(
+    segments: list[Segment], *, source_segments_digest: str | None = None
+) -> dict[str, Any]:
+    overrides: list[dict[str, Any]] = []
+    counts = {disposition: 0 for disposition in sorted(CONTEXT_DISPOSITIONS)}
+    for segment in segments:
+        disposition, reason = classify_context_disposition(segment)
+        counts[disposition] += 1
+        if disposition != CONTEXT_DISPOSITION_SEMANTIC_REQUIRED:
+            overrides.append(
+                {
+                    "target_id": segment.id,
+                    "disposition": disposition,
+                    "reason_code": reason,
+                }
+            )
+    return {
+        "schema": CONTEXT_PREFLIGHT_SCHEMA,
+        "policy_version": CONTEXT_PREFLIGHT_POLICY_VERSION,
+        "source_segments_digest": source_segments_digest
+        or stable_hash_sequence(asdict(item) for item in segments),
+        "default_disposition": CONTEXT_DISPOSITION_SEMANTIC_REQUIRED,
+        "counts": counts,
+        "overrides": overrides,
+    }
+
+
+def _semantic_context_segments(
+    segments: list[Segment], preflight: dict[str, Any] | None = None
+) -> list[Segment]:
+    preflight = preflight or build_context_preflight(segments)
+    deterministic_ids = {
+        item["target_id"]
+        for item in preflight["overrides"]
+        if item["disposition"] == CONTEXT_DISPOSITION_DETERMINISTIC_UI
+    }
+    return [
+        segment
+        for segment in segments
+        if segment.id not in deterministic_ids
+    ]
+
+
 def _chunks(segments: list[Segment], max_chars: int) -> list[list[Segment]]:
     result: list[list[Segment]] = []
     current: list[Segment] = []
     size = 0
     for segment in segments:
-        row_size = len(segment.source) + len(segment.scene) + len(segment.speaker) + 80
+        row_size = len(
+            json.dumps(
+                {
+                    "id": segment.id,
+                    "scene": segment.scene,
+                    "speaker": segment.speaker,
+                    "source": segment.source,
+                    "metadata": segment.metadata,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        ) + 80
         if current and size + row_size > max_chars:
             result.append(current)
             current = []
@@ -508,12 +725,15 @@ def context_attestation(
     segments: list[Segment],
     context_pack: ContextPack,
     analyzer: "ContextAnalyzer",
+    *,
+    preflight: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return context_attestation_for_mode(
         segments,
         context_pack,
         context_mode=analyzer.context_mode,
         analyzer_routes=analyzer.registry.fingerprints(analyzer.provider_chain),
+        preflight=preflight,
     )
 
 
@@ -523,6 +743,7 @@ def context_attestation_for_mode(
     *,
     context_mode: str = ContextMode.AUTO.value,
     analyzer_routes: list[dict[str, Any]] | None = None,
+    preflight: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the deterministic context gate without invoking a provider.
 
@@ -551,6 +772,13 @@ def context_attestation_for_mode(
     narrative_segments = [
         item for item in segments if ContextMode.NARRATIVE.value in domains_by_id[item.id]
     ]
+    preflight = preflight or build_context_preflight(segments)
+    deterministic_ui_ids = {
+        item["target_id"]
+        for item in preflight["overrides"]
+        if item["disposition"] == CONTEXT_DISPOSITION_DETERMINISTIC_UI
+    }
+    semantic_segment_count = len(segments) - len(deterministic_ui_ids)
     functional_ids = sorted(
         item.id
         for item in segments
@@ -569,7 +797,9 @@ def context_attestation_for_mode(
         context_pack.feature_guides
     )
     knowledge_evidence = _evidence_ids(context_pack.knowledge_nodes)
-    covered_functional = sorted(set(functional_ids) & functional_evidence)
+    covered_functional = sorted(
+        set(functional_ids) & (functional_evidence | deterministic_ui_ids)
+    )
     covered_knowledge = sorted(set(knowledge_ids) & knowledge_evidence)
     return {
         "ordered_script_hash": stable_hash_sequence(asdict(item) for item in segments),
@@ -577,6 +807,13 @@ def context_attestation_for_mode(
         "context_mode": resolved_mode,
         "required_domains": sorted(required_domains),
         "segment_count": len(segments),
+        "context_preflight": {
+            "schema": preflight["schema"],
+            "policy_version": preflight["policy_version"],
+            "counts": preflight["counts"],
+            "digest": stable_hash(preflight),
+        },
+        "semantic_segment_count": semantic_segment_count,
         "scene_coverage": {
             "required": len(required_scenes),
             "covered": len(covered_scenes),
@@ -601,6 +838,7 @@ def context_attestation_for_mode(
         "functional_summary_present": bool(context_pack.functional_summary.strip()),
         "knowledge_summary_present": bool(context_pack.knowledge_summary.strip()),
         "global_style_rules_present": bool(context_pack.global_style_rules),
+        "global_style_rules_required": bool(semantic_segment_count),
         "relationship_timeline_present": bool(context_pack.relationship_timeline),
         "analyzer_routes": analyzer_routes or [],
     }
@@ -608,7 +846,9 @@ def context_attestation_for_mode(
 
 def require_complete_context(attestation: dict[str, Any]) -> None:
     required_domains = set(attestation["required_domains"])
-    if not attestation["global_style_rules_present"]:
+    if attestation.get("global_style_rules_required", True) and not attestation[
+        "global_style_rules_present"
+    ]:
         raise ProviderError("Context gate failed: global style rules are missing")
     if ContextMode.NARRATIVE.value in required_domains:
         if not attestation["story_summary_present"]:
@@ -618,7 +858,13 @@ def require_complete_context(attestation: dict[str, Any]) -> None:
         if not attestation["character_coverage"]["complete"]:
             raise ProviderError("Context gate failed: character coverage is incomplete")
     if ContextMode.FUNCTIONAL.value in required_domains:
-        if not attestation["functional_summary_present"]:
+        semantic_functional_required = (
+            attestation["functional_coverage"]["required"]
+            > attestation["context_preflight"]["counts"].get(
+                CONTEXT_DISPOSITION_DETERMINISTIC_UI, 0
+            )
+        )
+        if semantic_functional_required and not attestation["functional_summary_present"]:
             raise ProviderError("Context gate failed: functional summary is missing")
         if not attestation["functional_coverage"]["complete"]:
             raise ProviderError("Context gate failed: functional evidence coverage is incomplete")
@@ -669,13 +915,34 @@ class ContextAnalyzer:
     def schema(self, segments: list[Segment]) -> dict[str, Any]:
         return _SCHEMAS[self.resolve_mode(segments)]
 
-    def analyze(self, segments: list[Segment]) -> ContextPack:
+    def analyze(
+        self,
+        segments: list[Segment],
+        *,
+        preflight: dict[str, Any] | None = None,
+    ) -> ContextPack:
         if not segments:
             raise ProviderError("Context gate failed: ordered source inventory is empty")
         mode = self.resolve_mode(segments)
         domains_by_id = self.domains_by_id(segments)
-        chunks = _chunks(segments, self.max_chunk_chars)
+        preflight = preflight or build_context_preflight(segments)
+        semantic_segments = _semantic_context_segments(segments, preflight)
+        chunks = _chunks(semantic_segments, self.max_chunk_chars)
         self.last_execution = None
+
+        if not chunks:
+            self.last_execution = {
+                "status": "success",
+                "total_parts": 0,
+                "completed_parts": 0,
+                "fallback_part_count": 0,
+                "deterministic_segment_count": preflight["counts"][
+                    CONTEXT_DISPOSITION_DETERMINISTIC_UI
+                ],
+                "semantic_segment_count": 0,
+                "parts": [],
+            }
+            return ContextPack(context_mode=mode)
 
         def analyze_part(item: tuple[int, list[Segment]]) -> tuple[dict[str, Any], dict[str, Any]]:
             index, chunk = item
@@ -721,6 +988,10 @@ class ContextAnalyzer:
             "total_parts": len(chunks),
             "completed_parts": len(completed_parts),
             "fallback_part_count": sum(item["routes_attempted"] > 1 for item in part_routes),
+            "deterministic_segment_count": preflight["counts"][
+                CONTEXT_DISPOSITION_DETERMINISTIC_UI
+            ],
+            "semantic_segment_count": len(semantic_segments),
             "parts": part_routes,
         }
         return _merge(completed_parts, mode)
@@ -731,7 +1002,16 @@ def _require_successful_execution(execution: Any) -> dict[str, Any]:
         raise ProviderError("Context gate failed: successful execution attestation is missing")
     total = execution.get("total_parts")
     completed = execution.get("completed_parts")
-    if not isinstance(total, int) or total < 1 or completed != total:
+    deterministic_count = execution.get("deterministic_segment_count", 0)
+    if (
+        not isinstance(total, int)
+        or total < 0
+        or completed != total
+        or (
+            total == 0
+            and (not isinstance(deterministic_count, int) or deterministic_count < 1)
+        )
+    ):
         raise ProviderError("Context gate failed: not every context part completed")
     parts = execution.get("parts")
     if not isinstance(parts, list) or len(parts) != total:
@@ -739,6 +1019,26 @@ def _require_successful_execution(execution: Any) -> dict[str, Any]:
     if any(not isinstance(item, dict) or item.get("status") != "success" for item in parts):
         raise ProviderError("Context gate failed: a context part did not succeed")
     return execution
+
+
+def _legacy_context_cache_reusable(
+    state: dict[str, Any],
+    attestation: dict[str, Any],
+    *,
+    source_segments_digest: str,
+) -> bool:
+    previous = state.get("attestation")
+    return bool(
+        isinstance(previous, dict)
+        and "schema" not in state
+        and "context_preflight" not in previous
+        and state.get("status") == "success"
+        and state.get("source_segments_digest") == source_segments_digest
+        and previous.get("ordered_script_hash") == source_segments_digest
+        and previous.get("context_pack_hash") == attestation["context_pack_hash"]
+        and previous.get("context_mode") == attestation["context_mode"]
+        and previous.get("required_domains") == attestation["required_domains"]
+    )
 
 
 def analyze_with_cache(
@@ -752,6 +1052,10 @@ def analyze_with_cache(
 ) -> tuple[ContextPack, bool]:
     mode = analyzer.resolve_mode(segments)
     source_segments_digest = stable_hash_sequence(asdict(item) for item in segments)
+    preflight = build_context_preflight(
+        segments, source_segments_digest=source_segments_digest
+    )
+    contract_fingerprints = context_contract_fingerprints()
     fingerprint = stable_hash(
         {
             "source_segments_digest": source_segments_digest,
@@ -761,39 +1065,72 @@ def analyze_with_cache(
             "resolved_context_mode": mode,
             "required_domains": sorted(analyzer.required_domains(segments)),
             "schema": analyzer.schema(segments),
+            "context_preflight_policy_version": CONTEXT_PREFLIGHT_POLICY_VERSION,
+            "context_preflight": preflight,
+            **contract_fingerprints,
         }
     )
     if not force and output_path.exists() and state_path.exists():
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        output_body = output_path.read_bytes()
-        if (
-            state.get("fingerprint") == fingerprint
-            and state.get("source_segments_digest") == source_segments_digest
-            and state.get("output_sha256") == hashlib.sha256(output_body).hexdigest()
-            and state.get("output_size") == len(output_body)
-        ):
-            data = json.loads(output_path.read_text(encoding="utf-8"))
-            context_pack = ContextPack(**data)
-            attestation = context_attestation(segments, context_pack, analyzer)
-            require_complete_context(attestation)
-            _require_successful_execution(state.get("execution"))
-            if state.get("attestation") == attestation:
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            output_body = output_path.read_bytes()
+            if (
+                state.get("source_segments_digest") == source_segments_digest
+                and state.get("output_sha256")
+                == hashlib.sha256(output_body).hexdigest()
+                and state.get("output_size") == len(output_body)
+            ):
+                data = json.loads(output_path.read_text(encoding="utf-8"))
+                context_pack = ContextPack(**data)
+                attestation = context_attestation(
+                    segments, context_pack, analyzer, preflight=preflight
+                )
+                require_complete_context(attestation)
+                _require_successful_execution(state.get("execution"))
                 if (
-                    source_inventory_fingerprint is not None
-                    and state.get("source_inventory_fingerprint")
-                    != source_inventory_fingerprint
+                    state.get("fingerprint") == fingerprint
+                    and state.get("attestation") == attestation
                 ):
-                    state["source_inventory_fingerprint"] = source_inventory_fingerprint
-                    state_temporary = state_path.with_name(f"{state_path.name}.tmp")
-                    state_temporary.write_text(
-                        json.dumps(state, ensure_ascii=False, indent=2) + "\n",
-                        encoding="utf-8",
-                    )
-                    state_temporary.replace(state_path)
-                return context_pack, True
-    context_pack = analyzer.analyze(segments)
+                    if (
+                        source_inventory_fingerprint is not None
+                        and state.get("source_inventory_fingerprint")
+                        != source_inventory_fingerprint
+                    ):
+                        state["source_inventory_fingerprint"] = (
+                            source_inventory_fingerprint
+                        )
+                        state_temporary = state_path.with_name(
+                            f"{state_path.name}.tmp"
+                        )
+                        state_temporary.write_text(
+                            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+                            encoding="utf-8",
+                        )
+                        state_temporary.replace(state_path)
+                    return context_pack, True
+                if _legacy_context_cache_reusable(
+                    state,
+                    attestation,
+                    source_segments_digest=source_segments_digest,
+                ):
+                    return context_pack, True
+        except (
+            OSError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+            AttributeError,
+            KeyError,
+            ProviderError,
+        ):
+            # Cache corruption is not semantic failure. Rebuild from the bound
+            # source while preserving the old files until the new result seals.
+            pass
+    context_pack = analyzer.analyze(segments, preflight=preflight)
     execution = _require_successful_execution(analyzer.last_execution)
-    attestation = context_attestation(segments, context_pack, analyzer)
+    attestation = context_attestation(
+        segments, context_pack, analyzer, preflight=preflight
+    )
     require_complete_context(attestation)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -805,6 +1142,7 @@ def analyze_with_cache(
     state_temporary.write_text(
         json.dumps(
             {
+                "schema": CONTEXT_STATE_SCHEMA,
                 "status": "success",
                 "fingerprint": fingerprint,
                 "source_segments_digest": source_segments_digest,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import threading
@@ -7,7 +8,16 @@ import time
 import unittest
 from pathlib import Path
 
-from game_l10n.context_analysis import ContextAnalyzer, analyze_with_cache, infer_context_mode
+from game_l10n.context_analysis import (
+    CONTEXT_DISPOSITION_DETERMINISTIC_UI,
+    CONTEXT_DISPOSITION_SEMANTIC_REQUIRED,
+    CONTEXT_DISPOSITION_UNCERTAIN_UI,
+    ContextAnalyzer,
+    analyze_with_cache,
+    build_context_preflight,
+    classify_context_disposition,
+    infer_context_mode,
+)
 from game_l10n.errors import ProviderError
 from game_l10n.models import Segment
 from game_l10n.providers import ProviderRegistry, ScriptedProvider
@@ -90,6 +100,100 @@ def successful_knowledge_context(**kwargs):
 
 
 class ContextAnalysisTests(unittest.TestCase):
+    @staticmethod
+    def _context_free_ui_metadata(**extra):
+        return {
+            "context_domains": ["functional"],
+            "text_type": "button",
+            "ui_slot_role": "standalone",
+            "storage_role": "display_only",
+            "context_preflight": {
+                "schema": "parr0t.context-preflight-authority/v1",
+                "disposition": "deterministic_ui",
+                "reason_code": "static_context_free_ui",
+                "source_sha256": hashlib.sha256(b"SOURCE").hexdigest(),
+                "evidence_sha256": "a" * 64,
+            },
+            **extra,
+        }
+
+    def test_button_is_ui_but_not_context_free_without_positive_authority(self) -> None:
+        disposition, reason = classify_context_disposition(
+            Segment("ui-1", "SOURCE", metadata={"text_type": "button"})
+        )
+
+        self.assertEqual(disposition, CONTEXT_DISPOSITION_UNCERTAIN_UI)
+        self.assertEqual(reason, "ui_context_not_proven")
+
+    def test_dynamic_ui_authority_is_still_semantic_required(self) -> None:
+        disposition, _ = classify_context_disposition(
+            Segment(
+                "ui-1",
+                "SOURCE",
+                metadata=self._context_free_ui_metadata(
+                    ui_slot_role="state_value", ui_state_semantics="enabled"
+                ),
+            )
+        )
+
+        self.assertEqual(disposition, CONTEXT_DISPOSITION_SEMANTIC_REQUIRED)
+
+    def test_stale_ui_authority_cannot_skip_context(self) -> None:
+        disposition, reason = classify_context_disposition(
+            Segment(
+                "ui-1",
+                "CHANGED_SOURCE",
+                metadata=self._context_free_ui_metadata(),
+            )
+        )
+
+        self.assertEqual(disposition, CONTEXT_DISPOSITION_UNCERTAIN_UI)
+        self.assertEqual(reason, "ui_context_not_proven")
+
+    def test_context_free_ui_is_removed_before_semantic_calls(self) -> None:
+        provider = ScriptedProvider("context", successful_functional_context)
+        analyzer = ContextAnalyzer(ProviderRegistry({"context": provider}), ["context"])
+        segments = [
+            Segment(
+                "ui-1",
+                "SOURCE",
+                metadata=self._context_free_ui_metadata(),
+            )
+        ]
+        preflight = build_context_preflight(segments)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pack, cached = analyze_with_cache(
+                analyzer=analyzer,
+                segments=segments,
+                output_path=root / "context.json",
+                state_path=root / "state.json",
+            )
+            state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(cached)
+        self.assertEqual(provider.call_count, 0)
+        self.assertEqual(pack.context_mode, "functional")
+        self.assertEqual(
+            preflight["counts"][CONTEXT_DISPOSITION_DETERMINISTIC_UI], 1
+        )
+        self.assertEqual(state["execution"]["total_parts"], 0)
+        self.assertTrue(state["attestation"]["functional_coverage"]["complete"])
+
+    def test_ui_composition_without_resolved_context_remains_uncertain(self) -> None:
+        metadata = self._context_free_ui_metadata(
+            ui_composed_with_ids=["ui-missing"]
+        )
+        preflight = build_context_preflight(
+            [Segment("ui-1", "SOURCE", metadata=metadata)]
+        )
+
+        self.assertEqual(
+            preflight["overrides"][0]["disposition"],
+            CONTEXT_DISPOSITION_UNCERTAIN_UI,
+        )
+
     def test_independent_context_chunks_run_in_parallel_and_merge_in_order(self) -> None:
         lock = threading.Lock()
         active = 0
@@ -130,6 +234,29 @@ class ContextAnalysisTests(unittest.TestCase):
             [part["part"] for part in analyzer.last_execution["parts"]],
             list(range(1, provider.call_count + 1)),
         )
+
+    def test_chunk_limit_counts_serialized_metadata(self) -> None:
+        provider = ScriptedProvider("context", successful_context)
+        analyzer = ContextAnalyzer(
+            ProviderRegistry({"context": provider}),
+            ["context"],
+            max_chunk_chars=300,
+        )
+
+        analyzer.analyze(
+            [
+                Segment(
+                    str(index),
+                    "SOURCE",
+                    speaker="A",
+                    scene="S",
+                    metadata={"structural_evidence": "X" * 220},
+                )
+                for index in range(2)
+            ]
+        )
+
+        self.assertEqual(provider.call_count, 2)
 
     def test_auto_mode_treats_quest_metadata_as_narrative_context(self) -> None:
         self.assertEqual(
@@ -212,6 +339,93 @@ class ContextAnalysisTests(unittest.TestCase):
         self.assertTrue(second_cached)
         self.assertEqual(first.story_summary, second.story_summary)
         self.assertEqual(provider.call_count, 1)
+
+    def test_malformed_context_state_rebuilds_instead_of_stopping(self) -> None:
+        provider = ScriptedProvider("context", successful_context)
+        analyzer = ContextAnalyzer(ProviderRegistry({"context": provider}), ["context"])
+        segments = [Segment("1", "SOURCE", speaker="A", scene="S")]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            analyze_with_cache(
+                analyzer=analyzer,
+                segments=segments,
+                output_path=root / "context.json",
+                state_path=root / "state.json",
+            )
+            (root / "state.json").write_text("{malformed", encoding="utf-8")
+
+            _, cached = analyze_with_cache(
+                analyzer=analyzer,
+                segments=segments,
+                output_path=root / "context.json",
+                state_path=root / "state.json",
+            )
+
+        self.assertFalse(cached)
+        self.assertEqual(provider.call_count, 2)
+
+    def test_completed_legacy_context_is_reused_without_state_rewrite(self) -> None:
+        provider = ScriptedProvider("context", successful_context)
+        analyzer = ContextAnalyzer(ProviderRegistry({"context": provider}), ["context"])
+        segments = [Segment("1", "SOURCE", speaker="A", scene="S")]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            analyze_with_cache(
+                analyzer=analyzer,
+                segments=segments,
+                output_path=root / "context.json",
+                state_path=root / "state.json",
+            )
+            state_path = root / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.pop("schema")
+            state["fingerprint"] = "legacy-fingerprint"
+            state["attestation"].pop("context_preflight")
+            state["attestation"].pop("semantic_segment_count")
+            state["attestation"].pop("global_style_rules_required")
+            legacy_text = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
+            state_path.write_text(legacy_text, encoding="utf-8")
+
+            _, cached = analyze_with_cache(
+                analyzer=analyzer,
+                segments=segments,
+                output_path=root / "context.json",
+                state_path=state_path,
+            )
+
+            self.assertEqual(state_path.read_text(encoding="utf-8"), legacy_text)
+
+        self.assertTrue(cached)
+        self.assertEqual(provider.call_count, 1)
+
+    def test_current_context_state_cannot_downgrade_itself_to_legacy(self) -> None:
+        provider = ScriptedProvider("context", successful_context)
+        analyzer = ContextAnalyzer(ProviderRegistry({"context": provider}), ["context"])
+        segments = [Segment("1", "SOURCE", speaker="A", scene="S")]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            analyze_with_cache(
+                analyzer=analyzer,
+                segments=segments,
+                output_path=root / "context.json",
+                state_path=root / "state.json",
+            )
+            state_path = root / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["schema"], "parr0t.context-state.v2")
+            state["fingerprint"] = "tampered-fingerprint"
+            state["attestation"].pop("context_preflight")
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            _, cached = analyze_with_cache(
+                analyzer=analyzer,
+                segments=segments,
+                output_path=root / "context.json",
+                state_path=state_path,
+            )
+
+        self.assertFalse(cached)
+        self.assertEqual(provider.call_count, 2)
 
     def test_parallelism_change_reuses_semantically_identical_context_cache(self) -> None:
         provider = ScriptedProvider("context", successful_context)

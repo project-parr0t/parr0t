@@ -146,6 +146,19 @@ class LocalizationOrchestrator:
         self._progress_lock = threading.Lock()
         self._progress_total = 0
         self._progress_attempts = 0
+        semantic_config = asdict(config)
+        semantic_config.pop("max_workers", None)
+        self._semantic_config = semantic_config
+        self._provider_fingerprints = self.registry.fingerprints(
+            list(
+                dict.fromkeys(
+                    self.config.translator_chain
+                    + self.config.review_triager_chain
+                    + self.config.reviewer_chain
+                    + self.config.rewriter_chain
+                )
+            )
+        )
 
     def _emit_progress(self, stage: str, **statistics: int) -> None:
         if self._progress_callback is None:
@@ -191,26 +204,47 @@ class LocalizationOrchestrator:
             self._remember(segment, result.text)
 
     def _cache_key(self, segment: Segment, anchors: list[dict[str, str]]) -> str:
+        character = self._character(segment.speaker)
+        system, user = translation_prompt(
+            self.project,
+            segment,
+            self.glossary,
+            character,
+            self.context_pack,
+            anchors,
+        )
+        return stable_hash(
+            {
+                "cache_schema": "parr0t.semantic-cache.v2",
+                "prompt_version": PROMPT_VERSION,
+                "focused_translation_prompt": {"system": system, "user": user},
+                # Review may make a glossary entry relevant through the candidate,
+                # so glossary identity remains job-wide even though context entries
+                # are limited to what the prompt can actually consume.
+                "glossary": [asdict(item) for item in self.glossary],
+                "orchestrator": self._semantic_config,
+                "providers": self._provider_fingerprints,
+            }
+        )
+
+    def _legacy_cache_key(
+        self, segment: Segment, anchors: list[dict[str, str]]
+    ) -> str:
         return stable_hash(
             {
                 "prompt_version": PROMPT_VERSION,
                 "project": asdict(self.project),
                 "segment": asdict(segment),
                 "glossary": [asdict(item) for item in self.glossary],
-                "character": asdict(self._character(segment.speaker)) if self._character(segment.speaker) else None,
+                "character": (
+                    asdict(self._character(segment.speaker))
+                    if self._character(segment.speaker)
+                    else None
+                ),
                 "context_pack": asdict(self.context_pack) if self.context_pack else None,
                 "style_anchors": anchors,
                 "orchestrator": asdict(self.config),
-                "providers": self.registry.fingerprints(
-                    list(
-                        dict.fromkeys(
-                            self.config.translator_chain
-                            + self.config.review_triager_chain
-                            + self.config.reviewer_chain
-                            + self.config.rewriter_chain
-                        )
-                    )
-                ),
+                "providers": self._provider_fingerprints,
             }
         )
 
@@ -985,6 +1019,10 @@ class LocalizationOrchestrator:
         cache_key = self._cache_key(segment, anchors)
         if not force:
             cached = self.store.get(cache_key)
+            if cached is None:
+                cached = self.store.get(self._legacy_cache_key(segment, anchors))
+                if cached is not None:
+                    self.store.put(cache_key, cached)
             if cached:
                 self._remember_result(segment, cached)
                 return cached
@@ -1201,7 +1239,7 @@ class LocalizationOrchestrator:
             futures = {index: pool.submit(observed, index) for index in indexes}
             return [(index, futures[index].result()) for index in indexes]
 
-    def _deferred_batch_key(self, items: list[Segment]) -> str:
+    def _legacy_deferred_batch_key(self, items: list[Segment]) -> str:
         return stable_hash(
             {
                 "prompt_version": PROMPT_VERSION,
@@ -1221,6 +1259,15 @@ class LocalizationOrchestrator:
                         )
                     )
                 ),
+            }
+        )
+
+    @staticmethod
+    def _deferred_batch_key(cache_keys: list[str]) -> str:
+        return stable_hash(
+            {
+                "schema": "parr0t.deferred-batch-cache.v3",
+                "ordered_segment_cache_keys": cache_keys,
             }
         )
 
@@ -1282,18 +1329,44 @@ class LocalizationOrchestrator:
         """
         self._progress_total = len(items)
         self._progress_attempts = 0
-        batch_key = self._deferred_batch_key(items)
+        anchors: dict[int, list[dict[str, str]]] = {
+            index: self._anchors(segment.speaker) for index, segment in enumerate(items)
+        }
+        cache_keys: dict[int, str] = {
+            index: self._cache_key(segment, anchors[index])
+            for index, segment in enumerate(items)
+        }
+        batch_key = self._deferred_batch_key(
+            [cache_keys[index] for index in range(len(items))]
+        )
+        legacy_batch_key = self._legacy_deferred_batch_key(items)
         state_path = self.work_dir / ".game-l10n" / "deferred" / f"{batch_key}.json"
         if force:
             state_path.unlink(missing_ok=True)
         state: dict[str, Any] = {}
-        if not force and state_path.exists():
-            try:
-                loaded = json.loads(state_path.read_text(encoding="utf-8"))
-                if loaded.get("version") == 2 and loaded.get("batch_key") == batch_key:
-                    state = loaded
-            except (OSError, json.JSONDecodeError, AttributeError):
-                state = {}
+        if not force:
+            state_candidates = [(state_path, batch_key)]
+            legacy_state_path = (
+                self.work_dir
+                / ".game-l10n"
+                / "deferred"
+                / f"{legacy_batch_key}.json"
+            )
+            if legacy_state_path != state_path:
+                state_candidates.append((legacy_state_path, legacy_batch_key))
+            for candidate_path, expected_key in state_candidates:
+                if not candidate_path.exists():
+                    continue
+                try:
+                    loaded = json.loads(candidate_path.read_text(encoding="utf-8"))
+                    if (
+                        loaded.get("version") == 2
+                        and loaded.get("batch_key") == expected_key
+                    ):
+                        state = loaded
+                        break
+                except (OSError, json.JSONDecodeError, AttributeError):
+                    continue
 
         completed_translators = set(state.get("completed_translators", []))
         completed_reviewers = set(state.get("completed_reviewers", []))
@@ -1303,24 +1376,22 @@ class LocalizationOrchestrator:
         )
 
         results: list[TranslationResult | None] = [None] * len(items)
-        anchors: dict[int, list[dict[str, str]]] = {
-            index: self._anchors(segment.speaker) for index, segment in enumerate(items)
-        }
-        cache_keys: dict[int, str] = {
-            index: stable_hash(
-                {
-                    "deferred_batch": batch_key,
-                    "segment_index": index,
-                    "segment_id": segment.id,
-                }
-            )
-            for index, segment in enumerate(items)
-        }
         candidates: dict[int, str] = {}
         pending_translation: list[int] = []
 
         for index, segment in enumerate(items):
             cached = self.store.get(cache_keys[index]) if not force else None
+            if cached is None and not force:
+                legacy_cache_key = stable_hash(
+                    {
+                        "deferred_batch": legacy_batch_key,
+                        "segment_index": index,
+                        "segment_id": segment.id,
+                    }
+                )
+                cached = self.store.get(legacy_cache_key)
+                if cached is not None:
+                    self.store.put(cache_keys[index], cached)
             if cached:
                 results[index] = cached
                 self._remember_result(segment, cached)

@@ -399,8 +399,24 @@ class WorkspaceTests(unittest.TestCase):
             self.assertTrue(
                 _context_state_valid(payload, context, None, "inventory-v1")
             )
+            payload["schema"] = "parr0t.context-state.unknown"
+            self.assertFalse(
+                _context_state_valid(payload, context, None, "inventory-v1")
+            )
             self.assertFalse(
                 _context_state_valid(payload, context, None, "inventory-v2")
+            )
+            payload["schema"] = "parr0t.context-state.v2"
+            payload["source_inventory_fingerprint"] = "inventory-v1"
+            payload["execution"] = {
+                "status": "success",
+                "total_parts": 0,
+                "completed_parts": 0,
+                "deterministic_segment_count": 1,
+                "parts": [],
+            }
+            self.assertTrue(
+                _context_state_valid(payload, context, None, "inventory-v1")
             )
 
     def test_legacy_native_execution_defaults_upgrade_in_memory(self) -> None:
