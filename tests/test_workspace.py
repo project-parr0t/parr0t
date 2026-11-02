@@ -1682,7 +1682,7 @@ class WorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(
             primary_status["data_plane_task"]["relay_schema"],
-            "parr0t.data-plane-relay.v3",
+            "parr0t.data-plane-relay.v4",
         )
         self.assertEqual(
             primary_status["data_plane_task"]["parent_response"],
@@ -1823,6 +1823,14 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(
             status["data_plane_task"]["merge_policy"],
             "single_fresh_finalizer_source_order",
+        )
+        self.assertEqual(
+            status["data_plane_task"]["execution_accounting"],
+            "core_recorded_slot_and_finalizer_lifecycle",
+        )
+        self.assertEqual(
+            status["data_plane_task"]["implicit_timeout_policy"],
+            "forbidden",
         )
         self.assertFalse(status["data_plane_task"]["job_terminal"])
         self.assertEqual(
