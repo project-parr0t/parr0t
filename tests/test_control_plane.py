@@ -28,6 +28,9 @@ from game_l10n.control_plane import (
 )
 from game_l10n.errors import ConfigurationError
 from game_l10n.data_plane_task import (
+    claim_context_chunk,
+    commit_context_fragment,
+    finalize_context_fragments,
     prepare_data_plane_task,
     record_data_plane_relay_event,
     seal_data_plane_task,
@@ -79,6 +82,49 @@ class ControlPlaneContractTests(unittest.TestCase):
         )
         self.assertEqual(args.func.__name__, "cmd_record_data_plane_relay_event")
         self.assertEqual(args.slot, 1)
+
+    def test_context_fragment_protocol_cli_is_registered(self) -> None:
+        cases = (
+            (
+                [
+                    "claim-context-chunk",
+                    "--workspace",
+                    "fixture-workspace",
+                    "--task",
+                    "task.json",
+                    "--slot",
+                    "1",
+                ],
+                "cmd_claim_context_chunk",
+            ),
+            (
+                [
+                    "commit-context-fragment",
+                    "--workspace",
+                    "fixture-workspace",
+                    "--task",
+                    "task.json",
+                    "--claim",
+                    "claim.json",
+                    "--result",
+                    "result.json",
+                ],
+                "cmd_commit_context_fragment",
+            ),
+            (
+                [
+                    "finalize-context-fragments",
+                    "--workspace",
+                    "fixture-workspace",
+                    "--task",
+                    "task.json",
+                ],
+                "cmd_finalize_context_fragments",
+            ),
+        )
+        for argv, name in cases:
+            with self.subTest(command=argv[0]):
+                self.assertEqual(build_parser().parse_args(argv).func.__name__, name)
 
     def test_ended_data_plane_worker_is_sealed_without_forwarding_prose(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -614,54 +660,50 @@ class ControlPlaneContractTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            context_path = work / "context" / "context-pack.json"
-            context_path.parent.mkdir()
-            context_path.write_text(
-                json.dumps(
-                    asdict(
-                        ContextPack(
-                            context_mode="functional",
-                            functional_summary="Fixture screen flow.",
-                            global_style_rules=("Use consistent UI terms.",),
-                            screen_flows={
-                                "fixture": {"evidence_line_ids": ["fixture-1"]}
-                            },
-                        )
-                    )
-                ),
-                encoding="utf-8",
-            )
-            envelope = work / relay_payload["expected_envelope"]
-            envelope.write_text(
+            task_path = work / relay_payload["task_path"]
+            claimed = claim_context_chunk(work, task_path, slot=1)
+            claim_path = work / claimed["claim_path"]
+            claim = json.loads(claim_path.read_text(encoding="utf-8"))
+            result_path = work / ".game-l10n" / "context-progress" / "result.json"
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path.write_text(
                 json.dumps(
                     {
-                        "schema": "parr0t.control-envelope.v2",
-                        "worker_role": "context_analyzer",
-                        "stage": "context",
+                        "schema": "parr0t.context-chunk-result.v1",
+                        "claim_id": claim["claim_id"],
                         "status": "success",
-                        "target_ids": [],
-                        "counts": {"total": 1, "success": 1},
-                        "issue_codes": [],
-                        "artifact_paths": ["context/context-pack.json"],
-                        "queue_transitions": [],
-                        "route_evidence_path": "",
+                        "context_part": {
+                            "status": "success",
+                            "reason": "",
+                            "global_style_rules": ["Use consistent UI terms."],
+                            "terminology_rules": [],
+                            "reference_cues": [],
+                            "functional_summary": "Fixture screen flow.",
+                            "screens": [
+                                {
+                                    "screen": "fixture",
+                                    "purpose": "Fixture purpose.",
+                                    "actions": [],
+                                    "states": [],
+                                    "constraints": [],
+                                    "evidence_line_ids": ["fixture-1"],
+                                }
+                            ],
+                            "features": [],
+                        },
+                        "issue_code": "",
                     }
                 ),
                 encoding="utf-8",
+            )
+            committed = commit_context_fragment(
+                work, task_path, claim_path, result_path
             )
 
             slots = relay_payload["execution_plan"]["required_worker_slots"]
             record_data_plane_relay_event(
                 work, relay, event="worker-started", slot=slots[0]
             )
-            with self.assertRaisesRegex(ConfigurationError, "every required slot"):
-                record_data_plane_relay_event(
-                    work, relay, event="worker-ended", slot=slots[0]
-                )
-            for slot in slots[1:]:
-                record_data_plane_relay_event(
-                    work, relay, event="worker-started", slot=slot
-                )
             with self.assertRaisesRegex(ConfigurationError, "finalizer requires"):
                 record_data_plane_relay_event(work, relay, event="finalizer-started")
             with self.assertRaisesRegex(ConfigurationError, "EXECUTION_INCOMPLETE"):
@@ -671,6 +713,7 @@ class ControlPlaneContractTests(unittest.TestCase):
                     work, relay, event="worker-ended", slot=slot
                 )
             record_data_plane_relay_event(work, relay, event="finalizer-started")
+            finalized = finalize_context_fragments(work, task_path)
             record_data_plane_relay_event(work, relay, event="finalizer-ended")
 
             sealed = seal_data_plane_task(work, relay)
@@ -679,23 +722,51 @@ class ControlPlaneContractTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
+            resumed = prepare_data_plane_task(
+                work,
+                work / ".game-l10n" / "data-plane" / "context_analyzer",
+                worker_role="context_analyzer",
+                config=config,
+                sdk_activation={"status": "active"},
+            )
+            resumed_relay_path = work / resumed["relay_path"]
+            resumed_relay = json.loads(
+                resumed_relay_path.read_text(encoding="utf-8")
+            )
+            resumed_task_path = work / resumed_relay["task_path"]
+            record_data_plane_relay_event(
+                work, resumed_relay_path, event="finalizer-started"
+            )
+            resumed_finalized = finalize_context_fragments(
+                work, resumed_task_path
+            )
+            record_data_plane_relay_event(
+                work, resumed_relay_path, event="finalizer-ended"
+            )
+            resumed_sealed = seal_data_plane_task(work, resumed_relay_path)
 
         self.assertEqual(sealed["status"], "success")
         self.assertEqual(sealed["schema"], "parr0t.data-plane-receipt.v2")
-        self.assertEqual(relay_payload["max_workers"], 6)
-        self.assertTrue(relay_payload["worker_delegation_allowed"])
+        self.assertEqual(committed["status"], "committed")
+        self.assertEqual(finalized["status"], "success")
+        self.assertEqual(relay_payload["max_workers"], 1)
+        self.assertFalse(relay_payload["worker_delegation_allowed"])
         self.assertEqual(
             relay_payload["execution_plan"]["required_worker_slots"],
-            [1, 2, 3, 4, 5, 6],
+            [1],
         )
         self.assertEqual(
             relay_payload["execution_plan"]["implicit_timeout_policy"],
             "forbidden",
         )
         self.assertTrue(sealed["execution"]["complete"])
-        self.assertEqual(sealed["execution"]["terminal_workers"], 6)
+        self.assertEqual(sealed["execution"]["terminal_workers"], 1)
         self.assertTrue(sealed["execution"]["finalizer_terminal"])
-        self.assertEqual(private_task["context_parallelism"]["max_workers"], 6)
+        self.assertEqual(private_task["context_parallelism"]["max_workers"], 1)
+        self.assertEqual(
+            private_task["context_protocol"]["result_schema"],
+            "parr0t.context-chunk-result.v1",
+        )
         self.assertEqual(
             private_task["context_chunk_measurement"],
             "serialized_payload_chars_including_ids_source_and_metadata",
@@ -726,6 +797,17 @@ class ControlPlaneContractTests(unittest.TestCase):
             state["source_inventory_fingerprint"], verified["primary_fingerprint"]
         )
         self.assertTrue(state["attestation"]["functional_coverage"]["complete"])
+        self.assertEqual(resumed_relay["max_workers"], 0)
+        self.assertEqual(
+            resumed_relay["execution_plan"]["strategy"],
+            "context_finalizer_only",
+        )
+        self.assertEqual(
+            resumed_relay["execution_plan"]["required_worker_slots"], []
+        )
+        self.assertEqual(resumed_finalized["status"], "success")
+        self.assertEqual(resumed_sealed["execution"]["required_workers"], 0)
+        self.assertTrue(resumed_sealed["execution"]["complete"])
 
     def test_context_recovery_rotates_routes_and_reduces_private_chunk_ceiling(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -803,7 +885,7 @@ class ControlPlaneContractTests(unittest.TestCase):
                     sealed["issue_codes"], ["relay_execution_incomplete"]
                 )
                 self.assertEqual(
-                    sealed["execution"]["unstarted_slots"], [1, 2, 3, 4, 5, 6]
+                    sealed["execution"]["unstarted_slots"], [1]
                 )
             receipt_path = output / "receipt.json"
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
