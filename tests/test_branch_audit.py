@@ -125,6 +125,32 @@ class BranchAuditTests(unittest.TestCase):
         self.assertEqual(result["executed"], 2)
         self.assertFalse(result["branches"][1]["cached"])
 
+    def test_matching_previous_report_seeds_impact_cache_without_retesting_adapter(self) -> None:
+        runner = "\n".join(
+            f"def {name}(*args, **kwargs):\n    pass"
+            for name in [
+                "dependency_tree_digest", "external_environment_digest", "extract_snapshot",
+                "initialize_snapshot", "run_checks", "validation_environment_files",
+            ]
+        )
+        self.write("scripts/check_branches.py", runner + "\nPLANNER_VERSION = 1\n")
+        self.write("scripts/check_repo_privacy.py", "# stable privacy runner\n")
+        self.write("scripts/check_engine_faq.py", "# stable faq runner\n")
+        self.commit("Add fixture validation runner")
+        with patch("scripts.check_branches.run_checks", side_effect=self.passed):
+            self.audit()
+        cache_path = self.state / "cache.json"
+        cache = json.loads(cache_path.read_text())
+        cache.pop("impact_results", None)
+        cache_path.write_text(json.dumps(cache))
+        self.write("scripts/check_branches.py", runner + "\nPLANNER_VERSION = 2\n")
+        self.commit("Change only fixture validation planner")
+        with patch("scripts.check_branches.run_checks", side_effect=self.passed) as checks:
+            result = self.audit()
+        self.assertEqual(checks.call_count, 1)
+        self.assertEqual(result["branches"][1]["cache_scope"], "historical_adapter_impact")
+        self.assertEqual(result["executed"], 1)
+
     def test_adapter_change_invalidates_only_that_adapter(self) -> None:
         with patch("scripts.check_branches.run_checks", side_effect=self.passed):
             self.audit()
