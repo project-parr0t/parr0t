@@ -38,6 +38,7 @@ DATA_PLANE_RELAY_CONTRACT_SCHEMA = "parr0t.data-plane-relay-contract.v2"
 DATA_PLANE_RECEIPT_SCHEMA = "parr0t.data-plane-receipt.v1"
 
 MIN_CONTEXT_CHUNK_CHARS = 2048
+MAX_CONTEXT_WORKERS = 6
 
 DATA_PLANE_PROFILES: dict[str, dict[str, str]] = {
     "source_probe": {
@@ -137,9 +138,18 @@ def current_data_plane_receipt(
         or not isinstance(payload.get("issue_codes"), list)
     ):
         return None
+    counts = payload.get("counts", {})
+    safe_counts = {
+        key: int(counts.get(key, 0))
+        for key in ("total", "success", "error", "pending")
+        if isinstance(counts, dict)
+        and isinstance(counts.get(key, 0), int)
+        and not isinstance(counts.get(key, 0), bool)
+    }
     return {
         "status": payload.get("status"),
         "issue_codes": list(payload["issue_codes"]),
+        "counts": safe_counts,
     }
 
 
@@ -202,13 +212,15 @@ def prepare_data_plane_task(
             config.get("files", {}).get("context_pack", artifact_relative)
         )
     artifact = (work_dir / artifact_relative).resolve()
-    envelope = (output_dir / "control-envelope.json").resolve()
     counterpart = (
         (work_dir / profile["counterpart"]).resolve()
         if profile["counterpart"]
         else None
     )
     attempt = 1
+    previous_context_receipt_success = 0
+    previous_context_baseline = 0
+    previous_context_no_progress = 0
     previous_task_path = output_dir / "task.json"
     if previous_task_path.is_file():
         try:
@@ -225,6 +237,22 @@ def prepare_data_plane_task(
                 if previous_receipt_path.is_file()
                 else None
             )
+            if worker_role == "context_analyzer":
+                previous_counts = (
+                    previous_receipt.get("counts", {})
+                    if isinstance(previous_receipt, dict)
+                    else {}
+                )
+                if isinstance(previous_counts, dict):
+                    value = previous_counts.get("success", 0)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        previous_context_receipt_success = max(0, value)
+                baseline = previous_task.get("context_progress_baseline_success", 0)
+                if isinstance(baseline, int) and not isinstance(baseline, bool):
+                    previous_context_baseline = max(0, baseline)
+                no_progress = previous_task.get("context_no_progress_attempts", 0)
+                if isinstance(no_progress, int) and not isinstance(no_progress, bool):
+                    previous_context_no_progress = max(0, no_progress)
             receipt_closes_previous = (
                 isinstance(previous_receipt, dict)
                 and previous_receipt.get("schema") == DATA_PLANE_RECEIPT_SCHEMA
@@ -258,8 +286,16 @@ def prepare_data_plane_task(
                         }
         except (OSError, json.JSONDecodeError):
             attempt = 1
+    # Every attempt and control-plane generation owns a distinct response path.
+    # Older envelopes remain immutable evidence and can never be resealed as a
+    # later attempt merely because their file name was reused.
+    envelope = (
+        output_dir / f"control-envelope.g{control_generation}.attempt-{attempt}.json"
+    ).resolve()
     worker_route = ""
     worker_model_family = ""
+    relay_max_workers = 1
+    worker_delegation_allowed = False
     private_payload: dict[str, Any] = {
         "schema": DATA_PLANE_TASK_SCHEMA,
         "worker_role": worker_role,
@@ -348,10 +384,31 @@ def prepare_data_plane_task(
             raise ConfigurationError(
                 "E_DATA_PLANE_TASK_ROUTE: context chunk size must be positive"
             )
+        made_progress = previous_context_receipt_success > previous_context_baseline
+        context_progress_baseline = max(
+            previous_context_baseline, previous_context_receipt_success
+        )
+        context_no_progress_attempts = (
+            0 if made_progress else previous_context_no_progress + (1 if attempt > 1 else 0)
+        )
+        failed_route_cycles = context_no_progress_attempts // len(context_routes)
         context_chunk_chars = max(
             MIN_CONTEXT_CHUNK_CHARS,
-            base_context_chunk_chars // (2**route_cycle),
+            base_context_chunk_chars // (2**failed_route_cycles),
         )
+        relay_max_workers = min(
+            MAX_CONTEXT_WORKERS,
+            max(
+                1,
+                int(
+                    config.get("routing", {}).get(
+                        "context_max_workers",
+                        config.get("routing", {}).get("max_workers", 1),
+                    )
+                ),
+            ),
+        )
+        worker_delegation_allowed = relay_max_workers > 1
         private_payload.update(
             {
                 "input_inventory": _relative(work_dir, primary_path),
@@ -364,11 +421,26 @@ def prepare_data_plane_task(
                 "context_route_attempt": route_cycle + 1,
                 "context_base_chunk_chars": base_context_chunk_chars,
                 "context_chunk_chars": context_chunk_chars,
+                "context_progress_baseline_success": context_progress_baseline,
+                "context_no_progress_attempts": context_no_progress_attempts,
+                "context_parallelism": {
+                    "max_workers": relay_max_workers,
+                    "assignment": "atomic_lowest_unfinished_chunk_claim_loop",
+                    "claim_root": ".game-l10n/context-progress/claims",
+                    "fragment_root": ".game-l10n/context-progress/fragments",
+                    "fragment_ownership": "one_active_chunk_per_slot",
+                    "worker_loop": "claim_process_commit_repeat_until_exhausted",
+                    "shared_artifact_writer": "single_fresh_finalizer_after_wave",
+                    "merge_order": "source_chunk_index",
+                    "reuse_completed_fragments": True,
+                    "retry_only_unfinished_chunks": True,
+                },
                 "context_recovery": {
                     "resume_private_progress": True,
                     "retry_scope": "smallest_unfinished_context_chunk",
                     "route_selection": "core_round_robin",
-                    "chunk_reduction": "halve_after_each_complete_route_cycle",
+                    "chunk_reduction": "halve_only_after_a_complete_no_progress_route_cycle",
+                    "progress_resets_chunk_reduction": True,
                     "minimum_chunk_chars": MIN_CONTEXT_CHUNK_CHARS,
                     "sealed_failure_is_job_terminal": False,
                     "unchanged_progress_limit_applies": False,
@@ -460,6 +532,12 @@ def prepare_data_plane_task(
                 "preserve_evidence_line_ids_for_every_required_domain",
                 "on_partial_or_operational_failure_record_resumable_private_progress",
                 "continue_unaffected_chunks_when_one_chunk_requires_fallback",
+                "relay_assigns_unique_context_worker_slots_from_one_to_max_workers",
+                "each_worker_keeps_at_most_one_atomic_claim_active_at_a_time",
+                "after_committing_a_fragment_claim_the_next_lowest_unfinished_chunk",
+                "workers_write_only_slot_owned_fragments_never_the_shared_context_pack",
+                "after_the_wave_one_fresh_finalizer_merges_fragments_in_source_order",
+                "finalizer_reuses_completed_fragments_and_retries_only_missing_chunks",
                 "never_treat_context_refusal_or_unchanged_progress_as_whole_job_terminal",
                 "do_not_translate_review_apply_pack_install_launch_or_delegate",
             ]
@@ -509,10 +587,10 @@ def prepare_data_plane_task(
         "worker_role": worker_role,
         "stage": profile["stage"],
         "expected_envelope": _relative(work_dir, envelope),
-        "max_workers": 1,
+        "max_workers": relay_max_workers,
         "relay_authority": "exact_dispatch_only",
         "worker_history": "none",
-        "worker_delegation_allowed": False,
+        "worker_delegation_allowed": worker_delegation_allowed,
         "worker_route": worker_route,
         "worker_model_family": worker_model_family,
         "attempt": attempt,
@@ -671,10 +749,21 @@ def _load_bound_data_plane_relay(
             LEGACY_DATA_PLANE_RELAY_V2_SCHEMA,
             DATA_PLANE_RELAY_SCHEMA,
         }
-        or relay.get("max_workers") != 1
+        or not isinstance(relay.get("max_workers"), int)
+        or isinstance(relay.get("max_workers"), bool)
+        or relay.get("max_workers", 0) < 1
+        or relay.get("max_workers", 0) > MAX_CONTEXT_WORKERS
+        or (
+            relay.get("worker_role") != "context_analyzer"
+            and relay.get("max_workers") != 1
+        )
         or relay.get("relay_authority") != "exact_dispatch_only"
         or relay.get("worker_history") != "none"
-        or relay.get("worker_delegation_allowed") is not False
+        or relay.get("worker_delegation_allowed")
+        is not (
+            relay.get("worker_role") == "context_analyzer"
+            and relay.get("max_workers", 1) > 1
+        )
     ):
         raise ConfigurationError("E_DATA_PLANE_RELAY_INVALID: relay contract is invalid")
 

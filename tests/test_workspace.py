@@ -1812,6 +1812,18 @@ class WorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(status["data_plane_task"]["worker_role"], "context_analyzer")
         self.assertEqual(status["data_plane_task"]["stage"], "context")
+        self.assertEqual(
+            status["data_plane_task"]["dispatch"],
+            "fresh_isolated_context_wave_relay",
+        )
+        self.assertEqual(
+            status["data_plane_task"]["parallelism"],
+            "core_bound_disjoint_chunks_up_to_six_workers",
+        )
+        self.assertEqual(
+            status["data_plane_task"]["merge_policy"],
+            "single_fresh_finalizer_source_order",
+        )
         self.assertFalse(status["data_plane_task"]["job_terminal"])
         self.assertEqual(
             status["data_plane_task"]["failure_action"],

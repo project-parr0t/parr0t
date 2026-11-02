@@ -241,8 +241,8 @@ Engine branches do not append implementation bugs or ordinary engine questions h
 - **Symptom:** The inventory is statically complete, but sealed context attempts remain non-successful or produce no new verified scene/character coverage, and the parent proposes stopping the whole job.
 - **General cause:** One large semantic request repeatedly reached the same native model, or the native-pass unchanged-observation rule was incorrectly applied to the separate data-plane context gate.
 - **Diagnosis:** Read only status, the sealed receipt, and the relay's safe route/attempt fields. Never open the source inventory, partial context pack, progress files, or worker response to calculate coverage in the parent; doing so is a control-plane leak even if a script prints counts only.
-- **Resolution:** Return to status and prepare the next exact context relay. The core rotates Sol/Luna, resumes private progress, and reduces the bounded chunk ceiling after each full failed route cycle. Seal every ended worker categorically. A receipt is not a terminal job result.
-- **Prevention:** Keep context routing and chunk reduction core-owned, label every data-plane failure nonterminal, and scope unchanged-observation stopping exclusively to `native-pass-step` wave scheduling.
+- **Resolution:** Return to status and prepare the next exact context relay. It runs up to six fresh workers over disjoint atomically claimed chunks, preserves committed fragments, and uses one fresh source-order finalizer. The core rotates Sol/Luna, restores the base chunk ceiling after measurable progress, and halves it only after a full no-progress route cycle. Seal every ended wave categorically. A receipt is not a terminal job result.
+- **Prevention:** Keep context routing, bounded parallelism, fragment reuse, and adaptive chunking core-owned; label every data-plane failure nonterminal and scope unchanged-observation stopping exclusively to `native-pass-step` wave scheduling.
 
 ## A transient provider failure leaves a patch partly usable
 

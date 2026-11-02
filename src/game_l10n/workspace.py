@@ -119,6 +119,7 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "require_review": True,
         "review_max_rounds": 2,
         "max_workers": 8,
+        "context_max_workers": 6,
         "retry_refusals_once": False,
         "grace_retries": 3,
         "grace_retry_codes": [
@@ -173,6 +174,7 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "native_agent_max_depth": 1,
         "model_controller_allowed": False,
         "worker_delegation_allowed": False,
+        "context_worker_delegation_policy": "bound_data_plane_relay_only",
         "control_turn_budget_policy_version": 2,
         "control_turn_budget_user_approved": False,
         "max_root_model_calls_per_wave": None,
@@ -263,7 +265,7 @@ This private workspace contains game data. Resolve Parr0t from `game-l10n.json`;
 - Select and activate the exact engine/version SDK before data-plane work. A different SDK may be a bound `reference` for `derive-new`; generated pass-through tools are not an adapter.
 - Require two independent complete ordered inventories, typed context analysis, primary translation, translation fallback for failures only, complete low-cost triage, selective strong review for flags/risk/sample, flagged-only rewrite, review fallback for failures only, deterministic validation, then packing. Do not shrink scope or reorder barriers.
 - The top-level agent is text-free. It may observe only core CLI metadata, validated `parr0t.control-envelope.v2`/receipt paths, and direct-relay categorical lifecycle. Never inspect session transcripts/logs, agent trees, nested-worker status/output, or semantic-worker logs. Usage comes only from core ledgers/receipts. Run `game-l10n validate-control-envelope`; forbidden detail requires rotation.
-- Prepared relays alone own discovery, inventory, reconciliation, and context. They never forward child output; they seal once and return only the receipt. Parent never opens private data or assigns workers directly. Data-plane receipts and native-pass unchanged limits are nonterminal here.
+- Prepared relays alone own discovery, inventory, reconciliation, and context. Ordinary relays use one worker; a context relay may use only its core-bound ceiling of disjoint workers, slot-owned fragments, and one source-order finalizer. They never forward child output; they seal once and return only the receipt. Parent never opens private data or assigns workers directly. Data-plane receipts and native-pass unchanged limits are nonterminal here.
 - If private text or semantic/refusal prose reaches the parent, run `game-l10n record-control-plane-leak` and stop. The contaminated agent cannot resume. A fresh control plane uses only the canonical receipt with `--fresh-session-confirmed --contracts-read --source-unopened`; prose handoffs are invalid.
 - Normalize every refusal to `fallback_required` / “폴백 처리 필요”. It is a routing event, never an exclusion, batch cancellation, or content decision. `source_preserved` requires route evidence that every configured route was attempted and exhausted.
 - Use the locked target language (default: Korean). Another language requires `target-language-policy --user-requested`. Preserve relevant context, meaning, function, natural tone, voice, terminology, allusions, placeholders, markup, control codes, conditions, units, and order.
@@ -1276,6 +1278,11 @@ def _apply_context_routing_defaults(config: dict[str, Any]) -> None:
     routing = config.setdefault("routing", {})
     if not isinstance(routing, dict):
         raise ConfigurationError("Workspace routing policy must be an object")
+    configured_workers = routing.get("max_workers", 1)
+    if isinstance(configured_workers, int) and not isinstance(
+        configured_workers, bool
+    ):
+        routing.setdefault("context_max_workers", min(6, max(1, configured_workers)))
     if (
         str(config.get("provider_preset", "")) == CODEX_APP_PRESET
         and routing.get("context_analyzers") == ["native-sol"]
@@ -1368,6 +1375,7 @@ def initialize_workspace(
             "require_review": True,
             "review_max_rounds": 2,
             "max_workers": 8,
+            "context_max_workers": 6,
             "retry_refusals_once": False,
             "grace_retries": 3,
             "grace_retry_codes": [
@@ -1407,6 +1415,7 @@ def initialize_workspace(
             "require_review": True,
             "review_max_rounds": 2,
             "max_workers": 1,
+            "context_max_workers": 1,
             "retry_refusals_once": True,
             "grace_retries": 0,
             "defer_fallbacks_until_primary_complete": False,

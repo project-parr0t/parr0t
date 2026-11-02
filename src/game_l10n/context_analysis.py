@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -635,6 +636,7 @@ class ContextAnalyzer:
         provider_chain: list[str],
         *,
         max_chunk_chars: int = 30000,
+        max_workers: int = 1,
         context_mode: str = ContextMode.AUTO.value,
     ):
         if not provider_chain:
@@ -647,6 +649,7 @@ class ContextAnalyzer:
         self.registry = registry
         self.provider_chain = provider_chain
         self.max_chunk_chars = max_chunk_chars
+        self.max_workers = max(1, int(max_workers))
         self.context_mode = context_mode
         self.last_execution: dict[str, Any] | None = None
 
@@ -672,10 +675,10 @@ class ContextAnalyzer:
         mode = self.resolve_mode(segments)
         domains_by_id = self.domains_by_id(segments)
         chunks = _chunks(segments, self.max_chunk_chars)
-        completed_parts: list[dict[str, Any]] = []
-        part_routes: list[dict[str, Any]] = []
         self.last_execution = None
-        for index, chunk in enumerate(chunks, start=1):
+
+        def analyze_part(item: tuple[int, list[Segment]]) -> tuple[dict[str, Any], dict[str, Any]]:
+            index, chunk = item
             last_error = ""
             attempted = 0
             for name in self.provider_chain:
@@ -688,23 +691,31 @@ class ContextAnalyzer:
                         schema_name=f"game_{mode}_context",
                     )
                     if raw.get("status") == "success":
-                        completed_parts.append(raw)
-                        part_routes.append(
-                            {
-                                "part": index,
-                                "provider": name,
-                                "routes_attempted": attempted,
-                                "status": "success",
-                            }
-                        )
-                        break
+                        return raw, {
+                            "part": index,
+                            "provider": name,
+                            "routes_attempted": attempted,
+                            "status": "success",
+                        }
                     last_error = (
                         "provider_refusal" if raw.get("status") == "refused" else "provider_error"
                     )
                 except Exception:
                     last_error = "provider_error"
-            else:
-                raise ProviderError(f"All context-analysis routes failed for part {index}: {last_error}")
+            raise ProviderError(
+                f"All context-analysis routes failed for part {index}: {last_error}"
+            )
+
+        indexed_chunks = list(enumerate(chunks, start=1))
+        if self.max_workers <= 1 or len(indexed_chunks) <= 1:
+            analyzed = [analyze_part(item) for item in indexed_chunks]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(self.max_workers, len(indexed_chunks))
+            ) as pool:
+                analyzed = list(pool.map(analyze_part, indexed_chunks))
+        completed_parts = [item[0] for item in analyzed]
+        part_routes = [item[1] for item in analyzed]
         self.last_execution = {
             "status": "success",
             "total_parts": len(chunks),

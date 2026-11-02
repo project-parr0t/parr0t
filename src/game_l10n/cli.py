@@ -260,12 +260,19 @@ def _status_data_plane_task(work_dir: Path, action: str) -> dict[str, Any] | Non
             "--relay <relay-path> --worker-ended"
         ),
         "parent_response": "receipt_path_only",
-        "dispatch": "fresh_isolated_relay_only",
+        "dispatch": (
+            "fresh_isolated_context_wave_relay"
+            if role == "context_analyzer"
+            else "fresh_isolated_relay_only"
+        ),
         "job_terminal": False,
         "failure_action": "seal_then_follow_status",
         "private_artifact_access": "parent_forbidden_rotate_on_access",
         "unchanged_progress_limit_scope": "native_pass_wave_only",
     }
+    if role == "context_analyzer":
+        task["parallelism"] = "core_bound_disjoint_chunks_up_to_six_workers"
+        task["merge_policy"] = "single_fresh_finalizer_source_order"
     if receipt is not None and receipt.get("status") != "success":
         task["last_receipt"] = receipt
         task["continuation_required"] = True
@@ -685,6 +692,17 @@ def _analyze_context(
         registry,
         chain,
         max_chunk_chars=int(routing.get("context_chunk_chars", 30000)),
+        max_workers=min(
+            6,
+            max(
+                1,
+                int(
+                    routing.get(
+                        "context_max_workers", routing.get("max_workers", 1)
+                    )
+                ),
+            ),
+        ),
         context_mode=context_mode or str(config.get("project", {}).get("context_mode", "auto")),
     )
     context_relative = config.get("files", {}).get("context_pack", "context/context-pack.json")
