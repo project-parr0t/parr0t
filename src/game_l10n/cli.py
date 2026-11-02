@@ -44,6 +44,7 @@ from .data_plane_task import (
     DATA_PLANE_RELAY_SCHEMA,
     current_data_plane_receipt,
     prepare_data_plane_task,
+    record_data_plane_relay_event,
     seal_data_plane_task,
 )
 from .failure_queue import (
@@ -273,6 +274,12 @@ def _status_data_plane_task(work_dir: Path, action: str) -> dict[str, Any] | Non
     if role == "context_analyzer":
         task["parallelism"] = "core_bound_disjoint_chunks_up_to_six_workers"
         task["merge_policy"] = "single_fresh_finalizer_source_order"
+        task["execution_accounting"] = "core_recorded_slot_and_finalizer_lifecycle"
+        task["implicit_timeout_policy"] = "forbidden"
+        task["relay_event_command"] = (
+            "game-l10n record-data-plane-relay-event --workspace <workspace> "
+            "--relay <relay-path> --event <event> [--slot <slot>]"
+        )
     if receipt is not None and receipt.get("status") != "success":
         task["last_receipt"] = receipt
         task["continuation_required"] = True
@@ -1333,6 +1340,18 @@ def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
         worker_role=args.worker_role,
         config=config,
         sdk_activation=activation,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_record_data_plane_relay_event(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    result = record_data_plane_relay_event(
+        work_dir,
+        _path_in_workspace(work_dir, args.relay, must_exist=True),
+        event=args.event,
+        slot=args.slot,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -3288,6 +3307,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Private task directory; defaults under .game-l10n/data-plane",
     )
     data_plane_prepare.set_defaults(func=cmd_prepare_data_plane_task)
+
+    data_plane_event = sub.add_parser(
+        "record-data-plane-relay-event",
+        help="Record one categorical context-relay lifecycle event",
+    )
+    data_plane_event.add_argument("--workspace", required=True)
+    data_plane_event.add_argument("--relay", required=True)
+    data_plane_event.add_argument(
+        "--event",
+        choices=[
+            "worker-started",
+            "worker-ended",
+            "finalizer-started",
+            "finalizer-ended",
+        ],
+        required=True,
+    )
+    data_plane_event.add_argument(
+        "--slot",
+        type=int,
+        help="Required numeric slot for worker events; omitted for finalizer events",
+    )
+    data_plane_event.set_defaults(func=cmd_record_data_plane_relay_event)
 
     data_plane_seal = sub.add_parser(
         "seal-data-plane-task",
