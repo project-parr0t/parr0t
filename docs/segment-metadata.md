@@ -18,6 +18,29 @@ All fields are optional and belong in `Segment.metadata`. Emit them only from st
 - `functional_group_ids`: stable IDs whose selection, description, index, state, animation, or return value must remain aligned with this target.
 - `target_language_exception`: only `proper_name`, `immutable_identifier`, `acronym`, `control_token`, or `required_foreign_text`, when the displayed value must intentionally remain outside the target script.
 - `target_language_exception_evidence_sha256`: SHA-256 of SDK/call-site evidence supporting that exact exception. Without both fields, foreign-language prose remains a blocking target-language defect.
+- `context_preflight`: optional positive adapter authority for a context-free UI slot. It is never inferred from wording or from `text_type=button` alone. The exact object is described below.
+
+## Context preflight authority
+
+UI includes buttons, labels, values, status text, and composed fragments. UI is not automatically context-free. Dynamic state, quest/tutorial linkage, terminology, speaker or target linkage, logic/storage use, ambiguity, strong-review signals, and unresolved composition dependencies always remain in semantic context analysis.
+
+An SDK may authorize the deterministic fast path only after static resource or call-site inspection proves that a slot is display-only and independent of those signals. The segment must have a supported `ui_slot_role`, `storage_role=display_only`, and this exact object:
+
+```json
+{
+  "context_preflight": {
+    "schema": "parr0t.context-preflight-authority/v1",
+    "disposition": "deterministic_ui",
+    "reason_code": "static_context_free_ui",
+    "source_sha256": "<SHA-256 of the exact UTF-8 source>",
+    "evidence_sha256": "<lowercase SHA-256>"
+  }
+}
+```
+
+`source_sha256` binds the authority to the exact UTF-8 source. `evidence_sha256` binds the private static evidence inspected by the adapter; a digest is not evidence by itself. Missing, malformed, stale, conflicting, or dependency-bearing UI is classified `uncertain_ui` and sent through semantic analysis. Narrative, knowledge, logic-facing, dynamic, or high-risk UI is classified `semantic_required`. A button is UI, but being a button never proves `deterministic_ui`.
+
+The core writes a private `parr0t.context-preflight.v1` sidecar before chunking. Only `deterministic_ui` records are omitted from semantic requests. Both `semantic_required` and `uncertain_ui` remain in their original order. The context completeness gate accounts for an authorized deterministic slot locally while retaining its segment metadata for translation and review.
 
 Example with synthetic values:
 
