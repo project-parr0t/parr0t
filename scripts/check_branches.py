@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
@@ -17,6 +18,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = "parr0t.branch-audit.v1"
+IMPACT_SCHEMA = "parr0t.branch-adapter-impact.v1"
 
 
 def digest(value: object) -> str:
@@ -111,6 +113,206 @@ def validation_environment_files(repo: Path, files: dict[str, str]) -> tuple[lis
     return sorted(required), None
 
 
+def _blob(repo: Path, entry: str) -> bytes:
+    return git(repo, "cat-file", "blob", entry.rsplit(" ", 1)[-1])
+
+
+def _module_name(path: str) -> str | None:
+    pure = PurePosixPath(path)
+    parts = list(pure.parts)
+    if parts and parts[0] == "src":
+        parts.pop(0)
+    if not parts or parts[-1].split(".")[-1] != "py":
+        return None
+    if parts[-1] == "__init__.py":
+        parts.pop()
+    else:
+        parts[-1] = PurePosixPath(parts[-1]).stem
+    return ".".join(parts) if parts else None
+
+
+def _module_paths(files: dict[str, str], module: str) -> list[str]:
+    if not module:
+        return []
+    base = module.replace(".", "/")
+    candidates = {
+        f"src/{base}.py", f"src/{base}/__init__.py",
+        f"{base}.py", f"{base}/__init__.py",
+    }
+    parts = module.split(".")
+    for index in range(1, len(parts)):
+        package = "/".join(parts[:index])
+        candidates.update({f"src/{package}/__init__.py", f"{package}/__init__.py"})
+    if "." not in module:
+        candidates.update(
+            path for path in files
+            if path.endswith(".py") and PurePosixPath(path).stem == module
+        )
+    return sorted(path for path in candidates if path in files)
+
+
+def _imported_modules(path: str, source: bytes) -> tuple[set[str], bool]:
+    """Return statically resolvable imports and whether a dynamic import is unknown."""
+    try:
+        root = ast.parse(source.decode("utf-8"), filename=path)
+    except (SyntaxError, UnicodeDecodeError):
+        return set(), True
+    current = _module_name(path)
+    package = current.split(".") if current else []
+    if PurePosixPath(path).name != "__init__.py" and package:
+        package.pop()
+    modules: set[str] = set()
+    unsafe = False
+    for node in ast.walk(root):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            prefix = package[:]
+            if node.level:
+                remove = max(0, node.level - 1)
+                prefix = prefix[:-remove] if remove else prefix
+            else:
+                prefix = []
+            if node.module:
+                prefix.extend(node.module.split("."))
+            base = ".".join(prefix)
+            if base:
+                modules.add(base)
+            for alias in node.names:
+                if alias.name != "*":
+                    modules.add(".".join([part for part in (base, alias.name) if part]))
+        elif isinstance(node, ast.Call):
+            name = ""
+            if isinstance(node.func, ast.Name):
+                name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                name = node.func.attr
+            if name in {"__import__", "import_module"}:
+                if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    modules.add(node.args[0].value)
+                else:
+                    unsafe = True
+    return modules, unsafe
+
+
+def adapter_impact(repo: Path, effective: dict[str, str], main_files: dict[str, str],
+                   additions: list[str], adapter_tests: list[str]) -> tuple[str, list[str], bool]:
+    """Bind adapter evidence only to branch bytes and reachable shared Python bytes.
+
+    Unknown dynamic imports fail closed by binding the proof to the complete main
+    tree. That keeps the optimization conservative while allowing ordinary SDK
+    tests to survive unrelated control-plane and documentation changes.
+    """
+    pending = list(adapter_tests)
+    visited: set[str] = set()
+    unsafe = False
+    while pending:
+        path = pending.pop()
+        if path in visited or path not in effective or not path.endswith(".py"):
+            continue
+        visited.add(path)
+        modules, dynamic = _imported_modules(path, _blob(repo, effective[path]))
+        unsafe = unsafe or dynamic
+        for module in modules:
+            for candidate in _module_paths(effective, module):
+                if candidate not in visited:
+                    pending.append(candidate)
+    shared = sorted(main_files if unsafe else (visited & main_files.keys()))
+    branch_bytes = [[path, effective[path]] for path in sorted(additions)]
+    shared_bytes = [[path, effective[path]] for path in shared]
+    return digest([IMPACT_SCHEMA, branch_bytes, shared_bytes]), shared, unsafe
+
+
+def validation_runner_digest(repo: Path, commit: str) -> str | None:
+    """Fingerprint only code that executes and judges adapter tests."""
+    files = tree(repo, commit)
+    checker = "scripts/check_branches.py"
+    supporting = ["scripts/check_repo_privacy.py", "scripts/check_engine_faq.py"]
+    if checker not in files or any(path not in files for path in supporting):
+        return None
+    try:
+        root = ast.parse(_blob(repo, files[checker]).decode("utf-8"), filename=checker)
+    except (SyntaxError, UnicodeDecodeError):
+        return None
+    required = {
+        "dependency_tree_digest", "external_environment_digest", "extract_snapshot",
+        "initialize_snapshot", "run_checks", "validation_environment_files",
+    }
+    functions = {
+        node.name: ast.dump(node, annotate_fields=True, include_attributes=False)
+        for node in root.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in required
+    }
+    if set(functions) != required:
+        return None
+    return digest([
+        "parr0t.branch-adapter-runner.v1", functions,
+        [[path, files[path]] for path in supporting],
+    ])
+
+
+def historical_adapter_impact(repo: Path, main_commit: str, branch_commit: str) -> str | None:
+    """Reconstruct a prior clean overlay's impact digest from immutable commits."""
+    main_files, files = tree(repo, main_commit), tree(repo, branch_commit)
+    base = git(repo, "merge-base", main_commit, branch_commit).decode().strip()
+    base_files = tree(repo, base)
+    changed = {path for path in files.keys() | base_files.keys() if files.get(path) != base_files.get(path)}
+    owned = main_files.keys() | base_files.keys()
+    if any(files.get(path) != main_files.get(path) for path in changed & owned):
+        return None
+    additions = sorted(changed - owned)
+    effective = dict(main_files)
+    effective.update({path: files[path] for path in additions})
+    tests = sorted(
+        path for path in files if path.startswith("tests/")
+        and PurePosixPath(path).name.startswith("test")
+        and path.endswith(".py") and path not in main_files
+    )
+    return adapter_impact(repo, effective, main_files, additions, tests)[0]
+
+
+def historical_impact_results(repo: Path, state: Path, plans: list[dict]) -> dict[str, dict]:
+    """Promote the immediately preceding report only when its runner and impact match."""
+    try:
+        report = json.loads((state / "last-report.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(report, dict) or not isinstance(report.get("branches"), list):
+        return {}
+    prior_main = report.get("main_commit")
+    if not isinstance(prior_main, str):
+        return {}
+    current_runner = validation_runner_digest(repo, plans[0]["main_commit"])
+    if current_runner is None or validation_runner_digest(repo, prior_main) != current_runner:
+        return {}
+    prior = {row.get("ref"): row for row in report["branches"] if isinstance(row, dict)}
+    promoted: dict[str, dict] = {}
+    for plan in plans:
+        row = prior.get(plan["ref"])
+        if (
+            not plan.get("sdk") or plan.get("core_overrides")
+            or not complete_cached_result(row, sdk=True)
+            or not isinstance(row.get("commit"), str)
+        ):
+            continue
+        try:
+            old_impact = historical_adapter_impact(repo, prior_main, row["commit"])
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+        if old_impact != plan.get("adapter_impact_digest"):
+            continue
+        promoted[plan["ref"]] = {
+            "passed": True,
+            "checks": row["checks"],
+            **({"log": row["log"]} if isinstance(row.get("log"), str) else {}),
+            "external_tool_key": row.get("external_tool_key", "none"),
+            "dependency_key": row.get("dependency_key", "historical"),
+            "dependency_state_digest": row.get("dependency_state_digest", "historical"),
+            "historical_main_commit": prior_main,
+        }
+    return promoted
+
+
 def plan_branches(repo: Path, main_ref: str, refs: list[str] | None = None) -> list[dict]:
     # Resolve all refs once. Every later operation uses immutable commit IDs.
     inventory = {}
@@ -157,6 +359,13 @@ def plan_branches(repo: Path, main_ref: str, refs: list[str] | None = None) -> l
             if is_validation_requirement(path)
         ]
         required_environment_files, validation_configuration_error = validation_environment_files(repo, effective)
+        adapter_tests = sorted(path for path in files if path.startswith("tests/")
+                               and PurePosixPath(path).name.startswith("test")
+                               and path.endswith(".py") and path not in main_files)
+        impact_digest, impact_paths, impact_conservative = (
+            adapter_impact(repo, effective, main_files, additions, adapter_tests)
+            if overlay else ("none", [], False)
+        )
         plans.append({
             "ref": ref, "commit": commit, "main_commit": main_commit, "merge_base": base,
             "sdk": sdk, "core_overrides": overrides,
@@ -164,9 +373,10 @@ def plan_branches(repo: Path, main_ref: str, refs: list[str] | None = None) -> l
             "snapshot_kind": "latest_core_with_sdk" if overlay else "branch_tree",
             "source_commit": main_commit if overlay else commit,
             "additions": additions if overlay else [],
-            "adapter_tests": sorted(path for path in files if path.startswith("tests/")
-                                    and PurePosixPath(path).name.startswith("test")
-                                    and path.endswith(".py") and path not in main_files),
+            "adapter_tests": adapter_tests,
+            "adapter_impact_digest": impact_digest,
+            "adapter_impact_paths": impact_paths,
+            "adapter_impact_conservative": impact_conservative,
             "validation_requirements": validation_requirements,
             "required_environment_files": required_environment_files,
             "validation_configuration_error": validation_configuration_error,
@@ -182,6 +392,28 @@ print(json.dumps([sys.version,sys.executable,platform.platform(),sorted((d.metad
     result = subprocess.run([python, "-c", probe], capture_output=True, check=True, text=True)
     return digest([result.stdout, environment_key, {key: os.environ.get(key, "") for key in
                   ("PATH", "PYTHONPATH", "CSC", "CECIL", "GAME_L10N_CSC", "GAME_L10N_CECIL")}])
+
+
+def runtime_digest(python: str) -> str:
+    """Stable host identity for historical adapter evidence, excluding optional tools."""
+    probe = "import json,platform,sys;print(json.dumps([sys.version,sys.executable,platform.platform()]))"
+    result = subprocess.run([python, "-c", probe], capture_output=True, check=True, text=True)
+    return digest(result.stdout)
+
+
+def complete_cached_result(value: object, *, sdk: bool) -> bool:
+    required = {"privacy", "tests"} | ({"engine_faq"} if sdk else set())
+    if not isinstance(value, dict) or value.get("passed") is not True or "error" in value:
+        return False
+    checks = value.get("checks", {})
+    tests = checks.get("tests", {}) if isinstance(checks, dict) else {}
+    return (
+        isinstance(checks, dict) and set(checks) == required
+        and all(isinstance(check, dict) and check.get("passed") is True for check in checks.values())
+        and type(tests.get("count")) is int and tests["count"] > 0
+        and type(tests.get("skipped")) is int and tests["skipped"] == 0
+        and tests.get("complete") is True
+    )
 
 
 def validator_digest() -> str:
@@ -399,14 +631,44 @@ def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", re
     except (OSError, ValueError):
         cache = {}
     cached = cache.get("results", {})
-    validators, environment = validator_digest(), environment_digest(python, environment_key)
+    impact_cached = cache.get("impact_results", {})
+    if not isinstance(impact_cached, dict):
+        impact_cached = {}
+    validators = validator_digest()
+    environment = environment_digest(python, environment_key)
+    runtime = runtime_digest(python)
     plans = plan_branches(repo, main_ref, refs) if pinned_plans is None else pinned_plans
+    historical_cached = historical_impact_results(repo, state, plans) if not force else {}
     dependency_bindings: dict[str, tuple[list[Path], str]] = {}
     dependency_errors: dict[str, str] = {}
+    impact_hits: dict[str, tuple[str, dict, str]] = {}
     for plan in plans:
         external_key, missing_environment_files = external_environment_digest(
             plan.get("required_environment_files", [])
         )
+        impact_key = digest([
+            IMPACT_SCHEMA, plan.get("adapter_impact_digest", "none"), validators,
+            runtime, environment_key,
+        ])
+        plan["impact_validation_key"] = impact_key
+        impact_hit = impact_cached.get(impact_key)
+        impact_scope = "adapter_impact"
+        if not isinstance(impact_hit, dict):
+            impact_hit = historical_cached.get(plan["ref"])
+            impact_scope = "historical_adapter_impact"
+        external_matches = (
+            bool(missing_environment_files)
+            or impact_hit.get("external_tool_key", "none") == external_key
+        ) if isinstance(impact_hit, dict) else False
+        if (
+            not force and plan.get("sdk") and not plan.get("core_overrides")
+            and complete_cached_result(impact_hit, sdk=True) and external_matches
+        ):
+            impact_hits[plan["ref"]] = (impact_key, impact_hit, impact_scope)
+            plan["external_tool_key"] = impact_hit.get("external_tool_key", "none")
+            plan["dependency_state_digest"] = impact_hit.get("dependency_state_digest", "historical")
+            dependency_bindings[plan["content_digest"]] = ([], "cached-impact")
+            continue
         plan["external_tool_key"] = external_key
         if plan.get("validation_configuration_error"):
             dependency_errors[plan["content_digest"]] = plan["validation_configuration_error"]
@@ -436,6 +698,13 @@ def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", re
         )
     pending, results = {}, {}
     for plan in plans:
+        if plan["ref"] in impact_hits:
+            key, hit, impact_scope = impact_hits[plan["ref"]]
+            plan["dependency_mode"] = "cached_evidence"
+            plan["dependency_key"] = hit.get("dependency_key", "historical")
+            plan["validation_key"] = key
+            results[key] = {**hit, "cached": True, "cache_scope": impact_scope}
+            continue
         dependency_paths, dependency_key = dependency_bindings.get(plan["content_digest"], ([], "failed"))
         plan["dependency_mode"] = "isolated" if dependency_paths else "ambient"
         plan["dependency_key"] = dependency_key
@@ -450,20 +719,7 @@ def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", re
             }
             continue
         hit = cached.get(key)
-        required = {"privacy", "tests"} | ({"engine_faq"} if plan["sdk"] else set())
-        checks = hit.get("checks", {}) if isinstance(hit, dict) else {}
-        valid = (
-            isinstance(hit, dict) and hit.get("passed") is True
-            and isinstance(checks, dict) and set(checks) == required
-            and all(isinstance(check, dict) and check.get("passed") is True for check in checks.values())
-            and type(checks.get("tests", {}).get("count")) is int
-            and checks["tests"]["count"] > 0
-            and type(checks["tests"].get("skipped")) is int
-            and checks["tests"]["skipped"] == 0
-            and checks["tests"].get("complete") is True
-            and "error" not in hit
-        )
-        if not force and valid:
+        if not force and complete_cached_result(hit, sdk=plan["sdk"]):
             results[key] = {**hit, "cached": True}
         else:
             pending.setdefault(key, plan)
@@ -528,7 +784,31 @@ def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", re
         action = ("skip_update" if compatibility in {"up_to_date", "up_to_date_compatible"}
                   else "update_required" if compatibility == "update_ready" else "manual_review")
         rows.append({**plan, **result, "compatibility": compatibility, "update_action": action})
-    cache_path.write_text(json.dumps({"schema": SCHEMA, "results": {**cached, **{key: {k: v for k, v in value.items() if k != "cached"} for key, value in results.items()}}}, indent=2) + "\n", encoding="utf-8")
+    impact_results = dict(impact_cached)
+    for plan in plans:
+        if not plan.get("sdk") or plan.get("core_overrides"):
+            continue
+        if force:
+            impact_results.pop(plan["impact_validation_key"], None)
+        result = results.get(plan.get("validation_key", ""))
+        if not complete_cached_result(result, sdk=True):
+            continue
+        impact_results[plan["impact_validation_key"]] = {
+            **{key: value for key, value in result.items() if key not in {"cached", "cache_scope"}},
+            "external_tool_key": plan.get("external_tool_key", "none"),
+            "dependency_key": plan.get("dependency_key", "historical"),
+            "dependency_state_digest": plan.get("dependency_state_digest", "historical"),
+            "evidence_content_digest": plan["content_digest"],
+            "impact_paths": plan.get("adapter_impact_paths", []),
+        }
+    cache_path.write_text(json.dumps({
+        "schema": SCHEMA,
+        "results": {**cached, **{
+            key: {name: value for name, value in result.items() if name not in {"cached", "cache_scope"}}
+            for key, result in results.items()
+        }},
+        "impact_results": impact_results,
+    }, indent=2) + "\n", encoding="utf-8")
     report = {"schema": SCHEMA, "main_commit": plans[0]["main_commit"], "branches": rows,
               "executed": len(pending), "reused": sum(row["cached"] for row in rows),
               "checks_passed": all(
