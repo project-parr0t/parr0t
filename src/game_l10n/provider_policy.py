@@ -162,7 +162,7 @@ def validate_provider_policy(
     ):
         _mode_drift("strong-review categories must be unique non-empty strings")
     required_routes = {
-        "context_analyzers": ["native-sol"],
+        "context_analyzers": ["native-sol", "native-luna"],
         "translators": ["native-luna", "native-sol", "deepseek"],
         "review_triagers": ["native-luna"],
         "reviewers": ["native-sol", "deepseek"],
