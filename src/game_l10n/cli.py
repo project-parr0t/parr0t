@@ -384,6 +384,7 @@ def _context_state_valid(
     total = execution.get("total_parts")
     completed = execution.get("completed_parts")
     parts = execution.get("parts")
+    deterministic_count = execution.get("deterministic_segment_count", 0)
     if not context_path.is_file():
         return False
     output_body = context_path.read_bytes()
@@ -401,7 +402,15 @@ def _context_state_valid(
     return bool(
         execution.get("status") == "success"
         and isinstance(total, int)
-        and total > 0
+        and total >= 0
+        and (
+            total > 0
+            or (
+                isinstance(deterministic_count, int)
+                and not isinstance(deterministic_count, bool)
+                and deterministic_count > 0
+            )
+        )
         and completed == total
         and isinstance(parts, list)
         and len(parts) == total

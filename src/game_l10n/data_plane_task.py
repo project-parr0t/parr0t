@@ -6,7 +6,14 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
-from .context_analysis import context_attestation_for_mode, require_complete_context
+from .context_analysis import (
+    CONTEXT_PREFLIGHT_POLICY_VERSION,
+    CONTEXT_PREFLIGHT_SCHEMA,
+    build_context_preflight,
+    context_contract_fingerprints,
+    context_attestation_for_mode,
+    require_complete_context,
+)
 from .control_plane import (
     control_plane_state,
     require_control_plane_entry,
@@ -654,9 +661,20 @@ def prepare_data_plane_task(
             ),
         )
         worker_delegation_allowed = relay_max_workers > 1
+        context_preflight = build_context_preflight(read_segments(primary_path))
+        context_fingerprints = context_contract_fingerprints()
+        context_preflight_path = (
+            work_dir / ".game-l10n" / "context-progress" / "preflight.json"
+        )
+        _atomic_json(context_preflight_path, context_preflight)
         private_payload.update(
             {
                 "input_inventory": _relative(work_dir, primary_path),
+                "input_context_preflight": _relative(
+                    work_dir, context_preflight_path
+                ),
+                "context_preflight_sha256": _digest(context_preflight_path),
+                "context_contract_fingerprints": context_fingerprints,
                 "source_inventory_fingerprint": verified["primary_fingerprint"],
                 "output_state": ".game-l10n/context-state.json",
                 "context_mode": context_mode,
@@ -689,6 +707,32 @@ def prepare_data_plane_task(
                     "minimum_chunk_chars": MIN_CONTEXT_CHUNK_CHARS,
                     "sealed_failure_is_job_terminal": False,
                     "unchanged_progress_limit_applies": False,
+                },
+                "context_preflight_contract": {
+                    "schema": CONTEXT_PREFLIGHT_SCHEMA,
+                    "policy_version": CONTEXT_PREFLIGHT_POLICY_VERSION,
+                    "dispositions": [
+                        "deterministic_ui",
+                        "semantic_required",
+                        "uncertain_ui",
+                    ],
+                    "semantic_input": ["semantic_required", "uncertain_ui"],
+                    "deterministic_skip": ["deterministic_ui"],
+                    "buttons_are_ui_but_never_prove_deterministic_skip": True,
+                    "uncertainty_fails_to_semantic_analysis": True,
+                },
+                "context_summary_reuse_contract": {
+                    "reuse_requires_exact_match": [
+                        "fragment_source_digest",
+                        "fragment_ordered_evidence_ids",
+                        "context_preflight_sha256",
+                        "context_mode",
+                        "context_contract_fingerprints",
+                    ],
+                    "changed_chunk_ceiling_repartitions_only_unfinished_records": True,
+                    "stale_or_unbound_summary_is_input_only": True,
+                    "summary_presence_never_proves_reuse": True,
+                    "reuse_completed_legacy_pack_without_rewrite": True,
                 },
                 "context_pack_fields": [item.name for item in fields(ContextPack)],
                 "context_pack_contract": {
@@ -769,6 +813,12 @@ def prepare_data_plane_task(
         private_payload["requirements"].extend(
             [
                 "read_only_the_verified_primary_inventory_and_existing_context_metadata",
+                "read_and_obey_the_core_generated_context_preflight_before_chunking",
+                "never_treat_ui_or_button_classification_alone_as_context_free",
+                "send_semantic_required_and_uncertain_ui_records_to_context_analysis",
+                "skip_only_deterministic_ui_records_with_positive_static_authority",
+                "reuse_a_prior_summary_only_when_every_bound_fingerprint_matches",
+                "treat_unbound_or_stale_summaries_as_non_authoritative_input_only",
                 "analyze_complete_flow_character_voice_tone_terminology_and_references",
                 "use_only_the_core_bound_context_route_for_this_attempt",
                 "never_send_the_whole_inventory_in_one_semantic_request",
@@ -1439,7 +1489,40 @@ def _seal_bound_data_plane_task(
             raise ConfigurationError(
                 "E_DATA_PLANE_RESULT_INVALID: bound context inventory is missing"
             )
+        preflight_fields = {
+            "input_context_preflight",
+            "context_preflight_sha256",
+            "context_contract_fingerprints",
+        }
+        present_preflight_fields = preflight_fields & set(task)
+        preflight_path: Path | None = None
+        if present_preflight_fields:
+            if present_preflight_fields != preflight_fields:
+                raise ConfigurationError(
+                    "E_DATA_PLANE_RESULT_INVALID: bound context contract is incomplete"
+                )
+            preflight_path = (
+                work_dir / str(task["input_context_preflight"])
+            ).resolve()
+            if (
+                not is_within(preflight_path, work_dir)
+                or not preflight_path.is_file()
+                or _digest(preflight_path) != task["context_preflight_sha256"]
+                or task["context_contract_fingerprints"]
+                != context_contract_fingerprints()
+            ):
+                raise ConfigurationError(
+                    "E_DATA_PLANE_RESULT_INVALID: bound context contract is missing or changed"
+                )
         try:
+            segments = read_segments(source_path)
+            expected_preflight = build_context_preflight(segments)
+            if preflight_path is not None:
+                preflight_payload = json.loads(
+                    preflight_path.read_text(encoding="utf-8")
+                )
+                if preflight_payload != expected_preflight:
+                    raise ValueError("context preflight")
             context_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
             expected_fields = {item.name for item in fields(ContextPack)}
             if (
@@ -1448,7 +1531,6 @@ def _seal_bound_data_plane_task(
             ):
                 raise ValueError("context fields")
             context_pack = ContextPack(**context_payload)
-            segments = read_segments(source_path)
             attestation = context_attestation_for_mode(
                 segments,
                 context_pack,
@@ -1457,6 +1539,7 @@ def _seal_bound_data_plane_task(
                     {"name": str(name), "type": "native_collaboration"}
                     for name in task.get("context_routes", [])
                 ],
+                preflight=expected_preflight,
             )
             if context_pack.context_mode != attestation["context_mode"]:
                 raise ValueError("context mode")
@@ -1474,6 +1557,11 @@ def _seal_bound_data_plane_task(
                 "E_DATA_PLANE_RESULT_INVALID: context pack failed deterministic validation"
             ) from exc
         output_body = artifact_path.read_bytes()
+        semantic_segment_count = attestation["semantic_segment_count"]
+        deterministic_segment_count = attestation["context_preflight"]["counts"][
+            "deterministic_ui"
+        ]
+        validated_parts = 1 if semantic_segment_count else 0
         context_state = {
             "status": "success",
             "fingerprint": stable_hash(
@@ -1489,17 +1577,24 @@ def _seal_bound_data_plane_task(
             "attestation": attestation,
             "execution": {
                 "status": "success",
-                "total_parts": 1,
-                "completed_parts": 1,
+                "accounting_basis": "validated_final_artifact_not_provider_call_count",
+                "total_parts": validated_parts,
+                "completed_parts": validated_parts,
                 "fallback_part_count": 0,
-                "parts": [
-                    {
-                        "part": 1,
-                        "provider": "isolated_context_worker",
-                        "routes_attempted": 1,
-                        "status": "success",
-                    }
-                ],
+                "deterministic_segment_count": deterministic_segment_count,
+                "semantic_segment_count": semantic_segment_count,
+                "parts": (
+                    [
+                        {
+                            "part": 1,
+                            "provider": "isolated_context_worker",
+                            "routes_attempted": 1,
+                            "status": "success",
+                        }
+                    ]
+                    if validated_parts
+                    else []
+                ),
             },
         }
         state_path = (work_dir / str(task["output_state"])).resolve()
