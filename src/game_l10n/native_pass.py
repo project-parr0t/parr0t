@@ -7,7 +7,7 @@ import re
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .control_plane import (
     CONTROL_ENVELOPE_SCHEMA,
@@ -59,8 +59,17 @@ NATIVE_WAVE_RELAY_SCHEMA = "parr0t.native-wave-relay.v1"
 NATIVE_WAVE_RELAY_RECEIPT_SCHEMA = "parr0t.native-wave-relay-receipt.v1"
 NATIVE_REVIEW_SPLIT_CHAIN_SCHEMA = "parr0t.native-review-split-chain.v1"
 USAGE_EVENT = re.compile(r"^[a-zA-Z0-9._-]{1,128}$")
-RESULT_VALIDATION_REVISION = 3
+RESULT_VALIDATION_REVISION = 5
+RELAY_DISPATCH_REVISION = 2
 LANGUAGE_TAG = re.compile(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*")
+OPERATIONAL_RESULT_ISSUES = {
+    "worker_ended_without_result",
+    "worker_result_binding_invalid",
+    "worker_result_contract_invalid",
+    "worker_result_missing_target",
+    "worker_result_provider_mismatch",
+    "worker_result_schema_invalid",
+}
 
 
 def _normalized_language_binding(binding: dict[str, Any] | None) -> dict[str, Any]:
@@ -183,6 +192,25 @@ def _worker_contract(
         "failure_result_proof_fields": (
             ["split_depth", "semantic_attempts"] if worker_owned_split else []
         ),
+    }
+
+
+def _result_contract() -> dict[str, Any]:
+    """Canonical worker output contract, kept free of game text."""
+
+    return {
+        "schema": "parr0t.native-result-jsonl.v1",
+        "format": "jsonl",
+        "one_row_per_bound_target": True,
+        "ordered_like_task": True,
+        "canonical_fields": ["target_id", "status", "text", "provider", "issues"],
+        "required_fields": ["target_id", "status", "text"],
+        "optional_fields": ["provider", "issues", "split_depth", "semantic_attempts"],
+        "status_values": sorted(ALLOWED_STATUSES),
+        "success_text_required_unless_source_authorizes_empty": True,
+        "non_success_text_must_be_empty": True,
+        "route_bound_success_provider": "route_binding.provider",
+        "alternate_text_fields_allowed": False,
     }
 
 
@@ -495,6 +523,7 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
         worker_contract = payload.get("worker_contract")
         detail_contract = payload.get("detail_contract")
         execution_contract = payload.get("execution_contract")
+        result_contract = payload.get("result_contract")
         route_binding = payload.get("route_binding")
         language_binding = (
             _normalized_language_binding(payload.get("language_binding"))
@@ -517,6 +546,15 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
             "detail_contract": detail_contract,
             "execution_contract": execution_contract,
         }
+        # Manifests prepared before the explicit result contract remain
+        # resumable. Newly prepared manifests bind the canonical schema into
+        # the same immutable contract fingerprint.
+        if result_contract is not None:
+            if result_contract != _result_contract():
+                raise ValueError(
+                    "E_DETAIL_CONTRACT_CONFLICT: native result contract was changed"
+                )
+            fingerprint_payload["result_contract"] = result_contract
         if route_binding is not None:
             fingerprint_payload["route_binding"] = route_binding
         if language_binding is not None:
@@ -987,6 +1025,7 @@ def prepare_native_tasks(
                     "worker_contract": _worker_contract(pass_kind),
                     "detail_contract": _detail_contract(pass_kind),
                     "execution_contract": expected_execution_contract,
+                    "result_contract": _result_contract(),
                     **(
                         {"route_binding": route_binding}
                         if route_binding is not None
@@ -1000,6 +1039,7 @@ def prepare_native_tasks(
                 and manifest.get("worker_contract") == _worker_contract(pass_kind)
                 and manifest.get("detail_contract") == _detail_contract(pass_kind)
                 and manifest.get("execution_contract") == expected_execution_contract
+                and manifest.get("result_contract") == _result_contract()
                 and manifest.get("contract_fingerprint")
                 == expected_contract_fingerprint
                 and all(
@@ -1135,11 +1175,13 @@ def prepare_native_tasks(
         )
     worker_contract = _worker_contract(pass_kind)
     detail_contract = _detail_contract(pass_kind)
+    result_contract = _result_contract()
     contract_fingerprint = stable_hash(
         {
             "worker_contract": worker_contract,
             "detail_contract": detail_contract,
             "execution_contract": execution_contract,
+            "result_contract": result_contract,
             **({"route_binding": route_binding} if route_binding is not None else {}),
             "language_binding": language_binding,
         }
@@ -1163,6 +1205,7 @@ def prepare_native_tasks(
         "worker_contract": worker_contract,
         "detail_contract": detail_contract,
         "execution_contract": execution_contract,
+        "result_contract": result_contract,
         "contract_fingerprint": contract_fingerprint,
         "tasks": tasks,
     }
@@ -1252,7 +1295,10 @@ def _normalize_review_failure(
 
     if row["status"] == "success":
         return row
-    if row.get("issues") == ["worker_ended_without_result"]:
+    if (
+        len(row.get("issues", [])) == 1
+        and row["issues"][0] in OPERATIONAL_RESULT_ISSUES
+    ):
         return row
     if _review_failure_has_split_proof(
         row, max_depth=max_depth, max_calls=max_calls
@@ -1473,6 +1519,7 @@ def _write_wave_relay_dispatch(
     ]
     unsigned = {
         "schema": NATIVE_WAVE_RELAY_SCHEMA,
+        "dispatch_revision": RELAY_DISPATCH_REVISION,
         "pass_kind": manifest["pass_kind"],
         "route_binding": manifest.get("route_binding"),
         "manifest": manifest_path.resolve().relative_to(work_dir.resolve()).as_posix(),
@@ -1484,6 +1531,8 @@ def _write_wave_relay_dispatch(
             "role": "isolated_wave_relay",
             "history_mode": "none",
             "authority": "dispatch_exact_bindings_only",
+            "relay_delegation_allowed": True,
+            "all_task_bindings_must_be_attempted_once": True,
             "semantic_task_files_may_be_opened_by_relay": False,
             "semantic_worker_history_mode": "none",
             "semantic_worker_delegation_allowed": False,
@@ -1492,6 +1541,17 @@ def _write_wave_relay_dispatch(
             "route_change_allowed": False,
             "raw_child_response_forwarding_allowed": False,
             "child_leak_action": "quarantine_relay_and_return_categorical_receipt",
+            "worker_message_template": (
+                "Workspace: {workspace}. Execute only the bound {pass_kind} task {task}. "
+                "Read {manifest} for its immutable worker, detail, execution and route contracts. "
+                "Read workspace policy/configuration for shared context references; load shared "
+                "context once and use only evidence relevant to the assigned task records. "
+                "Never open the complete source_artifact or delegate. Write one ordered JSONL "
+                "result to {result}, with target_id, status, text, provider and issues for every "
+                "bound target. Use the locked task language and exact route_binding.provider "
+                "when present. Obey the manifest's one semantic batch contract and return only "
+                "the prescribed metadata/artifact path, never source or translated text."
+            ),
             "terminal_seal_command": (
                 "game-l10n seal-native-wave-relay --workspace <workspace> "
                 "--dispatch <relay-path> --relay-ended"
@@ -1520,6 +1580,8 @@ def _wave_relay_dispatch_path(
 def _read_structurally_bound_result(
     task: Path,
     result: Path,
+    *,
+    validate_rows: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]]] | None:
     """Return a complete ordered result without exposing semantic fields."""
 
@@ -1527,7 +1589,11 @@ def _read_structurally_bound_result(
         return None
     try:
         expected_ids = _task_target_ids(task, require_payload=True)
-        rows = [_validate_row(row) for row in _read_jsonl(result)]
+        raw_rows = _read_jsonl(result)
+        rows = (
+            validate_rows(raw_rows) if validate_rows is not None
+            else [_validate_row(row) for row in raw_rows]
+        )
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
         return None
     if [row["target_id"] for row in rows] != expected_ids:
@@ -1540,10 +1606,12 @@ def _complete_ended_task_result(
     result: Path,
     *,
     expected_records: int,
+    validate_rows: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None = None,
+    expected_provider: str | None = None,
 ) -> bool:
     """Preserve an ordered partial result and fill only its missing targets."""
 
-    if _read_structurally_bound_result(task, result) is not None:
+    if _read_structurally_bound_result(task, result, validate_rows=validate_rows) is not None:
         return False
     if result.exists() and not result.is_file():
         raise ValueError("E_NATIVE_RELAY_INVALID: result path is not a file")
@@ -1553,41 +1621,74 @@ def _complete_ended_task_result(
         raise ValueError("E_NATIVE_RELAY_INVALID: ended task record count changed")
 
     preserved: dict[str, dict[str, Any]] = {}
+    issue_by_target: dict[str, str] = {}
+    default_issue = "worker_ended_without_result"
     if result.is_file():
         original = result.read_bytes()
+        default_issue = "worker_result_missing_target"
         partial_rows: list[dict[str, Any]] = []
-        malformed = False
+        observed_target_ids: list[str] = []
         for line in original.splitlines():
             if not line.strip():
                 continue
+            raw: dict[str, Any] | None = None
             try:
-                raw = json.loads(line.decode("utf-8-sig"))
+                decoded = json.loads(line.decode("utf-8-sig"))
+                raw = decoded if isinstance(decoded, dict) else None
                 if not isinstance(raw, dict):
                     raise ValueError("Result row must be an object")
-                partial_rows.append(_validate_row(raw))
+                if isinstance(raw.get("target_id"), str):
+                    observed_target_ids.append(raw["target_id"])
+                partial_rows.append(
+                    validate_rows([raw])[0] if validate_rows is not None
+                    else _validate_row(raw)
+                )
             except (UnicodeError, ValueError, TypeError):
-                malformed = True
+                target_id = raw.get("target_id") if isinstance(raw, dict) else None
+                issue = "worker_result_schema_invalid"
+                if isinstance(raw, dict):
+                    try:
+                        normalized = _validate_row(raw)
+                    except (ValueError, TypeError):
+                        normalized = None
+                    if normalized is not None:
+                        issue = "worker_result_contract_invalid"
+                        if (
+                            expected_provider is not None
+                            and normalized["status"] != "error"
+                            and normalized.get("provider") != expected_provider
+                        ):
+                            issue = "worker_result_provider_mismatch"
+                if isinstance(target_id, str) and target_id in expected_ids:
+                    issue_by_target[target_id] = issue
+                else:
+                    default_issue = issue
         expected_positions = {target_id: index for index, target_id in enumerate(expected_ids)}
         partial_ids = [row["target_id"] for row in partial_rows]
+        binding_ids = observed_target_ids or partial_ids
         if (
-            len(partial_ids) != len(set(partial_ids))
-            or any(target_id not in expected_positions for target_id in partial_ids)
-            or [expected_positions[target_id] for target_id in partial_ids]
-            != sorted(expected_positions[target_id] for target_id in partial_ids)
+            len(binding_ids) != len(set(binding_ids))
+            or any(target_id not in expected_positions for target_id in binding_ids)
+            or [expected_positions[target_id] for target_id in binding_ids]
+            != sorted(expected_positions[target_id] for target_id in binding_ids)
         ):
             # An ended worker's invalid ID binding must not block its peers.
             # Keep the original bytes as evidence and route the whole task as
             # an operational failure; none of its candidates are safe to keep.
-            malformed = True
+            issue_by_target = {
+                target_id: "worker_result_binding_invalid" for target_id in expected_ids
+            }
             partial_rows = []
-        if malformed:
-            digest = hashlib.sha256(original).hexdigest()
-            archive = result.with_name(f"{result.name}.ended-original-{digest}")
-            if archive.exists():
-                if archive.read_bytes() != original:
-                    raise ValueError("E_NATIVE_RELAY_INVALID: original archive changed")
-            else:
-                archive.write_bytes(original)
+        # Any result reaching this repair path will be rewritten. Preserve its
+        # exact original bytes once so malformed/provider/binding evidence is
+        # never collapsed into a generic missing-output diagnosis.
+        digest = hashlib.sha256(original).hexdigest()
+        archive = result.with_name(f"{result.name}.ended-original-{digest}")
+        if archive.exists():
+            if archive.read_bytes() != original:
+                raise ValueError("E_NATIVE_RELAY_INVALID: original archive changed")
+        else:
+            archive.write_bytes(original)
         preserved = {row["target_id"]: row for row in partial_rows}
 
     completed_rows = [
@@ -1597,8 +1698,8 @@ def _complete_ended_task_result(
                 "target_id": target_id,
                 "status": "error",
                 "text": "",
-                "provider": "native-worker",
-                "issues": ["worker_ended_without_result"],
+                "provider": "native-control",
+                "issues": [issue_by_target.get(target_id, default_issue)],
             },
         )
         for target_id in expected_ids
@@ -1627,7 +1728,7 @@ def seal_native_wave_relay(
         payload = json.loads(resolved.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("E_NATIVE_RELAY_INVALID: dispatch is unreadable") from exc
-    fields = {
+    legacy_fields = {
         "schema",
         "pass_kind",
         "route_binding",
@@ -1639,11 +1740,22 @@ def seal_native_wave_relay(
         "relay_contract",
         "dispatch_fingerprint",
     }
-    if not isinstance(payload, dict) or set(payload) != fields:
+    fields = legacy_fields | {"dispatch_revision"}
+    if not isinstance(payload, dict) or frozenset(payload) not in {
+        frozenset(legacy_fields),
+        frozenset(fields),
+    }:
         raise ValueError("E_NATIVE_RELAY_INVALID: dispatch shape is invalid")
-    unsigned = {key: payload[key] for key in fields if key != "dispatch_fingerprint"}
+    active_fields = set(payload)
+    unsigned = {
+        key: payload[key] for key in active_fields if key != "dispatch_fingerprint"
+    }
     if (
         payload.get("schema") != NATIVE_WAVE_RELAY_SCHEMA
+        or (
+            "dispatch_revision" in payload
+            and payload.get("dispatch_revision") != RELAY_DISPATCH_REVISION
+        )
         or payload.get("pass_kind") not in PASS_KINDS
         or (
             payload.get("route_binding") is not None
@@ -1688,6 +1800,24 @@ def seal_native_wave_relay(
     if len(set(ended_tasks)) != len(ended_tasks):
         raise ValueError("E_NATIVE_RELAY_INVALID: ended tasks must be unique")
 
+    try:
+        manifest_path = (work_dir / payload["manifest"]).resolve()
+        manifest_path.relative_to(work_dir.resolve())
+        manifest = _load_task_manifest(work_dir, manifest_path)
+        if (
+            manifest["contract_fingerprint"] != payload["manifest_contract_fingerprint"]
+            or _native_control_plan_fingerprint(manifest) != payload["plan_fingerprint"]
+        ):
+            raise ValueError("Relay manifest binding changed")
+    except (OSError, KeyError, TypeError, ValueError):
+        raise ValueError("E_NATIVE_RELAY_INVALID: bound manifest is invalid") from None
+    bound_segments: dict[str, Segment] = {}
+
+    def validate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return _validate_manifest_rows(
+            work_dir, manifest, rows, bound_segments=bound_segments
+        )
+
     bindings_by_name: dict[str, tuple[Path, Path, int]] = {}
     for binding in payload["task_bindings"]:
         if not isinstance(binding, dict) or set(binding) != {
@@ -1727,7 +1857,7 @@ def seal_native_wave_relay(
         effective_ended_tasks = tuple(
             name
             for name, (task, result, _) in bindings_by_name.items()
-            if _read_structurally_bound_result(task, result) is None
+            if _read_structurally_bound_result(task, result, validate_rows=validate_rows) is None
         )
 
     unknown_ended = [
@@ -1744,11 +1874,17 @@ def seal_native_wave_relay(
                 task,
                 result,
                 expected_records=expected_records,
+                validate_rows=validate_rows,
+                expected_provider=(
+                    manifest["route_binding"]["provider"]
+                    if manifest.get("route_binding") is not None
+                    else None
+                ),
             )
         )
 
     ready = sum(
-        _read_structurally_bound_result(task, result) is not None
+        _read_structurally_bound_result(task, result, validate_rows=validate_rows) is not None
         for task, result, _ in bindings_by_name.values()
     )
 
@@ -1788,6 +1924,8 @@ def _validated_native_wave_relay_receipt(
     work_dir: Path,
     plan_fingerprint: str,
     wave: int,
+    *,
+    manifest: dict[str, Any],
 ) -> dict[str, Any]:
     dispatch_path = _wave_relay_dispatch_path(work_dir, plan_fingerprint, wave).resolve()
     receipt_path = dispatch_path.with_name(f"{dispatch_path.stem}-receipt.json")
@@ -1814,8 +1952,19 @@ def _validated_native_wave_relay_receipt(
     }
     dispatch_relative = dispatch_path.relative_to(work_dir.resolve()).as_posix()
     bindings = dispatch.get("task_bindings") if isinstance(dispatch, dict) else None
-    if not isinstance(bindings, list):
+    dispatch_revision = dispatch.get("dispatch_revision") if isinstance(dispatch, dict) else None
+    if (
+        not isinstance(bindings, list)
+        or dispatch_revision not in {None, RELAY_DISPATCH_REVISION}
+    ):
         raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
+    bound_segments: dict[str, Segment] = {}
+
+    def validate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return _validate_manifest_rows(
+            work_dir, manifest, rows, bound_segments=bound_segments
+        )
+
     ready = 0
     for binding in bindings:
         if (
@@ -1831,7 +1980,21 @@ def _validated_native_wave_relay_receipt(
             result.relative_to(work_dir.resolve())
         except ValueError as exc:
             raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID") from exc
-        ready += int(_read_structurally_bound_result(task, result) is not None)
+        if dispatch_revision == RELAY_DISPATCH_REVISION:
+            # New dispatches use the exact same validator as import. A result
+            # cannot be terminal-ready under a looser relay-only definition.
+            bound_result = _read_structurally_bound_result(
+                task, result, validate_rows=validate_rows
+            )
+        else:
+            # Legacy terminal receipts used shape-only readiness. Retain that
+            # path so an old checkpoint can reach deterministic repair once.
+            bound_result = _read_structurally_bound_result(task, result)
+            if bound_result is None:
+                bound_result = _read_structurally_bound_result(
+                    task, result, validate_rows=validate_rows
+                )
+        ready += int(bound_result is not None)
     total = len(bindings)
     expected_counts = {
         "expected_tasks": total,
@@ -2607,7 +2770,7 @@ def _native_control_step_single(
         progress_marker = (
             f"{imported_tasks}:{next_wave}:{ready_results}:"
             f"{result_fingerprint}:{relay_receipt_fingerprint}:"
-            f"validation-{RESULT_VALIDATION_REVISION}"
+            f"validation-{RESULT_VALIDATION_REVISION}:dispatch-{RELAY_DISPATCH_REVISION}"
         )
         if state["active_wave"] == next_wave:
             state["control_steps_in_wave"] += 1
@@ -2649,7 +2812,7 @@ def _native_control_step_single(
         ):
             try:
                 relay_receipt = _validated_native_wave_relay_receipt(
-                    work_dir, plan_fingerprint, next_wave
+                    work_dir, plan_fingerprint, next_wave, manifest=manifest
                 )
             except ValueError as exc:
                 code = str(exc)
@@ -2686,9 +2849,22 @@ def _native_control_step_single(
             issue_codes = ["E_NATIVE_NO_MEASURABLE_PROGRESS"]
         elif ready_results == len(tasks):
             try:
-                import_summary = import_native_wave(
-                    work_dir, manifest_path, results_dir, next_wave
-                )
+                try:
+                    import_summary = import_native_wave(
+                        work_dir, manifest_path, results_dir, next_wave
+                    )
+                except (ValueError, json.JSONDecodeError):
+                    if not require_relay_receipt:
+                        raise
+                    # The verified terminal receipt permits deterministic repair
+                    # of ended output only. Keep valid rows and archive rejected
+                    # bytes; route invalid/missing targets as operational failures.
+                    seal_native_wave_relay(
+                        work_dir, relay_dispatch_path, relay_ended=True
+                    )
+                    import_summary = import_native_wave(
+                        work_dir, manifest_path, results_dir, next_wave
+                    )
             except (ValueError, json.JSONDecodeError):
                 action = "checkpoint_and_stop"
                 issue_codes = ["E_NATIVE_WAVE_RESULT_INVALID"]
