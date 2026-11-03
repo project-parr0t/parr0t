@@ -41,6 +41,151 @@ def review_segment(segment_id: str, source: str = "S", candidate: str = "T") -> 
 
 
 class NativePassTests(unittest.TestCase):
+    def test_terminal_seal_classifies_alternate_text_schema_without_losing_peer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks, results = root / "tasks", root / "results"
+            prepare_native_tasks(
+                root,
+                source,
+                [Segment("a", "S"), Segment("b", "S")],
+                tasks,
+                max_records=2,
+                max_workers=1,
+                route_binding={"provider": "native-luna", "attempt": 1},
+            )
+            first = native_control_step(root, tasks / "manifest.json", results)
+            result = results / "task-0001.jsonl"
+            self._write_rows(
+                result,
+                [
+                    {
+                        "target_id": "a",
+                        "status": "success",
+                        "text": "A",
+                        "provider": "native-luna",
+                    },
+                    {
+                        "target_id": "b",
+                        "translation": "B",
+                        "provider": "native-luna",
+                    },
+                ],
+            )
+            original = result.read_bytes()
+
+            sealed = seal_native_wave_relay(
+                root, root / first["relay"]["dispatch"], relay_ended=True
+            )
+            repaired = [json.loads(line) for line in result.read_text().splitlines()]
+            completed = native_control_step(
+                root,
+                tasks / "manifest.json",
+                results,
+                require_relay_receipt=True,
+            )
+
+            self.assertEqual(sealed["counts"]["ready_tasks"], 1)
+            self.assertEqual(repaired[0]["text"], "A")
+            self.assertEqual(repaired[1]["status"], "error")
+            self.assertEqual(repaired[1]["issues"], ["worker_result_schema_invalid"])
+            archives = list(results.glob("task-0001.jsonl.ended-original-*"))
+            self.assertEqual(len(archives), 1)
+            self.assertEqual(archives[0].read_bytes(), original)
+            self.assertEqual(completed["action"], "aggregate_completed_pass")
+
+    def test_ended_route_failure_resumes_without_reopening_valid_candidates(self) -> None:
+        from game_l10n import native_pass as module
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks, results = root / "tasks", root / "results"
+            prepare_native_tasks(
+                root, source, [Segment(item, "S") for item in ("a", "b", "c", "d")],
+                tasks, max_records=2, max_workers=2,
+                route_binding={"provider": "native-sol", "attempt": 1},
+            )
+            first = native_control_step(root, tasks / "manifest.json", results)
+            dispatch_path = root / first["relay"]["dispatch"]
+            legacy_dispatch = json.loads(dispatch_path.read_text(encoding="utf-8"))
+            legacy_dispatch.pop("dispatch_revision")
+            unsigned = {
+                key: value
+                for key, value in legacy_dispatch.items()
+                if key != "dispatch_fingerprint"
+            }
+            legacy_dispatch["dispatch_fingerprint"] = stable_hash(unsigned)
+            dispatch_path.write_text(
+                json.dumps(legacy_dispatch, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            mixed = results / "task-0001.jsonl"
+            peer = results / "task-0002.jsonl"
+            self._write_rows(mixed, [
+                {"target_id": "a", "status": "success", "text": "A", "provider": "native-sol"},
+                {"target_id": "b", "status": "success", "text": "B", "provider": "native-luna"},
+            ])
+            self._write_rows(peer, [
+                {"target_id": "c", "status": "success", "text": "C", "provider": "native-sol"},
+                {"target_id": "d", "status": "success", "text": "D", "provider": "native-sol"},
+            ])
+            original, peer_bytes = mixed.read_bytes(), peer.read_bytes()
+            # Reproduce a receipt made by the older shape-only terminal seal.
+            with patch.object(module, "_validate_manifest_rows", side_effect=(
+                lambda work_dir, manifest, rows, **kwargs: [module._validate_row(row) for row in rows]
+            )):
+                seal_native_wave_relay(root, root / first["relay"]["dispatch"], relay_ended=True)
+            with (
+                patch.object(module, "RESULT_VALIDATION_REVISION", 3),
+                patch.object(module, "seal_native_wave_relay", return_value={}),
+            ):
+                stopped = native_control_step(
+                    root, tasks / "manifest.json", results, require_relay_receipt=True,
+                )
+            self.assertEqual(stopped["action"], "checkpoint_and_stop")
+
+            resumed = native_control_step(
+                root, tasks / "manifest.json", results, require_relay_receipt=True,
+            )
+            self.assertEqual(resumed["action"], "aggregate_completed_pass")
+            self.assertEqual(resumed["imported_wave"]["success"], 3)
+            self.assertEqual(resumed["imported_wave"]["failed"], 1)
+            rows = [json.loads(line) for line in mixed.read_text().splitlines()]
+            self.assertEqual(rows[0]["text"], "A")
+            self.assertEqual(rows[1]["status"], "error")
+            self.assertEqual(rows[1]["issues"], ["worker_result_provider_mismatch"])
+            self.assertEqual(peer.read_bytes(), peer_bytes)
+            archives = list(results.glob("task-0001.jsonl.ended-original-*"))
+            self.assertEqual(len(archives), 1)
+            self.assertEqual(archives[0].read_bytes(), original)
+
+    def test_route_failure_without_terminal_receipt_is_not_repaired(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks, results = root / "tasks", root / "results"
+            prepare_native_tasks(
+                root, source, [Segment("a", "S")], tasks,
+                route_binding={"provider": "native-sol", "attempt": 1},
+            )
+            native_control_step(root, tasks / "manifest.json", results, require_relay_receipt=True)
+            result = results / "task-0001.jsonl"
+            self._write_rows(result, [
+                {"target_id": "a", "status": "success", "text": "A", "provider": "native-luna"},
+            ])
+            original = result.read_bytes()
+            stopped = native_control_step(
+                root, tasks / "manifest.json", results, require_relay_receipt=True,
+            )
+            self.assertEqual(stopped["issue_codes"], ["E_NATIVE_RELAY_RECEIPT_REQUIRED"])
+            self.assertEqual(result.read_bytes(), original)
+            self.assertFalse(list(results.glob("*.ended-original-*")))
+
     def test_ended_invalid_binding_archives_task_and_preserves_ready_peer(self) -> None:
         for invalid_ids in (("c", "c"), ("c", "foreign"), ("d", "c")):
             with self.subTest(invalid_ids=invalid_ids), tempfile.TemporaryDirectory() as directory:
@@ -157,7 +302,9 @@ class NativePassTests(unittest.TestCase):
             state = json.loads(state_path.read_text())
             state["control_steps_in_wave"] = 100
             state_path.write_text(json.dumps(state), encoding="utf-8")
-            with patch.object(module, "RESULT_VALIDATION_REVISION", 4):
+            with patch.object(
+                module, "RESULT_VALIDATION_REVISION", module.RESULT_VALIDATION_REVISION + 1
+            ):
                 resumed = native_control_step(root, tasks / "manifest.json", results)
 
             self.assertEqual(first["action"], "dispatch_isolated_wave_relay")
@@ -570,7 +717,7 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "success")
         self.assertEqual(
             [row["issues"] for row in rows[1:]],
-            [["worker_ended_without_result"]],
+            [["worker_result_missing_target"]],
         )
 
     def test_native_step_hashes_only_the_selected_wave_tasks(self) -> None:
@@ -720,6 +867,28 @@ class NativePassTests(unittest.TestCase):
             # Import and merge retain candidate state; neither claims review.
             self.assertNotIn("reviewer", row)
             self.assertNotEqual(row["status"], "reviewed")
+
+    def test_terminal_receipt_preserves_source_authorized_empty_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, _, tasks, prepared = self._prepare_optional_wave(root)
+            results = root / "active-results"
+            first = native_control_step(
+                root, tasks / "manifest.json", results, require_relay_receipt=True,
+            )
+            originals = {}
+            for result in prepared.glob("task-*.jsonl"):
+                originals[result.name] = result.read_bytes()
+                (results / result.name).write_bytes(originals[result.name])
+            seal_native_wave_relay(root, root / first["relay"]["dispatch"], relay_ended=True)
+            completed = native_control_step(
+                root, tasks / "manifest.json", results, require_relay_receipt=True,
+            )
+            self.assertEqual(completed["action"], "aggregate_completed_pass")
+            self.assertEqual(completed["imported_wave"]["success"], 2)
+            for name, original in originals.items():
+                self.assertEqual((results / name).read_bytes(), original)
+            self.assertFalse(list(results.glob("*.ended-original-*")))
 
     def test_optional_empty_wave_rejects_changed_inventory_before_any_write(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1037,6 +1206,13 @@ class NativePassTests(unittest.TestCase):
             [row["target_id"] for row in task_rows],
         )
         self.assertEqual(manifest["language_binding"]["target_language"], "ko")
+        self.assertEqual(
+            manifest["result_contract"]["canonical_fields"],
+            ["target_id", "status", "text", "provider", "issues"],
+        )
+        self.assertFalse(
+            manifest["result_contract"]["alternate_text_fields_allowed"]
+        )
         self.assertTrue(
             all(row["language_binding"] == manifest["language_binding"] for row in task_rows)
         )
@@ -1445,7 +1621,19 @@ class NativePassTests(unittest.TestCase):
             relay_path = root / first["relay"]["dispatch"]
             relay = json.loads(relay_path.read_text(encoding="utf-8"))
             self.assertEqual(relay["schema"], "parr0t.native-wave-relay.v1")
+            self.assertEqual(relay["dispatch_revision"], 2)
             self.assertEqual(len(relay["task_bindings"]), 1)
+            self.assertTrue(relay["relay_contract"]["relay_delegation_allowed"])
+            self.assertTrue(relay["relay_contract"]["all_task_bindings_must_be_attempted_once"])
+            self.assertFalse(relay["relay_contract"]["semantic_worker_delegation_allowed"])
+            worker_message = relay["relay_contract"]["worker_message_template"].format(
+                workspace=root, pass_kind=relay["pass_kind"],
+                task=relay["task_bindings"][0]["task"],
+                result=relay["task_bindings"][0]["result"],
+                manifest=relay["manifest"],
+            )
+            self.assertIn(relay["manifest"], worker_message)
+            self.assertIn(relay["task_bindings"][0]["result"], worker_message)
             self.assertFalse(
                 relay["relay_contract"]["raw_child_response_forwarding_allowed"]
             )
@@ -1831,6 +2019,7 @@ class NativePassTests(unittest.TestCase):
                     "worker_contract": manifest["worker_contract"],
                     "detail_contract": manifest["detail_contract"],
                     "execution_contract": contract,
+                    "result_contract": manifest["result_contract"],
                     "language_binding": manifest["language_binding"],
                 }
             )
@@ -1964,6 +2153,7 @@ class NativePassTests(unittest.TestCase):
                     "worker_contract": manifest["worker_contract"],
                     "detail_contract": manifest["detail_contract"],
                     "execution_contract": manifest["execution_contract"],
+                    "result_contract": manifest["result_contract"],
                     "language_binding": manifest["language_binding"],
                 }
             )
