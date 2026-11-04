@@ -1815,10 +1815,24 @@ def cmd_collect_native_review(args: argparse.Namespace) -> int:
         sample_percent=routing.get("strong_review_sample_percent", 5.0),
         high_risk_categories=routing.get("strong_review_high_risk_categories", []),
         target_language=str(config.get("project", {}).get("target_language", "")),
+        reference_cues=_context_reference_cues(work_dir, config),
+        primary_translator=str((routing.get("translators") or [""])[0]),
         **_native_review_integrity_options(work_dir, config),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
+
+
+def _context_reference_cues(work_dir: Path, config: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    """Analyzed cues for review routing; an absent pack simply contributes no reasons."""
+    path = _path_in_workspace(
+        work_dir, config.get("files", {}).get("context_pack", "context/context-pack.json")
+    )
+    if not path.is_file():
+        return ()
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    cues = payload.get("reference_cues", []) if isinstance(payload, dict) else []
+    return tuple(cue for cue in cues if isinstance(cue, dict))
 
 
 def cmd_collect_native_rewrite(args: argparse.Namespace) -> int:

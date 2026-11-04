@@ -21,8 +21,8 @@ from .native_followup import CANDIDATE_METADATA_KEY, _atomic_json, _atomic_jsonl
 from .native_pass import _load_task_manifest, _require_candidate_bindings, merge_native_pass
 from .orchestrator import LocalizationOrchestrator
 from .review_selection import (
-    DEFAULT_STRONG_REVIEW_CATEGORIES, review_category, rewrite_issue_codes,
-    strong_review_selection_reasons, target_language_review_reasons,
+    DEFAULT_STRONG_REVIEW_CATEGORIES, provenance_review_reasons, review_category,
+    rewrite_issue_codes, strong_review_selection_reasons, target_language_review_reasons,
 )
 from .store import stable_hash
 from .validators import validate_integrity
@@ -274,6 +274,8 @@ def collect_native_review(
     target_language: str = "",
     glossary: list[Any] | None = None, extra_patterns: list[str] | None = None,
     max_length_ratio: float = 4.0,
+    reference_cues: tuple[dict[str, Any], ...] = (),
+    primary_translator: str = "",
 ) -> dict[str, Any]:
     """Collect a complete bound pass; preserve accepted rows and route only gaps."""
     require_control_plane_ready(work_dir)
@@ -340,6 +342,12 @@ def collect_native_review(
             reasons = strong_review_selection_reasons(
                 segment, sample_percent=sample_percent, high_risk_categories=high_risk_categories,
             )
+            origin = segment.metadata.get(CANDIDATE_METADATA_KEY, {}).get("provider", "")
+            reasons.extend(provenance_review_reasons(
+                segment.id, reference_cues,
+                non_primary_translation=bool(primary_translator)
+                and origin not in {"", "native-worker", primary_translator},
+            ))
             language_reasons = target_language_review_reasons(
                 result.text, target_language, segment.metadata
             )

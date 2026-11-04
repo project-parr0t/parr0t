@@ -130,6 +130,26 @@ def strong_review_selection_reasons(
     return reasons
 
 
+def provenance_review_reasons(
+    segment_id: str,
+    reference_cues: Iterable[dict[str, Any]] = (),
+    *,
+    non_primary_translation: bool = False,
+) -> list[str]:
+    """Route, never reject: analyzed allusions/wordplay and fallback-route candidates.
+
+    A cue counts only when it names this exact target in evidence_line_ids; scene-wide
+    cues stay translation context. Fallback output skipped the primary route's
+    calibration, so it should not reach acceptance on a cheap triage pass alone.
+    """
+    reasons = []
+    if any(segment_id in cue.get("evidence_line_ids", ()) for cue in reference_cues):
+        reasons.append("context_reference_cue")
+    if non_primary_translation:
+        reasons.append("fallback_translation")
+    return reasons
+
+
 def target_language_review_reasons(
     candidate: str,
     target_language: str,

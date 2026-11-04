@@ -396,3 +396,27 @@ class NativeReviewTests(unittest.TestCase):
         )
         self.assertEqual(rewrite_issue_codes(["voice"], language_risk=True), ["voice", "fluency"])
         self.assertEqual(rewrite_issue_codes(), ["formatting"])
+
+    def test_native_triage_ok_escalates_cue_and_fallback_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            segments = [review_segment(f"fixture-{i}") for i in range(3)]
+            segments[2].metadata["_parr0t_candidate"]["provider"] = "fixture-fallback"
+            source.write_text("\n".join(json.dumps(asdict(s)) for s in segments) + "\n")
+            segments = read_segments(source)
+            tasks, results = root / "tasks", root / "results"
+            prepare_native_tasks(root, source, segments, tasks, pass_kind="review")
+            results.mkdir()
+            (results / "task-0001.jsonl").write_text("\n".join(json.dumps({
+                "target_id": s.id, "status": "success", "text": '{"verdict":"ok","issues":[]}',
+            }) for s in segments) + "\n")
+            import_native_wave(root, tasks / "manifest.json", results, 1)
+            summary = collect_native_review(
+                root, source, tasks / "manifest.json", root / "collected", tier="triage",
+                sample_percent=0, reference_cues=({"evidence_line_ids": ["fixture-1"]},),
+                primary_translator="fixture",
+            )
+            pending = {s.id: s for s in read_segments(root / "collected/strong-input.jsonl")}
+        self.assertEqual(summary["accepted"], 1)
+        self.assertEqual(sorted(pending), ["fixture-1", "fixture-2"])

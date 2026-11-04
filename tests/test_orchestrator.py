@@ -1127,5 +1127,36 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIn("{name}", feedback[0]["detail"])
         self.assertNotIn("retry after a refusal", calls[1][0])
 
+    def test_reference_cue_and_fallback_origin_escalate_past_triage(self) -> None:
+        failing = ScriptedProvider(
+            "fixture-primary", lambda **_: {"status": "error", "text": "", "reason": ""}
+        )
+        fallback = ScriptedProvider(
+            "fixture-fallback", lambda **_: {"status": "success", "text": "TARGET", "reason": ""}
+        )
+        triager = ScriptedProvider("fixture-triager", lambda **_: {"verdict": "ok", "issues": []})
+        strong = ScriptedProvider("fixture-strong", lambda **_: {"verdict": "ok", "issues": []})
+        registry = ProviderRegistry(
+            {item.name: item for item in (failing, fallback, triager, strong)}
+        )
+        cue = {"kind": "wordplay", "scene": "", "evidence_line_ids": ["cue-target"],
+               "recognition_cue": "CUE", "translation_goal": "GOAL", "confidence": "high"}
+        for chain, segment_id, reason in (
+            ([fallback.name], "cue-target", "context_reference_cue"),
+            ([failing.name, fallback.name], "fallback-target", "fallback_translation"),
+        ):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                result = LocalizationOrchestrator(
+                    registry=registry,
+                    config=OrchestratorConfig(
+                        chain, [strong.name], review_triager_chain=[triager.name],
+                        strong_review_sample_percent=0, strong_review_high_risk_categories=[],
+                    ),
+                    project=ProjectContext("TEST", "src", "dst"),
+                    context_pack=ContextPack(story_summary="STORY", reference_cues=(cue,)),
+                    work_dir=Path(directory),
+                ).translate_one(Segment(segment_id, "SOURCE"))
+                self.assertIn(reason, result.metadata["strong_review_reasons"])
+
 if __name__ == "__main__":
     unittest.main()

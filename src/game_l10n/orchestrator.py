@@ -40,6 +40,7 @@ from .providers import ModelProvider, ProviderRegistry
 from .review_selection import (
     DEFAULT_STRONG_REVIEW_CATEGORIES,
     DEFAULT_STRONG_REVIEW_SAMPLE_PERCENT,
+    provenance_review_reasons,
     review_category,
     rewrite_issue_codes,
     strong_review_selection_reasons,
@@ -909,11 +910,23 @@ class LocalizationOrchestrator:
             self._set_candidate(result, working)
         return ReviewEnvelope(ReviewDecision.ERROR, text=working)
 
-    def _strong_review_reasons(self, segment: Segment, candidate: str) -> list[str]:
+    def _strong_review_reasons(
+        self, segment: Segment, candidate: str, translator: str = ""
+    ) -> list[str]:
         reasons = strong_review_selection_reasons(
             segment,
             sample_percent=self.config.strong_review_sample_percent,
             high_risk_categories=self.config.strong_review_high_risk_categories,
+        )
+        primary = self.config.translator_chain[:1]
+        reasons.extend(
+            provenance_review_reasons(
+                segment.id,
+                self.context_pack.reference_cues if self.context_pack else (),
+                non_primary_translation=bool(
+                    translator and primary and translator not in {primary[0], "existing-candidate"}
+                ),
+            )
         )
         reasons.extend(
             target_language_review_reasons(
@@ -979,7 +992,7 @@ class LocalizationOrchestrator:
             ReviewVerdict.ERROR,
         }:
             return "unresolved"
-        reasons = self._strong_review_reasons(segment, candidate)
+        reasons = self._strong_review_reasons(segment, candidate, result.translator)
         if verdict.verdict is ReviewVerdict.REWRITE:
             reasons.insert(0, "triage_flagged")
         if verdict.text and verdict.text != candidate:
