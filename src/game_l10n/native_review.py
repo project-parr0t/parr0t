@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -304,6 +305,8 @@ def collect_native_review(
     rewrite: list[Segment] = []
     fallback: list[Segment] = []
     invalid_verdicts = 0
+    verdict_counts: Counter[str] = Counter()
+    issue_counts: Counter[str] = Counter()
     for segment, row in zip(segments, rows, strict=True):
         result = _bound_result(segment)
         if result.candidate_digest != stable_hash(result.text):
@@ -322,6 +325,8 @@ def collect_native_review(
         status = ("approved" if verdict and verdict.verdict is ReviewVerdict.OK
                   else verdict.verdict.value if verdict else "error")
         issues = list(verdict.issues) if verdict else []
+        verdict_counts[status] += 1
+        issue_counts.update(dict.fromkeys(issues, 1))
         result.attempts.append(AttemptRecord(
             stage, provider, status, issues=issues,
             ordinal=1 + sum(item.stage == stage and item.provider == provider
@@ -399,6 +404,15 @@ def collect_native_review(
     for name, items in (("strong-input.jsonl", strong), ("rewrite-input.jsonl", rewrite),
                         ("fallback-input.jsonl", fallback)):
         _atomic_jsonl(output / name, (asdict(item) for item in items))
+    # Observational drift signal for batch-size effects on judges (fewer issues per record
+    # in large batches). Never a stop, scope-reduction or pass criterion; private data plane.
+    _atomic_json(output / "review-metrics.json", {
+        "schema": "parr0t.native-review-metrics.v1", "tier": tier, "records": len(segments),
+        "task_max_records": manifest.get("task_max_records"),
+        "task_max_material_tokens": manifest.get("task_max_material_tokens"),
+        "verdicts": dict(sorted(verdict_counts.items())), "invalid_verdicts": invalid_verdicts,
+        "issue_code_counts": dict(sorted(issue_counts.items())),
+    })
     return {
         "records": len(segments), "accepted": len(accepted), "strong_pending": len(strong),
         "rewrite_pending": len(rewrite), "fallback_pending": len(fallback),
