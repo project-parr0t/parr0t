@@ -5,7 +5,7 @@ import unittest
 
 from game_l10n.models import GlossaryEntry, Segment
 from game_l10n.store import stable_hash
-from game_l10n.validators import validate_integrity
+from game_l10n.validators import protected_tokens, validate_integrity
 
 
 def optional_slot_fixture(
@@ -113,6 +113,24 @@ class ValidatorTests(unittest.TestCase):
 
         issues = validate_integrity(segment, "TARGET", [])
         self.assertIn("ui-length-limit", {item.code for item in issues})
+
+    def test_protected_tokens_ignore_prose_and_count_escapes_once(self) -> None:
+        cases = {
+            "50% off": {},
+            "%s and %1$d at 100%%": {"%s": 1, "%1$d": 1, "%%": 1},
+            "\\nWord": {"\\n": 1},
+            "\\C[2]Name\\C[0]": {"\\C[2]": 1, "\\C[0]": 1},
+            "\\G \\V[1]": {"\\G": 1, "\\V[1]": 1},
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(dict(protected_tokens(text)), expected)
+
+    def test_translated_prose_after_escape_is_not_a_token_mismatch(self) -> None:
+        for source, candidate in (("\\nWord", "\\n\ub2e8\uc5b4"), ("50% off", "50% \ud560\uc778")):
+            with self.subTest(source=source):
+                issues = validate_integrity(Segment("fixture-token", source), candidate, [])
+                self.assertNotIn("protected-token-mismatch", {item.code for item in issues})
 
 
 if __name__ == "__main__":

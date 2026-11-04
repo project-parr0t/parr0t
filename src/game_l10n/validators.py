@@ -11,12 +11,14 @@ from .store import stable_hash
 DEFAULT_PROTECTED_PATTERNS = (
     r"\{\{[^{}]*\}\}",
     r"\{[A-Za-z_][A-Za-z0-9_.:-]*\}",
-    r"%(?:\d+\$)?[-+#0 ']*\d*(?:\.\d+)?[diouxXeEfFgGcrsa%]",
+    # No space flag: "50% off" is prose, not "% o". Add "% d" per project if an engine uses it.
+    r"%(?:\d+\$)?[-+#0']*\d*(?:\.\d+)?[diouxXeEfFgGcrsa%]",
     r"<\/?[A-Za-z][^>]*>",
-    r"\\[nrt]",
-    r"\\[A-Za-z]+(?:\[[^\]]*\])?",
+    # One alternation so "\nWord" yields only "\n" and no escape is counted twice.
+    r"\\(?:[A-Za-z]+\[[^\]]*\]|[nrt]|[A-Za-z]+)",
     r"\$[A-Za-z_][A-Za-z0-9_]*",
 )
+_DEFAULT_PROTECTED_RE = re.compile("|".join(f"(?:{p})" for p in DEFAULT_PROTECTED_PATTERNS))
 
 SUSPICIOUS_ADDITIONS = (
     re.compile(r"<script\b", re.IGNORECASE),
@@ -27,8 +29,9 @@ SUSPICIOUS_ADDITIONS = (
 
 
 def protected_tokens(text: str, extra_patterns: list[str] | None = None) -> Counter[str]:
-    tokens: list[str] = []
-    for pattern in (*DEFAULT_PROTECTED_PATTERNS, *(extra_patterns or [])):
+    # Defaults scan as one leftmost alternation, so nested matches ("$d" in "%1$d") never double-count.
+    tokens = _DEFAULT_PROTECTED_RE.findall(text)
+    for pattern in extra_patterns or []:
         tokens.extend(re.findall(pattern, text))
     return Counter(tokens)
 
