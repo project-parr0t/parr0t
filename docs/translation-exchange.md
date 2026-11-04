@@ -18,6 +18,8 @@ game-l10n prepare-translation-exchange \
   --source-queue primary_pending|translation_fallback_pending
 ```
 
+The `--output` directory path must use only `[A-Za-z0-9._-]` segments, because its receipt path is reported through the control plane.
+
 Each bundle contains 1–2,000 ordered targets and exactly these files:
 
 ```text

@@ -191,5 +191,38 @@ class FilesystemPackageTests(unittest.TestCase):
                 self.assertFalse((game / "localization.dat").exists())
 
 
+    def test_runtime_approval_binds_filesystem_package_fingerprint(self) -> None:
+        from game_l10n.runtime_approval import create_runtime_approval
+        from game_l10n.workspace import initialize_workspace
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "sdk").mkdir()
+            game = root / "fixture-game"
+            game.mkdir()
+            work = root / "work"
+            initialize_workspace(work, root / "sdk", git_choice="disabled", game_roots=[game])
+            payload = root / "payload"
+            payload.mkdir()
+            (payload / "localization.dat").write_bytes(b"fixture")
+            checkpoint = _checkpoint(root)
+            spec = root / "spec.json"
+            spec.write_text(json.dumps({
+                "patch_id": "fixture-localization", "release_id": "r1",
+                "display_name": "Fixture patch", "checkpoint_file": checkpoint.name,
+                "target": {"required_files": ["fixture-game.exe"]},
+            }), encoding="utf-8")
+            package = work / "build" / "fixture.zip"
+            package.parent.mkdir()
+            build_filesystem_package(payload, spec, package)
+            _, approval = create_runtime_approval(
+                work, action="install", artifact_path=package, target_path=game,
+                user_confirmed=True,
+            )
+            expected = validate_filesystem_package(package)
+
+        self.assertEqual(approval["artifact"]["fingerprint"], expected["artifact_fingerprint"])
+        self.assertEqual(approval["artifact"]["installer_sha256"], expected["installer_sha256"])
+
 if __name__ == "__main__":
     unittest.main()

@@ -77,5 +77,16 @@ class ReviewSelectionTests(unittest.TestCase):
         )
 
 
+    def test_provenance_reasons_need_exact_cue_ids_or_fallback_origin(self) -> None:
+        from game_l10n.review_selection import provenance_review_reasons
+
+        cues = ({"evidence_line_ids": ["fixture-1"], "scene": "fixture-scene"},)
+        self.assertEqual(provenance_review_reasons("fixture-1", cues), ["context_reference_cue"])
+        self.assertEqual(provenance_review_reasons("fixture-2", cues), [])
+        self.assertEqual(
+            provenance_review_reasons("fixture-2", cues, non_primary_translation=True),
+            ["fallback_translation"],
+        )
+
 if __name__ == "__main__":
     unittest.main()

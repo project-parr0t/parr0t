@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -1086,9 +1087,11 @@ class WorkspaceTests(unittest.TestCase):
             )
             activate_workspace_adapter(work)
             command = ["python", "tools/unpack.py", "{input}", "{output}"]
-            first = run_cached_tool(
-                stage="unpack", command=command, input_path=source, output_path=output, work_dir=work
-            )
+            with patch("game_l10n.tooling.subprocess.run", wraps=subprocess.run) as run:
+                first = run_cached_tool(
+                    stage="unpack", command=command, input_path=source, output_path=output, work_dir=work
+                )
+            self.assertEqual(run.call_args.args[0][0], sys.executable)
             second = run_cached_tool(
                 stage="unpack", command=command, input_path=source, output_path=output, work_dir=work
             )

@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 import sys
-from dataclasses import asdict, fields
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +57,7 @@ from .failure_queue import (
     update_failure_queue,
 )
 from .formats import (
+    load_dataclass_list,
     read_existing_translations,
     read_segments,
     read_translation_results,
@@ -561,12 +562,23 @@ def _source_path(work_dir: Path, value: str, config: dict[str, Any]) -> Path:
     return path
 
 
-def _load_dataclass_list(path: Path, cls: type) -> list[Any]:
-    if not path.exists():
-        return []
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    allowed = {item.name for item in fields(cls)}
-    return [cls(**{key: value for key, value in row.items() if key in allowed}) for row in payload]
+_load_dataclass_list = load_dataclass_list
+
+
+def _context_localization_inputs(work_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
+    """Locked project facts plus user glossary and character profiles for context analysis."""
+    file_config = config.get("files", {})
+    return {
+        "project": ProjectContext(**config["project"]),
+        "glossary": _load_dataclass_list(
+            _path_in_workspace(work_dir, file_config.get("glossary", "context/glossary.json")),
+            GlossaryEntry,
+        ),
+        "characters": _load_dataclass_list(
+            _path_in_workspace(work_dir, file_config.get("characters", "context/characters.json")),
+            CharacterProfile,
+        ),
+    }
 
 
 def _orchestrator(
@@ -725,6 +737,7 @@ def _analyze_context(
             ),
         ),
         context_mode=context_mode or str(config.get("project", {}).get("context_mode", "auto")),
+        **_context_localization_inputs(work_dir, config),
     )
     context_relative = config.get("files", {}).get("context_pack", "context/context-pack.json")
     return analyze_with_cache(
@@ -1815,10 +1828,24 @@ def cmd_collect_native_review(args: argparse.Namespace) -> int:
         sample_percent=routing.get("strong_review_sample_percent", 5.0),
         high_risk_categories=routing.get("strong_review_high_risk_categories", []),
         target_language=str(config.get("project", {}).get("target_language", "")),
+        reference_cues=_context_reference_cues(work_dir, config),
+        primary_translator=str((routing.get("translators") or [""])[0]),
         **_native_review_integrity_options(work_dir, config),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
+
+
+def _context_reference_cues(work_dir: Path, config: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    """Analyzed cues for review routing; an absent pack simply contributes no reasons."""
+    path = _path_in_workspace(
+        work_dir, config.get("files", {}).get("context_pack", "context/context-pack.json")
+    )
+    if not path.is_file():
+        return ()
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    cues = payload.get("reference_cues", []) if isinstance(payload, dict) else []
+    return tuple(cue for cue in cues if isinstance(cue, dict))
 
 
 def cmd_collect_native_rewrite(args: argparse.Namespace) -> int:
@@ -1837,6 +1864,14 @@ def cmd_collect_native_rewrite(args: argparse.Namespace) -> int:
 
 
 def cmd_process_native_review_followup(args: argparse.Namespace) -> int:
+    if (args.budget_started_at_epoch is None) != (args.max_elapsed_minutes is None):
+        raise ConfigurationError(
+            "E_REVIEW_FALLBACK_BUDGET_INVALID: elapsed ceiling needs both start and minutes"
+        )
+    deadline_epoch = (
+        None if args.max_elapsed_minutes is None
+        else args.budget_started_at_epoch + args.max_elapsed_minutes * 60
+    )
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     require_sdk_activation(work_dir, config)
@@ -1867,8 +1902,7 @@ def cmd_process_native_review_followup(args: argparse.Namespace) -> int:
             output,
             orchestrator,
             operation=args.operation,
-            deadline_epoch=args.budget_started_at_epoch
-            + args.max_elapsed_minutes * 60,
+            deadline_epoch=deadline_epoch,
             wave_size=args.wave_size,
             progress_callback=progress.apply_event,
         )
@@ -3196,8 +3230,12 @@ def build_parser() -> argparse.ArgumentParser:
     review_followup.add_argument("--output", required=True)
     review_followup.add_argument("--operation", choices=["judge", "rewrite"], required=True)
     review_followup.add_argument("--wave-size", type=int, default=8)
-    review_followup.add_argument("--budget-started-at-epoch", type=float, required=True)
-    review_followup.add_argument("--max-elapsed-minutes", type=float, required=True)
+    review_followup.add_argument(
+        "--budget-started-at-epoch", type=float, help="Only with a user-requested elapsed ceiling"
+    )
+    review_followup.add_argument(
+        "--max-elapsed-minutes", type=float, help="Optional user-requested whole-job ceiling"
+    )
     review_followup.set_defaults(func=cmd_process_native_review_followup)
 
     native_followup = sub.add_parser(

@@ -11,12 +11,14 @@ from .store import stable_hash
 DEFAULT_PROTECTED_PATTERNS = (
     r"\{\{[^{}]*\}\}",
     r"\{[A-Za-z_][A-Za-z0-9_.:-]*\}",
-    r"%(?:\d+\$)?[-+#0 ']*\d*(?:\.\d+)?[diouxXeEfFgGcrsa%]",
+    # No space flag: "50% off" is prose, not "% o". Add "% d" per project if an engine uses it.
+    r"%(?:\d+\$)?[-+#0']*\d*(?:\.\d+)?[diouxXeEfFgGcrsa%]",
     r"<\/?[A-Za-z][^>]*>",
-    r"\\[nrt]",
-    r"\\[A-Za-z]+(?:\[[^\]]*\])?",
+    # One alternation so "\nWord" yields only "\n" and no escape is counted twice.
+    r"\\(?:[A-Za-z]+\[[^\]]*\]|[nrt]|[A-Za-z]+)",
     r"\$[A-Za-z_][A-Za-z0-9_]*",
 )
+_DEFAULT_PROTECTED_RE = re.compile("|".join(f"(?:{p})" for p in DEFAULT_PROTECTED_PATTERNS))
 
 SUSPICIOUS_ADDITIONS = (
     re.compile(r"<script\b", re.IGNORECASE),
@@ -25,10 +27,58 @@ SUSPICIOUS_ADDITIONS = (
     re.compile(r"\b(?:powershell|cmd\.exe|/bin/sh)\b", re.IGNORECASE),
 )
 
+# Latin (with accents), Greek and Cyrillic letters; scripts without word spacing are excluded.
+_ALPHABETIC = "A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u024f\u0386\u0388-\u03ff\u0400-\u0481\u048a-\u04ff"
+
+
+def contains_term(term: str, text: str, *, case_sensitive: bool = False) -> bool:
+    """Match a source term without hitting it inside a longer Latin word ("Ice" in "Device").
+
+    Boundaries apply only at alphabetic-letter edges, so CJK names followed by particles still match
+    and a plain English plural ("Potions") still counts as the glossary term.
+    """
+    if not term:
+        return False
+    if not case_sensitive:
+        term, text = term.casefold(), text.casefold()
+    # Alphabetic letters only: digits ("HP100") and CJK particles still count as edges.
+    letter = f"[{_ALPHABETIC}]"
+    left = f"(?<!{letter})" if re.match(letter, term[0]) else ""
+    right = f"(?:e?s)?(?!{letter})" if re.match(letter, term[-1]) else ""
+    return re.search(left + re.escape(term) + right, text) is not None
+
+
+_MARKUP_TAG = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9:_-]*)[^<>]*?(/?)>")
+
+
+def _paired_tag_names(text: str) -> set[str]:
+    """Tag names the source actually closes; standalone tags like <br> are not structure."""
+    return {match[2].casefold() for match in _MARKUP_TAG.finditer(text) if match[1]}
+
+
+def _markup_nesting_ok(text: str, paired: set[str]) -> bool:
+    """Counts alone miss "<b>x</b>" -> "</b>x<b>"; a close must match the innermost open tag.
+
+    Tags left open at the end are tolerated because several engines allow them.
+    """
+    stack: list[str] = []
+    for match in _MARKUP_TAG.finditer(text):
+        closing, name, self_closing = match[1], match[2].casefold(), match[3]
+        if self_closing or name not in paired:
+            continue
+        if not closing:
+            stack.append(name)
+        elif stack and stack[-1] == name:
+            stack.pop()
+        else:
+            return False
+    return True
+
 
 def protected_tokens(text: str, extra_patterns: list[str] | None = None) -> Counter[str]:
-    tokens: list[str] = []
-    for pattern in (*DEFAULT_PROTECTED_PATTERNS, *(extra_patterns or [])):
+    # Defaults scan as one leftmost alternation, so nested matches ("$d" in "%1$d") never double-count.
+    tokens = _DEFAULT_PROTECTED_RE.findall(text)
+    for pattern in extra_patterns or []:
         tokens.extend(re.findall(pattern, text))
     return Counter(tokens)
 
@@ -110,18 +160,29 @@ def validate_integrity(
             )
         )
 
-    source_folded = segment.source.casefold()
+    paired = _paired_tag_names(segment.source)
+    if paired and _markup_nesting_ok(segment.source, paired) and not _markup_nesting_ok(candidate, paired):
+        issues.append(
+            ValidationIssue(
+                "markup-malformed",
+                "Paired markup tags are crossed or closed out of order",
+            )
+        )
+
     candidate_folded = candidate.casefold()
     for entry in glossary:
-        source = entry.source if entry.case_sensitive else entry.source.casefold()
-        target = entry.target if entry.case_sensitive else entry.target.casefold()
-        source_haystack = segment.source if entry.case_sensitive else source_folded
         target_haystack = candidate if entry.case_sensitive else candidate_folded
-        if source in source_haystack and target not in target_haystack:
+        if contains_term(
+            entry.source, segment.source, case_sensitive=entry.case_sensitive
+        ) and not any(
+            (target if entry.case_sensitive else target.casefold()) in target_haystack
+            for target in entry.allowed_targets
+        ):
+            allowed = " or ".join(repr(target) for target in entry.allowed_targets)
             issues.append(
                 ValidationIssue(
                     "glossary-missing",
-                    f"Required glossary target {entry.target!r} is absent for {entry.source!r}",
+                    f"Required glossary target {allowed} is absent for {entry.source!r}",
                 )
             )
 

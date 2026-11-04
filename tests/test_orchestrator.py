@@ -1100,5 +1100,100 @@ class OrchestratorTests(unittest.TestCase):
         )
 
 
+    def test_integrity_retry_carries_validator_feedback_without_refusal_note(self) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        def handler(*, system: str, user: str, **_: object) -> dict:
+            calls.append((system, json.loads(user)))
+            text = "TARGET" if len(calls) == 1 else "TARGET {name}"
+            return {"status": "success", "text": text, "reason": ""}
+
+        translator = ScriptedProvider("fixture-translator", handler)
+        with tempfile.TemporaryDirectory() as directory:
+            result = LocalizationOrchestrator(
+                registry=ProviderRegistry({translator.name: translator}),
+                config=OrchestratorConfig(
+                    [translator.name], [], require_review=False, max_workers=1, grace_retries=1
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                work_dir=Path(directory),
+            ).translate_one(Segment("fixture-token", "SOURCE {name}"))
+
+        self.assertEqual(result.text, "TARGET {name}")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("previous_attempt_validation_failures", calls[0][1])
+        feedback = calls[1][1]["previous_attempt_validation_failures"]
+        self.assertEqual(feedback[0]["code"], "protected-token-mismatch")
+        self.assertIn("{name}", feedback[0]["detail"])
+        self.assertNotIn("retry after a refusal", calls[1][0])
+        self.assertIn("failed deterministic validation", calls[1][0])
+
+    def test_reference_cue_and_fallback_origin_escalate_past_triage(self) -> None:
+        failing = ScriptedProvider(
+            "fixture-primary", lambda **_: {"status": "error", "text": "", "reason": ""}
+        )
+        fallback = ScriptedProvider(
+            "fixture-fallback", lambda **_: {"status": "success", "text": "TARGET", "reason": ""}
+        )
+        triager = ScriptedProvider("fixture-triager", lambda **_: {"verdict": "ok", "issues": []})
+        strong = ScriptedProvider("fixture-strong", lambda **_: {"verdict": "ok", "issues": []})
+        registry = ProviderRegistry(
+            {item.name: item for item in (failing, fallback, triager, strong)}
+        )
+        cue = {"kind": "wordplay", "scene": "", "evidence_line_ids": ["cue-target"],
+               "recognition_cue": "CUE", "translation_goal": "GOAL", "confidence": "high"}
+        for chain, segment_id, reason in (
+            ([fallback.name], "cue-target", "context_reference_cue"),
+            ([failing.name, fallback.name], "fallback-target", "fallback_translation"),
+        ):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                result = LocalizationOrchestrator(
+                    registry=registry,
+                    config=OrchestratorConfig(
+                        chain, [strong.name], review_triager_chain=[triager.name],
+                        strong_review_sample_percent=0, strong_review_high_risk_categories=[],
+                    ),
+                    project=ProjectContext("TEST", "src", "dst"),
+                    context_pack=ContextPack(story_summary="STORY", reference_cues=(cue,)),
+                    work_dir=Path(directory),
+                ).translate_one(Segment(segment_id, "SOURCE"))
+                self.assertIn(reason, result.metadata["strong_review_reasons"])
+
+    def test_rewrite_retry_signals_follow_only_their_own_cause(self) -> None:
+        rewrites: list[tuple[str, dict]] = []
+        replies = iter([
+            {"status": "success", "text": "TARGET"},            # drops {name}: integrity retry
+            {"status": "refused", "text": ""},                  # refusal retry
+            {"status": "success", "text": "TARGET {name}"},
+        ])
+
+        def rewriter_handler(*, system: str, user: str, **_: object) -> dict:
+            rewrites.append((system, json.loads(user)))
+            return next(replies)
+
+        verdicts = iter([{"verdict": "rewrite", "issues": ["voice"]}, {"verdict": "ok", "issues": []}])
+        translator = ScriptedProvider(
+            "fixture-translator", lambda **_: {"status": "success", "text": "DRAFT {name}", "reason": ""}
+        )
+        judge = ScriptedProvider("fixture-judge", lambda **_: next(verdicts))
+        rewriter = ScriptedProvider("fixture-rewriter", rewriter_handler)
+        with tempfile.TemporaryDirectory() as directory:
+            result = LocalizationOrchestrator(
+                registry=ProviderRegistry({p.name: p for p in (translator, judge, rewriter)}),
+                config=OrchestratorConfig(
+                    [translator.name], [judge.name], rewriter_chain=[rewriter.name],
+                    grace_retries=1, max_workers=1,
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                work_dir=Path(directory),
+            ).translate_one(Segment("fixture-rewrite", "SOURCE {name}"))
+
+        self.assertEqual(result.text, "TARGET {name}")
+        self.assertEqual(len(rewrites), 3)
+        self.assertIn("previous_attempt_validation_failures", rewrites[1][1])
+        self.assertNotIn("previous_attempt_validation_failures", rewrites[2][1])
+        self.assertNotIn("correction target. If permitted", rewrites[1][0])
+        self.assertIn("correction target. If permitted", rewrites[2][0])
+
 if __name__ == "__main__":
     unittest.main()

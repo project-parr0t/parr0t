@@ -664,6 +664,8 @@ class ControlPlaneContractTests(unittest.TestCase):
             claimed = claim_context_chunk(work, task_path, slot=1)
             claim_path = work / claimed["claim_path"]
             claim = json.loads(claim_path.read_text(encoding="utf-8"))
+            # Native context workers get the same locked project facts as the API analyzer.
+            self.assertIn("target_language", claim["localization_inputs"]["project"])
             result_path = work / ".game-l10n" / "context-progress" / "result.json"
             result_path.parent.mkdir(parents=True, exist_ok=True)
             result_path.write_text(
@@ -1175,6 +1177,19 @@ class ControlPlaneContractTests(unittest.TestCase):
         self.assertNotIn("reason", result)
         self.assertNotIn("text", result)
 
+    def test_envelope_rejects_artifact_names_that_carry_free_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = self._valid_translation_envelope(root)
+            leaked = root / ".game-l10n" / "data-plane" / "The hero said hello.json"
+            leaked.write_text("{}", encoding="utf-8")
+            payload["artifact_paths"] = [leaked.relative_to(root).as_posix()]
+            envelope = self._write_envelope(root, payload)
+            with self.assertRaisesRegex(ConfigurationError, "unsafe characters"):
+                validate_control_envelope(
+                    root, envelope, expected_role="translator", expected_stage="translation"
+                )
+
     def test_source_probe_can_return_metadata_only_discovery_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1446,6 +1461,28 @@ class ControlPlaneContractTests(unittest.TestCase):
             state = control_plane_state(root)
 
         self.assertEqual(state["status"], "rotation_required")
+
+    def test_interrupted_second_leak_does_not_wedge_rotation(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = root / CONTROL_HANDOFF_PATH
+            record_control_plane_leak(root, "source_or_candidate_received")
+            acknowledge_control_plane_rotation(root, receipt)
+            self.assertFalse(receipt.exists())
+            # Simulate a stale receipt plus a crash between the state and handoff writes.
+            record_control_plane_leak(root, "source_or_candidate_received")
+            stale = receipt.read_text(encoding="utf-8")
+            acknowledge_control_plane_rotation(root, receipt)
+            receipt.write_text(stale, encoding="utf-8")
+            with mock.patch("game_l10n.control_plane._write_control_plane_handoff"):
+                record_control_plane_leak(root, "source_or_candidate_received")
+            record_control_plane_leak(root, "source_or_candidate_received")
+            resumed = acknowledge_control_plane_rotation(root, receipt)
+
+        self.assertEqual(resumed["status"], "ready")
+        self.assertEqual(resumed["generation"], 4)
 
     def test_control_state_rejects_unknown_fields_without_echoing_them(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
