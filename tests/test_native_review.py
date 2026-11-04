@@ -395,9 +395,17 @@ class NativeReviewTests(unittest.TestCase):
         integrity = [ValidationIssue("glossary-missing", "x"), ValidationIssue("ui-length-limit", "y")]
         self.assertEqual(
             rewrite_issue_codes(["meaning", "omission"], integrity, language_risk=True),
-            ["meaning", "omission", "terminology", "length_risk"],
+            ["terminology", "length_risk", "fluency", "meaning"],
         )
-        self.assertEqual(rewrite_issue_codes(["voice"], language_risk=True), ["voice", "fluency"])
+        # The cap trims judge codes, never the hard-gate findings.
+        self.assertEqual(
+            rewrite_issue_codes(
+                ["meaning", "voice", "register", "literalism"],
+                [ValidationIssue("glossary-missing", "x")], language_risk=True,
+            ),
+            ["terminology", "fluency", "meaning", "voice"],
+        )
+        self.assertEqual(rewrite_issue_codes(["voice"], language_risk=True), ["fluency", "voice"])
         self.assertEqual(rewrite_issue_codes(), ["formatting"])
 
     def test_native_triage_ok_escalates_cue_and_fallback_candidates(self) -> None:

@@ -55,11 +55,15 @@ MAX_REWRITE_ISSUES = 4
 def rewrite_issue_codes(
     judge_issues: Iterable[str] = (), integrity: Iterable[Any] = (), *, language_risk: bool = False
 ) -> list[str]:
-    """Union judge codes, mapped validator codes, and language risk; capped at the protocol limit."""
+    """Union validator codes, language risk, then judge codes, capped at the protocol limit.
+
+    Deterministic findings come first: a rewrite that never hears about them fails the
+    same hard gate again at confirmation, so the cap may only trim judge codes.
+    """
     codes = [
-        *judge_issues,
         *(_INTEGRITY_REVIEW_ISSUES.get(item.code, "formatting") for item in integrity),
         *(["fluency"] if language_risk else []),
+        *judge_issues,
     ]
     return list(dict.fromkeys(codes))[:MAX_REWRITE_ISSUES] or ["formatting"]
 
