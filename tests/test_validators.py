@@ -161,6 +161,17 @@ class ValidatorTests(unittest.TestCase):
         self.assertNotIn("markup-malformed", codes("A<br/>B", "B<br/>A"))
         self.assertIn("markup-malformed", codes("<b>A<br>B</b>", "</b>A<br>B<b>"))
 
+    def test_glossary_accepts_any_allowed_target_and_rejects_bad_lists(self) -> None:
+        entry = GlossaryEntry("Potion", "TARGET_A", targets=["TARGET_B", " ", "TARGET_A"])
+        self.assertEqual(entry.targets, ("TARGET_B",))
+        segment = Segment("fixture-glossary", "Potion")
+        for candidate, ok in (("TARGET_B", True), ("TARGET_A", True), ("TARGET_C", False)):
+            with self.subTest(candidate=candidate):
+                codes = {item.code for item in validate_integrity(segment, candidate, [entry])}
+                self.assertEqual("glossary-missing" not in codes, ok)
+        with self.assertRaises(ValueError):
+            GlossaryEntry("Potion", "TARGET_A", targets="TARGET_B")
+
 
 if __name__ == "__main__":
     unittest.main()

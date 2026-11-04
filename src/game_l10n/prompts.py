@@ -123,11 +123,15 @@ def _relevant_glossary(
         if item.source
         and (
             contains_term(item.source, haystack, case_sensitive=item.case_sensitive)
-            or (item.target and (
-                item.target in candidate
-                if item.case_sensitive
-                else item.target.casefold() in candidate.casefold()
-            ))
+            or any(
+                target
+                and (
+                    target in candidate
+                    if item.case_sensitive
+                    else target.casefold() in candidate.casefold()
+                )
+                for target in item.allowed_targets
+            )
         )
     ]
 
@@ -315,6 +319,7 @@ def _shared_context(
                 "target": item.target,
                 "note": item.note,
                 "case_sensitive": item.case_sensitive,
+                **({"also_accepted_targets": list(item.targets)} if item.targets else {}),
             }
             for item in (
                 _relevant_glossary(glossary, segment.source, candidate)

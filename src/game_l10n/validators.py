@@ -171,16 +171,18 @@ def validate_integrity(
 
     candidate_folded = candidate.casefold()
     for entry in glossary:
-        target = entry.target if entry.case_sensitive else entry.target.casefold()
         target_haystack = candidate if entry.case_sensitive else candidate_folded
-        if (
-            contains_term(entry.source, segment.source, case_sensitive=entry.case_sensitive)
-            and target not in target_haystack
+        if contains_term(
+            entry.source, segment.source, case_sensitive=entry.case_sensitive
+        ) and not any(
+            (target if entry.case_sensitive else target.casefold()) in target_haystack
+            for target in entry.allowed_targets
         ):
+            allowed = " or ".join(repr(target) for target in entry.allowed_targets)
             issues.append(
                 ValidationIssue(
                     "glossary-missing",
-                    f"Required glossary target {entry.target!r} is absent for {entry.source!r}",
+                    f"Required glossary target {allowed} is absent for {entry.source!r}",
                 )
             )
 

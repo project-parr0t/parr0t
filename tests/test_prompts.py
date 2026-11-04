@@ -282,5 +282,14 @@ class PromptTests(unittest.TestCase):
         self.assertEqual(character["example_lines"], ["FIXTURE_EXAMPLE"])
         self.assertNotIn("personality", character)
 
+    def test_glossary_projection_lists_also_accepted_targets(self) -> None:
+        glossary = [GlossaryEntry("Potion", "TARGET_A", targets=("TARGET_B",)), GlossaryEntry("Ice", "TARGET_I")]
+        _, user = translation_prompt(
+            ProjectContext("FIXTURE", "src", "dst"), Segment("fixture-1", "Potion"), glossary, None
+        )
+        projected = json.loads(user)["glossary"]
+        self.assertEqual(projected[0]["also_accepted_targets"], ["TARGET_B"])
+        self.assertEqual(len(projected), 1)
+
 if __name__ == "__main__":
     unittest.main()
