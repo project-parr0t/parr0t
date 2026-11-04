@@ -597,7 +597,15 @@ def _chunks(segments: list[Segment], max_chars: int) -> list[list[Segment]]:
                 separators=(",", ":"),
             )
         ) + 80
-        if current and size + row_size > max_chars:
+        # Prefer ending a mostly full chunk at a scene change; the size cap is unchanged.
+        scene_break = (
+            bool(current)
+            and bool(segment.scene)
+            and bool(current[-1].scene)
+            and segment.scene != current[-1].scene
+            and size * 4 >= max_chars * 3
+        )
+        if current and (scene_break or size + row_size > max_chars):
             result.append(current)
             current = []
             size = 0

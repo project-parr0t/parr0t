@@ -1873,6 +1873,24 @@ class NativePassTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "bound manifest is invalid"):
                 seal_native_wave_relay(root, dispatch, relay_ended=True)
 
+    def test_translation_batches_end_at_scene_change_once_mostly_full(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            scenes = ["fixture-a"] * 7 + ["fixture-b"] * 5
+            prepare_native_tasks(
+                root, source,
+                [Segment(f"fixture-{i}", f"SOURCE_{i}", scene=scene) for i, scene in enumerate(scenes)],
+                root / "tasks", max_records=8, min_records=1,
+            )
+            sizes = [
+                len((root / "tasks" / task["file"]).read_text(encoding="utf-8").splitlines())
+                for task in json.loads((root / "tasks" / "manifest.json").read_text(encoding="utf-8"))["tasks"]
+            ]
+
+        self.assertEqual(sizes, [7, 5])
+
     def test_native_wave_relay_rejects_mixed_terminal_modes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -672,5 +672,15 @@ class ContextAnalysisTests(unittest.TestCase):
         self.assertEqual([term["source"] for term in inputs["glossary"]], ["Potion"])
         self.assertEqual(inputs["speaker_profiles"][0]["formality"], "FIXTURE_FORMALITY")
 
+    def test_context_chunks_prefer_scene_boundaries(self) -> None:
+        from game_l10n.context_analysis import context_chunks
+
+        segments = [Segment(f"{i}", "X" * 20, scene="A" if i < 4 else "B") for i in range(8)]
+        row = len(json.dumps({"id": "0", "scene": "A", "speaker": "", "source": "X" * 20,
+                              "metadata": {}}, separators=(",", ":"))) + 80
+        # Five rows fit the cap, but four rows already reach 75% and the scene changes.
+        chunks = context_chunks(segments, row * 16 // 3)
+        self.assertEqual([len(chunk) for chunk in chunks], [4, 4])
+
 if __name__ == "__main__":
     unittest.main()
