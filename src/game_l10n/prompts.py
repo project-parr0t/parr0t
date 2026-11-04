@@ -113,8 +113,8 @@ _ADEQUACY_NOTE = (
 _LENGTH_NOTE = (
     "\nlength_budget is a hard UI limit: the corrected text must be at most max_chars characters "
     "(Python len, counting whitespace, markup and control tokens) while keeping the source meaning, "
-    "state, units and every protected token. Prefer the compact UI register shown in "
-    "compression_examples when supplied."
+    "state, units and every protected token. For UI labels and status text, compression_examples "
+    "show acceptable compact phrasing; for spoken lines keep the character's voice and register."
 )
 # Synthetic, provenance-free illustrations of compact Korean UI phrasing.
 _KO_COMPRESSION_EXAMPLES = (

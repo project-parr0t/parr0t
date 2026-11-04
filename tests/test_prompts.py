@@ -297,6 +297,7 @@ class PromptTests(unittest.TestCase):
         system, user = review_rewrite_prompt(project, segment, "TARGET_TOO_LONG", ["omission"], [], None)
         payload = json.loads(user)
         self.assertIn("retranslate translation_target.source from scratch", system)
+        self.assertIn("length_budget is a hard UI limit", system)
         self.assertEqual(payload["length_budget"], {"max_chars": 4, "candidate_chars": 15, "must_cut_chars": 11})
         self.assertEqual(len(payload["compression_examples"]), 2)
 
@@ -305,6 +306,12 @@ class PromptTests(unittest.TestCase):
         )
         self.assertNotIn("from scratch", system)
         self.assertNotIn("length_budget", json.loads(user))
+
+    def test_candidate_alternative_target_makes_glossary_entry_relevant(self) -> None:
+        from game_l10n.prompts import _relevant_glossary
+
+        entry = GlossaryEntry("Potion", "TARGET_A", targets=("TARGET_B",))
+        self.assertEqual(_relevant_glossary([entry], "OTHER", "TARGET_B"), [entry])
 
 if __name__ == "__main__":
     unittest.main()

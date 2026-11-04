@@ -159,6 +159,8 @@ class ValidatorTests(unittest.TestCase):
         self.assertNotIn("markup-malformed", codes("<b>A</b> <i>B</i>", "<i>B</i> <b>A</b>"))
         self.assertNotIn("markup-malformed", codes("<color=red>A", "<color=red>B"))
         self.assertNotIn("markup-malformed", codes("A<br/>B", "B<br/>A"))
+        # A source that is itself crossed is engine-specific markup; do not judge it.
+        self.assertNotIn("markup-malformed", codes("<b>A<i>B</b></i>", "<b>A<i>B</b></i>"))
         self.assertIn("markup-malformed", codes("<b>A<br>B</b>", "</b>A<br>B<b>"))
 
     def test_glossary_accepts_any_allowed_target_and_rejects_bad_lists(self) -> None:
