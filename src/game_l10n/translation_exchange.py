@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .control_plane import CONTROL_ENVELOPE_SCHEMA, validate_control_envelope
+from .control_plane import CONTROL_ENVELOPE_SCHEMA, safe_artifact_path, validate_control_envelope
 from .errors import GameL10nError
 from .models import FailureCode, Segment, TranslationResult
 from .privacy import is_within
@@ -319,6 +319,9 @@ def prepare_translation_exchange(
     output_dir = output_dir.resolve()
     if not is_within(output_dir, work_dir):
         raise TranslationExchangeError("Translation exchange must stay inside the private workspace")
+    if not safe_artifact_path(output_dir.relative_to(work_dir)):
+        # Its receipt path crosses the control plane; fail before any work, not at seal.
+        raise TranslationExchangeError("Translation exchange directory name must use [A-Za-z0-9._-]")
     if output_dir.exists():
         if not output_dir.is_dir() or any(output_dir.iterdir()):
             raise TranslationExchangeError("Translation exchange directory must be new or empty")

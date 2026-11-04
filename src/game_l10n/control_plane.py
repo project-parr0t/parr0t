@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -642,6 +643,14 @@ def control_target_id(target_id: str) -> str:
     return "ctl_" + hashlib.sha256(target_id.encode("utf-8")).hexdigest()
 
 
+_ARTIFACT_PATH_PART = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+
+def safe_artifact_path(relative: Path) -> bool:
+    """Parent-visible paths are echoed verbatim, so they must not be able to carry prose."""
+    return all(_ARTIFACT_PATH_PART.fullmatch(part) for part in relative.parts)
+
+
 def _validate_artifact_paths(work_dir: Path, value: Any) -> list[str]:
     if not isinstance(value, list) or len(value) > 256:
         raise ConfigurationError("E_CONTROL_ENVELOPE_INVALID: artifact_paths must be a bounded list")
@@ -652,6 +661,9 @@ def _validate_artifact_paths(work_dir: Path, value: Any) -> list[str]:
         relative = Path(item)
         if relative.is_absolute() or ".." in relative.parts:
             raise ConfigurationError("E_CONTROL_ENVELOPE_INVALID: artifact paths must be workspace-relative")
+        # Paths are echoed to the parent: a free-form filename would be a text channel.
+        if not safe_artifact_path(relative):
+            raise ConfigurationError("E_CONTROL_ENVELOPE_INVALID: artifact path has unsafe characters")
         resolved = (work_dir / relative).resolve()
         if not is_within(resolved, work_dir) or not resolved.is_file():
             raise ConfigurationError("E_CONTROL_ENVELOPE_INVALID: artifact path is unavailable")

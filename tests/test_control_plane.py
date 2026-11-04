@@ -1175,6 +1175,19 @@ class ControlPlaneContractTests(unittest.TestCase):
         self.assertNotIn("reason", result)
         self.assertNotIn("text", result)
 
+    def test_envelope_rejects_artifact_names_that_carry_free_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = self._valid_translation_envelope(root)
+            leaked = root / ".game-l10n" / "data-plane" / "The hero said hello.json"
+            leaked.write_text("{}", encoding="utf-8")
+            payload["artifact_paths"] = [leaked.relative_to(root).as_posix()]
+            envelope = self._write_envelope(root, payload)
+            with self.assertRaisesRegex(ConfigurationError, "unsafe characters"):
+                validate_control_envelope(
+                    root, envelope, expected_role="translator", expected_stage="translation"
+                )
+
     def test_source_probe_can_return_metadata_only_discovery_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

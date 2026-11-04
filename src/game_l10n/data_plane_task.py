@@ -23,6 +23,7 @@ from .context_analysis import (
 )
 from .control_plane import (
     control_plane_state,
+    safe_artifact_path,
     require_control_plane_entry,
     require_control_plane_ready,
     validate_control_envelope,
@@ -1188,6 +1189,10 @@ def prepare_data_plane_task(
         artifact_relative = str(
             config.get("files", {}).get("context_pack", artifact_relative)
         )
+        if not safe_artifact_path(Path(artifact_relative)):
+            raise ConfigurationError(
+                "E_DATA_PLANE_TASK_PATH: files.context_pack must use [A-Za-z0-9._-] path parts"
+            )
     artifact = (work_dir / artifact_relative).resolve()
     counterpart = (
         (work_dir / profile["counterpart"]).resolve()
