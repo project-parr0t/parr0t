@@ -43,6 +43,7 @@ _INTEGRITY_REVIEW_ISSUES = {
     "empty": "omission",
     "glossary-missing": "terminology",
     "length-outlier": "length_risk",
+    "markup-malformed": "formatting",
     "protected-token-mismatch": "formatting",
     "script-intrusion": "addition",
     "ui-composition-duplication": "slot_composition",

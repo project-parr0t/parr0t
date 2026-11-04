@@ -159,6 +159,7 @@ class ValidatorTests(unittest.TestCase):
         self.assertNotIn("markup-malformed", codes("<b>A</b> <i>B</i>", "<i>B</i> <b>A</b>"))
         self.assertNotIn("markup-malformed", codes("<color=red>A", "<color=red>B"))
         self.assertNotIn("markup-malformed", codes("A<br/>B", "B<br/>A"))
+        self.assertIn("markup-malformed", codes("<b>A<br>B</b>", "</b>A<br>B<b>"))
 
 
 if __name__ == "__main__":

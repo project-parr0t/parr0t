@@ -51,7 +51,12 @@ def contains_term(term: str, text: str, *, case_sensitive: bool = False) -> bool
 _MARKUP_TAG = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9:_-]*)[^<>]*?(/?)>")
 
 
-def _markup_nesting_ok(text: str) -> bool:
+def _paired_tag_names(text: str) -> set[str]:
+    """Tag names the source actually closes; standalone tags like <br> are not structure."""
+    return {match[2].casefold() for match in _MARKUP_TAG.finditer(text) if match[1]}
+
+
+def _markup_nesting_ok(text: str, paired: set[str]) -> bool:
     """Counts alone miss "<b>x</b>" -> "</b>x<b>"; a close must match the innermost open tag.
 
     Tags left open at the end are tolerated because several engines allow them.
@@ -59,7 +64,7 @@ def _markup_nesting_ok(text: str) -> bool:
     stack: list[str] = []
     for match in _MARKUP_TAG.finditer(text):
         closing, name, self_closing = match[1], match[2].casefold(), match[3]
-        if self_closing:
+        if self_closing or name not in paired:
             continue
         if not closing:
             stack.append(name)
@@ -155,7 +160,8 @@ def validate_integrity(
             )
         )
 
-    if _markup_nesting_ok(segment.source) and not _markup_nesting_ok(candidate):
+    paired = _paired_tag_names(segment.source)
+    if paired and _markup_nesting_ok(segment.source, paired) and not _markup_nesting_ok(candidate, paired):
         issues.append(
             ValidationIssue(
                 "markup-malformed",
