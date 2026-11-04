@@ -134,8 +134,12 @@ def _context_binding(
     source_inventory_fingerprint: str,
     resolved_context_mode: str,
     contract_fingerprints: dict[str, Any],
+    localization: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    inputs = _chunk_localization(segments, localization).get("localization_inputs")
     binding = {
+        # A fragment analyzed against other locked inputs (glossary, profiles, style) is stale.
+        **({"localization_inputs_digest": stable_hash(inputs)} if inputs else {}),
         "source_inventory_fingerprint": source_inventory_fingerprint,
         "source_digest": stable_hash([asdict(item) for item in segments]),
         "ordered_evidence_ids": [item.id for item in segments],
@@ -273,6 +277,7 @@ def _write_context_manifest(
                 source_inventory_fingerprint=source_inventory_fingerprint,
                 resolved_context_mode=resolved_mode,
                 contract_fingerprints=contract_fingerprints,
+                localization=localization,
             )
             if binding_id != expected_binding["binding_id"]:
                 continue
@@ -320,6 +325,7 @@ def _write_context_manifest(
                 source_inventory_fingerprint=source_inventory_fingerprint,
                 resolved_context_mode=resolved_mode,
                 contract_fingerprints=contract_fingerprints,
+                localization=localization,
             )
             units.append(
                 {
@@ -1547,6 +1553,7 @@ def prepare_data_plane_task(
                         "context_preflight_policy_version",
                         "context_mode",
                         "context_contract_fingerprints",
+                        "localization_inputs_digest",
                     ],
                     "changed_chunk_ceiling_repartitions_only_unfinished_records": True,
                     "stale_or_unbound_summary_is_input_only": True,

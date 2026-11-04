@@ -630,7 +630,7 @@ def chunk_localization_inputs(
 ) -> dict[str, Any]:
     """User-locked facts the analyzer must phrase guidance against; empty when none exist."""
     text = "\n".join(item.source for item in chunk)
-    speakers = {item.speaker for item in chunk if item.speaker}
+    speakers = {item.speaker.casefold() for item in chunk if item.speaker}
     inputs: dict[str, Any] = {}
     if project is not None:
         inputs["project"] = {
@@ -654,7 +654,9 @@ def chunk_localization_inputs(
     profiles = [
         {key: value for key, value in asdict(profile).items() if value or key == "name"}
         for profile in characters
-        if profile.name in speakers or speakers.intersection(profile.aliases)
+        # Same matching as the translator's profile lookup: exact name or case-folded alias.
+        if profile.name.casefold() in speakers
+        or speakers.intersection(alias.casefold() for alias in profile.aliases)
     ][:32]
     if profiles:
         inputs["speaker_profiles"] = profiles
@@ -1049,9 +1051,10 @@ class ContextAnalyzer:
         self.last_execution: dict[str, Any] | None = None
 
     def localization_fingerprint(self) -> str:
+        # Only fields the analyzer actually receives, so unrelated config edits keep the cache.
         return stable_hash(
-            {
-                "project": asdict(self.project) if self.project else None,
+            chunk_localization_inputs([], self.project, (), ())
+            | {
                 "glossary": [asdict(item) for item in self.glossary],
                 "characters": [asdict(item) for item in self.characters],
             }
@@ -1086,7 +1089,9 @@ class ContextAnalyzer:
         preflight = preflight or build_context_preflight(segments)
         semantic_segments = _semantic_context_segments(segments, preflight)
         chunks = _chunks(semantic_segments, self.max_chunk_chars)
-        offsets = [sum(len(chunk) for chunk in chunks[:index]) for index in range(len(chunks))]
+        offsets = [0]
+        for chunk in chunks[:-1]:
+            offsets.append(offsets[-1] + len(chunk))
         self.last_execution = None
 
         if not chunks:

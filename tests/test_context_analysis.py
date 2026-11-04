@@ -682,5 +682,32 @@ class ContextAnalysisTests(unittest.TestCase):
         chunks = context_chunks(segments, row * 16 // 3)
         self.assertEqual([len(chunk) for chunk in chunks], [4, 4])
 
+    def test_context_cache_and_native_binding_follow_locked_inputs(self) -> None:
+        from game_l10n.data_plane_task import _context_binding
+        from game_l10n.models import GlossaryEntry, ProjectContext
+
+        provider = ScriptedProvider("context", successful_context)
+        segments = [Segment("1", "Potion", speaker="A", scene="S")]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for glossary in ([GlossaryEntry("Potion", "TARGET_A")], [GlossaryEntry("Potion", "TARGET_B")]):
+                analyze_with_cache(
+                    analyzer=ContextAnalyzer(
+                        ProviderRegistry({"context": provider}), ["context"], glossary=glossary
+                    ),
+                    segments=segments,
+                    output_path=root / "context.json",
+                    state_path=root / "state.json",
+                )
+        self.assertEqual(provider.call_count, 2)
+
+        def binding(style: str) -> str:
+            return _context_binding(
+                segments, source_inventory_fingerprint="f", resolved_context_mode="narrative",
+                contract_fingerprints={},
+                localization={"project": ProjectContext("T", "src", "ko", style_guide=style)},
+            )["binding_id"]
+        self.assertNotEqual(binding("FORMAL"), binding("CASUAL"))
+
 if __name__ == "__main__":
     unittest.main()
