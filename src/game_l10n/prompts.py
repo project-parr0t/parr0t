@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
 from .models import CharacterProfile, ContextPack, GlossaryEntry, ProjectContext, Segment
+from .validators import contains_term
 
 PROMPT_VERSION = "2026-10-26.1"
 
@@ -100,13 +100,12 @@ def _relevant_glossary(
     glossary: list[GlossaryEntry], source: str, candidate: str = ""
 ) -> list[GlossaryEntry]:
     haystack = f"{source}\n{candidate}"
-    folded = haystack.casefold()
     return [
         item
         for item in glossary
         if item.source
         and (
-            (item.source in haystack if item.case_sensitive else item.source.casefold() in folded)
+            contains_term(item.source, haystack, case_sensitive=item.case_sensitive)
             or (item.target and (
                 item.target in candidate
                 if item.case_sensitive
@@ -121,15 +120,9 @@ def _focused_relationships(
 ) -> list[str]:
     if not timeline:
         return []
-    needles = [value.casefold() for value in (speaker, scene) if value]
+    needles = [value for value in (speaker, scene) if value]
     matched = [
-        entry
-        for entry in timeline
-        if needles
-        and any(
-            re.search(rf"(?<!\w){re.escape(needle)}(?!\w)", entry.casefold())
-            for needle in needles
-        )
+        entry for entry in timeline if any(contains_term(needle, entry) for needle in needles)
     ]
     selected = matched[-limit:] if matched else list(timeline[-limit:])
     return selected

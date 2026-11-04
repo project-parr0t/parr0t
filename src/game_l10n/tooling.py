@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -251,7 +252,8 @@ def run_cached_tool(
     env.update({"GAME_L10N_STAGE": stage, "GAME_L10N_WORKDIR": str(work_dir)})
     try:
         completed = subprocess.run(
-            expanded,
+            # The portable "python" template means this interpreter; many hosts ship only python3/py.
+            [sys.executable, *expanded[1:]] if expanded[:1] == ["python"] else expanded,
             cwd=work_dir,
             env=env,
             text=True,

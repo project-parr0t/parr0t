@@ -325,5 +325,16 @@ class TranslationExchangeTests(unittest.TestCase):
                 seal_translation_exchange(workspace, bundle)
 
 
+    def test_exchange_directory_must_be_control_plane_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(TranslationExchangeError, "directory name"):
+                prepare_translation_exchange(
+                    root, [Segment("fixture", "S")], root / "exchange 1",
+                    exchange_id="unsafe-fixture", mode="fallback",
+                    source_queue="translation_fallback_pending",
+                )
+            self.assertFalse((root / "exchange 1").exists())
+
 if __name__ == "__main__":
     unittest.main()

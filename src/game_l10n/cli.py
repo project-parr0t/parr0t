@@ -1837,6 +1837,14 @@ def cmd_collect_native_rewrite(args: argparse.Namespace) -> int:
 
 
 def cmd_process_native_review_followup(args: argparse.Namespace) -> int:
+    if (args.budget_started_at_epoch is None) != (args.max_elapsed_minutes is None):
+        raise ConfigurationError(
+            "E_REVIEW_FALLBACK_BUDGET_INVALID: elapsed ceiling needs both start and minutes"
+        )
+    deadline_epoch = (
+        None if args.max_elapsed_minutes is None
+        else args.budget_started_at_epoch + args.max_elapsed_minutes * 60
+    )
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     require_sdk_activation(work_dir, config)
@@ -1867,8 +1875,7 @@ def cmd_process_native_review_followup(args: argparse.Namespace) -> int:
             output,
             orchestrator,
             operation=args.operation,
-            deadline_epoch=args.budget_started_at_epoch
-            + args.max_elapsed_minutes * 60,
+            deadline_epoch=deadline_epoch,
             wave_size=args.wave_size,
             progress_callback=progress.apply_event,
         )
@@ -3196,8 +3203,12 @@ def build_parser() -> argparse.ArgumentParser:
     review_followup.add_argument("--output", required=True)
     review_followup.add_argument("--operation", choices=["judge", "rewrite"], required=True)
     review_followup.add_argument("--wave-size", type=int, default=8)
-    review_followup.add_argument("--budget-started-at-epoch", type=float, required=True)
-    review_followup.add_argument("--max-elapsed-minutes", type=float, required=True)
+    review_followup.add_argument(
+        "--budget-started-at-epoch", type=float, help="Only with a user-requested elapsed ceiling"
+    )
+    review_followup.add_argument(
+        "--max-elapsed-minutes", type=float, help="Optional user-requested whole-job ceiling"
+    )
     review_followup.set_defaults(func=cmd_process_native_review_followup)
 
     native_followup = sub.add_parser(
