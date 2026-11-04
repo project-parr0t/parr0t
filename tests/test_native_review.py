@@ -315,7 +315,7 @@ class NativeReviewTests(unittest.TestCase):
                 return ReviewVerdictEnvelope(ReviewVerdict.OK)
             fake = SimpleNamespace(
                 registry=SimpleNamespace(get=lambda name: SimpleNamespace(fingerprint=lambda: {"name": name})),
-                context_pack=ContextPack(), glossary=[],
+                context_pack=ContextPack(), glossary=[], project=SimpleNamespace(target_language=""),
                 config=SimpleNamespace(extra_protected_patterns=[], max_length_ratio=4, review_max_rounds=2),
                 _judge_with_refusal_retry=judge,
             )
@@ -357,3 +357,30 @@ class NativeReviewTests(unittest.TestCase):
         args.max_elapsed_minutes = 5.0
         with self.assertRaisesRegex(ConfigurationError, "E_REVIEW_FALLBACK_BUDGET_INVALID"):
             cmd_process_native_review_followup(args)
+
+    def test_fallback_judge_approval_cannot_waive_target_language(self) -> None:
+        from game_l10n.models import AttemptRecord, ContextPack, ReviewVerdictEnvelope, ReviewVerdict
+        from game_l10n.native_review import _bound_result, _pending_segment, process_native_review_followup
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = review_segment("fixture-1", candidate="untranslated latin sentence")
+            result = _bound_result(base)
+            result.attempts.append(AttemptRecord("review", "native-sol", "error", candidate_generation=1))
+            source = root / "fallback.jsonl"
+            source.write_text(json.dumps(asdict(_pending_segment(base, result))) + "\n")
+            fake = SimpleNamespace(
+                registry=SimpleNamespace(get=lambda name: SimpleNamespace(fingerprint=lambda: {"name": name})),
+                context_pack=ContextPack(), glossary=[], project=SimpleNamespace(target_language="ko"),
+                config=SimpleNamespace(extra_protected_patterns=[], max_length_ratio=4, review_max_rounds=2),
+                _judge_with_refusal_retry=lambda *args: ReviewVerdictEnvelope(ReviewVerdict.OK),
+            )
+            summary = process_native_review_followup(root, source, root / "out", fake, operation="judge")
+            # A cache written before the gate existed: the same row stored as approved.
+            cache = root / "out" / "results.json"
+            rows = json.loads(cache.read_text(encoding="utf-8"))
+            rows["results"][0]["status"] = "reviewed"
+            cache.write_text(json.dumps(rows), encoding="utf-8")
+            resumed = process_native_review_followup(root, source, root / "out", fake, operation="judge")
+        self.assertEqual(summary["accepted"], 0)
+        self.assertEqual(summary["rewrite_pending"], 1)
+        self.assertEqual((resumed["executed"], resumed["accepted"], resumed["rewrite_pending"]), (0, 0, 1))

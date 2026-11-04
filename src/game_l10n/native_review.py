@@ -542,7 +542,15 @@ def process_native_review_followup(
             integrity = validate_integrity(clean, result.text, orchestrator.glossary,
                 extra_patterns=orchestrator.config.extra_protected_patterns,
                 max_length_ratio=orchestrator.config.max_length_ratio)
-            if verdict and verdict.verdict is ReviewVerdict.OK and not integrity:
+            language_reasons = target_language_review_reasons(
+                result.text, orchestrator.project.target_language, segment.metadata
+            )
+            if language_reasons:
+                result.metadata["target_language_risk"] = language_reasons
+            if verdict and verdict.verdict is ReviewVerdict.OK and language_reasons and not integrity:
+                # Approval cannot waive the locked target language; collect would reject the join.
+                result.metadata["rewrite_issues"] = ["fluency"]
+            elif verdict and verdict.verdict is ReviewVerdict.OK and not integrity:
                 result.status = "reviewed"
                 result.reviewer = "deepseek"
                 result.review_outcome = "approved"
@@ -622,6 +630,12 @@ def process_native_review_followup(
         if result is None:
             unresolved.append(segment)
             continue
+        if result.status == "reviewed" and target_language_review_reasons(
+            result.text, orchestrator.project.target_language, segment.metadata
+        ):
+            # A cached approval from before the language gate must not reach collection.
+            result.status = "failed"
+            result.metadata["rewrite_issues"] = ["fluency"]
         if result.status == "reviewed":
             accepted.append(result)
             continue
