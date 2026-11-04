@@ -465,7 +465,15 @@ def record_control_plane_leak(work_dir: Path, incident_code: str) -> dict[str, A
         raise ConfigurationError("E_CONTROL_PLANE_LEAK: unsupported incident code")
     state = control_plane_state(work_dir)
     if state["status"] == "rotation_required":
-        if not (work_dir / CONTROL_HANDOFF_PATH).is_file():
+        # Recovery after an interrupted leak record: replace a missing or prior-incident receipt.
+        try:
+            receipt = _validated_control_plane_handoff(work_dir, work_dir / CONTROL_HANDOFF_PATH)
+        except (ConfigurationError, OSError, ValueError):
+            receipt = None
+        if receipt is None or (
+            receipt["incident_id"] != state["incident_id"]
+            or receipt["from_generation"] != state["generation"]
+        ):
             _write_control_plane_handoff(work_dir, state)
         return state
     contaminated = {
@@ -618,6 +626,8 @@ def acknowledge_control_plane_rotation(
     _atomic_json(work_dir / CONTROL_STATE_PATH, resumed)
     _atomic_json(work_dir / CONTROL_ENTRY_PATH, initial_control_plane_entry_state())
     _reset_native_control_observations(work_dir)
+    # A consumed receipt must not outlive its incident.
+    (work_dir / CONTROL_HANDOFF_PATH).unlink(missing_ok=True)
     return resumed
 
 

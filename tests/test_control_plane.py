@@ -1460,6 +1460,28 @@ class ControlPlaneContractTests(unittest.TestCase):
 
         self.assertEqual(state["status"], "rotation_required")
 
+    def test_interrupted_second_leak_does_not_wedge_rotation(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = root / CONTROL_HANDOFF_PATH
+            record_control_plane_leak(root, "source_or_candidate_received")
+            acknowledge_control_plane_rotation(root, receipt)
+            self.assertFalse(receipt.exists())
+            # Simulate a stale receipt plus a crash between the state and handoff writes.
+            record_control_plane_leak(root, "source_or_candidate_received")
+            stale = receipt.read_text(encoding="utf-8")
+            acknowledge_control_plane_rotation(root, receipt)
+            receipt.write_text(stale, encoding="utf-8")
+            with mock.patch("game_l10n.control_plane._write_control_plane_handoff"):
+                record_control_plane_leak(root, "source_or_candidate_received")
+            record_control_plane_leak(root, "source_or_candidate_received")
+            resumed = acknowledge_control_plane_rotation(root, receipt)
+
+        self.assertEqual(resumed["status"], "ready")
+        self.assertEqual(resumed["generation"], 4)
+
     def test_control_state_rejects_unknown_fields_without_echoing_them(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
