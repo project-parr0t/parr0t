@@ -223,7 +223,6 @@ def _shared_context(
             "mode": context_pack.context_mode,
             "global_style_rules": list(context_pack.global_style_rules),
             "terminology_rules": list(context_pack.terminology_rules),
-            "relevant_reference_cues": relevant_reference_cues,
         }
     )
     functional_context = (
@@ -296,10 +295,11 @@ def _shared_context(
                 if focused
                 else list(context_pack.relationship_timeline)
             ),
-            "relevant_reference_cues": relevant_reference_cues,
         },
         "functional_context": functional_context,
         "knowledge_context": knowledge_context,
+        # Target-specific, so it follows every job-wide field (one copy, prefix-cache friendly).
+        "relevant_reference_cues": relevant_reference_cues,
         # Every user-authored profile field, so formality, address and speech rules reach the model.
         "character": None
         if character is None

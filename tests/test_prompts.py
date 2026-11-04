@@ -52,10 +52,10 @@ class PromptTests(unittest.TestCase):
             payload["narrative_context"]["relationship_timeline"], ["A RELATIONSHIP"]
         )
         self.assertEqual(
-            payload["narrative_context"]["relevant_reference_cues"][0]["recognition_cue"],
+            payload["relevant_reference_cues"][0]["recognition_cue"],
             "FIXTURE_RECOGNITION_PATTERN",
         )
-        self.assertEqual(len(payload["narrative_context"]["relevant_reference_cues"]), 1)
+        self.assertEqual(len(payload["relevant_reference_cues"]), 1)
         self.assertIn("compact", system)
         self.assertIn("Do not return, quote, or rewrite", system)
         self.assertIn("mechanically literal", system)
@@ -199,8 +199,10 @@ class PromptTests(unittest.TestCase):
         payload = json.loads(user)
 
         self.assertEqual(payload["localization_context"]["mode"], "hybrid")
+        # Job-wide blocks stay target-independent so providers can reuse the prompt prefix.
+        self.assertNotIn("relevant_reference_cues", payload["localization_context"])
         self.assertEqual(
-            payload["localization_context"]["relevant_reference_cues"][0]["kind"],
+            payload["relevant_reference_cues"][0]["kind"],
             "wordplay",
         )
         self.assertEqual(len(payload["functional_context"]["relevant_screens"]), 1)
