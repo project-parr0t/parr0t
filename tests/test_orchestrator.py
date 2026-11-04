@@ -1126,6 +1126,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(feedback[0]["code"], "protected-token-mismatch")
         self.assertIn("{name}", feedback[0]["detail"])
         self.assertNotIn("retry after a refusal", calls[1][0])
+        self.assertIn("failed deterministic validation", calls[1][0])
 
     def test_reference_cue_and_fallback_origin_escalate_past_triage(self) -> None:
         failing = ScriptedProvider(
@@ -1157,6 +1158,42 @@ class OrchestratorTests(unittest.TestCase):
                     work_dir=Path(directory),
                 ).translate_one(Segment(segment_id, "SOURCE"))
                 self.assertIn(reason, result.metadata["strong_review_reasons"])
+
+    def test_rewrite_retry_signals_follow_only_their_own_cause(self) -> None:
+        rewrites: list[tuple[str, dict]] = []
+        replies = iter([
+            {"status": "success", "text": "TARGET"},            # drops {name}: integrity retry
+            {"status": "refused", "text": ""},                  # refusal retry
+            {"status": "success", "text": "TARGET {name}"},
+        ])
+
+        def rewriter_handler(*, system: str, user: str, **_: object) -> dict:
+            rewrites.append((system, json.loads(user)))
+            return next(replies)
+
+        verdicts = iter([{"verdict": "rewrite", "issues": ["voice"]}, {"verdict": "ok", "issues": []}])
+        translator = ScriptedProvider(
+            "fixture-translator", lambda **_: {"status": "success", "text": "DRAFT {name}", "reason": ""}
+        )
+        judge = ScriptedProvider("fixture-judge", lambda **_: next(verdicts))
+        rewriter = ScriptedProvider("fixture-rewriter", rewriter_handler)
+        with tempfile.TemporaryDirectory() as directory:
+            result = LocalizationOrchestrator(
+                registry=ProviderRegistry({p.name: p for p in (translator, judge, rewriter)}),
+                config=OrchestratorConfig(
+                    [translator.name], [judge.name], rewriter_chain=[rewriter.name],
+                    grace_retries=1, max_workers=1,
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                work_dir=Path(directory),
+            ).translate_one(Segment("fixture-rewrite", "SOURCE {name}"))
+
+        self.assertEqual(result.text, "TARGET {name}")
+        self.assertEqual(len(rewrites), 3)
+        self.assertIn("previous_attempt_validation_failures", rewrites[1][1])
+        self.assertNotIn("previous_attempt_validation_failures", rewrites[2][1])
+        self.assertNotIn("correction target. If permitted", rewrites[1][0])
+        self.assertIn("correction target. If permitted", rewrites[2][0])
 
 if __name__ == "__main__":
     unittest.main()

@@ -660,7 +660,7 @@ class LocalizationOrchestrator:
                     segment,
                     candidate,
                     anchors,
-                    refusal_retry=refusal_retried,
+                    refusal_retry=ordinal > 1 and retry_stage == f"{stage_prefix}-refusal-retry",
                 )
                 duration = int((time.monotonic() - started) * 1000)
                 self._record(
@@ -739,8 +739,11 @@ class LocalizationOrchestrator:
                     candidate,
                     issue_codes,
                     anchors,
-                    refusal_retry=refusal_retried,
-                    retry_feedback=feedback or None,
+                    # Each signal belongs only to the retry that directly follows its cause.
+                    refusal_retry=ordinal > 1 and retry_stage == "review-rewrite-refusal-retry",
+                    retry_feedback=(
+                        feedback if ordinal > 1 and retry_stage == "review-rewrite-integrity-retry" else None
+                    ),
                 )
                 duration = int((time.monotonic() - started) * 1000)
                 self._record(
@@ -809,7 +812,7 @@ class LocalizationOrchestrator:
                 ),
             )
             if self._can_grace_retry(FailureCode.INTEGRITY_INVALID.value, ordinal):
-                retry_stage = "review-rewrite-grace-retry"
+                retry_stage = "review-rewrite-integrity-retry"
                 feedback = retry_feedback(integrity)
                 continue
             return None
