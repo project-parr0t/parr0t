@@ -37,6 +37,32 @@ _EXPLICIT_RISK_FLAGS = (
     "logic_facing",
 )
 
+# Deterministic validator codes expressed in the judge's issue vocabulary, so a rewrite
+# learns what actually failed instead of a generic "formatting".
+_INTEGRITY_REVIEW_ISSUES = {
+    "empty": "omission",
+    "glossary-missing": "terminology",
+    "length-outlier": "length_risk",
+    "protected-token-mismatch": "formatting",
+    "script-intrusion": "addition",
+    "ui-composition-duplication": "slot_composition",
+    "ui-length-limit": "length_risk",
+}
+MAX_REWRITE_ISSUES = 4
+
+
+def rewrite_issue_codes(
+    judge_issues: Iterable[str] = (), integrity: Iterable[Any] = (), *, language_risk: bool = False
+) -> list[str]:
+    """Union judge codes, mapped validator codes, and language risk; capped at the protocol limit."""
+    codes = [
+        *judge_issues,
+        *(_INTEGRITY_REVIEW_ISSUES.get(item.code, "formatting") for item in integrity),
+        *(["fluency"] if language_risk else []),
+    ]
+    return list(dict.fromkeys(codes))[:MAX_REWRITE_ISSUES] or ["formatting"]
+
+
 _TARGET_SCRIPT_PATTERNS = {
     "ko": re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]"),
     "ja": re.compile(r"[\u3040-\u30ff\u3400-\u9fff]"),

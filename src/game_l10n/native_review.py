@@ -21,8 +21,8 @@ from .native_followup import CANDIDATE_METADATA_KEY, _atomic_json, _atomic_jsonl
 from .native_pass import _load_task_manifest, _require_candidate_bindings, merge_native_pass
 from .orchestrator import LocalizationOrchestrator
 from .review_selection import (
-    DEFAULT_STRONG_REVIEW_CATEGORIES, review_category, strong_review_selection_reasons,
-    target_language_review_reasons,
+    DEFAULT_STRONG_REVIEW_CATEGORIES, review_category, rewrite_issue_codes,
+    strong_review_selection_reasons, target_language_review_reasons,
 )
 from .store import stable_hash
 from .validators import validate_integrity
@@ -368,14 +368,14 @@ def collect_native_review(
             result.metadata["target_language_risk"] = language_reasons
         if tier == "strong" and language_reasons:
             result.metadata["review_tier"] = "strong_pending"
-            result.metadata["rewrite_issues"] = ["fluency"]
+            result.metadata["rewrite_issues"] = rewrite_issue_codes(
+                issues, integrity, language_risk=True
+            )
             rewrite.append(_pending_segment(segment, result))
             continue
         if verdict.verdict is ReviewVerdict.REWRITE or integrity:
             result.metadata["review_tier"] = "strong_pending"
-            deterministic_issues = (["terminology"] if any(
-                item.code == "glossary-missing" for item in integrity) else ["formatting"])
-            result.metadata["rewrite_issues"] = issues or deterministic_issues
+            result.metadata["rewrite_issues"] = rewrite_issue_codes(issues, integrity)
             rewrite.append(_pending_segment(segment, result))
             continue
         # Only a parsed current-candidate OK and clean integrity can approve.
@@ -547,20 +547,17 @@ def process_native_review_followup(
             )
             if language_reasons:
                 result.metadata["target_language_risk"] = language_reasons
-            if verdict and verdict.verdict is ReviewVerdict.OK and language_reasons and not integrity:
-                # Approval cannot waive the locked target language; collect would reject the join.
-                result.metadata["rewrite_issues"] = ["fluency"]
-            elif verdict and verdict.verdict is ReviewVerdict.OK and not integrity:
+            if verdict and verdict.verdict is ReviewVerdict.OK and not integrity and not language_reasons:
                 result.status = "reviewed"
                 result.reviewer = "deepseek"
                 result.review_outcome = "approved"
                 result.acceptance_authority = "reviewer"
                 result.metadata["review_tier"] = "strong"
-            elif verdict and verdict.verdict is ReviewVerdict.REWRITE:
-                result.metadata["rewrite_issues"] = list(verdict.issues)
-            elif verdict and verdict.verdict is ReviewVerdict.OK and integrity:
-                result.metadata["rewrite_issues"] = (["terminology"] if any(
-                    item.code == "glossary-missing" for item in integrity) else ["formatting"])
+            elif verdict and verdict.verdict in {ReviewVerdict.OK, ReviewVerdict.REWRITE}:
+                # Approval cannot waive integrity or the locked target language.
+                result.metadata["rewrite_issues"] = rewrite_issue_codes(
+                    verdict.issues, integrity, language_risk=bool(language_reasons)
+                )
         else:
             rewrites_done = sum(a.stage.startswith("review-rewrite") and a.status == "success"
                                 for a in result.attempts)
@@ -635,7 +632,7 @@ def process_native_review_followup(
         ):
             # A cached approval from before the language gate must not reach collection.
             result.status = "failed"
-            result.metadata["rewrite_issues"] = ["fluency"]
+            result.metadata["rewrite_issues"] = rewrite_issue_codes(language_risk=True)
         if result.status == "reviewed":
             accepted.append(result)
             continue

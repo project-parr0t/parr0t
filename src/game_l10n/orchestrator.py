@@ -41,6 +41,7 @@ from .review_selection import (
     DEFAULT_STRONG_REVIEW_CATEGORIES,
     DEFAULT_STRONG_REVIEW_SAMPLE_PERCENT,
     review_category,
+    rewrite_issue_codes,
     strong_review_selection_reasons,
     target_language_review_reasons,
 )
@@ -1142,7 +1143,7 @@ class LocalizationOrchestrator:
                     self.registry.get(rewriter_name),
                     segment,
                     candidate,
-                    ["formatting"],
+                    rewrite_issue_codes(integrity=integrity),
                     anchors,
                 )
                 if repaired is not None and repaired.status is AgentStatus.SUCCESS:

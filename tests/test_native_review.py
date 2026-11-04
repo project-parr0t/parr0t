@@ -384,3 +384,15 @@ class NativeReviewTests(unittest.TestCase):
         self.assertEqual(summary["accepted"], 0)
         self.assertEqual(summary["rewrite_pending"], 1)
         self.assertEqual((resumed["executed"], resumed["accepted"], resumed["rewrite_pending"]), (0, 0, 1))
+
+    def test_rewrite_issue_codes_keep_judge_and_validator_findings(self) -> None:
+        from game_l10n.models import ValidationIssue
+        from game_l10n.review_selection import rewrite_issue_codes
+
+        integrity = [ValidationIssue("glossary-missing", "x"), ValidationIssue("ui-length-limit", "y")]
+        self.assertEqual(
+            rewrite_issue_codes(["meaning", "omission"], integrity, language_risk=True),
+            ["meaning", "omission", "terminology", "length_risk"],
+        )
+        self.assertEqual(rewrite_issue_codes(["voice"], language_risk=True), ["voice", "fluency"])
+        self.assertEqual(rewrite_issue_codes(), ["formatting"])
