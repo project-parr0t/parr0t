@@ -1100,5 +1100,32 @@ class OrchestratorTests(unittest.TestCase):
         )
 
 
+    def test_integrity_retry_carries_validator_feedback_without_refusal_note(self) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        def handler(*, system: str, user: str, **_: object) -> dict:
+            calls.append((system, json.loads(user)))
+            text = "TARGET" if len(calls) == 1 else "TARGET {name}"
+            return {"status": "success", "text": text, "reason": ""}
+
+        translator = ScriptedProvider("fixture-translator", handler)
+        with tempfile.TemporaryDirectory() as directory:
+            result = LocalizationOrchestrator(
+                registry=ProviderRegistry({translator.name: translator}),
+                config=OrchestratorConfig(
+                    [translator.name], [], require_review=False, max_workers=1, grace_retries=1
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                work_dir=Path(directory),
+            ).translate_one(Segment("fixture-token", "SOURCE {name}"))
+
+        self.assertEqual(result.text, "TARGET {name}")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("previous_attempt_validation_failures", calls[0][1])
+        feedback = calls[1][1]["previous_attempt_validation_failures"]
+        self.assertEqual(feedback[0]["code"], "protected-token-mismatch")
+        self.assertIn("{name}", feedback[0]["detail"])
+        self.assertNotIn("retry after a refusal", calls[1][0])
+
 if __name__ == "__main__":
     unittest.main()

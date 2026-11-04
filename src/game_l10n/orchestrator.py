@@ -31,6 +31,7 @@ from .prompts import (
     REVIEW_JUDGE_SCHEMA,
     REVIEW_REWRITE_SCHEMA,
     TRANSLATION_SCHEMA,
+    retry_feedback,
     review_judge_prompt,
     review_rewrite_prompt,
     translation_prompt,
@@ -427,6 +428,7 @@ class LocalizationOrchestrator:
         anchors: list[dict[str, str]],
         *,
         refusal_retry: bool = False,
+        retry_feedback: list[dict[str, str]] | None = None,
     ) -> AgentEnvelope:
         system, user = translation_prompt(
             self.project,
@@ -436,6 +438,7 @@ class LocalizationOrchestrator:
             self.context_pack,
             anchors,
             refusal_retry,
+            retry_feedback,
         )
         return self._translation_envelope(
             provider.generate_json(
@@ -485,6 +488,7 @@ class LocalizationOrchestrator:
         anchors: list[dict[str, str]],
         *,
         refusal_retry: bool = False,
+        retry_feedback: list[dict[str, str]] | None = None,
     ) -> AgentEnvelope:
         system, user = review_rewrite_prompt(
             self.project,
@@ -496,6 +500,7 @@ class LocalizationOrchestrator:
             self.context_pack,
             anchors,
             refusal_retry,
+            retry_feedback,
         )
         return self._translation_envelope(
             provider.generate_json(
@@ -517,13 +522,19 @@ class LocalizationOrchestrator:
         refusal_retried = False
         attempt_limit = self._translation_attempt_limit(provider.name)
         retry_stage = "translate-grace-retry"
+        feedback: list[dict[str, str]] = []
         while True:
             ordinal += 1
             started = time.monotonic()
             stage = "translate" if ordinal == 1 else retry_stage
             try:
+                # The refusal note belongs only to a retry after a refusal, not a timeout or bad output.
                 envelope = self._call_translation(
-                    provider, segment, anchors, refusal_retry=ordinal > 1
+                    provider,
+                    segment,
+                    anchors,
+                    refusal_retry=retry_stage == "translate-refusal-retry" and ordinal > 1,
+                    retry_feedback=feedback if retry_stage == "translate-integrity-retry" else None,
                 )
                 duration = int((time.monotonic() - started) * 1000)
                 self._record(
@@ -616,7 +627,8 @@ class LocalizationOrchestrator:
                     FailureCode.INTEGRITY_INVALID.value, ordinal
                 )
             ):
-                retry_stage = "translate-grace-retry"
+                retry_stage = "translate-integrity-retry"
+                feedback = retry_feedback(integrity)
                 continue
             return None
 
@@ -646,7 +658,7 @@ class LocalizationOrchestrator:
                     segment,
                     candidate,
                     anchors,
-                    refusal_retry=ordinal > 1,
+                    refusal_retry=refusal_retried,
                 )
                 duration = int((time.monotonic() - started) * 1000)
                 self._record(
@@ -713,6 +725,7 @@ class LocalizationOrchestrator:
         ordinal = 0
         refusal_retried = False
         retry_stage = "review-rewrite-grace-retry"
+        feedback: list[dict[str, str]] = []
         while True:
             ordinal += 1
             started = time.monotonic()
@@ -724,7 +737,8 @@ class LocalizationOrchestrator:
                     candidate,
                     issue_codes,
                     anchors,
-                    refusal_retry=ordinal > 1,
+                    refusal_retry=refusal_retried,
+                    retry_feedback=feedback or None,
                 )
                 duration = int((time.monotonic() - started) * 1000)
                 self._record(
@@ -794,6 +808,7 @@ class LocalizationOrchestrator:
             )
             if self._can_grace_retry(FailureCode.INTEGRITY_INVALID.value, ordinal):
                 retry_stage = "review-rewrite-grace-retry"
+                feedback = retry_feedback(integrity)
                 continue
             return None
 
