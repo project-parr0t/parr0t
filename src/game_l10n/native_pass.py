@@ -1775,7 +1775,6 @@ def seal_native_wave_relay(
         or payload.get("dispatch_fingerprint") != stable_hash(unsigned)
         or not isinstance(payload.get("task_bindings"), list)
         or not payload["task_bindings"]
-        or len(payload["task_bindings"]) > DEFAULT_MAX_WORKERS
         or not isinstance(payload.get("relay_contract"), dict)
         or payload["relay_contract"].get("role") != "isolated_wave_relay"
         or payload["relay_contract"].get("authority")
@@ -1807,6 +1806,8 @@ def seal_native_wave_relay(
         if (
             manifest["contract_fingerprint"] != payload["manifest_contract_fingerprint"]
             or _native_control_plan_fingerprint(manifest) != payload["plan_fingerprint"]
+            # The wave width is whatever prepare accepted (1..64), not the default.
+            or len(payload["task_bindings"]) > int(manifest["max_workers"])
         ):
             raise ValueError("Relay manifest binding changed")
     except (OSError, KeyError, TypeError, ValueError):
