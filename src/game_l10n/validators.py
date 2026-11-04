@@ -48,6 +48,28 @@ def contains_term(term: str, text: str, *, case_sensitive: bool = False) -> bool
     return re.search(left + re.escape(term) + right, text) is not None
 
 
+_MARKUP_TAG = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9:_-]*)[^<>]*?(/?)>")
+
+
+def _markup_nesting_ok(text: str) -> bool:
+    """Counts alone miss "<b>x</b>" -> "</b>x<b>"; a close must match the innermost open tag.
+
+    Tags left open at the end are tolerated because several engines allow them.
+    """
+    stack: list[str] = []
+    for match in _MARKUP_TAG.finditer(text):
+        closing, name, self_closing = match[1], match[2].casefold(), match[3]
+        if self_closing:
+            continue
+        if not closing:
+            stack.append(name)
+        elif stack and stack[-1] == name:
+            stack.pop()
+        else:
+            return False
+    return True
+
+
 def protected_tokens(text: str, extra_patterns: list[str] | None = None) -> Counter[str]:
     # Defaults scan as one leftmost alternation, so nested matches ("$d" in "%1$d") never double-count.
     tokens = _DEFAULT_PROTECTED_RE.findall(text)
@@ -130,6 +152,14 @@ def validate_integrity(
             ValidationIssue(
                 "protected-token-mismatch",
                 f"Protected tokens changed; missing={missing!r}, added={added!r}",
+            )
+        )
+
+    if _markup_nesting_ok(segment.source) and not _markup_nesting_ok(candidate):
+        issues.append(
+            ValidationIssue(
+                "markup-malformed",
+                "Paired markup tags are crossed or closed out of order",
             )
         )
 

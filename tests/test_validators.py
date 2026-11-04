@@ -150,6 +150,16 @@ class ValidatorTests(unittest.TestCase):
         self.assertFalse(contains_term("Jos\u00e9", "Jos\u00e9phine"))
         self.assertTrue(contains_term("Jos\u00e9", "Jos\u00e9, FIXTURE"))
         self.assertTrue(contains_term("\u03a6\u03af\u03bb", "\u03a6\u03af\u03bb\u037e"))
+    def test_crossed_markup_is_rejected_but_moved_spans_are_not(self) -> None:
+        def codes(source: str, candidate: str) -> set[str]:
+            return {item.code for item in validate_integrity(Segment("fixture-markup", source), candidate, [])}
+
+        self.assertIn("markup-malformed", codes("<b>A</b> <i>B</i>", "</b>A<b> <i>B</i>"))
+        self.assertIn("markup-malformed", codes("<b><i>A</i></b>", "<b><i>A</b></i>"))
+        self.assertNotIn("markup-malformed", codes("<b>A</b> <i>B</i>", "<i>B</i> <b>A</b>"))
+        self.assertNotIn("markup-malformed", codes("<color=red>A", "<color=red>B"))
+        self.assertNotIn("markup-malformed", codes("A<br/>B", "B<br/>A"))
+
 
 if __name__ == "__main__":
     unittest.main()
