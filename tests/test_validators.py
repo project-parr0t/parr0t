@@ -5,7 +5,7 @@ import unittest
 
 from game_l10n.models import GlossaryEntry, Segment
 from game_l10n.store import stable_hash
-from game_l10n.validators import protected_tokens, validate_integrity
+from game_l10n.validators import contains_term, protected_tokens, validate_integrity
 
 
 def optional_slot_fixture(
@@ -132,6 +132,24 @@ class ValidatorTests(unittest.TestCase):
                 issues = validate_integrity(Segment("fixture-token", source), candidate, [])
                 self.assertNotIn("protected-token-mismatch", {item.code for item in issues})
 
+    def test_term_matching_respects_latin_words_but_not_cjk_particles(self) -> None:
+        self.assertFalse(contains_term("Ice", "Device price"))
+        self.assertTrue(contains_term("Ice", "Ice shard"))
+        self.assertTrue(contains_term("Potion", "Two potions"))
+        self.assertTrue(contains_term("\u592a\u90ce", "\u592a\u90ce\u306f\u6765\u305f"))
+        self.assertTrue(contains_term("SOURCE", "SOURCE_OPTIONAL"))
+        glossary = [GlossaryEntry("Ice", "TARGET_ICE")]
+        issues = validate_integrity(Segment("fixture-term", "Device"), "TARGET", glossary)
+        self.assertNotIn("glossary-missing", {item.code for item in issues})
+
+
+    def test_term_matching_keeps_abbreviations_glued_to_numbers(self) -> None:
+        for text in ("HP100", "50HP", "Lv99"):
+            with self.subTest(text=text):
+                self.assertTrue(contains_term(text.strip("0123456789"), text))
+        self.assertFalse(contains_term("Jos\u00e9", "Jos\u00e9phine"))
+        self.assertTrue(contains_term("Jos\u00e9", "Jos\u00e9, FIXTURE"))
+        self.assertTrue(contains_term("\u03a6\u03af\u03bb", "\u03a6\u03af\u03bb\u037e"))
 
 if __name__ == "__main__":
     unittest.main()

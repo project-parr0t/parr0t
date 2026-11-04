@@ -246,5 +246,17 @@ class PromptTests(unittest.TestCase):
         self.assertLess(len(user), 5_000)
 
 
+    def test_focus_terms_skip_latin_substrings_and_match_cjk_particles(self) -> None:
+        from game_l10n.prompts import _focused_relationships, _relevant_glossary
+
+        glossary = [GlossaryEntry("Ice", "TARGET_ICE"), GlossaryEntry("Potion", "TARGET_POTION")]
+        relevant = _relevant_glossary(glossary, "Device and potions")
+        self.assertEqual([item.source for item in relevant], ["Potion"])
+        speaker = "\u592a\u90ce"
+        timeline = ("FIXTURE_OTHER", speaker + "\u306f FIXTURE_EVENT")
+        self.assertEqual(
+            _focused_relationships(timeline, speaker=speaker, scene=""), [timeline[1]]
+        )
+
 if __name__ == "__main__":
     unittest.main()
