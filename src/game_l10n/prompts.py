@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from typing import Any
 
 from .models import CharacterProfile, ContextPack, GlossaryEntry, ProjectContext, Segment
@@ -299,14 +300,13 @@ def _shared_context(
         },
         "functional_context": functional_context,
         "knowledge_context": knowledge_context,
+        # Every user-authored profile field, so formality, address and speech rules reach the model.
         "character": None
         if character is None
         else {
-            "name": character.name,
-            "aliases": list(character.aliases),
-            "voice": character.voice,
-            "relationships": character.relationships,
-            "notes": character.notes,
+            name: list(value) if isinstance(value, tuple) else value
+            for name, value in asdict(character).items()
+            if value or name == "name"
         },
         "approved_same_speaker_style_anchors": style_anchors or [],
         "glossary": [

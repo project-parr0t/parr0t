@@ -258,5 +258,27 @@ class PromptTests(unittest.TestCase):
             _focused_relationships(timeline, speaker=speaker, scene=""), [timeline[1]]
         )
 
+    def test_character_profile_projects_every_authored_field(self) -> None:
+        profile = CharacterProfile(
+            "fixture-speaker",
+            formality="FIXTURE_FORMALITY",
+            address_rules="FIXTURE_ADDRESS",
+            speech_rules=("FIXTURE_RULE",),
+            example_lines=("FIXTURE_EXAMPLE",),
+        )
+        _, user = translation_prompt(
+            ProjectContext("FIXTURE", "src", "dst"),
+            Segment("fixture-1", "SOURCE", speaker="fixture-speaker"),
+            [],
+            profile,
+        )
+        character = json.loads(user)["character"]
+
+        self.assertEqual(character["formality"], "FIXTURE_FORMALITY")
+        self.assertEqual(character["address_rules"], "FIXTURE_ADDRESS")
+        self.assertEqual(character["speech_rules"], ["FIXTURE_RULE"])
+        self.assertEqual(character["example_lines"], ["FIXTURE_EXAMPLE"])
+        self.assertNotIn("personality", character)
+
 if __name__ == "__main__":
     unittest.main()
