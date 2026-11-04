@@ -479,7 +479,7 @@ def collect_native_rewrite(
 
 def process_native_review_followup(
     work_dir: Path, source: Path, output: Path, orchestrator: Any, *, operation: str,
-    deadline_epoch: float, wave_size: int = 8,
+    deadline_epoch: float | None = None, wave_size: int = 8,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Run only the locked external review role, with durable per-wave results.
@@ -587,7 +587,8 @@ def process_native_review_followup(
         except (TypeError, ValueError, OSError):
             pass
     for offset in range(0, len(pending), wave_size):
-        if time.time() >= deadline_epoch:
+        # Only a user-requested ceiling binds a deadline (AGENTS rule 16).
+        if deadline_epoch is not None and time.time() >= deadline_epoch:
             break
         chunk = pending[offset:offset + wave_size]
         with ThreadPoolExecutor(max_workers=wave_size) as pool:
@@ -643,4 +644,5 @@ def process_native_review_followup(
     return {"records": len(segments), "executed": executed, "cached": len(saved),
             "accepted": len(accepted), "rewrite_pending": len(rewrite),
             "confirmation_pending": len(confirmation), "unresolved": len(unresolved),
+            "deadline_pending": len(pending) - executed,
             "output": output.relative_to(work_dir).as_posix()}

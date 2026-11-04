@@ -322,9 +322,10 @@ class NativeReviewTests(unittest.TestCase):
             first = process_native_review_followup(root, source, root / "out", fake,
                                                    operation="judge", deadline_epoch=time.time()+60)
             second = process_native_review_followup(root, source, root / "out", fake,
-                                                    operation="judge", deadline_epoch=time.time()+60)
+                                                    operation="judge")
             self.assertEqual(first["accepted"], 1)
             self.assertEqual(second["executed"], 0)
+            self.assertEqual(second["deadline_pending"], 0)
             self.assertEqual(calls, ["judge"])
             result.attempts[-1].status = "rewrite"
             result.metadata["rewrite_issues"] = ["voice"]
@@ -343,3 +344,16 @@ class NativeReviewTests(unittest.TestCase):
             binding = confirmation.metadata["_parr0t_candidate"]
             self.assertEqual(binding["generation"], 2)
             self.assertEqual(binding["digest"], stable_hash("REVISED"))
+
+    def test_review_followup_cli_does_not_require_a_time_ceiling(self) -> None:
+        from game_l10n.cli import build_parser, cmd_process_native_review_followup
+        from game_l10n.errors import ConfigurationError
+
+        args = build_parser().parse_args([
+            "process-native-review-followup", "--workspace", "w", "--input", "i",
+            "--output", "o", "--operation", "judge",
+        ])
+        self.assertIsNone(args.max_elapsed_minutes)
+        args.max_elapsed_minutes = 5.0
+        with self.assertRaisesRegex(ConfigurationError, "E_REVIEW_FALLBACK_BUDGET_INVALID"):
+            cmd_process_native_review_followup(args)
