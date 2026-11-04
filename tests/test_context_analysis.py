@@ -642,5 +642,35 @@ class ContextAnalysisTests(unittest.TestCase):
                 )
 
 
+    def test_analyzer_receives_locked_inputs_and_global_line_order(self) -> None:
+        from game_l10n.models import CharacterProfile, GlossaryEntry, ProjectContext
+
+        payloads = []
+
+        def observed(**kwargs):
+            payloads.append(json.loads(kwargs["user"]))
+            return successful_context(**kwargs)
+
+        analyzer = ContextAnalyzer(
+            ProviderRegistry({"context": ScriptedProvider("context", observed)}),
+            ["context"],
+            max_chunk_chars=100,
+            project=ProjectContext("FIXTURE", "src", "ko", style_guide="FIXTURE_STYLE"),
+            glossary=[GlossaryEntry("Potion", "TARGET_POTION"), GlossaryEntry("Ice", "TARGET_ICE")],
+            characters=[CharacterProfile("A", formality="FIXTURE_FORMALITY")],
+        )
+        analyzer.analyze([
+            Segment(str(index), "Potion " + "X" * 38, speaker="A", scene="S") for index in range(4)
+        ])
+
+        payloads.sort(key=lambda item: item["part"])
+        self.assertGreater(len(payloads), 1)
+        orders = [line["order"] for payload in payloads for line in payload["lines"]]
+        self.assertEqual(orders, list(range(4)))
+        inputs = payloads[0]["localization_inputs"]
+        self.assertEqual(inputs["project"]["target_language"], "ko")
+        self.assertEqual([term["source"] for term in inputs["glossary"]], ["Potion"])
+        self.assertEqual(inputs["speaker_profiles"][0]["formality"], "FIXTURE_FORMALITY")
+
 if __name__ == "__main__":
     unittest.main()

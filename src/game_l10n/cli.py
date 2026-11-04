@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 import sys
-from dataclasses import asdict, fields
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +57,7 @@ from .failure_queue import (
     update_failure_queue,
 )
 from .formats import (
+    load_dataclass_list,
     read_existing_translations,
     read_segments,
     read_translation_results,
@@ -561,12 +562,23 @@ def _source_path(work_dir: Path, value: str, config: dict[str, Any]) -> Path:
     return path
 
 
-def _load_dataclass_list(path: Path, cls: type) -> list[Any]:
-    if not path.exists():
-        return []
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    allowed = {item.name for item in fields(cls)}
-    return [cls(**{key: value for key, value in row.items() if key in allowed}) for row in payload]
+_load_dataclass_list = load_dataclass_list
+
+
+def _context_localization_inputs(work_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
+    """Locked project facts plus user glossary and character profiles for context analysis."""
+    file_config = config.get("files", {})
+    return {
+        "project": ProjectContext(**config["project"]),
+        "glossary": _load_dataclass_list(
+            _path_in_workspace(work_dir, file_config.get("glossary", "context/glossary.json")),
+            GlossaryEntry,
+        ),
+        "characters": _load_dataclass_list(
+            _path_in_workspace(work_dir, file_config.get("characters", "context/characters.json")),
+            CharacterProfile,
+        ),
+    }
 
 
 def _orchestrator(
@@ -725,6 +737,7 @@ def _analyze_context(
             ),
         ),
         context_mode=context_mode or str(config.get("project", {}).get("context_mode", "auto")),
+        **_context_localization_inputs(work_dir, config),
     )
     context_relative = config.get("files", {}).get("context_pack", "context/context-pack.json")
     return analyze_with_cache(

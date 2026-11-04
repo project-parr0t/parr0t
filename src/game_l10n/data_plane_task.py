@@ -11,6 +11,7 @@ from .context_analysis import (
     CONTEXT_PREFLIGHT_SCHEMA,
     CONTEXT_STATE_SCHEMA,
     build_context_preflight,
+    chunk_localization_inputs,
     context_chunks,
     context_contract_fingerprints,
     context_attestation_for_mode,
@@ -30,7 +31,7 @@ from .control_plane import (
 )
 from .coverage import require_inventory_attestation
 from .errors import ConfigurationError, ProviderError
-from .formats import read_segments
+from .formats import load_dataclass_list, read_segments
 from .image_localization import (
     SCOPE_PATH as IMAGE_SCOPE_PATH,
     public_image_localization_state,
@@ -39,7 +40,7 @@ from .image_localization import (
     verify_image_ui_inventory,
 )
 from .language_policy import language_binding
-from .models import ContextMode, ContextPack, Segment
+from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext, Segment
 from .privacy import is_within
 from .store import stable_hash
 
@@ -74,6 +75,38 @@ CONTEXT_RESULT_ISSUE_CODES = {
 
 MIN_CONTEXT_CHUNK_CHARS = 2048
 MAX_CONTEXT_WORKERS = 6
+
+
+def _chunk_localization(chunk: list[Segment], localization: dict[str, Any] | None) -> dict[str, Any]:
+    inputs = chunk_localization_inputs(chunk, **(localization or {})) if localization else {}
+    return {"localization_inputs": inputs} if inputs else {}
+
+
+def _context_localization(work_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
+    """Same locked inputs the API analyzer receives; paths stay inside the workspace."""
+    files = config.get("files", {})
+
+    def load(key: str, default: str, cls: type) -> list[Any]:
+        path = (work_dir / str(files.get(key, default))).resolve()
+        if not is_within(path, work_dir):
+            raise ConfigurationError(f"E_DATA_PLANE_TASK_PATH: files.{key} left the workspace")
+        return load_dataclass_list(path, cls)
+
+    return {
+        # Native workspaces may carry a partial project block; absent facts stay empty.
+        "project": ProjectContext(
+            **{
+                "game_title": "", "source_language": "", "target_language": "",
+                **{
+                    key: value
+                    for key, value in config.get("project", {}).items()
+                    if key in {item.name for item in fields(ProjectContext)}
+                },
+            }
+        ),
+        "glossary": load("glossary", "context/glossary.json", GlossaryEntry),
+        "characters": load("characters", "context/characters.json", CharacterProfile),
+    }
 
 
 def _context_row(segment: Segment) -> dict[str, Any]:
@@ -205,6 +238,7 @@ def _write_context_manifest(
     context_mode: str,
     chunk_chars: int,
     contract_fingerprints: dict[str, Any],
+    localization: dict[str, Any] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     semantic = semantic_context_segments(segments, preflight)
     resolved_mode = (
@@ -295,6 +329,7 @@ def _write_context_manifest(
                     "rows": [_context_row(item) for item in chunk],
                     "initial_status": "pending",
                     "fragment_path": "",
+                    **_chunk_localization(chunk, localization),
                 }
             )
     units.sort(key=lambda item: int(item["source_index"]))
@@ -543,6 +578,11 @@ def claim_context_chunk(
             "slot": slot,
             "provider": task["context_route"],
             "rows": chunk["rows"],
+            **(
+                {"localization_inputs": chunk["localization_inputs"]}
+                if chunk.get("localization_inputs")
+                else {}
+            ),
         }
         claim = {
             **unsigned,
@@ -613,6 +653,8 @@ def commit_context_fragment(
             "rows",
         )
     }
+    if isinstance(claim, dict) and "localization_inputs" in claim:
+        claim_unsigned["localization_inputs"] = claim["localization_inputs"]
     if (
         not isinstance(claim, dict)
         or claim.get("schema") != CONTEXT_CHUNK_CLAIM_SCHEMA
@@ -1406,6 +1448,7 @@ def prepare_data_plane_task(
             context_mode=context_mode,
             chunk_chars=context_chunk_chars,
             contract_fingerprints=context_fingerprints,
+            localization=_context_localization(work_dir, config),
         )
         _, pending_context_chunks = _context_progress(work_dir, context_manifest)
         relay_max_workers = min(

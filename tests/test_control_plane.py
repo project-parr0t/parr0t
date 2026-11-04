@@ -664,6 +664,8 @@ class ControlPlaneContractTests(unittest.TestCase):
             claimed = claim_context_chunk(work, task_path, slot=1)
             claim_path = work / claimed["claim_path"]
             claim = json.loads(claim_path.read_text(encoding="utf-8"))
+            # Native context workers get the same locked project facts as the API analyzer.
+            self.assertIn("target_language", claim["localization_inputs"]["project"])
             result_path = work / ".game-l10n" / "context-progress" / "result.json"
             result_path.parent.mkdir(parents=True, exist_ok=True)
             result_path.write_text(
