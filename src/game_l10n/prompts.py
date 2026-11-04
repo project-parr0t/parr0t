@@ -7,7 +7,7 @@ from typing import Any
 from .models import CharacterProfile, ContextPack, GlossaryEntry, ProjectContext, Segment
 from .validators import contains_term
 
-PROMPT_VERSION = "2026-11-04.1"
+PROMPT_VERSION = "2026-11-04.2"
 
 _DUPLICATE_CONTEXT_METADATA_KEYS = {
     "context_attachment",
@@ -102,6 +102,38 @@ _RETRY_FEEDBACK_NOTE = (
     "previous_attempt_validation_failures lists each failed check. Fix exactly those problems "
     "while keeping every other requirement above."
 )
+
+
+_ADEQUACY_ISSUES = {"meaning", "omission", "addition"}
+_ADEQUACY_NOTE = (
+    "\nFor meaning, omission or addition issues, retranslate translation_target.source from scratch "
+    "and use candidate_translation only as a reference; do not minimally edit a wrong candidate. Fix "
+    "every other listed issue with the smallest change."
+)
+_LENGTH_NOTE = (
+    "\nlength_budget is a hard UI limit: the corrected text must be at most max_chars characters "
+    "(Python len, counting whitespace, markup and control tokens) while keeping the source meaning, "
+    "state, units and every protected token. Prefer the compact UI register shown in "
+    "compression_examples when supplied."
+)
+# Synthetic, provenance-free illustrations of compact Korean UI phrasing.
+_KO_COMPRESSION_EXAMPLES = (
+    {"long": "\uc800\uc7a5\uc774 \uc644\ub8cc\ub418\uc5c8\uc2b5\ub2c8\ub2e4", "short": "\uc800\uc7a5\ub428"},
+    {"long": "\uc544\uc774\ud15c\uc744 \ud68d\ub4dd\ud588\uc2b5\ub2c8\ub2e4", "short": "\uc544\uc774\ud15c \ud68d\ub4dd"},
+)
+
+
+def _length_budget(segment: Segment, candidate: str, issue_codes: list[str]) -> dict[str, Any] | None:
+    limit = segment.metadata.get("ui_max_chars")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        return None
+    if "length_risk" not in issue_codes and len(candidate) <= limit:
+        return None
+    return {
+        "max_chars": limit,
+        "candidate_chars": len(candidate),
+        "must_cut_chars": max(0, len(candidate) - limit),
+    }
 
 
 def retry_feedback(issues: list[Any]) -> list[dict[str, str]]:
@@ -532,6 +564,11 @@ def review_rewrite_prompt(
     payload["detected_issue_codes"] = issue_codes
     if retry_feedback:
         payload["previous_attempt_validation_failures"] = retry_feedback
+    length_budget = _length_budget(segment, candidate, issue_codes)
+    if length_budget:
+        payload["length_budget"] = length_budget
+        if project.target_language.casefold().startswith("ko"):
+            payload["compression_examples"] = list(_KO_COMPRESSION_EXAMPLES)
     system = """You are a game-localization correction editor. Rewrite only candidate_translation, and only
 because the independent judge identified the categorical issues supplied in detected_issue_codes. Preserve the
 source meaning, intent, intensity, character voice, register, terminology, names, placeholders, markup, escape
@@ -553,6 +590,10 @@ status=success and the complete corrected translation. Return only the requested
             "\nThis retry still covers one bounded correction target. If permitted, return the faithful "
             "correction; otherwise return refused."
         )
+    if _ADEQUACY_ISSUES.intersection(issue_codes):
+        system += _ADEQUACY_NOTE
+    if length_budget:
+        system += _LENGTH_NOTE
     if retry_feedback:
         system += _RETRY_FEEDBACK_NOTE
     return system, json.dumps(payload, ensure_ascii=False)

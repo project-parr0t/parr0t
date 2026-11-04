@@ -4,7 +4,7 @@ import json
 import unittest
 
 from game_l10n.models import CharacterProfile, ContextPack, GlossaryEntry, ProjectContext, Segment
-from game_l10n.prompts import REVIEW_ISSUE_CODES, review_judge_prompt, translation_prompt
+from game_l10n.prompts import REVIEW_ISSUE_CODES, review_judge_prompt, review_rewrite_prompt, translation_prompt
 
 
 class PromptTests(unittest.TestCase):
@@ -290,6 +290,21 @@ class PromptTests(unittest.TestCase):
         projected = json.loads(user)["glossary"]
         self.assertEqual(projected[0]["also_accepted_targets"], ["TARGET_B"])
         self.assertEqual(len(projected), 1)
+
+    def test_rewrite_prompt_retranslates_adequacy_issues_and_budgets_ui_length(self) -> None:
+        segment = Segment("fixture-ui", "SOURCE_LABEL", metadata={"ui_max_chars": 4})
+        project = ProjectContext("FIXTURE", "src", "ko")
+        system, user = review_rewrite_prompt(project, segment, "TARGET_TOO_LONG", ["omission"], [], None)
+        payload = json.loads(user)
+        self.assertIn("retranslate translation_target.source from scratch", system)
+        self.assertEqual(payload["length_budget"], {"max_chars": 4, "candidate_chars": 15, "must_cut_chars": 11})
+        self.assertEqual(len(payload["compression_examples"]), 2)
+
+        system, user = review_rewrite_prompt(
+            ProjectContext("FIXTURE", "src", "dst"), segment, "OK", ["voice"], [], None
+        )
+        self.assertNotIn("from scratch", system)
+        self.assertNotIn("length_budget", json.loads(user))
 
 if __name__ == "__main__":
     unittest.main()
