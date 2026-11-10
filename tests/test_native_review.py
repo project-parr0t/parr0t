@@ -395,15 +395,22 @@ class NativeReviewTests(unittest.TestCase):
         integrity = [ValidationIssue("glossary-missing", "x"), ValidationIssue("ui-length-limit", "y")]
         self.assertEqual(
             rewrite_issue_codes(["meaning", "omission"], integrity, language_risk=True),
-            ["terminology", "length_risk", "fluency", "meaning"],
+            ["terminology", "length_risk", "fluency", "meaning", "omission"],
         )
-        # The cap trims judge codes, never the hard-gate findings.
+        # The cap applies to judge codes alone, never to hard-gate findings.
         self.assertEqual(
             rewrite_issue_codes(
                 ["meaning", "voice", "register", "literalism"],
                 [ValidationIssue("glossary-missing", "x")], language_risk=True,
             ),
-            ["terminology", "fluency", "meaning", "voice"],
+            [
+                "terminology",
+                "fluency",
+                "meaning",
+                "voice",
+                "register",
+                "literalism",
+            ],
         )
         self.assertEqual(rewrite_issue_codes(["voice"], language_risk=True), ["fluency", "voice"])
         self.assertEqual(rewrite_issue_codes(), ["formatting"])

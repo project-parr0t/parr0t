@@ -49,23 +49,24 @@ _INTEGRITY_REVIEW_ISSUES = {
     "ui-composition-duplication": "slot_composition",
     "ui-length-limit": "length_risk",
 }
-MAX_REWRITE_ISSUES = 4
+MAX_JUDGE_ISSUES = 4
 
 
 def rewrite_issue_codes(
     judge_issues: Iterable[str] = (), integrity: Iterable[Any] = (), *, language_risk: bool = False
 ) -> list[str]:
-    """Union validator codes, language risk, then judge codes, capped at the protocol limit.
+    """Union every hard gate with the judge's bounded semantic findings.
 
-    Deterministic findings come first: a rewrite that never hears about them fails the
-    same hard gate again at confirmation, so the cap may only trim judge codes.
+    The four-code protocol limit applies to a judge response, not to the internal
+    rewrite instruction assembled by the deterministic core.  Dropping any mapped
+    validator or language finding makes the rewrite repeat a known failure.
     """
-    codes = [
+    hard_gates = [
         *(_INTEGRITY_REVIEW_ISSUES.get(item.code, "formatting") for item in integrity),
         *(["fluency"] if language_risk else []),
-        *judge_issues,
     ]
-    return list(dict.fromkeys(codes))[:MAX_REWRITE_ISSUES] or ["formatting"]
+    bounded_judge = list(dict.fromkeys(judge_issues))[:MAX_JUDGE_ISSUES]
+    return list(dict.fromkeys([*hard_gates, *bounded_judge])) or ["formatting"]
 
 
 _TARGET_SCRIPT_PATTERNS = {

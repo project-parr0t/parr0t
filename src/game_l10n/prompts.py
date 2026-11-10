@@ -125,7 +125,7 @@ _KO_COMPRESSION_EXAMPLES = (
 
 def _length_budget(segment: Segment, candidate: str, issue_codes: list[str]) -> dict[str, Any] | None:
     limit = segment.metadata.get("ui_max_chars")
-    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
         return None
     if "length_risk" not in issue_codes and len(candidate) <= limit:
         return None
@@ -156,12 +156,7 @@ def _relevant_glossary(
         and (
             contains_term(item.source, haystack, case_sensitive=item.case_sensitive)
             or any(
-                target
-                and (
-                    target in candidate
-                    if item.case_sensitive
-                    else target.casefold() in candidate.casefold()
-                )
+                contains_term(target, candidate, case_sensitive=item.case_sensitive)
                 for target in item.allowed_targets
             )
         )

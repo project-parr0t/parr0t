@@ -167,10 +167,25 @@ class ValidatorTests(unittest.TestCase):
         entry = GlossaryEntry("Potion", "TARGET_A", targets=["TARGET_B", " ", "TARGET_A"])
         self.assertEqual(entry.targets, ("TARGET_B",))
         segment = Segment("fixture-glossary", "Potion")
-        for candidate, ok in (("TARGET_B", True), ("TARGET_A", True), ("TARGET_C", False)):
+        for candidate, ok in (
+            ("TARGET_B", True),
+            ("TARGET_A", True),
+            ("TARGET_BROKEN", False),
+            ("TARGET_C", False),
+        ):
             with self.subTest(candidate=candidate):
                 codes = {item.code for item in validate_integrity(segment, candidate, [entry])}
                 self.assertEqual("glossary-missing" not in codes, ok)
+        cjk_entry = GlossaryEntry("Taro", "\u592a\u90ce")
+        cjk_codes = {
+            item.code
+            for item in validate_integrity(
+                Segment("fixture-cjk-glossary", "Taro"),
+                "\u592a\u90ce\u306f\u6765\u305f",
+                [cjk_entry],
+            )
+        }
+        self.assertNotIn("glossary-missing", cjk_codes)
         with self.assertRaises(ValueError):
             GlossaryEntry("Potion", "TARGET_A", targets="TARGET_B")
 

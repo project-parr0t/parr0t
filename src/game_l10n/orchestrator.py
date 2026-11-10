@@ -858,7 +858,12 @@ class LocalizationOrchestrator:
                 revised = revised or legacy_candidate_changed
                 working = verdict.text
                 self._set_candidate(result, working)
-            if verdict.verdict is ReviewVerdict.OK:
+            language_risk = target_language_review_reasons(
+                working, self.project.target_language, segment.metadata
+            )
+            if language_risk:
+                result.metadata["target_language_risk"] = language_risk
+            if verdict.verdict is ReviewVerdict.OK and not language_risk:
                 if legacy_candidate_changed:
                     if round_index + 1 >= self.config.review_max_rounds:
                         self._record(
@@ -893,6 +898,9 @@ class LocalizationOrchestrator:
                 )
                 return ReviewEnvelope(ReviewDecision.ERROR, text=working)
             rewrite = None
+            rewrite_issues = rewrite_issue_codes(
+                verdict.issues, language_risk=bool(language_risk)
+            )
             rewriters = self.config.rewriter_chain or [provider.name]
             for rewriter_name in rewriters:
                 rewriter = self.registry.get(rewriter_name)
@@ -901,7 +909,7 @@ class LocalizationOrchestrator:
                     rewriter,
                     segment,
                     working,
-                    verdict.issues,
+                    rewrite_issues,
                     anchors,
                 )
                 if rewrite is not None and rewrite.status is AgentStatus.SUCCESS:

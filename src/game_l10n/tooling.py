@@ -210,9 +210,15 @@ def run_cached_tool(
     if stage == "pack":
         _require_pack_input_binding(work_dir, resolved_input)
     expanded = _expand(command, input_path=input_path, output_path=output_path, work_dir=work_dir)
+    # The portable ``python`` token denotes this runtime.  Bind the resolved
+    # interpreter into the cache fingerprint as well as the executed command,
+    # so changing Python cannot silently reuse output from another runtime.
+    execution_command = (
+        [sys.executable, *expanded[1:]] if expanded[:1] == ["python"] else expanded
+    )
     tool_files: list[Path] = []
     excluded = {input_path.resolve(), output_path.resolve()}
-    for part in expanded:
+    for part in execution_command:
         candidate = Path(part)
         if not candidate.is_absolute():
             candidate = work_dir / candidate
@@ -224,7 +230,7 @@ def run_cached_tool(
     fingerprint = stable_hash(
         {
             "stage": stage,
-            "command": expanded,
+            "command": execution_command,
             "input": input_hash,
             "tools": [(str(path), _hash_path(path)) for path in tool_files],
         }
@@ -252,8 +258,7 @@ def run_cached_tool(
     env.update({"GAME_L10N_STAGE": stage, "GAME_L10N_WORKDIR": str(work_dir)})
     try:
         completed = subprocess.run(
-            # The portable "python" template means this interpreter; many hosts ship only python3/py.
-            [sys.executable, *expanded[1:]] if expanded[:1] == ["python"] else expanded,
+            execution_command,
             cwd=work_dir,
             env=env,
             text=True,
@@ -289,7 +294,7 @@ def run_cached_tool(
         "output_path": str(resolved_output),
         "output_hash": _hash_path(output_path),
         "completion_attestation_hash": completion_hash,
-        "command": expanded,
+        "command": execution_command,
     }
     _write_tool_state(state_path, state)
     return {"stage": stage, "status": "completed", "fingerprint": fingerprint}

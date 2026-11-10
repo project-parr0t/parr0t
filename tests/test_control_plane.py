@@ -1462,6 +1462,45 @@ class ControlPlaneContractTests(unittest.TestCase):
 
         self.assertEqual(state["status"], "rotation_required")
 
+    def test_rotation_acknowledgment_is_retryable_when_receipt_removal_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = root / CONTROL_HANDOFF_PATH
+            record_control_plane_leak(root, "source_or_candidate_received")
+
+            with patch.object(
+                Path, "unlink", side_effect=PermissionError("synthetic receipt lock")
+            ):
+                with self.assertRaises(PermissionError):
+                    acknowledge_control_plane_rotation(root, receipt)
+
+            self.assertEqual(control_plane_state(root)["status"], "rotation_required")
+            self.assertTrue(receipt.exists())
+            resumed = acknowledge_control_plane_rotation(root, receipt)
+
+        self.assertEqual(resumed["status"], "ready")
+        self.assertEqual(resumed["generation"], 2)
+
+    def test_rotation_acknowledgment_regenerates_receipt_after_late_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = root / CONTROL_HANDOFF_PATH
+            record_control_plane_leak(root, "source_or_candidate_received")
+
+            with patch(
+                "game_l10n.control_plane._reset_native_control_observations",
+                side_effect=OSError("synthetic observation reset failure"),
+            ):
+                with self.assertRaises(OSError):
+                    acknowledge_control_plane_rotation(root, receipt)
+
+            self.assertEqual(control_plane_state(root)["status"], "rotation_required")
+            self.assertFalse(receipt.exists())
+            resumed = acknowledge_control_plane_rotation(root, receipt)
+
+        self.assertEqual(resumed["status"], "ready")
+        self.assertEqual(resumed["generation"], 2)
+
     def test_interrupted_second_leak_does_not_wedge_rotation(self) -> None:
         from unittest import mock
 

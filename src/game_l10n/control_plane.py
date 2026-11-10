@@ -623,11 +623,15 @@ def acknowledge_control_plane_rotation(
         "incident_code": "",
         "resumed_from_incident": incident_id,
     }
-    _atomic_json(work_dir / CONTROL_STATE_PATH, resumed)
+    # Keep the rotation marker authoritative until every prerequisite mutation
+    # succeeds.  If receipt removal, entry reset, or observation reset fails,
+    # a retry still sees ``rotation_required`` and can regenerate the canonical
+    # receipt.  Committing ``ready`` first made an interrupted acknowledgement
+    # impossible to retry.
+    (work_dir / CONTROL_HANDOFF_PATH).unlink(missing_ok=True)
     _atomic_json(work_dir / CONTROL_ENTRY_PATH, initial_control_plane_entry_state())
     _reset_native_control_observations(work_dir)
-    # A consumed receipt must not outlive its incident.
-    (work_dir / CONTROL_HANDOFF_PATH).unlink(missing_ok=True)
+    _atomic_json(work_dir / CONTROL_STATE_PATH, resumed)
     return resumed
 
 

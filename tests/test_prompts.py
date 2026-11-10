@@ -312,6 +312,22 @@ class PromptTests(unittest.TestCase):
 
         entry = GlossaryEntry("Potion", "TARGET_A", targets=("TARGET_B",))
         self.assertEqual(_relevant_glossary([entry], "OTHER", "TARGET_B"), [entry])
+        self.assertEqual(_relevant_glossary([entry], "OTHER", "TARGET_BROKEN"), [])
+
+    def test_zero_character_ui_slot_keeps_an_explicit_rewrite_budget(self) -> None:
+        _, user = review_rewrite_prompt(
+            ProjectContext("FIXTURE", "src", "ko"),
+            Segment("fixture-zero-slot", "SOURCE", metadata={"ui_max_chars": 0}),
+            "X",
+            ["length_risk"],
+            [],
+            None,
+        )
+
+        self.assertEqual(
+            json.loads(user)["length_budget"],
+            {"max_chars": 0, "candidate_chars": 1, "must_cut_chars": 1},
+        )
 
 if __name__ == "__main__":
     unittest.main()

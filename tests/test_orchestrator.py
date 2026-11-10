@@ -495,6 +495,57 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIn("review-confirm", [item.stage for item in result.attempts])
         self.assertIn("review-rewrite", [item.stage for item in result.attempts])
 
+    def test_strong_approval_cannot_waive_locked_target_language(self) -> None:
+        def rewrite_handler(**kwargs):
+            payload = json.loads(kwargs["user"])
+            self.assertEqual(payload["detected_issue_codes"], ["fluency"])
+            return {
+                "status": "success",
+                "text": "\ud55c\uad6d\uc5b4 \ud604\uc9c0\ud654 \uac80\uc218\ub97c \uc704\ud55c \uc815\uc0c1\uc801\uc778 \ubc88\uc5ed\ubb38\uc785\ub2c8\ub2e4.",
+            }
+
+        translator = ScriptedProvider(
+            "fixture-translator",
+            lambda **_: {
+                "status": "success",
+                "text": "This candidate is still written entirely in English.",
+                "reason": "",
+            },
+        )
+        judge = ScriptedProvider(
+            "fixture-judge", lambda **_: {"verdict": "ok", "issues": []}
+        )
+        rewriter = ScriptedProvider("fixture-rewriter", rewrite_handler)
+        registry = ProviderRegistry(
+            {item.name: item for item in [translator, judge, rewriter]}
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(
+                    [translator.name],
+                    [judge.name],
+                    rewriter_chain=[rewriter.name],
+                    strong_review_sample_percent=0,
+                    strong_review_high_risk_categories=[],
+                ),
+                project=ProjectContext("TEST", "en", "ko"),
+                context_pack=ContextPack(story_summary="STORY"),
+                work_dir=Path(directory),
+            ).translate_one(
+                Segment(
+                    "fixture-language-lock",
+                    "This is a source sentence for the Korean localization review.",
+                )
+            )
+
+        self.assertEqual(result.status, "reviewed")
+        self.assertEqual(result.review_outcome, "revised")
+        self.assertIn("\ud55c\uad6d\uc5b4", result.text)
+        self.assertEqual(judge.call_count, 2)
+        self.assertEqual(rewriter.call_count, 1)
+
     def test_rewriter_refusal_does_not_accept_a_candidate_flagged_for_rewrite(self) -> None:
         translator = ScriptedProvider(
             "fixture-translator",

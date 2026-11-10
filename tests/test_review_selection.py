@@ -2,15 +2,47 @@ from __future__ import annotations
 
 import unittest
 
-from game_l10n.models import Segment
+from game_l10n.models import Segment, ValidationIssue
 from game_l10n.review_selection import (
     review_category,
+    rewrite_issue_codes,
     strong_review_selection_reasons,
     target_language_review_reasons,
 )
 
 
 class ReviewSelectionTests(unittest.TestCase):
+    def test_rewrite_keeps_every_hard_gate_before_bounded_judge_findings(self) -> None:
+        integrity = [
+            ValidationIssue("glossary-missing", "fixture"),
+            ValidationIssue("markup-malformed", "fixture"),
+            ValidationIssue("script-intrusion", "fixture"),
+            ValidationIssue("ui-composition-duplication", "fixture"),
+            ValidationIssue("ui-length-limit", "fixture"),
+        ]
+
+        codes = rewrite_issue_codes(
+            ["meaning", "voice", "register", "literalism", "reference_loss"],
+            integrity,
+            language_risk=True,
+        )
+
+        self.assertEqual(
+            codes,
+            [
+                "terminology",
+                "formatting",
+                "addition",
+                "slot_composition",
+                "length_risk",
+                "fluency",
+                "meaning",
+                "voice",
+                "register",
+                "literalism",
+            ],
+        )
+
     def test_selection_is_text_independent_for_same_id_and_metadata(self) -> None:
         first = Segment("fixture", "SOURCE_A", metadata={"text_type": "ordinary"})
         second = Segment("fixture", "SOURCE_B", metadata={"text_type": "ordinary"})

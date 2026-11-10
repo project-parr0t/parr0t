@@ -1099,12 +1099,16 @@ class WorkspaceTests(unittest.TestCase):
             third = run_cached_tool(
                 stage="unpack", command=command, input_path=source, output_path=output, work_dir=work
             )
+            tool_state = json.loads(
+                (work / ".game-l10n" / "tool-state.json").read_text(encoding="utf-8")
+            )
             profile = prepare_sdk_profile(work, "fixture-engine", "1.0", user_confirmed_success=True)
             manifest = json.loads((profile / "profile.json").read_text(encoding="utf-8"))
             exported = {path.relative_to(profile).as_posix() for path in profile.rglob("*") if path.is_file()}
         self.assertEqual(first["status"], "completed")
         self.assertEqual(second["status"], "skipped")
         self.assertEqual(third["status"], "completed")
+        self.assertEqual(tool_state["unpack"]["command"][0], sys.executable)
         self.assertEqual(manifest["profile"], "sdk-fixture-engine-1.0")
         self.assertNotIn("next_step", manifest)
         self.assertNotIn("publish", json.dumps(manifest).lower())

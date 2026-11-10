@@ -169,13 +169,11 @@ def validate_integrity(
             )
         )
 
-    candidate_folded = candidate.casefold()
     for entry in glossary:
-        target_haystack = candidate if entry.case_sensitive else candidate_folded
         if contains_term(
             entry.source, segment.source, case_sensitive=entry.case_sensitive
         ) and not any(
-            (target if entry.case_sensitive else target.casefold()) in target_haystack
+            contains_term(target, candidate, case_sensitive=entry.case_sensitive)
             for target in entry.allowed_targets
         ):
             allowed = " or ".join(repr(target) for target in entry.allowed_targets)
