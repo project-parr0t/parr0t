@@ -31,6 +31,7 @@ from .prompts import (
     REVIEW_JUDGE_SCHEMA,
     REVIEW_REWRITE_SCHEMA,
     TRANSLATION_SCHEMA,
+    retry_feedback,
     review_judge_prompt,
     review_rewrite_prompt,
     translation_prompt,
@@ -39,7 +40,9 @@ from .providers import ModelProvider, ProviderRegistry
 from .review_selection import (
     DEFAULT_STRONG_REVIEW_CATEGORIES,
     DEFAULT_STRONG_REVIEW_SAMPLE_PERCENT,
+    provenance_review_reasons,
     review_category,
+    rewrite_issue_codes,
     strong_review_selection_reasons,
     target_language_review_reasons,
 )
@@ -427,6 +430,7 @@ class LocalizationOrchestrator:
         anchors: list[dict[str, str]],
         *,
         refusal_retry: bool = False,
+        retry_feedback: list[dict[str, str]] | None = None,
     ) -> AgentEnvelope:
         system, user = translation_prompt(
             self.project,
@@ -436,6 +440,7 @@ class LocalizationOrchestrator:
             self.context_pack,
             anchors,
             refusal_retry,
+            retry_feedback,
         )
         return self._translation_envelope(
             provider.generate_json(
@@ -485,6 +490,7 @@ class LocalizationOrchestrator:
         anchors: list[dict[str, str]],
         *,
         refusal_retry: bool = False,
+        retry_feedback: list[dict[str, str]] | None = None,
     ) -> AgentEnvelope:
         system, user = review_rewrite_prompt(
             self.project,
@@ -496,6 +502,7 @@ class LocalizationOrchestrator:
             self.context_pack,
             anchors,
             refusal_retry,
+            retry_feedback,
         )
         return self._translation_envelope(
             provider.generate_json(
@@ -517,13 +524,19 @@ class LocalizationOrchestrator:
         refusal_retried = False
         attempt_limit = self._translation_attempt_limit(provider.name)
         retry_stage = "translate-grace-retry"
+        feedback: list[dict[str, str]] = []
         while True:
             ordinal += 1
             started = time.monotonic()
             stage = "translate" if ordinal == 1 else retry_stage
             try:
+                # The refusal note belongs only to a retry after a refusal, not a timeout or bad output.
                 envelope = self._call_translation(
-                    provider, segment, anchors, refusal_retry=ordinal > 1
+                    provider,
+                    segment,
+                    anchors,
+                    refusal_retry=retry_stage == "translate-refusal-retry" and ordinal > 1,
+                    retry_feedback=feedback if retry_stage == "translate-integrity-retry" else None,
                 )
                 duration = int((time.monotonic() - started) * 1000)
                 self._record(
@@ -616,7 +629,8 @@ class LocalizationOrchestrator:
                     FailureCode.INTEGRITY_INVALID.value, ordinal
                 )
             ):
-                retry_stage = "translate-grace-retry"
+                retry_stage = "translate-integrity-retry"
+                feedback = retry_feedback(integrity)
                 continue
             return None
 
@@ -646,7 +660,7 @@ class LocalizationOrchestrator:
                     segment,
                     candidate,
                     anchors,
-                    refusal_retry=ordinal > 1,
+                    refusal_retry=ordinal > 1 and retry_stage == f"{stage_prefix}-refusal-retry",
                 )
                 duration = int((time.monotonic() - started) * 1000)
                 self._record(
@@ -713,6 +727,7 @@ class LocalizationOrchestrator:
         ordinal = 0
         refusal_retried = False
         retry_stage = "review-rewrite-grace-retry"
+        feedback: list[dict[str, str]] = []
         while True:
             ordinal += 1
             started = time.monotonic()
@@ -724,7 +739,11 @@ class LocalizationOrchestrator:
                     candidate,
                     issue_codes,
                     anchors,
-                    refusal_retry=ordinal > 1,
+                    # Each signal belongs only to the retry that directly follows its cause.
+                    refusal_retry=ordinal > 1 and retry_stage == "review-rewrite-refusal-retry",
+                    retry_feedback=(
+                        feedback if ordinal > 1 and retry_stage == "review-rewrite-integrity-retry" else None
+                    ),
                 )
                 duration = int((time.monotonic() - started) * 1000)
                 self._record(
@@ -793,7 +812,8 @@ class LocalizationOrchestrator:
                 ),
             )
             if self._can_grace_retry(FailureCode.INTEGRITY_INVALID.value, ordinal):
-                retry_stage = "review-rewrite-grace-retry"
+                retry_stage = "review-rewrite-integrity-retry"
+                feedback = retry_feedback(integrity)
                 continue
             return None
 
@@ -838,7 +858,12 @@ class LocalizationOrchestrator:
                 revised = revised or legacy_candidate_changed
                 working = verdict.text
                 self._set_candidate(result, working)
-            if verdict.verdict is ReviewVerdict.OK:
+            language_risk = target_language_review_reasons(
+                working, self.project.target_language, segment.metadata
+            )
+            if language_risk:
+                result.metadata["target_language_risk"] = language_risk
+            if verdict.verdict is ReviewVerdict.OK and not language_risk:
                 if legacy_candidate_changed:
                     if round_index + 1 >= self.config.review_max_rounds:
                         self._record(
@@ -873,6 +898,9 @@ class LocalizationOrchestrator:
                 )
                 return ReviewEnvelope(ReviewDecision.ERROR, text=working)
             rewrite = None
+            rewrite_issues = rewrite_issue_codes(
+                verdict.issues, language_risk=bool(language_risk)
+            )
             rewriters = self.config.rewriter_chain or [provider.name]
             for rewriter_name in rewriters:
                 rewriter = self.registry.get(rewriter_name)
@@ -881,7 +909,7 @@ class LocalizationOrchestrator:
                     rewriter,
                     segment,
                     working,
-                    verdict.issues,
+                    rewrite_issues,
                     anchors,
                 )
                 if rewrite is not None and rewrite.status is AgentStatus.SUCCESS:
@@ -893,11 +921,23 @@ class LocalizationOrchestrator:
             self._set_candidate(result, working)
         return ReviewEnvelope(ReviewDecision.ERROR, text=working)
 
-    def _strong_review_reasons(self, segment: Segment, candidate: str) -> list[str]:
+    def _strong_review_reasons(
+        self, segment: Segment, candidate: str, translator: str = ""
+    ) -> list[str]:
         reasons = strong_review_selection_reasons(
             segment,
             sample_percent=self.config.strong_review_sample_percent,
             high_risk_categories=self.config.strong_review_high_risk_categories,
+        )
+        primary = self.config.translator_chain[:1]
+        reasons.extend(
+            provenance_review_reasons(
+                segment.id,
+                self.context_pack.reference_cues if self.context_pack else (),
+                non_primary_translation=bool(
+                    translator and primary and translator not in {primary[0], "existing-candidate"}
+                ),
+            )
         )
         reasons.extend(
             target_language_review_reasons(
@@ -963,7 +1003,7 @@ class LocalizationOrchestrator:
             ReviewVerdict.ERROR,
         }:
             return "unresolved"
-        reasons = self._strong_review_reasons(segment, candidate)
+        reasons = self._strong_review_reasons(segment, candidate, result.translator)
         if verdict.verdict is ReviewVerdict.REWRITE:
             reasons.insert(0, "triage_flagged")
         if verdict.text and verdict.text != candidate:
@@ -1127,7 +1167,7 @@ class LocalizationOrchestrator:
                     self.registry.get(rewriter_name),
                     segment,
                     candidate,
-                    ["formatting"],
+                    rewrite_issue_codes(integrity=integrity),
                     anchors,
                 )
                 if repaired is not None and repaired.status is AgentStatus.SUCCESS:

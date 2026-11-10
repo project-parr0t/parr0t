@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -464,7 +465,15 @@ def record_control_plane_leak(work_dir: Path, incident_code: str) -> dict[str, A
         raise ConfigurationError("E_CONTROL_PLANE_LEAK: unsupported incident code")
     state = control_plane_state(work_dir)
     if state["status"] == "rotation_required":
-        if not (work_dir / CONTROL_HANDOFF_PATH).is_file():
+        # Recovery after an interrupted leak record: replace a missing or prior-incident receipt.
+        try:
+            receipt = _validated_control_plane_handoff(work_dir, work_dir / CONTROL_HANDOFF_PATH)
+        except (ConfigurationError, OSError, ValueError):
+            receipt = None
+        if receipt is None or (
+            receipt["incident_id"] != state["incident_id"]
+            or receipt["from_generation"] != state["generation"]
+        ):
             _write_control_plane_handoff(work_dir, state)
         return state
     contaminated = {
@@ -614,9 +623,15 @@ def acknowledge_control_plane_rotation(
         "incident_code": "",
         "resumed_from_incident": incident_id,
     }
-    _atomic_json(work_dir / CONTROL_STATE_PATH, resumed)
+    # Keep the rotation marker authoritative until every prerequisite mutation
+    # succeeds.  If receipt removal, entry reset, or observation reset fails,
+    # a retry still sees ``rotation_required`` and can regenerate the canonical
+    # receipt.  Committing ``ready`` first made an interrupted acknowledgement
+    # impossible to retry.
+    (work_dir / CONTROL_HANDOFF_PATH).unlink(missing_ok=True)
     _atomic_json(work_dir / CONTROL_ENTRY_PATH, initial_control_plane_entry_state())
     _reset_native_control_observations(work_dir)
+    _atomic_json(work_dir / CONTROL_STATE_PATH, resumed)
     return resumed
 
 
@@ -642,6 +657,14 @@ def control_target_id(target_id: str) -> str:
     return "ctl_" + hashlib.sha256(target_id.encode("utf-8")).hexdigest()
 
 
+_ARTIFACT_PATH_PART = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+
+def safe_artifact_path(relative: Path) -> bool:
+    """Parent-visible paths are echoed verbatim, so they must not be able to carry prose."""
+    return all(_ARTIFACT_PATH_PART.fullmatch(part) for part in relative.parts)
+
+
 def _validate_artifact_paths(work_dir: Path, value: Any) -> list[str]:
     if not isinstance(value, list) or len(value) > 256:
         raise ConfigurationError("E_CONTROL_ENVELOPE_INVALID: artifact_paths must be a bounded list")
@@ -652,6 +675,9 @@ def _validate_artifact_paths(work_dir: Path, value: Any) -> list[str]:
         relative = Path(item)
         if relative.is_absolute() or ".." in relative.parts:
             raise ConfigurationError("E_CONTROL_ENVELOPE_INVALID: artifact paths must be workspace-relative")
+        # Paths are echoed to the parent: a free-form filename would be a text channel.
+        if not safe_artifact_path(relative):
+            raise ConfigurationError("E_CONTROL_ENVELOPE_INVALID: artifact path has unsafe characters")
         resolved = (work_dir / relative).resolve()
         if not is_within(resolved, work_dir) or not resolved.is_file():
             raise ConfigurationError("E_CONTROL_ENVELOPE_INVALID: artifact path is unavailable")

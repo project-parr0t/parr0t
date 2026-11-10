@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -21,8 +22,8 @@ from .native_followup import CANDIDATE_METADATA_KEY, _atomic_json, _atomic_jsonl
 from .native_pass import _load_task_manifest, _require_candidate_bindings, merge_native_pass
 from .orchestrator import LocalizationOrchestrator
 from .review_selection import (
-    DEFAULT_STRONG_REVIEW_CATEGORIES, review_category, strong_review_selection_reasons,
-    target_language_review_reasons,
+    DEFAULT_STRONG_REVIEW_CATEGORIES, provenance_review_reasons, review_category,
+    rewrite_issue_codes, strong_review_selection_reasons, target_language_review_reasons,
 )
 from .store import stable_hash
 from .validators import validate_integrity
@@ -274,6 +275,8 @@ def collect_native_review(
     target_language: str = "",
     glossary: list[Any] | None = None, extra_patterns: list[str] | None = None,
     max_length_ratio: float = 4.0,
+    reference_cues: tuple[dict[str, Any], ...] = (),
+    primary_translator: str = "",
 ) -> dict[str, Any]:
     """Collect a complete bound pass; preserve accepted rows and route only gaps."""
     require_control_plane_ready(work_dir)
@@ -302,6 +305,8 @@ def collect_native_review(
     rewrite: list[Segment] = []
     fallback: list[Segment] = []
     invalid_verdicts = 0
+    verdict_counts: Counter[str] = Counter()
+    issue_counts: Counter[str] = Counter()
     for segment, row in zip(segments, rows, strict=True):
         result = _bound_result(segment)
         if result.candidate_digest != stable_hash(result.text):
@@ -320,6 +325,8 @@ def collect_native_review(
         status = ("approved" if verdict and verdict.verdict is ReviewVerdict.OK
                   else verdict.verdict.value if verdict else "error")
         issues = list(verdict.issues) if verdict else []
+        verdict_counts[status] += 1
+        issue_counts.update(dict.fromkeys(issues, 1))
         result.attempts.append(AttemptRecord(
             stage, provider, status, issues=issues,
             ordinal=1 + sum(item.stage == stage and item.provider == provider
@@ -340,6 +347,12 @@ def collect_native_review(
             reasons = strong_review_selection_reasons(
                 segment, sample_percent=sample_percent, high_risk_categories=high_risk_categories,
             )
+            origin = segment.metadata.get(CANDIDATE_METADATA_KEY, {}).get("provider", "")
+            reasons.extend(provenance_review_reasons(
+                segment.id, reference_cues,
+                non_primary_translation=bool(primary_translator)
+                and origin not in {"", "native-worker", primary_translator},
+            ))
             language_reasons = target_language_review_reasons(
                 result.text, target_language, segment.metadata
             )
@@ -368,14 +381,14 @@ def collect_native_review(
             result.metadata["target_language_risk"] = language_reasons
         if tier == "strong" and language_reasons:
             result.metadata["review_tier"] = "strong_pending"
-            result.metadata["rewrite_issues"] = ["fluency"]
+            result.metadata["rewrite_issues"] = rewrite_issue_codes(
+                issues, integrity, language_risk=True
+            )
             rewrite.append(_pending_segment(segment, result))
             continue
         if verdict.verdict is ReviewVerdict.REWRITE or integrity:
             result.metadata["review_tier"] = "strong_pending"
-            deterministic_issues = (["terminology"] if any(
-                item.code == "glossary-missing" for item in integrity) else ["formatting"])
-            result.metadata["rewrite_issues"] = issues or deterministic_issues
+            result.metadata["rewrite_issues"] = rewrite_issue_codes(issues, integrity)
             rewrite.append(_pending_segment(segment, result))
             continue
         # Only a parsed current-candidate OK and clean integrity can approve.
@@ -391,6 +404,15 @@ def collect_native_review(
     for name, items in (("strong-input.jsonl", strong), ("rewrite-input.jsonl", rewrite),
                         ("fallback-input.jsonl", fallback)):
         _atomic_jsonl(output / name, (asdict(item) for item in items))
+    # Observational drift signal for batch-size effects on judges (fewer issues per record
+    # in large batches). Never a stop, scope-reduction or pass criterion; private data plane.
+    _atomic_json(output / "review-metrics.json", {
+        "schema": "parr0t.native-review-metrics.v1", "tier": tier, "records": len(segments),
+        "task_max_records": manifest.get("task_max_records"),
+        "task_max_material_tokens": manifest.get("task_max_material_tokens"),
+        "verdicts": dict(sorted(verdict_counts.items())), "invalid_verdicts": invalid_verdicts,
+        "issue_code_counts": dict(sorted(issue_counts.items())),
+    })
     return {
         "records": len(segments), "accepted": len(accepted), "strong_pending": len(strong),
         "rewrite_pending": len(rewrite), "fallback_pending": len(fallback),
@@ -479,7 +501,7 @@ def collect_native_rewrite(
 
 def process_native_review_followup(
     work_dir: Path, source: Path, output: Path, orchestrator: Any, *, operation: str,
-    deadline_epoch: float, wave_size: int = 8,
+    deadline_epoch: float | None = None, wave_size: int = 8,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Run only the locked external review role, with durable per-wave results.
@@ -542,17 +564,22 @@ def process_native_review_followup(
             integrity = validate_integrity(clean, result.text, orchestrator.glossary,
                 extra_patterns=orchestrator.config.extra_protected_patterns,
                 max_length_ratio=orchestrator.config.max_length_ratio)
-            if verdict and verdict.verdict is ReviewVerdict.OK and not integrity:
+            language_reasons = target_language_review_reasons(
+                result.text, orchestrator.project.target_language, segment.metadata
+            )
+            if language_reasons:
+                result.metadata["target_language_risk"] = language_reasons
+            if verdict and verdict.verdict is ReviewVerdict.OK and not integrity and not language_reasons:
                 result.status = "reviewed"
                 result.reviewer = "deepseek"
                 result.review_outcome = "approved"
                 result.acceptance_authority = "reviewer"
                 result.metadata["review_tier"] = "strong"
-            elif verdict and verdict.verdict is ReviewVerdict.REWRITE:
-                result.metadata["rewrite_issues"] = list(verdict.issues)
-            elif verdict and verdict.verdict is ReviewVerdict.OK and integrity:
-                result.metadata["rewrite_issues"] = (["terminology"] if any(
-                    item.code == "glossary-missing" for item in integrity) else ["formatting"])
+            elif verdict and verdict.verdict in {ReviewVerdict.OK, ReviewVerdict.REWRITE}:
+                # Approval cannot waive integrity or the locked target language.
+                result.metadata["rewrite_issues"] = rewrite_issue_codes(
+                    verdict.issues, integrity, language_risk=bool(language_reasons)
+                )
         else:
             rewrites_done = sum(a.stage.startswith("review-rewrite") and a.status == "success"
                                 for a in result.attempts)
@@ -587,7 +614,8 @@ def process_native_review_followup(
         except (TypeError, ValueError, OSError):
             pass
     for offset in range(0, len(pending), wave_size):
-        if time.time() >= deadline_epoch:
+        # Only a user-requested ceiling binds a deadline (AGENTS rule 16).
+        if deadline_epoch is not None and time.time() >= deadline_epoch:
             break
         chunk = pending[offset:offset + wave_size]
         with ThreadPoolExecutor(max_workers=wave_size) as pool:
@@ -621,6 +649,12 @@ def process_native_review_followup(
         if result is None:
             unresolved.append(segment)
             continue
+        if result.status == "reviewed" and target_language_review_reasons(
+            result.text, orchestrator.project.target_language, segment.metadata
+        ):
+            # A cached approval from before the language gate must not reach collection.
+            result.status = "failed"
+            result.metadata["rewrite_issues"] = rewrite_issue_codes(language_risk=True)
         if result.status == "reviewed":
             accepted.append(result)
             continue
@@ -643,4 +677,5 @@ def process_native_review_followup(
     return {"records": len(segments), "executed": executed, "cached": len(saved),
             "accepted": len(accepted), "rewrite_pending": len(rewrite),
             "confirmation_pending": len(confirmation), "unresolved": len(unresolved),
+            "deadline_pending": len(pending) - executed,
             "output": output.relative_to(work_dir).as_posix()}

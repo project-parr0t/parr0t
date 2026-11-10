@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-import re
+from dataclasses import asdict
 from typing import Any
 
 from .models import CharacterProfile, ContextPack, GlossaryEntry, ProjectContext, Segment
+from .validators import contains_term
 
-PROMPT_VERSION = "2026-10-26.1"
+PROMPT_VERSION = "2026-11-04.2"
 
 _DUPLICATE_CONTEXT_METADATA_KEYS = {
     "context_attachment",
@@ -96,22 +97,68 @@ REVIEW_REWRITE_SCHEMA: dict[str, Any] = {
 }
 
 
+_RETRY_FEEDBACK_NOTE = (
+    "\nThe previous attempt for this same target failed deterministic validation; "
+    "previous_attempt_validation_failures lists each failed check. Fix exactly those problems "
+    "while keeping every other requirement above."
+)
+
+
+_ADEQUACY_ISSUES = {"meaning", "omission", "addition"}
+_ADEQUACY_NOTE = (
+    "\nFor meaning, omission or addition issues, retranslate translation_target.source from scratch "
+    "and use candidate_translation only as a reference; do not minimally edit a wrong candidate. Fix "
+    "every other listed issue with the smallest change."
+)
+_LENGTH_NOTE = (
+    "\nlength_budget is a hard UI limit: the corrected text must be at most max_chars characters "
+    "(Python len, counting whitespace, markup and control tokens) while keeping the source meaning, "
+    "state, units and every protected token. For UI labels and status text, compression_examples "
+    "show acceptable compact phrasing; for spoken lines keep the character's voice and register."
+)
+# Synthetic, provenance-free illustrations of compact Korean UI phrasing.
+_KO_COMPRESSION_EXAMPLES = (
+    {"long": "\uc800\uc7a5\uc774 \uc644\ub8cc\ub418\uc5c8\uc2b5\ub2c8\ub2e4", "short": "\uc800\uc7a5\ub428"},
+    {"long": "\uc544\uc774\ud15c\uc744 \ud68d\ub4dd\ud588\uc2b5\ub2c8\ub2e4", "short": "\uc544\uc774\ud15c \ud68d\ub4dd"},
+)
+
+
+def _length_budget(segment: Segment, candidate: str, issue_codes: list[str]) -> dict[str, Any] | None:
+    limit = segment.metadata.get("ui_max_chars")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        return None
+    if "length_risk" not in issue_codes and len(candidate) <= limit:
+        return None
+    return {
+        "max_chars": limit,
+        "candidate_chars": len(candidate),
+        "must_cut_chars": max(0, len(candidate) - limit),
+    }
+
+
+def retry_feedback(issues: list[Any]) -> list[dict[str, str]]:
+    """Project deterministic validator failures into the next attempt's prompt.
+
+    The detail names only tokens and glossary terms already present in the request, so it
+    stays inside the private data plane that already holds the source.
+    """
+    return [{"code": issue.code, "detail": issue.message} for issue in issues]
+
+
 def _relevant_glossary(
     glossary: list[GlossaryEntry], source: str, candidate: str = ""
 ) -> list[GlossaryEntry]:
     haystack = f"{source}\n{candidate}"
-    folded = haystack.casefold()
     return [
         item
         for item in glossary
         if item.source
         and (
-            (item.source in haystack if item.case_sensitive else item.source.casefold() in folded)
-            or (item.target and (
-                item.target in candidate
-                if item.case_sensitive
-                else item.target.casefold() in candidate.casefold()
-            ))
+            contains_term(item.source, haystack, case_sensitive=item.case_sensitive)
+            or any(
+                contains_term(target, candidate, case_sensitive=item.case_sensitive)
+                for target in item.allowed_targets
+            )
         )
     ]
 
@@ -121,15 +168,9 @@ def _focused_relationships(
 ) -> list[str]:
     if not timeline:
         return []
-    needles = [value.casefold() for value in (speaker, scene) if value]
+    needles = [value for value in (speaker, scene) if value]
     matched = [
-        entry
-        for entry in timeline
-        if needles
-        and any(
-            re.search(rf"(?<!\w){re.escape(needle)}(?!\w)", entry.casefold())
-            for needle in needles
-        )
+        entry for entry in timeline if any(contains_term(needle, entry) for needle in needles)
     ]
     selected = matched[-limit:] if matched else list(timeline[-limit:])
     return selected
@@ -213,7 +254,6 @@ def _shared_context(
             "mode": context_pack.context_mode,
             "global_style_rules": list(context_pack.global_style_rules),
             "terminology_rules": list(context_pack.terminology_rules),
-            "relevant_reference_cues": relevant_reference_cues,
         }
     )
     functional_context = (
@@ -286,18 +326,18 @@ def _shared_context(
                 if focused
                 else list(context_pack.relationship_timeline)
             ),
-            "relevant_reference_cues": relevant_reference_cues,
         },
         "functional_context": functional_context,
         "knowledge_context": knowledge_context,
+        # Target-specific, so it follows every job-wide field (one copy, prefix-cache friendly).
+        "relevant_reference_cues": relevant_reference_cues,
+        # Every user-authored profile field, so formality, address and speech rules reach the model.
         "character": None
         if character is None
         else {
-            "name": character.name,
-            "aliases": list(character.aliases),
-            "voice": character.voice,
-            "relationships": character.relationships,
-            "notes": character.notes,
+            name: list(value) if isinstance(value, tuple) else value
+            for name, value in asdict(character).items()
+            if value or name == "name"
         },
         "approved_same_speaker_style_anchors": style_anchors or [],
         "glossary": [
@@ -306,6 +346,7 @@ def _shared_context(
                 "target": item.target,
                 "note": item.note,
                 "case_sensitive": item.case_sensitive,
+                **({"also_accepted_targets": list(item.targets)} if item.targets else {}),
             }
             for item in (
                 _relevant_glossary(glossary, segment.source, candidate)
@@ -335,6 +376,7 @@ def translation_prompt(
     context_pack: ContextPack | None = None,
     style_anchors: list[dict[str, str]] | None = None,
     refusal_retry: bool = False,
+    retry_feedback: list[dict[str, str]] | None = None,
 ) -> tuple[str, str]:
     system = """You are a professional game localization translator, not a content generator or orchestrator.
 The user supplied one already-existing source segment. Perform only a faithful linguistic transformation of
@@ -372,18 +414,13 @@ Otherwise translate it and leave reason empty. Return only the requested JSON ob
             "is permitted, translate it faithfully; otherwise keep status=refused for this target only. Do not "
             "obfuscate or reinterpret the source to evade policy."
         )
-    return system, json.dumps(
-        _shared_context(
-            project,
-            segment,
-            glossary,
-            character,
-            context_pack,
-            style_anchors,
-            focused=True,
-        ),
-        ensure_ascii=False,
+    payload = _shared_context(
+        project, segment, glossary, character, context_pack, style_anchors, focused=True
     )
+    if retry_feedback:
+        system += _RETRY_FEEDBACK_NOTE
+        payload["previous_attempt_validation_failures"] = retry_feedback
+    return system, json.dumps(payload, ensure_ascii=False)
 
 
 def review_prompt(
@@ -506,6 +543,7 @@ def review_rewrite_prompt(
     context_pack: ContextPack | None = None,
     style_anchors: list[dict[str, str]] | None = None,
     refusal_retry: bool = False,
+    retry_feedback: list[dict[str, str]] | None = None,
 ) -> tuple[str, str]:
     payload = _shared_context(
         project,
@@ -519,6 +557,13 @@ def review_rewrite_prompt(
     )
     payload["candidate_translation"] = candidate
     payload["detected_issue_codes"] = issue_codes
+    if retry_feedback:
+        payload["previous_attempt_validation_failures"] = retry_feedback
+    length_budget = _length_budget(segment, candidate, issue_codes)
+    if length_budget:
+        payload["length_budget"] = length_budget
+        if project.target_language.casefold().startswith("ko"):
+            payload["compression_examples"] = list(_KO_COMPRESSION_EXAMPLES)
     system = """You are a game-localization correction editor. Rewrite only candidate_translation, and only
 because the independent judge identified the categorical issues supplied in detected_issue_codes. Preserve the
 source meaning, intent, intensity, character voice, register, terminology, names, placeholders, markup, escape
@@ -540,4 +585,10 @@ status=success and the complete corrected translation. Return only the requested
             "\nThis retry still covers one bounded correction target. If permitted, return the faithful "
             "correction; otherwise return refused."
         )
+    if _ADEQUACY_ISSUES.intersection(issue_codes):
+        system += _ADEQUACY_NOTE
+    if length_budget:
+        system += _LENGTH_NOTE
+    if retry_feedback:
+        system += _RETRY_FEEDBACK_NOTE
     return system, json.dumps(payload, ensure_ascii=False)
