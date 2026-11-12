@@ -11,12 +11,14 @@ from .store import stable_hash
 DEFAULT_PROTECTED_PATTERNS = (
     r"\{\{[^{}]*\}\}",
     r"\{[A-Za-z_][A-Za-z0-9_.:-]*\}",
-    r"%(?:\d+\$)?[-+#0 ']*\d*(?:\.\d+)?[diouxXeEfFgGcrsa%]",
+    # No space flag: "50% off" is prose, not "% o". Add "% d" per project if an engine uses it.
+    r"%(?:\d+\$)?[-+#0']*\d*(?:\.\d+)?[diouxXeEfFgGcrsa%]",
     r"<\/?[A-Za-z][^>]*>",
-    r"\\[nrt]",
-    r"\\[A-Za-z]+(?:\[[^\]]*\])?",
+    # One alternation so "\nWord" yields only "\n" and no escape is counted twice.
+    r"\\(?:[A-Za-z]+\[[^\]]*\]|[nrt]|[A-Za-z]+)",
     r"\$[A-Za-z_][A-Za-z0-9_]*",
 )
+_DEFAULT_PROTECTED_RE = re.compile("|".join(f"(?:{p})" for p in DEFAULT_PROTECTED_PATTERNS))
 
 SUSPICIOUS_ADDITIONS = (
     re.compile(r"<script\b", re.IGNORECASE),
@@ -25,12 +27,136 @@ SUSPICIOUS_ADDITIONS = (
     re.compile(r"\b(?:powershell|cmd\.exe|/bin/sh)\b", re.IGNORECASE),
 )
 
+# Latin (with accents), Greek and Cyrillic letters; scripts without word spacing are excluded.
+_ALPHABETIC = "A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u024f\u0386\u0388-\u03ff\u0400-\u0481\u048a-\u04ff"
+
+
+def contains_term(term: str, text: str, *, case_sensitive: bool = False) -> bool:
+    """Match a source term without hitting it inside a longer Latin word ("Ice" in "Device").
+
+    Boundaries apply only at alphabetic-letter edges, so CJK names followed by particles still match
+    and a plain English plural ("Potions") still counts as the glossary term.
+    """
+    return bool(_term_spans(term, text, case_sensitive=case_sensitive))
+
+
+def _term_spans(
+    term: str, text: str, *, case_sensitive: bool = False
+) -> list[tuple[int, int]]:
+    if not term:
+        return []
+    if not case_sensitive:
+        term, text = term.casefold(), text.casefold()
+    # Alphabetic letters only: digits ("HP100") and CJK particles still count as edges.
+    letter = f"[{_ALPHABETIC}]"
+    left = f"(?<!{letter})" if re.match(letter, term[0]) else ""
+    right = f"(?:e?s)?(?!{letter})" if re.match(letter, term[-1]) else ""
+    return [
+        match.span()
+        for match in re.finditer(left + re.escape(term) + right, text)
+    ]
+
+
+def applicable_glossary_entries(
+    glossary: list[GlossaryEntry], source: str
+) -> list[GlossaryEntry]:
+    """Select source terms by occurrence, preferring a longer overlapping phrase.
+
+    A short term remains applicable when it also occurs outside the longer phrase.
+    Equal-length conflicts remain visible instead of being silently resolved here.
+    """
+
+    matches: list[tuple[int, int, int]] = []
+    for index, entry in enumerate(glossary):
+        for start, end in _term_spans(
+            entry.source, source, case_sensitive=entry.case_sensitive
+        ):
+            matches.append((index, start, end))
+
+    selected_indexes: set[int] = set()
+    prior_max_end = -1
+    position = 0
+    ordered = sorted(matches, key=lambda item: (item[1], -item[2], item[0]))
+    while position < len(ordered):
+        start = ordered[position][1]
+        group_end = position
+        while group_end < len(ordered) and ordered[group_end][1] == start:
+            group_end += 1
+        same_start_max_end = -1
+        for index, _, end in ordered[position:group_end]:
+            covered = prior_max_end >= end or same_start_max_end > end
+            if not covered:
+                selected_indexes.add(index)
+            same_start_max_end = max(same_start_max_end, end)
+        prior_max_end = max(prior_max_end, same_start_max_end)
+        position = group_end
+    return [entry for index, entry in enumerate(glossary) if index in selected_indexes]
+
+
+_MARKUP_TAG = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9:_-]*)[^<>]*?(/?)>")
+
+
+def _paired_tag_names(text: str) -> set[str]:
+    """Tag names the source actually closes; standalone tags like <br> are not structure."""
+    return {match[2].casefold() for match in _MARKUP_TAG.finditer(text) if match[1]}
+
+
+def _markup_nesting_ok(text: str, paired: set[str]) -> bool:
+    """Counts alone miss "<b>x</b>" -> "</b>x<b>"; a close must match the innermost open tag.
+
+    Tags left open at the end are tolerated because several engines allow them.
+    """
+    stack: list[str] = []
+    for match in _MARKUP_TAG.finditer(text):
+        closing, name, self_closing = match[1], match[2].casefold(), match[3]
+        if self_closing or name not in paired:
+            continue
+        if not closing:
+            stack.append(name)
+        elif stack and stack[-1] == name:
+            stack.pop()
+        else:
+            return False
+    return True
+
 
 def protected_tokens(text: str, extra_patterns: list[str] | None = None) -> Counter[str]:
-    tokens: list[str] = []
-    for pattern in (*DEFAULT_PROTECTED_PATTERNS, *(extra_patterns or [])):
+    # Defaults scan as one leftmost alternation, so nested matches ("$d" in "%1$d") never double-count.
+    tokens = _DEFAULT_PROTECTED_RE.findall(text)
+    for pattern in extra_patterns or []:
         tokens.extend(re.findall(pattern, text))
     return Counter(tokens)
+
+
+def preflight_constraint_issues(
+    segment: Segment, *, extra_patterns: list[str] | None = None
+) -> list[ValidationIssue]:
+    """Reject provider-independent impossible render constraints before a model call."""
+
+    limit = segment.metadata.get("ui_max_chars")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        return []
+    spans = {match.span() for match in _DEFAULT_PROTECTED_RE.finditer(segment.source)}
+    for pattern in extra_patterns or []:
+        spans.update(match.span() for match in re.finditer(pattern, segment.source))
+    if not spans:
+        return []
+    merged: list[list[int]] = []
+    for start, end in sorted(spans):
+        if not merged or start >= merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    minimum_token_chars = sum(end - start for start, end in merged)
+    if minimum_token_chars > limit:
+        return [
+            ValidationIssue(
+                "constraint-unsatisfiable",
+                "Protected tokens cannot fit within the bound UI character limit",
+                retryable=False,
+            )
+        ]
+    return []
 
 
 def empty_target_allowed(segment: Segment) -> bool:
@@ -110,18 +236,25 @@ def validate_integrity(
             )
         )
 
-    source_folded = segment.source.casefold()
-    candidate_folded = candidate.casefold()
-    for entry in glossary:
-        source = entry.source if entry.case_sensitive else entry.source.casefold()
-        target = entry.target if entry.case_sensitive else entry.target.casefold()
-        source_haystack = segment.source if entry.case_sensitive else source_folded
-        target_haystack = candidate if entry.case_sensitive else candidate_folded
-        if source in source_haystack and target not in target_haystack:
+    paired = _paired_tag_names(segment.source)
+    if paired and _markup_nesting_ok(segment.source, paired) and not _markup_nesting_ok(candidate, paired):
+        issues.append(
+            ValidationIssue(
+                "markup-malformed",
+                "Paired markup tags are crossed or closed out of order",
+            )
+        )
+
+    for entry in applicable_glossary_entries(glossary, segment.source):
+        if not any(
+            contains_term(target, candidate, case_sensitive=entry.case_sensitive)
+            for target in entry.allowed_targets
+        ):
+            allowed = " or ".join(repr(target) for target in entry.allowed_targets)
             issues.append(
                 ValidationIssue(
                     "glossary-missing",
-                    f"Required glossary target {entry.target!r} is absent for {entry.source!r}",
+                    f"Required glossary target {allowed} is absent for {entry.source!r}",
                 )
             )
 

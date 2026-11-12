@@ -36,12 +36,14 @@ class ContextMode(str, Enum):
 class FailureCode(str, Enum):
     EXPLICIT_PROVIDER_REFUSAL = "explicit_provider_refusal"
     MALFORMED_RESPONSE = "malformed_response"
+    OUTPUT_TRUNCATED = "output_truncated"
     PROVIDER_ERROR = "provider_error"
     RATE_LIMITED = "rate_limited"
     QUOTA_EXHAUSTED = "quota_exhausted"
     AUTHENTICATION_ERROR = "authentication_error"
     TIMEOUT = "timeout"
     INTEGRITY_INVALID = "integrity_invalid"
+    CONSTRAINT_UNSATISFIABLE = "constraint_unsatisfiable"
     MEANING_NOT_PRESERVED = "meaning_not_preserved"
     BUDGET_EXHAUSTED = "budget_exhausted"
     BUDGET_ACCOUNTING_UNCERTAIN = "budget_accounting_uncertain"
@@ -55,6 +57,23 @@ class GlossaryEntry:
     target: str
     note: str = ""
     case_sensitive: bool = False
+    # Additional accepted renderings (e.g. honorific or inflected forms); target stays canonical.
+    targets: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if isinstance(self.targets, str) or not isinstance(self.targets, (list, tuple)):
+            raise ValueError("glossary targets must be a list of strings")
+        if not all(isinstance(item, str) for item in self.targets):
+            raise ValueError("glossary targets must be a list of strings")
+        # Empty values would make every candidate pass; the canonical target is implicit.
+        extra = dict.fromkeys(item.strip() for item in self.targets)
+        object.__setattr__(
+            self, "targets", tuple(item for item in extra if item and item != self.target)
+        )
+
+    @property
+    def allowed_targets(self) -> tuple[str, ...]:
+        return (self.target, *self.targets)
 
 
 @dataclass(slots=True, frozen=True)

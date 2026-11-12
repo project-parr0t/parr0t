@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.check_branches import (
+    unittest_summary,
     audit_branches,
     environment_digest,
     plan_branches,
@@ -549,3 +550,8 @@ class BranchAuditTests(unittest.TestCase):
     def test_audit_state_cannot_pollute_the_repository(self) -> None:
         with self.assertRaisesRegex(ValueError, "outside"):
             audit_branches(self.repo, self.repo / "state")
+
+    def test_unittest_summary_ignores_test_stdout_and_uses_last_trailer(self) -> None:
+        stderr = "OK\n" + "-" * 70 + "\nRan 3 tests in 0.010s\n\nOK (skipped=1)\n"
+        self.assertEqual(unittest_summary(stderr), (3, True, 1))
+        self.assertEqual(unittest_summary("Ran 0 tests in 0.000s\n"), (0, False, None))
