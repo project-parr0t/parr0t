@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import random
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, TypeVar
@@ -31,6 +32,7 @@ from .prompts import (
     REVIEW_JUDGE_SCHEMA,
     REVIEW_REWRITE_SCHEMA,
     TRANSLATION_SCHEMA,
+    retry_feedback,
     review_judge_prompt,
     review_rewrite_prompt,
     translation_prompt,
@@ -39,12 +41,14 @@ from .providers import ModelProvider, ProviderRegistry
 from .review_selection import (
     DEFAULT_STRONG_REVIEW_CATEGORIES,
     DEFAULT_STRONG_REVIEW_SAMPLE_PERCENT,
+    provenance_review_reasons,
     review_category,
+    rewrite_issue_codes,
     strong_review_selection_reasons,
     target_language_review_reasons,
 )
 from .store import AuditLog, ResultStore, stable_hash
-from .validators import validate_integrity
+from .validators import preflight_constraint_issues, validate_integrity
 
 
 @dataclass(slots=True)
@@ -63,6 +67,7 @@ class OrchestratorConfig:
     grace_retry_codes: list[str] = field(
         default_factory=lambda: [
             FailureCode.MALFORMED_RESPONSE.value,
+            FailureCode.OUTPUT_TRUNCATED.value,
             FailureCode.PROVIDER_ERROR.value,
             FailureCode.RATE_LIMITED.value,
             FailureCode.TIMEOUT.value,
@@ -146,6 +151,8 @@ class LocalizationOrchestrator:
         self._progress_lock = threading.Lock()
         self._progress_total = 0
         self._progress_attempts = 0
+        self._provider_cooldown_lock = threading.Lock()
+        self._provider_cooldowns: dict[str, float] = {}
         semantic_config = asdict(config)
         semantic_config.pop("max_workers", None)
         self._semantic_config = semantic_config
@@ -200,8 +207,104 @@ class LocalizationOrchestrator:
                 entries.append(item)
 
     def _remember_result(self, segment: Segment, result: TranslationResult) -> None:
-        if result.status in {"translated", "reviewed", "accepted_unreviewed"}:
+        if result.status == "reviewed":
             self._remember(segment, result.text)
+
+    def _wait_for_provider(self, provider_name: str) -> None:
+        while True:
+            with self._provider_cooldown_lock:
+                deadline = self._provider_cooldowns.get(provider_name, 0.0)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(remaining)
+
+    def _schedule_provider_retry(
+        self,
+        provider_name: str,
+        code: str,
+        ordinal: int,
+        exc: Exception,
+    ) -> None:
+        status_code = exc.status_code if isinstance(exc, ProviderFailure) else None
+        if code != FailureCode.RATE_LIMITED.value and not (
+            isinstance(status_code, int) and 500 <= status_code < 600
+        ):
+            return
+        retry_after = (
+            exc.retry_after_seconds if isinstance(exc, ProviderFailure) else None
+        )
+        delay = retry_after
+        if delay is None:
+            delay = min(30.0, float(2 ** min(max(ordinal - 1, 0), 5)))
+            delay += random.uniform(0.0, 0.25)
+        deadline = time.monotonic() + delay
+        with self._provider_cooldown_lock:
+            self._provider_cooldowns[provider_name] = max(
+                self._provider_cooldowns.get(provider_name, 0.0), deadline
+            )
+
+    def _translation_preflight(
+        self, result: TranslationResult, segment: Segment
+    ) -> bool:
+        issues = preflight_constraint_issues(
+            segment, extra_patterns=self.config.extra_protected_patterns
+        )
+        if not issues:
+            return True
+        self._record(
+            result,
+            AttemptRecord(
+                "preflight",
+                "deterministic-validator",
+                "rejected",
+                issues=[item.code for item in issues],
+                issue_code=FailureCode.CONSTRAINT_UNSATISFIABLE.value,
+            ),
+        )
+        result.errors.append("Translation constraints are unsatisfiable")
+        return False
+
+    def _accept_translation_candidate(
+        self, result: TranslationResult, segment: Segment, candidate: str
+    ) -> bool:
+        integrity = validate_integrity(
+            segment,
+            candidate,
+            self.glossary,
+            extra_patterns=self.config.extra_protected_patterns,
+            max_length_ratio=self.config.max_length_ratio,
+        )
+        language_risk = target_language_review_reasons(
+            candidate, self.project.target_language, segment.metadata
+        )
+        if integrity or language_risk:
+            if language_risk:
+                result.metadata["target_language_risk"] = language_risk
+            result.errors.append("Candidate failed the deterministic acceptance gate")
+            return False
+        result.text = candidate
+        result.status = "translated"
+        return True
+
+    def _cached_result_is_usable(
+        self, segment: Segment, result: TranslationResult
+    ) -> bool:
+        if result.segment_id != segment.id or result.source != segment.source:
+            return False
+        if result.status == "source_preserved":
+            return result.text == segment.source
+        if result.status not in {"translated", "reviewed", "accepted_unreviewed"}:
+            return False
+        return not validate_integrity(
+            segment,
+            result.text,
+            self.glossary,
+            extra_patterns=self.config.extra_protected_patterns,
+            max_length_ratio=self.config.max_length_ratio,
+        ) and not target_language_review_reasons(
+            result.text, self.project.target_language, segment.metadata
+        )
 
     def _cache_key(self, segment: Segment, anchors: list[dict[str, str]]) -> str:
         character = self._character(segment.speaker)
@@ -427,6 +530,7 @@ class LocalizationOrchestrator:
         anchors: list[dict[str, str]],
         *,
         refusal_retry: bool = False,
+        retry_feedback: list[dict[str, str]] | None = None,
     ) -> AgentEnvelope:
         system, user = translation_prompt(
             self.project,
@@ -436,6 +540,7 @@ class LocalizationOrchestrator:
             self.context_pack,
             anchors,
             refusal_retry,
+            retry_feedback,
         )
         return self._translation_envelope(
             provider.generate_json(
@@ -485,6 +590,7 @@ class LocalizationOrchestrator:
         anchors: list[dict[str, str]],
         *,
         refusal_retry: bool = False,
+        retry_feedback: list[dict[str, str]] | None = None,
     ) -> AgentEnvelope:
         system, user = review_rewrite_prompt(
             self.project,
@@ -496,6 +602,7 @@ class LocalizationOrchestrator:
             self.context_pack,
             anchors,
             refusal_retry,
+            retry_feedback,
         )
         return self._translation_envelope(
             provider.generate_json(
@@ -517,13 +624,20 @@ class LocalizationOrchestrator:
         refusal_retried = False
         attempt_limit = self._translation_attempt_limit(provider.name)
         retry_stage = "translate-grace-retry"
+        feedback: list[dict[str, str]] = []
         while True:
             ordinal += 1
+            self._wait_for_provider(provider.name)
             started = time.monotonic()
             stage = "translate" if ordinal == 1 else retry_stage
             try:
+                # The refusal note belongs only to a retry after a refusal, not a timeout or bad output.
                 envelope = self._call_translation(
-                    provider, segment, anchors, refusal_retry=ordinal > 1
+                    provider,
+                    segment,
+                    anchors,
+                    refusal_retry=retry_stage == "translate-refusal-retry" and ordinal > 1,
+                    retry_feedback=feedback if retry_stage == "translate-integrity-retry" else None,
                 )
                 duration = int((time.monotonic() - started) * 1000)
                 self._record(
@@ -565,6 +679,9 @@ class LocalizationOrchestrator:
                         and self._can_grace_retry(code, ordinal)
                     )
                 ):
+                    self._schedule_provider_retry(
+                        provider.name, code, ordinal, exc
+                    )
                     retry_stage = "translate-grace-retry"
                     continue
                 return None
@@ -593,15 +710,20 @@ class LocalizationOrchestrator:
                 extra_patterns=self.config.extra_protected_patterns,
                 max_length_ratio=self.config.max_length_ratio,
             )
-            if not integrity:
+            language_risk = target_language_review_reasons(
+                envelope.text, self.project.target_language, segment.metadata
+            )
+            if not integrity and not language_risk:
                 return envelope
+            if language_risk:
+                result.metadata["target_language_risk"] = language_risk
             self._record(
                 result,
                 AttemptRecord(
                     "integrity",
                     "deterministic-validator",
                     "rejected",
-                    issues=[item.code for item in integrity],
+                    issues=[item.code for item in integrity] + language_risk,
                     ordinal=ordinal,
                     issue_code=FailureCode.INTEGRITY_INVALID.value,
                     candidate_generation=result.candidate_generation,
@@ -616,7 +738,14 @@ class LocalizationOrchestrator:
                     FailureCode.INTEGRITY_INVALID.value, ordinal
                 )
             ):
-                retry_stage = "translate-grace-retry"
+                retry_stage = "translate-integrity-retry"
+                feedback = retry_feedback(integrity) + [
+                    {
+                        "code": item,
+                        "detail": "Candidate does not satisfy the locked target language",
+                    }
+                    for item in language_risk
+                ]
                 continue
             return None
 
@@ -636,6 +765,7 @@ class LocalizationOrchestrator:
         retry_stage = f"{stage_prefix}-grace-retry"
         while True:
             ordinal += 1
+            self._wait_for_provider(provider.name)
             started = time.monotonic()
             stage = (
                 f"{stage_prefix}-confirm" if confirmation else stage_prefix
@@ -646,7 +776,7 @@ class LocalizationOrchestrator:
                     segment,
                     candidate,
                     anchors,
-                    refusal_retry=ordinal > 1,
+                    refusal_retry=ordinal > 1 and retry_stage == f"{stage_prefix}-refusal-retry",
                 )
                 duration = int((time.monotonic() - started) * 1000)
                 self._record(
@@ -688,6 +818,9 @@ class LocalizationOrchestrator:
                     ),
                 )
                 if retryable and self._can_grace_retry(code, ordinal):
+                    self._schedule_provider_retry(
+                        provider.name, code, ordinal, exc
+                    )
                     retry_stage = f"{stage_prefix}-grace-retry"
                     continue
                 return None
@@ -713,8 +846,10 @@ class LocalizationOrchestrator:
         ordinal = 0
         refusal_retried = False
         retry_stage = "review-rewrite-grace-retry"
+        feedback: list[dict[str, str]] = []
         while True:
             ordinal += 1
+            self._wait_for_provider(provider.name)
             started = time.monotonic()
             stage = "review-rewrite" if ordinal == 1 else retry_stage
             try:
@@ -724,7 +859,11 @@ class LocalizationOrchestrator:
                     candidate,
                     issue_codes,
                     anchors,
-                    refusal_retry=ordinal > 1,
+                    # Each signal belongs only to the retry that directly follows its cause.
+                    refusal_retry=ordinal > 1 and retry_stage == "review-rewrite-refusal-retry",
+                    retry_feedback=(
+                        feedback if ordinal > 1 and retry_stage == "review-rewrite-integrity-retry" else None
+                    ),
                 )
                 duration = int((time.monotonic() - started) * 1000)
                 self._record(
@@ -760,6 +899,9 @@ class LocalizationOrchestrator:
                     ),
                 )
                 if retryable and self._can_grace_retry(code, ordinal):
+                    self._schedule_provider_retry(
+                        provider.name, code, ordinal, exc
+                    )
                     retry_stage = "review-rewrite-grace-retry"
                     continue
                 return None
@@ -793,7 +935,8 @@ class LocalizationOrchestrator:
                 ),
             )
             if self._can_grace_retry(FailureCode.INTEGRITY_INVALID.value, ordinal):
-                retry_stage = "review-rewrite-grace-retry"
+                retry_stage = "review-rewrite-integrity-retry"
+                feedback = retry_feedback(integrity)
                 continue
             return None
 
@@ -838,7 +981,12 @@ class LocalizationOrchestrator:
                 revised = revised or legacy_candidate_changed
                 working = verdict.text
                 self._set_candidate(result, working)
-            if verdict.verdict is ReviewVerdict.OK:
+            language_risk = target_language_review_reasons(
+                working, self.project.target_language, segment.metadata
+            )
+            if language_risk:
+                result.metadata["target_language_risk"] = language_risk
+            if verdict.verdict is ReviewVerdict.OK and not language_risk:
                 if legacy_candidate_changed:
                     if round_index + 1 >= self.config.review_max_rounds:
                         self._record(
@@ -873,6 +1021,9 @@ class LocalizationOrchestrator:
                 )
                 return ReviewEnvelope(ReviewDecision.ERROR, text=working)
             rewrite = None
+            rewrite_issues = rewrite_issue_codes(
+                verdict.issues, language_risk=bool(language_risk)
+            )
             rewriters = self.config.rewriter_chain or [provider.name]
             for rewriter_name in rewriters:
                 rewriter = self.registry.get(rewriter_name)
@@ -881,7 +1032,7 @@ class LocalizationOrchestrator:
                     rewriter,
                     segment,
                     working,
-                    verdict.issues,
+                    rewrite_issues,
                     anchors,
                 )
                 if rewrite is not None and rewrite.status is AgentStatus.SUCCESS:
@@ -893,11 +1044,23 @@ class LocalizationOrchestrator:
             self._set_candidate(result, working)
         return ReviewEnvelope(ReviewDecision.ERROR, text=working)
 
-    def _strong_review_reasons(self, segment: Segment, candidate: str) -> list[str]:
+    def _strong_review_reasons(
+        self, segment: Segment, candidate: str, translator: str = ""
+    ) -> list[str]:
         reasons = strong_review_selection_reasons(
             segment,
             sample_percent=self.config.strong_review_sample_percent,
             high_risk_categories=self.config.strong_review_high_risk_categories,
+        )
+        primary = self.config.translator_chain[:1]
+        reasons.extend(
+            provenance_review_reasons(
+                segment.id,
+                self.context_pack.reference_cues if self.context_pack else (),
+                non_primary_translation=bool(
+                    translator and primary and translator not in {primary[0], "existing-candidate"}
+                ),
+            )
         )
         reasons.extend(
             target_language_review_reasons(
@@ -963,7 +1126,7 @@ class LocalizationOrchestrator:
             ReviewVerdict.ERROR,
         }:
             return "unresolved"
-        reasons = self._strong_review_reasons(segment, candidate)
+        reasons = self._strong_review_reasons(segment, candidate, result.translator)
         if verdict.verdict is ReviewVerdict.REWRITE:
             reasons.insert(0, "triage_flagged")
         if verdict.text and verdict.text != candidate:
@@ -1019,8 +1182,16 @@ class LocalizationOrchestrator:
         cache_key = self._cache_key(segment, anchors)
         if not force:
             cached = self.store.get(cache_key)
+            if cached is not None and not self._cached_result_is_usable(
+                segment, cached
+            ):
+                cached = None
             if cached is None:
                 cached = self.store.get(self._legacy_cache_key(segment, anchors))
+                if cached is not None and not self._cached_result_is_usable(
+                    segment, cached
+                ):
+                    cached = None
                 if cached is not None:
                     self.store.put(cache_key, cached)
             if cached:
@@ -1032,29 +1203,25 @@ class LocalizationOrchestrator:
             source=segment.source,
             metadata=segment.metadata.copy(),
         )
-        candidate = ""
-        for translator_name in self.config.translator_chain:
-            translator = self.registry.get(translator_name)
-            envelope = self._translate_with_refusal_retry(result, translator, segment, anchors)
-            if envelope is None or envelope.status is not AgentStatus.SUCCESS:
-                continue
-            result.translator = translator_name
-            candidate = envelope.text
-            self._set_candidate(result, candidate)
-            break
+        candidate: str | None = None
+        if self._translation_preflight(result, segment):
+            for translator_name in self.config.translator_chain:
+                translator = self.registry.get(translator_name)
+                envelope = self._translate_with_refusal_retry(
+                    result, translator, segment, anchors
+                )
+                if envelope is None or envelope.status is not AgentStatus.SUCCESS:
+                    continue
+                result.translator = translator_name
+                candidate = envelope.text
+                self._set_candidate(result, candidate)
+                break
 
-        if not candidate:
-            result.errors.append("All translation routes were exhausted")
+        if candidate is None:
+            if not result.errors:
+                result.errors.append("All translation routes were exhausted")
         elif not self.config.require_review:
-            language_risk = target_language_review_reasons(
-                candidate, self.project.target_language, segment.metadata
-            )
-            if language_risk:
-                result.metadata["target_language_risk"] = language_risk
-                result.errors.append("Candidate violates the locked target language")
-            else:
-                result.text = candidate
-                result.status = "translated"
+            self._accept_translation_candidate(result, segment, candidate)
         else:
             needs_strong_review = self._triage_requires_strong_review(
                 result, segment, candidate, anchors
@@ -1069,10 +1236,11 @@ class LocalizationOrchestrator:
 
         if result.status in {"translated", "reviewed", "accepted_unreviewed"}:
             self.store.put(cache_key, result)
-            self._remember(segment, result.text)
+            self._remember_result(segment, result)
             return result
         if self.config.preserve_source_on_failure or (
-            candidate and self.config.review_refusal_policy == "source_preserve"
+            candidate is not None
+            and self.config.review_refusal_policy == "source_preserve"
         ):
             result.text = segment.source
             result.status = "source_preserved"
@@ -1127,7 +1295,7 @@ class LocalizationOrchestrator:
                     self.registry.get(rewriter_name),
                     segment,
                     candidate,
-                    ["formatting"],
+                    rewrite_issue_codes(integrity=integrity),
                     anchors,
                 )
                 if repaired is not None and repaired.status is AgentStatus.SUCCESS:
@@ -1227,17 +1395,20 @@ class LocalizationOrchestrator:
 
     def _run_deferred_stage(
         self, indexes: list[int], operation: Callable[[int], T], *, stage: str
-    ) -> list[tuple[int, T]]:
+    ) -> Iterable[tuple[int, T]]:
         def observed(index: int) -> T:
             value = operation(index)
             self._progress_attempt(stage)
             return value
 
         if self.config.max_workers <= 1 or len(indexes) <= 1:
-            return [(index, observed(index)) for index in indexes]
+            for index in indexes:
+                yield index, observed(index)
+            return
         with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
-            futures = {index: pool.submit(observed, index) for index in indexes}
-            return [(index, futures[index].result()) for index in indexes]
+            futures = {pool.submit(observed, index): index for index in indexes}
+            for future in as_completed(futures):
+                yield futures[future], future.result()
 
     def _legacy_deferred_batch_key(self, items: list[Segment]) -> str:
         return stable_hash(
@@ -1343,6 +1514,7 @@ class LocalizationOrchestrator:
         state_path = self.work_dir / ".game-l10n" / "deferred" / f"{batch_key}.json"
         if force:
             state_path.unlink(missing_ok=True)
+            self.store.clear_staged_candidates(batch_key)
         state: dict[str, Any] = {}
         if not force:
             state_candidates = [(state_path, batch_key)]
@@ -1374,13 +1546,19 @@ class LocalizationOrchestrator:
         saved_candidates = (
             state.get("candidates", {}) if isinstance(state.get("candidates", {}), dict) else {}
         )
+        staged_candidates = self.store.get_staged_candidates(batch_key)
 
         results: list[TranslationResult | None] = [None] * len(items)
         candidates: dict[int, str] = {}
         pending_translation: list[int] = []
+        preflight_failures: set[int] = set()
 
         for index, segment in enumerate(items):
             cached = self.store.get(cache_keys[index]) if not force else None
+            if cached is not None and not self._cached_result_is_usable(
+                segment, cached
+            ):
+                cached = None
             if cached is None and not force:
                 legacy_cache_key = stable_hash(
                     {
@@ -1390,6 +1568,10 @@ class LocalizationOrchestrator:
                     }
                 )
                 cached = self.store.get(legacy_cache_key)
+                if cached is not None and not self._cached_result_is_usable(
+                    segment, cached
+                ):
+                    cached = None
                 if cached is not None:
                     self.store.put(cache_keys[index], cached)
             if cached:
@@ -1411,6 +1593,17 @@ class LocalizationOrchestrator:
                     source=segment.source,
                     metadata=segment.metadata.copy(),
                 )
+            staged_candidate = staged_candidates.get(index)
+            if staged_candidate is not None:
+                staged_result, staged_text = staged_candidate
+                if (
+                    staged_result.segment_id == segment.id
+                    and staged_result.source == segment.source
+                    and staged_result.candidate_digest == stable_hash(staged_text)
+                ):
+                    results[index] = staged_result
+                    candidates[index] = staged_text
+                    continue
             saved_candidate = saved_candidates.get(str(index))
             if isinstance(saved_candidate, dict) and isinstance(saved_candidate.get("text"), str):
                 text = saved_candidate["text"]
@@ -1424,7 +1617,11 @@ class LocalizationOrchestrator:
                     completed_reviewers.clear()
                     pending_translation.append(index)
             else:
-                pending_translation.append(index)
+                assert results[index] is not None
+                if self._translation_preflight(results[index], segment):
+                    pending_translation.append(index)
+                else:
+                    preflight_failures.add(index)
 
         cached_count = sum(item is not None and item.from_cache for item in results)
         self._emit_progress(
@@ -1466,7 +1663,10 @@ class LocalizationOrchestrator:
                 result.translator = translator_name
                 self._set_candidate(result, candidate)
                 candidates[index] = candidate
-            pending_translation = next_pending
+                self.store.put_staged_candidate(
+                    batch_key, index, result, candidate
+                )
+            pending_translation = sorted(next_pending)
             self._emit_progress(
                 stage,
                 translation_completed=len(candidates) + cached_count,
@@ -1504,15 +1704,20 @@ class LocalizationOrchestrator:
             and results[index].status not in {"translated", "reviewed", "source_preserved"}
         )
         if not self.config.require_review:
+            acceptance_failures: set[int] = set()
             for index in pending_review:
                 result = results[index]
                 assert result is not None
-                result.text = candidates[index]
-                result.status = "translated"
-                self.store.put(cache_keys[index], result)
-                self._remember(items[index], result.text)
+                if self._accept_translation_candidate(
+                    result, items[index], candidates[index]
+                ):
+                    self.store.put(cache_keys[index], result)
+                    self._remember_result(items[index], result)
+                else:
+                    acceptance_failures.add(index)
             pending_review = []
         else:
+            acceptance_failures = set()
             if self.config.review_triager_chain:
                 strong_pending: list[int] = []
                 triage_pending: list[int] = []
@@ -1566,8 +1771,8 @@ class LocalizationOrchestrator:
                             strong_pending.append(index)
                         else:
                             self.store.put(cache_keys[index], result)
-                            self._remember(items[index], result.text)
-                    triage_pending = next_triage_pending
+                            self._remember_result(items[index], result)
+                    triage_pending = sorted(next_triage_pending)
                 for index in triage_pending:
                     result = results[index]
                     assert result is not None
@@ -1655,8 +1860,8 @@ class LocalizationOrchestrator:
                     result.acceptance_authority = "reviewer"
                     result.metadata["review_tier"] = "strong"
                     self.store.put(cache_keys[index], result)
-                    self._remember(items[index], result.text)
-                pending_review = next_pending
+                    self._remember_result(items[index], result)
+                pending_review = sorted(next_pending)
                 completed_review = sum(
                     result is not None and result.status == "reviewed"
                     for result in results
@@ -1691,13 +1896,16 @@ class LocalizationOrchestrator:
                     completed_reviewers,
                 )
 
-        failed_translation = set(pending_translation)
+        failed_translation = (
+            set(pending_translation) | preflight_failures | acceptance_failures
+        )
         failed_review = set(pending_review)
         for index in sorted(failed_translation | failed_review):
             result = results[index]
             assert result is not None
             if index in failed_translation:
-                result.errors.append("All translation routes were exhausted")
+                if index not in preflight_failures:
+                    result.errors.append("All translation routes were exhausted")
             else:
                 result.errors.append("All review routes were exhausted")
             accepted_unreviewed = (
@@ -1727,6 +1935,7 @@ class LocalizationOrchestrator:
             self.store.put(cache_keys[index], result)
 
         state_path.unlink(missing_ok=True)
+        self.store.clear_staged_candidates(batch_key)
         final_results = [result for result in results if result is not None]
         self._emit_progress(
             "finalizing",

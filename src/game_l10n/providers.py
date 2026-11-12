@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
 import subprocess
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -149,6 +153,24 @@ class ModelProvider(ABC):
         return self.generate_json(system=system, user=user, schema=schema, schema_name=schema_name)
 
 
+def _retry_after_seconds(headers: Any) -> float | None:
+    if headers is None:
+        return None
+    value = headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(str(value))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+
+
 def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeout: int) -> dict[str, Any]:
     request = urllib.request.Request(
         url,
@@ -173,7 +195,16 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeo
             code, retryable = "provider_error", True
         else:
             code, retryable = "provider_error", False
-        raise ProviderFailure(code, retryable=retryable, status_code=exc.code) from exc
+        raise ProviderFailure(
+            code,
+            retryable=retryable,
+            status_code=exc.code,
+            retry_after_seconds=(
+                _retry_after_seconds(exc.headers)
+                if retryable and (exc.code == 429 or 500 <= exc.code < 600)
+                else None
+            ),
+        ) from exc
     except json.JSONDecodeError as exc:
         raise ProviderFailure("malformed_response", retryable=True) from exc
     except (TimeoutError, socket.timeout) as exc:
@@ -249,8 +280,18 @@ class OpenAIResponsesProvider(ModelProvider):
                 data.get("error") or data.get("incomplete_details") or {},
                 ensure_ascii=False,
             ).casefold()
-            code = "quota_exhausted" if "quota" in details else "provider_error"
-            raise ProviderFailure(code, retryable=code == "provider_error")
+            if data.get("status") == "incomplete" and any(
+                token in details for token in ("max_output", "output_token", "length")
+            ):
+                code, retryable = "output_truncated", False
+            else:
+                code = "quota_exhausted" if "quota" in details else "provider_error"
+                retryable = code == "provider_error"
+            raise ProviderFailure(
+                code,
+                retryable=retryable,
+                usage=_normalized_usage(data),
+            )
         for item in data.get("output", []):
             if item.get("type") != "message":
                 continue
@@ -261,8 +302,14 @@ class OpenAIResponsesProvider(ModelProvider):
                     try:
                         return _with_usage(json.loads(content.get("text", "")), data)
                     except json.JSONDecodeError as exc:
-                        raise ProviderFailure("malformed_response", retryable=True) from exc
-        raise ProviderFailure("malformed_response", retryable=True)
+                        raise ProviderFailure(
+                            "malformed_response",
+                            retryable=True,
+                            usage=_normalized_usage(data),
+                        ) from exc
+        raise ProviderFailure(
+            "malformed_response", retryable=True, usage=_normalized_usage(data)
+        )
 
     def fingerprint(self) -> dict[str, Any]:
         return {
@@ -301,7 +348,18 @@ class OpenAIResponsesProvider(ModelProvider):
             self.timeout,
         )
         if data.get("status") in {"failed", "cancelled", "incomplete"}:
-            raise ProviderFailure("provider_error", retryable=True)
+            details = json.dumps(
+                data.get("error") or data.get("incomplete_details") or {},
+                ensure_ascii=False,
+            ).casefold()
+            truncated = data.get("status") == "incomplete" and any(
+                token in details for token in ("max_output", "output_token", "length")
+            )
+            raise ProviderFailure(
+                "output_truncated" if truncated else "provider_error",
+                retryable=not truncated,
+                usage=_normalized_usage(data),
+            )
         for item in data.get("output", []):
             if item.get("type") != "message":
                 continue
@@ -310,11 +368,15 @@ class OpenAIResponsesProvider(ModelProvider):
                     return _with_usage(_refusal_payload(schema_name), data)
                 if content.get("type") == "output_text":
                     return _with_usage(_parse_plain_review_verdict(content.get("text", "")), data)
-        raise ProviderFailure("malformed_response", retryable=True)
+        raise ProviderFailure(
+            "malformed_response", retryable=True, usage=_normalized_usage(data)
+        )
 
 
 class CompatibleChatProvider(ModelProvider):
     """OpenAI-compatible /chat/completions provider."""
+
+    _MAX_OUTPUT_RETRY_STATES = 4096
 
     def __init__(
         self,
@@ -376,6 +438,14 @@ class CompatibleChatProvider(ModelProvider):
         if review_verdict_format not in {"json", "plain"}:
             raise ConfigurationError("review_verdict_format must be json or plain")
         self.review_verdict_format = review_verdict_format
+        self._output_retry_lock = threading.Lock()
+        self._output_retry_limits: dict[str, int] = {}
+
+    @staticmethod
+    def _output_retry_key(user: str, schema_name: str) -> str:
+        return hashlib.sha256(
+            f"{schema_name}\0{user}".encode("utf-8")
+        ).hexdigest()
 
     def _request_max_tokens(self, user: str, schema_name: str) -> int | None:
         if schema_name in self.task_max_output_tokens:
@@ -395,7 +465,47 @@ class CompatibleChatProvider(ModelProvider):
         except (json.JSONDecodeError, AttributeError, TypeError):
             pass
         estimate = int(max(1, source_length) * self.max_tokens_per_source_char)
-        return max(self.min_output_tokens, min(self.max_output_tokens, estimate))
+        base = max(self.min_output_tokens, min(self.max_output_tokens, estimate))
+        with self._output_retry_lock:
+            return max(
+                base,
+                self._output_retry_limits.get(
+                    self._output_retry_key(user, schema_name), base
+                ),
+            )
+
+    def _prepare_output_retry(
+        self, user: str, schema_name: str, current_limit: int | None
+    ) -> bool:
+        if (
+            current_limit is None
+            or schema_name in self.task_max_output_tokens
+            or self.max_tokens is not None
+            or self.max_tokens_per_source_char is None
+        ):
+            return False
+        next_limit = min(
+            self.max_output_tokens,
+            max(current_limit + self.min_output_tokens, current_limit * 2),
+        )
+        if next_limit <= current_limit:
+            self._clear_output_retry(user, schema_name)
+            return False
+        with self._output_retry_lock:
+            key = self._output_retry_key(user, schema_name)
+            if (
+                key not in self._output_retry_limits
+                and len(self._output_retry_limits) >= self._MAX_OUTPUT_RETRY_STATES
+            ):
+                self._output_retry_limits.pop(next(iter(self._output_retry_limits)))
+            self._output_retry_limits[key] = next_limit
+        return True
+
+    def _clear_output_retry(self, user: str, schema_name: str) -> None:
+        with self._output_retry_lock:
+            self._output_retry_limits.pop(
+                self._output_retry_key(user, schema_name), None
+            )
 
     def _enforce_input_budget(self, system: str, user: str, schema_name: str) -> None:
         limit = self.task_max_input_chars.get(schema_name, self.max_input_chars)
@@ -440,11 +550,15 @@ class CompatibleChatProvider(ModelProvider):
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         if message.get("refusal") or choice.get("finish_reason") == "content_filter":
+            self._clear_output_retry(user, schema_name)
             return _with_usage(_refusal_payload(schema_name), data)
         if choice.get("finish_reason") == "length":
+            retryable = self._prepare_output_retry(
+                user, schema_name, request_max_tokens
+            )
             raise ProviderFailure(
-                "malformed_response",
-                retryable=True,
+                "output_truncated",
+                retryable=retryable,
                 usage=_normalized_usage(data),
             )
         if choice.get("finish_reason") in {"insufficient_system_resource", "aborted"}:
@@ -454,7 +568,9 @@ class CompatibleChatProvider(ModelProvider):
                 usage=_normalized_usage(data),
             )
         try:
-            return _with_usage(json.loads(message.get("content") or ""), data)
+            result = _with_usage(json.loads(message.get("content") or ""), data)
+            self._clear_output_retry(user, schema_name)
+            return result
         except json.JSONDecodeError as exc:
             raise ProviderFailure(
                 "malformed_response",
@@ -508,11 +624,15 @@ class CompatibleChatProvider(ModelProvider):
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         if message.get("refusal") or choice.get("finish_reason") == "content_filter":
+            self._clear_output_retry(user, schema_name)
             return _with_usage(_refusal_payload(schema_name), data)
         if choice.get("finish_reason") == "length":
+            retryable = self._prepare_output_retry(
+                user, schema_name, request_max_tokens
+            )
             raise ProviderFailure(
-                "malformed_response",
-                retryable=True,
+                "output_truncated",
+                retryable=retryable,
                 usage=_normalized_usage(data),
             )
         if choice.get("finish_reason") in {"insufficient_system_resource", "aborted"}:
@@ -530,7 +650,9 @@ class CompatibleChatProvider(ModelProvider):
                 status_code=exc.status_code,
                 usage=_normalized_usage(data),
             ) from exc
-        return _with_usage(verdict, data)
+        result = _with_usage(verdict, data)
+        self._clear_output_retry(user, schema_name)
+        return result
 
 
 class CommandProvider(ModelProvider):

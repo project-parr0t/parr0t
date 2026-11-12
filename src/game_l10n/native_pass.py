@@ -1100,8 +1100,22 @@ def prepare_native_tasks(
     current_tokens = 0
     for ordinal, segment in enumerate(segments):
         estimated_tokens = _estimated_material_tokens(segment)
+        # A mostly full translation batch ends at a scene change so a scene is translated
+        # by one worker with one shared context; hard caps are unchanged.
+        scene_break = (
+            pass_kind == "translation"
+            and bool(current)
+            and bool(segment.scene)
+            and bool(current[-1][1].scene)
+            and segment.scene != current[-1][1].scene
+            and (
+                len(current) * 4 >= task_max_records * 3
+                or current_tokens * 4 >= task_max_material_tokens * 3
+            )
+        )
         if current and (
-            len(current) >= task_max_records
+            scene_break
+            or len(current) >= task_max_records
             or current_tokens + estimated_tokens > task_max_material_tokens
         ):
             batches.append(current)
@@ -1775,7 +1789,6 @@ def seal_native_wave_relay(
         or payload.get("dispatch_fingerprint") != stable_hash(unsigned)
         or not isinstance(payload.get("task_bindings"), list)
         or not payload["task_bindings"]
-        or len(payload["task_bindings"]) > DEFAULT_MAX_WORKERS
         or not isinstance(payload.get("relay_contract"), dict)
         or payload["relay_contract"].get("role") != "isolated_wave_relay"
         or payload["relay_contract"].get("authority")
@@ -1807,6 +1820,8 @@ def seal_native_wave_relay(
         if (
             manifest["contract_fingerprint"] != payload["manifest_contract_fingerprint"]
             or _native_control_plan_fingerprint(manifest) != payload["plan_fingerprint"]
+            # The wave width is whatever prepare accepted (1..64), not the default.
+            or len(payload["task_bindings"]) > int(manifest["max_workers"])
         ):
             raise ValueError("Relay manifest binding changed")
     except (OSError, KeyError, TypeError, ValueError):

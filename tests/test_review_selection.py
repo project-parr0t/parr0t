@@ -2,15 +2,47 @@ from __future__ import annotations
 
 import unittest
 
-from game_l10n.models import Segment
+from game_l10n.models import Segment, ValidationIssue
 from game_l10n.review_selection import (
     review_category,
+    rewrite_issue_codes,
     strong_review_selection_reasons,
     target_language_review_reasons,
 )
 
 
 class ReviewSelectionTests(unittest.TestCase):
+    def test_rewrite_keeps_every_hard_gate_before_bounded_judge_findings(self) -> None:
+        integrity = [
+            ValidationIssue("glossary-missing", "fixture"),
+            ValidationIssue("markup-malformed", "fixture"),
+            ValidationIssue("script-intrusion", "fixture"),
+            ValidationIssue("ui-composition-duplication", "fixture"),
+            ValidationIssue("ui-length-limit", "fixture"),
+        ]
+
+        codes = rewrite_issue_codes(
+            ["meaning", "voice", "register", "literalism", "reference_loss"],
+            integrity,
+            language_risk=True,
+        )
+
+        self.assertEqual(
+            codes,
+            [
+                "terminology",
+                "formatting",
+                "addition",
+                "slot_composition",
+                "length_risk",
+                "fluency",
+                "meaning",
+                "voice",
+                "register",
+                "literalism",
+            ],
+        )
+
     def test_selection_is_text_independent_for_same_id_and_metadata(self) -> None:
         first = Segment("fixture", "SOURCE_A", metadata={"text_type": "ordinary"})
         second = Segment("fixture", "SOURCE_B", metadata={"text_type": "ordinary"})
@@ -76,6 +108,17 @@ class ReviewSelectionTests(unittest.TestCase):
             ["target_script_contamination"],
         )
 
+
+    def test_provenance_reasons_need_exact_cue_ids_or_fallback_origin(self) -> None:
+        from game_l10n.review_selection import provenance_review_reasons
+
+        cues = ({"evidence_line_ids": ["fixture-1"], "scene": "fixture-scene"},)
+        self.assertEqual(provenance_review_reasons("fixture-1", cues), ["context_reference_cue"])
+        self.assertEqual(provenance_review_reasons("fixture-2", cues), [])
+        self.assertEqual(
+            provenance_review_reasons("fixture-2", cues, non_primary_translation=True),
+            ["fallback_translation"],
+        )
 
 if __name__ == "__main__":
     unittest.main()
