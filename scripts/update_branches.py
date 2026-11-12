@@ -11,7 +11,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from scripts.check_branches import audit_branches, digest, git, plan_branches, tree
+from scripts.check_branches import audit_branches, default_cache_dir, digest, git, plan_branches, tree
 
 SCHEMA = "parr0t.branch-update.v1"
 
@@ -100,7 +100,8 @@ def merge_tree(repo: Path, plan: dict) -> str:
 
 def plan_updates(repo: Path, state: Path, *, main_ref: str = "origin/main", refs: list[str] | None = None,
                  python: str = sys.executable, environment_key: str = "", jobs: int = 2,
-                 require_ancestry: bool = False, provision_dependencies: bool = False) -> dict:
+                 require_ancestry: bool = False, provision_dependencies: bool = False,
+                 cache_dir: Path | None = None) -> dict:
     repo, state = repo.resolve(), state.resolve()
     if state.is_relative_to(repo):
         raise ValueError("Update state must be outside the repository")
@@ -131,7 +132,7 @@ def plan_updates(repo: Path, state: Path, *, main_ref: str = "origin/main", refs
         validation = audit_branches(
             repo, state, main_ref=main_ref, python=python,
             environment_key=environment_key, jobs=jobs, pinned_plans=[plans[0], *pending],
-            provision_dependencies=provision_dependencies,
+            provision_dependencies=provision_dependencies, cache_dir=cache_dir,
         )
         evidence = {row["ref"]: row for row in validation["branches"]}
         core_proof = evidence.get(plans[0]["ref"])
@@ -238,6 +239,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=ROOT)
     parser.add_argument("--state-dir", type=Path, required=True)
+    parser.add_argument("--cache-dir", type=Path,
+                        help="Stable external evidence/dependency cache; default: one repository-wide sibling cache")
     parser.add_argument("--main-ref", default="origin/main")
     parser.add_argument("--branch", action="append", help="Local sdk-* target; repeatable. Omit for origin SDK planning")
     parser.add_argument("--python", default=sys.executable)
@@ -252,10 +255,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.apply and not args.branch:
         parser.error("--apply requires explicit --branch targets")
     refs = [local_ref(branch) for branch in args.branch] if args.branch else None
+    cache_dir = args.cache_dir or default_cache_dir(args.repo)
     report = plan_updates(args.repo, args.state_dir, main_ref=args.main_ref, refs=refs,
                           python=args.python, environment_key=args.environment_key, jobs=args.jobs,
                           require_ancestry=args.require_ancestry,
-                          provision_dependencies=args.provision_dependencies)
+                          provision_dependencies=args.provision_dependencies, cache_dir=cache_dir)
     if args.apply:
         report = apply_updates(args.repo.resolve(), report)
         (args.state_dir / "update-result.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
