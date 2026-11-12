@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.check_branches import (
+    VALIDATION_RUNNER_FUNCTIONS,
     unittest_summary,
     audit_branches,
     environment_digest,
@@ -109,6 +110,47 @@ class BranchAuditTests(unittest.TestCase):
         self.assertEqual(second["branches"][1]["cache_scope"], "adapter_impact")
         self.assertNotEqual(first["branches"][1]["validation_key"], second["branches"][1]["validation_key"])
 
+    def test_implicit_parent_initializer_is_owned_by_core_proof(self) -> None:
+        self.write("src/pkg/__init__.py", "import core\n")
+        self.commit("Add fixture package initializer")
+        self.git("switch", "sdk-fixture-1.0")
+        self.write("src/pkg/adapter.py", "VALUE = 1\n")
+        self.write(
+            "tests/test_adapter.py",
+            "import pkg.adapter\nimport unittest\n"
+            "class Adapter(unittest.TestCase):\n    def test_fixture(self): self.assertEqual(pkg.adapter.VALUE, 1)\n",
+        )
+        self.commit("Add fixture package adapter")
+        self.git("switch", "main")
+        with patch("scripts.check_branches.run_checks", side_effect=self.passed):
+            self.audit()
+            self.write("core.py", "# parent-only reachable change\n")
+            self.commit("Change parent-only fixture dependency")
+            result = self.audit()
+        self.assertEqual(result["executed"], 1)
+        self.assertTrue(result["branches"][1]["cached"])
+        self.assertNotIn("src/pkg/__init__.py", result["branches"][1]["impact_paths"])
+
+    def test_stable_cache_reuses_proofs_across_run_state_directories(self) -> None:
+        cache = self.root / "stable-cache"
+        first_state = self.root / "run-one"
+        second_state = self.root / "run-two"
+        with patch("scripts.check_branches.environment_digest", return_value="fixture-environment"), patch(
+            "scripts.check_branches.run_checks", side_effect=self.passed
+        ) as checks:
+            first = audit_branches(
+                self.repo, first_state, main_ref="main", refs=["sdk-fixture-1.0"], jobs=1, cache_dir=cache,
+            )
+            second = audit_branches(
+                self.repo, second_state, main_ref="main", refs=["sdk-fixture-1.0"], jobs=1, cache_dir=cache,
+            )
+        self.assertEqual(first["executed"], 2)
+        self.assertEqual(second["executed"], 0)
+        self.assertEqual(second["reused"], 2)
+        self.assertEqual(checks.call_count, 2)
+        self.assertTrue((cache / "cache.json").is_file())
+        self.assertTrue((second_state / "cache.json").is_file())
+
     def test_reachable_main_change_invalidates_adapter_impact_proof(self) -> None:
         self.git("switch", "sdk-fixture-1.0")
         self.write(
@@ -129,10 +171,7 @@ class BranchAuditTests(unittest.TestCase):
     def test_matching_previous_report_seeds_impact_cache_without_retesting_adapter(self) -> None:
         runner = "\n".join(
             f"def {name}(*args, **kwargs):\n    pass"
-            for name in [
-                "dependency_tree_digest", "external_environment_digest", "extract_snapshot",
-                "initialize_snapshot", "run_checks", "validation_environment_files",
-            ]
+            for name in sorted(VALIDATION_RUNNER_FUNCTIONS)
         )
         self.write("scripts/check_branches.py", runner + "\nPLANNER_VERSION = 1\n")
         self.write("scripts/check_repo_privacy.py", "# stable privacy runner\n")
@@ -338,13 +377,13 @@ class BranchAuditTests(unittest.TestCase):
         self.assertEqual(result["checks"]["tests"]["scope"], "adapter")
         self.assertEqual(result["checks"]["tests"]["count"], 0)
 
-    def test_native_tool_configuration_changes_invalidate_environment(self) -> None:
+    def test_native_tool_configuration_does_not_invalidate_core_environment(self) -> None:
         with patch("scripts.check_branches.subprocess.run", return_value=type("Probe", (), {"stdout": "fixture"})()):
             with patch.dict("os.environ", {"GAME_L10N_CSC": "fixture-compiler-a"}):
                 first = environment_digest(sys.executable, "")
             with patch.dict("os.environ", {"GAME_L10N_CSC": "fixture-compiler-b"}):
                 second = environment_digest(sys.executable, "")
-        self.assertNotEqual(first, second)
+        self.assertEqual(first, second)
 
     def test_nested_sdk_requirements_are_discovered_and_provisioned_outside_repo(self) -> None:
         self.git("switch", "sdk-fixture-1.0")
@@ -362,6 +401,7 @@ class BranchAuditTests(unittest.TestCase):
                 environment = kwargs["env"]
                 self.assertEqual(environment["TMP"], environment["TEMP"])
                 self.assertTrue(Path(environment["TMP"]).is_relative_to(self.state))
+                self.assertTrue(Path(environment["PIP_CACHE_DIR"]).is_relative_to(self.state))
             return actual_run(command, **kwargs)
         with patch("scripts.check_branches.subprocess.run", side_effect=inspect_environment):
             paths, key = provision_requirements(self.repo, self.state, plan, sys.executable)
@@ -372,6 +412,32 @@ class BranchAuditTests(unittest.TestCase):
         (paths[0] / "unexpected-file").write_text("changed", encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "STATE_CHANGED"):
             provision_requirements(self.repo, self.state, plan, sys.executable)
+
+    def test_exact_dependency_environment_is_reused_from_prior_run_state(self) -> None:
+        self.git("switch", "sdk-fixture-1.0")
+        self.write("profiles/fixture-requirements.txt", "# no third-party fixture packages\n")
+        self.commit("Declare reusable fixture validation environment")
+        self.git("switch", "main")
+        plan = plan_branches(self.repo, "main", ["sdk-fixture-1.0"])[1]
+        prior_state = self.root / "prior-state"
+        stable_cache = self.root / "stable-cache"
+        paths, key = provision_requirements(self.repo, prior_state, plan, sys.executable)
+        actual_run = subprocess.run
+        pip_calls = 0
+
+        def count_pip(command: list[str], **kwargs: object):
+            nonlocal pip_calls
+            if command[:3] == [sys.executable, "-m", "pip"]:
+                pip_calls += 1
+            return actual_run(command, **kwargs)
+
+        with patch("scripts.check_branches.subprocess.run", side_effect=count_pip):
+            reused, reused_key = provision_requirements(
+                self.repo, stable_cache, plan, sys.executable, reuse_states=[prior_state],
+            )
+        self.assertEqual(reused_key, key)
+        self.assertTrue(os.path.samefile(reused[0], paths[0]))
+        self.assertEqual(pip_calls, 0)
 
     def test_declared_requirements_cannot_fall_back_to_ambient_packages(self) -> None:
         self.git("switch", "sdk-fixture-1.0")
