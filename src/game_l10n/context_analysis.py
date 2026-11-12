@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Any
 
 from .errors import ProviderError
-from .models import ContextMode, ContextPack, Segment
+from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext, Segment
 from .providers import ProviderRegistry
 from .store import stable_hash, stable_hash_sequence
+from .validators import contains_term
 
 SUPPORTED_CONTEXT_MODES = {mode.value for mode in ContextMode}
 CONTEXT_DOMAINS = {
@@ -23,7 +24,7 @@ CONTEXT_DOMAINS = {
 CONTEXT_PREFLIGHT_SCHEMA = "parr0t.context-preflight.v1"
 CONTEXT_STATE_SCHEMA = "parr0t.context-state.v2"
 CONTEXT_PREFLIGHT_POLICY_VERSION = 1
-CONTEXT_PROMPT_CONTRACT_VERSION = 1
+CONTEXT_PROMPT_CONTRACT_VERSION = 2
 CONTEXT_NESTED_SCHEMA_VERSION = 1
 CONTEXT_DISPOSITION_DETERMINISTIC_UI = "deterministic_ui"
 CONTEXT_DISPOSITION_SEMANTIC_REQUIRED = "semantic_required"
@@ -331,6 +332,10 @@ Do not continue scenes, roleplay, or create new content. When allowed by provide
 violence, profanity, horror, romance, nudity, sexual themes, or other mature subject matter is not by itself a
 reason to refuse linguistic analysis. If policy truly prevents analysis, return status=refused with
 reason=provider_refusal and do not quote, paraphrase, or classify the triggering content in that field.
+When localization_inputs is supplied, write formality, address and speech-rule guidance in the target
+language's own register terms (for Korean, name the speech level such as hapsyo-che, haeyo-che or hae-che and
+who is addressed). Its glossary is authoritative: terminology_rules must not contradict it. Its
+speaker_profiles are user-authored and take precedence over inferred traits.
 Return only the requested JSON object."""
 
 _MODE_SYSTEM_PROMPTS = {
@@ -592,7 +597,15 @@ def _chunks(segments: list[Segment], max_chars: int) -> list[list[Segment]]:
                 separators=(",", ":"),
             )
         ) + 80
-        if current and size + row_size > max_chars:
+        # Prefer ending a mostly full chunk at a scene change; the size cap is unchanged.
+        scene_break = (
+            bool(current)
+            and bool(segment.scene)
+            and bool(current[-1].scene)
+            and segment.scene != current[-1].scene
+            and size * 4 >= max_chars * 3
+        )
+        if current and (scene_break or size + row_size > max_chars):
             result.append(current)
             current = []
             size = 0
@@ -609,21 +622,67 @@ def context_chunks(segments: list[Segment], max_chars: int) -> list[list[Segment
     return _chunks(segments, max_chars)
 
 
+def chunk_localization_inputs(
+    chunk: list[Segment],
+    project: ProjectContext | None = None,
+    glossary: list[GlossaryEntry] | tuple[GlossaryEntry, ...] = (),
+    characters: list[CharacterProfile] | tuple[CharacterProfile, ...] = (),
+) -> dict[str, Any]:
+    """User-locked facts the analyzer must phrase guidance against; empty when none exist."""
+    text = "\n".join(item.source for item in chunk)
+    speakers = {item.speaker.casefold() for item in chunk if item.speaker}
+    inputs: dict[str, Any] = {}
+    if project is not None:
+        inputs["project"] = {
+            "source_language": project.source_language,
+            "target_language": project.target_language,
+            "genre": project.genre,
+            "style_guide": project.style_guide,
+        }
+    terms = [
+        {
+            "source": entry.source,
+            "target": entry.target,
+            **({"also_accepted_targets": list(entry.targets)} if entry.targets else {}),
+            **({"note": entry.note} if entry.note else {}),
+        }
+        for entry in glossary
+        if contains_term(entry.source, text, case_sensitive=entry.case_sensitive)
+    ][:64]
+    if terms:
+        inputs["glossary"] = terms
+    profiles = [
+        {key: value for key, value in asdict(profile).items() if value or key == "name"}
+        for profile in characters
+        # Same matching as the translator's profile lookup: exact name or case-folded alias.
+        if profile.name.casefold() in speakers
+        or speakers.intersection(alias.casefold() for alias in profile.aliases)
+    ][:32]
+    if profiles:
+        inputs["speaker_profiles"] = profiles
+    return inputs
+
+
 def _payload(
     chunk: list[Segment],
     part: int,
     total: int,
     mode: str,
     domains_by_id: dict[str, set[str]],
+    *,
+    offset: int = 0,
+    localization_inputs: dict[str, Any] | None = None,
 ) -> str:
     return json.dumps(
         {
             "context_mode": mode,
             "part": part,
             "total_parts": total,
+            **({"localization_inputs": localization_inputs} if localization_inputs else {}),
             "lines": [
                 {
-                    "order": index,
+                    # Global position, so order means the same thing across chunks.
+                    "order": offset + index,
                     "id": item.id,
                     "scene": item.scene,
                     "speaker": item.speaker,
@@ -970,6 +1029,9 @@ class ContextAnalyzer:
         max_chunk_chars: int = 30000,
         max_workers: int = 1,
         context_mode: str = ContextMode.AUTO.value,
+        project: ProjectContext | None = None,
+        glossary: list[GlossaryEntry] | tuple[GlossaryEntry, ...] = (),
+        characters: list[CharacterProfile] | tuple[CharacterProfile, ...] = (),
     ):
         if not provider_chain:
             raise ValueError("context analyzer provider chain is empty")
@@ -983,7 +1045,20 @@ class ContextAnalyzer:
         self.max_chunk_chars = max_chunk_chars
         self.max_workers = max(1, int(max_workers))
         self.context_mode = context_mode
+        self.project = project
+        self.glossary = tuple(glossary)
+        self.characters = tuple(characters)
         self.last_execution: dict[str, Any] | None = None
+
+    def localization_fingerprint(self) -> str:
+        # Only fields the analyzer actually receives, so unrelated config edits keep the cache.
+        return stable_hash(
+            chunk_localization_inputs([], self.project, (), ())
+            | {
+                "glossary": [asdict(item) for item in self.glossary],
+                "characters": [asdict(item) for item in self.characters],
+            }
+        )
 
     def domains_by_id(self, segments: list[Segment]) -> dict[str, set[str]]:
         if self.context_mode in CONTEXT_DOMAINS:
@@ -1014,6 +1089,9 @@ class ContextAnalyzer:
         preflight = preflight or build_context_preflight(segments)
         semantic_segments = _semantic_context_segments(segments, preflight)
         chunks = _chunks(semantic_segments, self.max_chunk_chars)
+        offsets = [0]
+        for chunk in chunks[:-1]:
+            offsets.append(offsets[-1] + len(chunk))
         self.last_execution = None
 
         if not chunks:
@@ -1039,7 +1117,13 @@ class ContextAnalyzer:
                 try:
                     raw = self.registry.get(name).generate_json(
                         system=f"{_BASE_SYSTEM_PROMPT}\n\n{_MODE_SYSTEM_PROMPTS[mode]}",
-                        user=_payload(chunk, index, len(chunks), mode, domains_by_id),
+                        user=_payload(
+                            chunk, index, len(chunks), mode, domains_by_id,
+                            offset=offsets[index - 1],
+                            localization_inputs=chunk_localization_inputs(
+                                chunk, self.project, self.glossary, self.characters
+                            ),
+                        ),
                         schema=_SCHEMAS[mode],
                         schema_name=f"game_{mode}_context",
                     )
@@ -1153,6 +1237,7 @@ def analyze_with_cache(
             "schema": analyzer.schema(segments),
             "context_preflight_policy_version": CONTEXT_PREFLIGHT_POLICY_VERSION,
             "context_preflight": preflight,
+            "localization_inputs": analyzer.localization_fingerprint(),
             **contract_fingerprints,
         }
     )
