@@ -37,6 +37,38 @@ _EXPLICIT_RISK_FLAGS = (
     "logic_facing",
 )
 
+# Deterministic validator codes expressed in the judge's issue vocabulary, so a rewrite
+# learns what actually failed instead of a generic "formatting".
+_INTEGRITY_REVIEW_ISSUES = {
+    "empty": "omission",
+    "glossary-missing": "terminology",
+    "length-outlier": "length_risk",
+    "markup-malformed": "formatting",
+    "protected-token-mismatch": "formatting",
+    "script-intrusion": "addition",
+    "ui-composition-duplication": "slot_composition",
+    "ui-length-limit": "length_risk",
+}
+MAX_JUDGE_ISSUES = 4
+
+
+def rewrite_issue_codes(
+    judge_issues: Iterable[str] = (), integrity: Iterable[Any] = (), *, language_risk: bool = False
+) -> list[str]:
+    """Union every hard gate with the judge's bounded semantic findings.
+
+    The four-code protocol limit applies to a judge response, not to the internal
+    rewrite instruction assembled by the deterministic core.  Dropping any mapped
+    validator or language finding makes the rewrite repeat a known failure.
+    """
+    hard_gates = [
+        *(_INTEGRITY_REVIEW_ISSUES.get(item.code, "formatting") for item in integrity),
+        *(["fluency"] if language_risk else []),
+    ]
+    bounded_judge = list(dict.fromkeys(judge_issues))[:MAX_JUDGE_ISSUES]
+    return list(dict.fromkeys([*hard_gates, *bounded_judge])) or ["formatting"]
+
+
 _TARGET_SCRIPT_PATTERNS = {
     "ko": re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]"),
     "ja": re.compile(r"[\u3040-\u30ff\u3400-\u9fff]"),
@@ -100,6 +132,26 @@ def strong_review_selection_reasons(
         bucket = int(digest[:12], 16) / float(16**12) * 100.0
         if bucket < sample_percent:
             reasons.append("deterministic_sample")
+    return reasons
+
+
+def provenance_review_reasons(
+    segment_id: str,
+    reference_cues: Iterable[dict[str, Any]] = (),
+    *,
+    non_primary_translation: bool = False,
+) -> list[str]:
+    """Route, never reject: analyzed allusions/wordplay and fallback-route candidates.
+
+    A cue counts only when it names this exact target in evidence_line_ids; scene-wide
+    cues stay translation context. Fallback output skipped the primary route's
+    calibration, so it should not reach acceptance on a cheap triage pass alone.
+    """
+    reasons = []
+    if any(segment_id in cue.get("evidence_line_ids", ()) for cue in reference_cues):
+        reasons.append("context_reference_cue")
+    if non_primary_translation:
+        reasons.append("fallback_translation")
     return reasons
 
 

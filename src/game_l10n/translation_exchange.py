@@ -8,10 +8,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .control_plane import CONTROL_ENVELOPE_SCHEMA, validate_control_envelope
+from .control_plane import CONTROL_ENVELOPE_SCHEMA, safe_artifact_path, validate_control_envelope
 from .errors import GameL10nError
 from .models import FailureCode, Segment, TranslationResult
 from .privacy import is_within
+from .validators import empty_target_allowed
 
 
 EXCHANGE_SCHEMA = "parr0t.translation-exchange/v1"
@@ -41,6 +42,34 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 class TranslationExchangeError(GameL10nError):
     pass
+
+
+def _valid_success_text(request: dict[str, Any], text: Any) -> bool:
+    if not isinstance(text, str):
+        return False
+    source = request.get("source")
+    if not isinstance(source, str):
+        return False
+    if text.strip() or (not source.strip() and text == source):
+        return True
+    if text != "":
+        return False
+    context = request.get("context")
+    if not isinstance(context, dict):
+        return False
+    try:
+        segment = Segment(
+            id=request["target_id"],
+            source=source,
+            speaker=context["speaker"],
+            scene=context["scene"],
+            previous=context["previous"],
+            next=context["next"],
+            metadata=context["metadata"],
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    return empty_target_allowed(segment)
 
 
 def _fallback_usage_state(
@@ -319,6 +348,9 @@ def prepare_translation_exchange(
     output_dir = output_dir.resolve()
     if not is_within(output_dir, work_dir):
         raise TranslationExchangeError("Translation exchange must stay inside the private workspace")
+    if not safe_artifact_path(output_dir.relative_to(work_dir)):
+        # Its receipt path crosses the control plane; fail before any work, not at seal.
+        raise TranslationExchangeError("Translation exchange directory name must use [A-Za-z0-9._-]")
     if output_dir.exists():
         if not output_dir.is_dir() or any(output_dir.iterdir()):
             raise TranslationExchangeError("Translation exchange directory must be new or empty")
@@ -470,10 +502,7 @@ def seal_translation_exchange(work_dir: Path, bundle: Path) -> dict[str, Any]:
         request = requests.get(target_id)
         if request is None or target_id in resolved:
             raise TranslationExchangeError("Success target is unknown or duplicated")
-        valid_success_text = isinstance(row["text"], str) and (
-            bool(row["text"].strip())
-            or (not request["source"].strip() and row["text"] == request["source"])
-        )
+        valid_success_text = _valid_success_text(request, row["text"])
         if row["status"] != "success" or not valid_success_text:
             raise TranslationExchangeError("Success rows require non-empty translated text")
         if not isinstance(row["route"], str) or not row["route"] or len(row["route"]) > 120:
@@ -691,6 +720,7 @@ def process_translation_exchange(
     success_by_id = {row["target_id"]: row for row in success_rows}
     retryable_codes = {
         FailureCode.MALFORMED_RESPONSE.value,
+        FailureCode.OUTPUT_TRUNCATED.value,
         FailureCode.PROVIDER_ERROR.value,
         FailureCode.RATE_LIMITED.value,
         FailureCode.TIMEOUT.value,
@@ -737,9 +767,7 @@ def process_translation_exchange(
             request = requests_by_id[result.segment_id]
             prior_attempt = int(prior_failures.get(result.segment_id, {}).get("attempt", 0))
             attempt = prior_attempt + 1
-            valid_success_text = bool(result.text.strip()) or (
-                not request["source"].strip() and result.text == request["source"]
-            )
+            valid_success_text = _valid_success_text(request, result.text)
             if (
                 result.status in {"translated", "reviewed", "accepted_unreviewed"}
                 and valid_success_text

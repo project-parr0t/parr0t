@@ -242,6 +242,9 @@ class NativeReviewTests(unittest.TestCase):
             self.assertEqual(summary["accepted"], 1)
             self.assertEqual(summary["strong_pending"], 3)
             self.assertEqual(summary["invalid_verdicts"], 1)
+            metrics = json.loads((root / "collected/review-metrics.json").read_text(encoding="utf-8"))
+            self.assertEqual(metrics["verdicts"], {"approved": 1, "error": 2, "rewrite": 1})
+            self.assertEqual(metrics["issue_code_counts"], {"voice": 1})
             accepted = read_translation_results(root / "collected/accepted.json")
             self.assertEqual(accepted[0].text, "T")
             self.assertEqual(accepted[0].candidate_digest, segments[0].metadata["_parr0t_candidate"]["digest"])
@@ -315,16 +318,17 @@ class NativeReviewTests(unittest.TestCase):
                 return ReviewVerdictEnvelope(ReviewVerdict.OK)
             fake = SimpleNamespace(
                 registry=SimpleNamespace(get=lambda name: SimpleNamespace(fingerprint=lambda: {"name": name})),
-                context_pack=ContextPack(), glossary=[],
+                context_pack=ContextPack(), glossary=[], project=SimpleNamespace(target_language=""),
                 config=SimpleNamespace(extra_protected_patterns=[], max_length_ratio=4, review_max_rounds=2),
                 _judge_with_refusal_retry=judge,
             )
             first = process_native_review_followup(root, source, root / "out", fake,
                                                    operation="judge", deadline_epoch=time.time()+60)
             second = process_native_review_followup(root, source, root / "out", fake,
-                                                    operation="judge", deadline_epoch=time.time()+60)
+                                                    operation="judge")
             self.assertEqual(first["accepted"], 1)
             self.assertEqual(second["executed"], 0)
+            self.assertEqual(second["deadline_pending"], 0)
             self.assertEqual(calls, ["judge"])
             result.attempts[-1].status = "rewrite"
             result.metadata["rewrite_issues"] = ["voice"]
@@ -343,3 +347,94 @@ class NativeReviewTests(unittest.TestCase):
             binding = confirmation.metadata["_parr0t_candidate"]
             self.assertEqual(binding["generation"], 2)
             self.assertEqual(binding["digest"], stable_hash("REVISED"))
+
+    def test_review_followup_cli_does_not_require_a_time_ceiling(self) -> None:
+        from game_l10n.cli import build_parser, cmd_process_native_review_followup
+        from game_l10n.errors import ConfigurationError
+
+        args = build_parser().parse_args([
+            "process-native-review-followup", "--workspace", "w", "--input", "i",
+            "--output", "o", "--operation", "judge",
+        ])
+        self.assertIsNone(args.max_elapsed_minutes)
+        args.max_elapsed_minutes = 5.0
+        with self.assertRaisesRegex(ConfigurationError, "E_REVIEW_FALLBACK_BUDGET_INVALID"):
+            cmd_process_native_review_followup(args)
+
+    def test_fallback_judge_approval_cannot_waive_target_language(self) -> None:
+        from game_l10n.models import AttemptRecord, ContextPack, ReviewVerdictEnvelope, ReviewVerdict
+        from game_l10n.native_review import _bound_result, _pending_segment, process_native_review_followup
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = review_segment("fixture-1", candidate="untranslated latin sentence")
+            result = _bound_result(base)
+            result.attempts.append(AttemptRecord("review", "native-sol", "error", candidate_generation=1))
+            source = root / "fallback.jsonl"
+            source.write_text(json.dumps(asdict(_pending_segment(base, result))) + "\n")
+            fake = SimpleNamespace(
+                registry=SimpleNamespace(get=lambda name: SimpleNamespace(fingerprint=lambda: {"name": name})),
+                context_pack=ContextPack(), glossary=[], project=SimpleNamespace(target_language="ko"),
+                config=SimpleNamespace(extra_protected_patterns=[], max_length_ratio=4, review_max_rounds=2),
+                _judge_with_refusal_retry=lambda *args: ReviewVerdictEnvelope(ReviewVerdict.OK),
+            )
+            summary = process_native_review_followup(root, source, root / "out", fake, operation="judge")
+            # A cache written before the gate existed: the same row stored as approved.
+            cache = root / "out" / "results.json"
+            rows = json.loads(cache.read_text(encoding="utf-8"))
+            rows["results"][0]["status"] = "reviewed"
+            cache.write_text(json.dumps(rows), encoding="utf-8")
+            resumed = process_native_review_followup(root, source, root / "out", fake, operation="judge")
+        self.assertEqual(summary["accepted"], 0)
+        self.assertEqual(summary["rewrite_pending"], 1)
+        self.assertEqual((resumed["executed"], resumed["accepted"], resumed["rewrite_pending"]), (0, 0, 1))
+
+    def test_rewrite_issue_codes_keep_judge_and_validator_findings(self) -> None:
+        from game_l10n.models import ValidationIssue
+        from game_l10n.review_selection import rewrite_issue_codes
+
+        integrity = [ValidationIssue("glossary-missing", "x"), ValidationIssue("ui-length-limit", "y")]
+        self.assertEqual(
+            rewrite_issue_codes(["meaning", "omission"], integrity, language_risk=True),
+            ["terminology", "length_risk", "fluency", "meaning", "omission"],
+        )
+        # The cap applies to judge codes alone, never to hard-gate findings.
+        self.assertEqual(
+            rewrite_issue_codes(
+                ["meaning", "voice", "register", "literalism"],
+                [ValidationIssue("glossary-missing", "x")], language_risk=True,
+            ),
+            [
+                "terminology",
+                "fluency",
+                "meaning",
+                "voice",
+                "register",
+                "literalism",
+            ],
+        )
+        self.assertEqual(rewrite_issue_codes(["voice"], language_risk=True), ["fluency", "voice"])
+        self.assertEqual(rewrite_issue_codes(), ["formatting"])
+
+    def test_native_triage_ok_escalates_cue_and_fallback_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            segments = [review_segment(f"fixture-{i}") for i in range(3)]
+            segments[2].metadata["_parr0t_candidate"]["provider"] = "fixture-fallback"
+            source.write_text("\n".join(json.dumps(asdict(s)) for s in segments) + "\n")
+            segments = read_segments(source)
+            tasks, results = root / "tasks", root / "results"
+            prepare_native_tasks(root, source, segments, tasks, pass_kind="review")
+            results.mkdir()
+            (results / "task-0001.jsonl").write_text("\n".join(json.dumps({
+                "target_id": s.id, "status": "success", "text": '{"verdict":"ok","issues":[]}',
+            }) for s in segments) + "\n")
+            import_native_wave(root, tasks / "manifest.json", results, 1)
+            summary = collect_native_review(
+                root, source, tasks / "manifest.json", root / "collected", tier="triage",
+                sample_percent=0, reference_cues=({"evidence_line_ids": ["fixture-1"]},),
+                primary_translator="fixture",
+            )
+            pending = {s.id: s for s in read_segments(root / "collected/strong-input.jsonl")}
+        self.assertEqual(summary["accepted"], 1)
+        self.assertEqual(sorted(pending), ["fixture-1", "fixture-2"])
