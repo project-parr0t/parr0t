@@ -538,6 +538,16 @@ def initialize_snapshot(snapshot: Path) -> None:
         "commit", "-m", "Synthetic branch audit snapshot")
 
 
+def unittest_summary(stderr: str) -> tuple[int, bool, int | None]:
+    """Read unittest's own trailer: it is on stderr and last, so test stdout cannot spoof it."""
+    counts = re.findall(r"^Ran (\d+) tests? in", stderr, re.MULTILINE)
+    summaries = re.findall(r"^(?:OK|FAILED)(?: \(([^)]*)\))?$", stderr, re.MULTILINE)
+    if not summaries:
+        return (int(counts[-1]) if counts else 0), False, None
+    skipped = re.search(r"(?:^|, )skipped=(\d+)(?:, |$)", summaries[-1])
+    return (int(counts[-1]) if counts else 0), True, int(skipped[1]) if skipped else 0
+
+
 def run_checks(snapshot: Path, python: str, sdk: bool, log: Path,
                test_paths: list[str] | None = None,
                dependency_paths: list[Path] | None = None) -> dict:
@@ -593,14 +603,11 @@ def run_checks(snapshot: Path, python: str, sdk: bool, log: Path,
         output = result.stdout + result.stderr
         checks[name] = {"passed": result.returncode == 0, "seconds": round(time.monotonic() - started, 3)}
         if name == "tests":
-            count = re.search(r"Ran (\d+) tests? in", output)
-            summary = re.search(r"^(?:OK|FAILED)(?: \(([^)]*)\))?$", output, re.MULTILINE)
-            skipped = re.search(r"(?:^|, )skipped=(\d+)(?:, |$)", summary[1] or "") if summary else None
-            skipped_count = int(skipped[1]) if skipped else 0 if summary else None
+            count, summary, skipped_count = unittest_summary(result.stderr)
             checks[name].update({
-                "count": int(count[1]) if count else 0,
+                "count": count,
                 "skipped": skipped_count,
-                "complete": bool(count and int(count[1]) > 0 and summary and skipped_count == 0),
+                "complete": bool(count > 0 and summary and skipped_count == 0),
                 "scope": "adapter" if test_paths is not None else "full",
             })
             if not checks[name]["complete"]:
