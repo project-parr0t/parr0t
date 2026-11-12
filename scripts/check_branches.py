@@ -402,14 +402,15 @@ def plan_branches(repo: Path, main_ref: str, refs: list[str] | None = None) -> l
 
 
 def environment_digest(python: str, environment_key: str) -> str:
-    probe = """import importlib.metadata as m,json,platform,sys
-print(json.dumps([sys.version,sys.executable,platform.platform(),sorted((d.metadata.get('Name',''),d.version,str(d.locate_file(''))) for d in m.distributions())]))"""
-    result = subprocess.run([python, "-c", probe], capture_output=True, check=True, text=True)
+    probe = "import json,platform,sys;print(json.dumps([sys.version,sys.executable,platform.platform()]))"
+    result = subprocess.run([python, "-s", "-c", probe], capture_output=True, check=True, text=True)
     # Native SDK tools are bound per branch by external_environment_digest().
-    # PATH and branch-only tool variables must not invalidate the complete core
-    # proof or unrelated SDK evidence when signing/provisioning changes process
-    # context. PYTHONPATH remains relevant because run_checks inherits it.
-    return digest([result.stdout, environment_key, os.environ.get("PYTHONPATH", "")])
+    # Declared Python dependencies are content-bound separately. Ambient package
+    # visibility, PATH, PYTHONPATH, and branch-only tool variables must not make
+    # an otherwise identical proof depend on whether the caller is the normal
+    # planner or the elevated GPG apply process. Operators can bind another
+    # meaningful external dependency explicitly with --environment-key.
+    return digest([result.stdout, environment_key])
 
 
 def runtime_digest(python: str) -> str:
