@@ -2908,7 +2908,21 @@ def _native_control_step_single(
         budget_issue = _native_budget_issue(
             manifest["execution_contract"], state, next_wave
         )
-        if relay_issue:
+        awaiting_live_relay = (
+            relay_issue == "E_NATIVE_RELAY_RECEIPT_REQUIRED"
+            and relay_dispatch_path.is_file()
+            and "launch_contract" in json.loads(relay_dispatch_path.read_text(encoding="utf-8"))
+        )
+        if awaiting_live_relay:
+            if budget_issue:
+                action, issue_codes = "checkpoint_and_stop", [budget_issue]
+            elif max_root_calls is not None and state["control_steps_in_wave"] > max_root_calls:
+                action, issue_codes = "checkpoint_and_stop", ["E_NATIVE_WAVE_CONTROL_LIMIT"]
+            else:
+                # A bounded host wait is a polling interval, not a worker
+                # deadline. Only the relay's terminal seal ends this lifecycle.
+                action, issue_codes = "wait_for_active_wave", []
+        elif relay_issue:
             action = "repair_native_runtime" if relay_issue in RUNTIME_ISSUES else "checkpoint_and_stop"
             issue_codes = [relay_issue]
         elif budget_issue and ready_results != len(tasks):

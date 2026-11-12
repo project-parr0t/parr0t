@@ -97,6 +97,18 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(resumed["wave"], 1)
         self.assertEqual(resumed["route_binding"]["attempt"], 1)
 
+    def test_live_relay_wait_has_no_implicit_deadline(self) -> None:
+        _, relay, _ = self.prepare()
+        for _ in range(5):
+            waiting = self.step()
+            self.assertEqual(waiting["action"], "wait_for_active_wave")
+            self.assertEqual(waiting["issue_codes"], [])
+            self.assertEqual(waiting["route_binding"]["attempt"], 1)
+            self.assertEqual(waiting["counts"]["imported_tasks"], 0)
+        record_native_launch(self.root, relay, event="capability-unavailable")
+        seal_native_wave_relay(self.root, relay, relay_ended=True)
+        self.assertEqual(self.step()["action"], "repair_native_runtime")
+
     def test_partial_launch_preserves_success_and_only_starts_remaining_task(self) -> None:
         _, relay, payload = self.prepare()
         model = payload["launch_contract"]["model"]
