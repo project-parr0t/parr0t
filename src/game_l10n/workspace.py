@@ -124,6 +124,7 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "grace_retries": 3,
         "grace_retry_codes": [
             "malformed_response",
+            "output_truncated",
             "provider_error",
             "rate_limited",
             "timeout",
@@ -1380,6 +1381,7 @@ def initialize_workspace(
             "grace_retries": 3,
             "grace_retry_codes": [
                 "malformed_response",
+                "output_truncated",
                 "provider_error",
                 "rate_limited",
                 "timeout",

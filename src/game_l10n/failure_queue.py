@@ -9,6 +9,7 @@ from .models import FailureCode, Segment, TranslationResult
 
 OPERATIONAL_FAILURE_CODES = {
     FailureCode.MALFORMED_RESPONSE.value,
+    FailureCode.OUTPUT_TRUNCATED.value,
     FailureCode.PROVIDER_ERROR.value,
     FailureCode.RATE_LIMITED.value,
     FailureCode.QUOTA_EXHAUSTED.value,
@@ -43,7 +44,13 @@ def _failure_category(result: TranslationResult) -> tuple[str, list[str]]:
         return "operational", codes
     if any(item.status == "refused" for item in result.attempts):
         return "provider_refusal", codes or [FailureCode.EXPLICIT_PROVIDER_REFUSAL.value]
-    if FailureCode.INTEGRITY_INVALID.value in codes:
+    if any(
+        code in {
+            FailureCode.INTEGRITY_INVALID.value,
+            FailureCode.CONSTRAINT_UNSATISFIABLE.value,
+        }
+        for code in codes
+    ):
         return "integrity", codes
     return "route_exhausted", codes
 

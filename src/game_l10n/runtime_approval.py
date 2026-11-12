@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import RuntimeApprovalError
+from .filesystem_package import validate_filesystem_package
 from .privacy import is_within
 from .steam import SteamPackageError, validate_steam_package
 from .workspace import load_config
@@ -97,13 +98,15 @@ def _artifact_descriptor(artifact_path: Path) -> dict[str, Any]:
         "sha256": digest,
     }
     if kind == "file" and artifact.suffix.casefold() == ".zip":
-        try:
-            package = validate_steam_package(artifact)
-        except SteamPackageError:
-            pass
-        else:
+        # The shared installer requires this binding for both package formats.
+        for validate in (validate_steam_package, validate_filesystem_package):
+            try:
+                package = validate(artifact)
+            except SteamPackageError:
+                continue
             descriptor["fingerprint"] = package["artifact_fingerprint"]
             descriptor["installer_sha256"] = package["installer_sha256"]
+            break
     return descriptor
 
 

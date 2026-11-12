@@ -1826,6 +1826,71 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(resumed["imported_wave"]["success"], 1)
         self.assertEqual(resumed["imported_wave"]["failed"], 1)
 
+    def test_native_wave_relay_seals_waves_wider_than_default_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            results = root / "results"
+            prepare_native_tasks(
+                root,
+                source,
+                [Segment(f"fixture-{index}", f"SOURCE_{index}") for index in range(12)],
+                tasks,
+                max_records=1,
+                min_records=1,
+                max_workers=12,
+            )
+            step = native_control_step(root, tasks / "manifest.json", results)
+            dispatch = root / step["relay"]["dispatch"]
+            bindings = json.loads(dispatch.read_text(encoding="utf-8"))["task_bindings"]
+
+            sealed = seal_native_wave_relay(root, dispatch, relay_ended=True)
+
+        self.assertGreater(len(bindings), 8)
+        self.assertEqual(sealed["ended_tasks_recorded"], len(bindings))
+
+    def test_native_wave_relay_rejects_more_bindings_than_manifest_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            tasks = root / "tasks"
+            prepare_native_tasks(
+                root, source, [Segment(f"fixture-{index}", f"SOURCE_{index}") for index in range(3)],
+                tasks, max_records=1, min_records=1, max_workers=2,
+            )
+            step = native_control_step(root, tasks / "manifest.json", root / "results")
+            dispatch = root / step["relay"]["dispatch"]
+            payload = json.loads(dispatch.read_text(encoding="utf-8"))
+            extra = dict(payload["task_bindings"][0], task="tasks/task-0003.jsonl")
+            payload["task_bindings"].append(extra)
+            unsigned = {key: value for key, value in payload.items() if key != "dispatch_fingerprint"}
+            payload["dispatch_fingerprint"] = stable_hash(unsigned)
+            dispatch.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "bound manifest is invalid"):
+                seal_native_wave_relay(root, dispatch, relay_ended=True)
+
+    def test_translation_batches_end_at_scene_change_once_mostly_full(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            scenes = ["fixture-a"] * 7 + ["fixture-b"] * 5
+            prepare_native_tasks(
+                root, source,
+                [Segment(f"fixture-{i}", f"SOURCE_{i}", scene=scene) for i, scene in enumerate(scenes)],
+                root / "tasks", max_records=8, min_records=1,
+            )
+            sizes = [
+                len((root / "tasks" / task["file"]).read_text(encoding="utf-8").splitlines())
+                for task in json.loads((root / "tasks" / "manifest.json").read_text(encoding="utf-8"))["tasks"]
+            ]
+
+        self.assertEqual(sizes, [7, 5])
+
     def test_native_wave_relay_rejects_mixed_terminal_modes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
