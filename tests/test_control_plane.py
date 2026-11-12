@@ -12,9 +12,11 @@ from unittest.mock import patch
 from game_l10n.cli import build_parser, main
 from game_l10n.control_plane import (
     CONTROL_HANDOFF_PATH,
+    ISSUE_CODES_BY_STAGE,
     REVIEW_CONTROL_ALLOWED_ACTIONS,
     REVIEW_CONTROL_CONTRACT_SCHEMA,
     REVIEW_CONTROL_MODE,
+    TERMINAL_ROUTE_STATUSES,
     review_control_contract,
     validate_review_control_action,
     acknowledge_control_plane_rotation,
@@ -41,6 +43,10 @@ from game_l10n.native_pass import _detail_contract, prepare_native_tasks
 
 
 class ControlPlaneContractTests(unittest.TestCase):
+    def test_preflight_constraint_failure_cannot_prove_provider_exhaustion(self) -> None:
+        self.assertIn("constraint_unsatisfiable", ISSUE_CODES_BY_STAGE["translation"])
+        self.assertNotIn("constraint_unsatisfiable", TERMINAL_ROUTE_STATUSES)
+
     def test_discovery_cli_uses_a_core_bound_data_plane_relay(self) -> None:
         args = build_parser().parse_args(
             [

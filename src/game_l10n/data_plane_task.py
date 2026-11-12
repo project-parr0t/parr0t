@@ -64,6 +64,7 @@ CONTEXT_FRAGMENT_SCHEMA = "parr0t.context-fragment.v1"
 CONTEXT_RESULT_ISSUE_CODES = {
     "fallback_required",
     "malformed_response",
+    "output_truncated",
     "provider_error",
     "rate_limited",
     "quota_exhausted",

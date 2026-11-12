@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from game_l10n.models import AttemptRecord, Segment, TranslationResult
+from game_l10n.store import stable_hash
 from game_l10n.translation_exchange import (
     FAILURE_NAME,
     FALLBACK_USAGE_RELATIVE,
@@ -25,6 +26,57 @@ def _digest(value: str) -> str:
 
 
 class TranslationExchangeTests(unittest.TestCase):
+    def test_bound_optional_ui_slot_accepts_empty_fallback_success(self) -> None:
+        source = "SOURCE_OPTIONAL"
+        metadata = {
+            "ui_slot_role": "template_fragment",
+            "ui_composed_with_ids": ["fixture-label"],
+            "ui_render_pattern": "{prefix}{value}",
+            "ui_fixed_target_prefix": "TARGET_",
+            "ui_fixed_target_suffix": "",
+        }
+        source_digest = _digest(source)
+        composition = {
+            "target_id": "optional-slot",
+            "source_sha256": source_digest,
+            **metadata,
+        }
+        metadata["ui_empty_target"] = {
+            "schema": "parr0t.ui-empty-target/v1",
+            "reason_code": "optional_grammatical_slot",
+            "source_sha256": source_digest,
+            "composition_sha256": stable_hash(composition),
+            "evidence_sha256": _digest("SYNTHETIC_BINDING"),
+        }
+        segment = Segment("optional-slot", source, metadata=metadata)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "exchange"
+            prepare_translation_exchange(
+                root,
+                [segment],
+                bundle,
+                exchange_id="optional-empty-fixture",
+                mode="fallback",
+                source_queue="translation_fallback_pending",
+            )
+            result = process_translation_exchange(
+                root,
+                bundle,
+                lambda segments: [
+                    TranslationResult(
+                        segment_id=segments[0].id,
+                        source=segments[0].source,
+                        text="",
+                        status="translated",
+                    )
+                ],
+                route="fallback",
+            )
+
+        self.assertEqual(result["success_count"], 1)
+
     def test_default_fallback_has_no_whole_job_limit_and_preserves_whitespace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

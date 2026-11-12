@@ -37,15 +37,60 @@ def contains_term(term: str, text: str, *, case_sensitive: bool = False) -> bool
     Boundaries apply only at alphabetic-letter edges, so CJK names followed by particles still match
     and a plain English plural ("Potions") still counts as the glossary term.
     """
+    return bool(_term_spans(term, text, case_sensitive=case_sensitive))
+
+
+def _term_spans(
+    term: str, text: str, *, case_sensitive: bool = False
+) -> list[tuple[int, int]]:
     if not term:
-        return False
+        return []
     if not case_sensitive:
         term, text = term.casefold(), text.casefold()
     # Alphabetic letters only: digits ("HP100") and CJK particles still count as edges.
     letter = f"[{_ALPHABETIC}]"
     left = f"(?<!{letter})" if re.match(letter, term[0]) else ""
     right = f"(?:e?s)?(?!{letter})" if re.match(letter, term[-1]) else ""
-    return re.search(left + re.escape(term) + right, text) is not None
+    return [
+        match.span()
+        for match in re.finditer(left + re.escape(term) + right, text)
+    ]
+
+
+def applicable_glossary_entries(
+    glossary: list[GlossaryEntry], source: str
+) -> list[GlossaryEntry]:
+    """Select source terms by occurrence, preferring a longer overlapping phrase.
+
+    A short term remains applicable when it also occurs outside the longer phrase.
+    Equal-length conflicts remain visible instead of being silently resolved here.
+    """
+
+    matches: list[tuple[int, int, int]] = []
+    for index, entry in enumerate(glossary):
+        for start, end in _term_spans(
+            entry.source, source, case_sensitive=entry.case_sensitive
+        ):
+            matches.append((index, start, end))
+
+    selected_indexes: set[int] = set()
+    prior_max_end = -1
+    position = 0
+    ordered = sorted(matches, key=lambda item: (item[1], -item[2], item[0]))
+    while position < len(ordered):
+        start = ordered[position][1]
+        group_end = position
+        while group_end < len(ordered) and ordered[group_end][1] == start:
+            group_end += 1
+        same_start_max_end = -1
+        for index, _, end in ordered[position:group_end]:
+            covered = prior_max_end >= end or same_start_max_end > end
+            if not covered:
+                selected_indexes.add(index)
+            same_start_max_end = max(same_start_max_end, end)
+        prior_max_end = max(prior_max_end, same_start_max_end)
+        position = group_end
+    return [entry for index, entry in enumerate(glossary) if index in selected_indexes]
 
 
 _MARKUP_TAG = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9:_-]*)[^<>]*?(/?)>")
@@ -81,6 +126,37 @@ def protected_tokens(text: str, extra_patterns: list[str] | None = None) -> Coun
     for pattern in extra_patterns or []:
         tokens.extend(re.findall(pattern, text))
     return Counter(tokens)
+
+
+def preflight_constraint_issues(
+    segment: Segment, *, extra_patterns: list[str] | None = None
+) -> list[ValidationIssue]:
+    """Reject provider-independent impossible render constraints before a model call."""
+
+    limit = segment.metadata.get("ui_max_chars")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        return []
+    spans = {match.span() for match in _DEFAULT_PROTECTED_RE.finditer(segment.source)}
+    for pattern in extra_patterns or []:
+        spans.update(match.span() for match in re.finditer(pattern, segment.source))
+    if not spans:
+        return []
+    merged: list[list[int]] = []
+    for start, end in sorted(spans):
+        if not merged or start >= merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    minimum_token_chars = sum(end - start for start, end in merged)
+    if minimum_token_chars > limit:
+        return [
+            ValidationIssue(
+                "constraint-unsatisfiable",
+                "Protected tokens cannot fit within the bound UI character limit",
+                retryable=False,
+            )
+        ]
+    return []
 
 
 def empty_target_allowed(segment: Segment) -> bool:
@@ -169,10 +245,8 @@ def validate_integrity(
             )
         )
 
-    for entry in glossary:
-        if contains_term(
-            entry.source, segment.source, case_sensitive=entry.case_sensitive
-        ) and not any(
+    for entry in applicable_glossary_entries(glossary, segment.source):
+        if not any(
             contains_term(target, candidate, case_sensitive=entry.case_sensitive)
             for target in entry.allowed_targets
         ):

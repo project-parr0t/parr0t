@@ -200,12 +200,14 @@ QUEUE_NAMES = {
 
 COMMON_ISSUE_CODES = {
     "malformed_response",
+    "output_truncated",
     "provider_error",
     "rate_limited",
     "quota_exhausted",
     "authentication_error",
     "timeout",
     "integrity_invalid",
+    "constraint_unsatisfiable",
     "budget_exhausted",
     "budget_accounting_uncertain",
     "task_incomplete",
@@ -286,6 +288,7 @@ ROUTES_BY_STAGE = {
 TERMINAL_ROUTE_STATUSES = {
     "provider_refusal",
     "malformed_response",
+    "output_truncated",
     "provider_error",
     "rate_limited",
     "quota_exhausted",

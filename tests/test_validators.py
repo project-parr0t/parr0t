@@ -5,7 +5,12 @@ import unittest
 
 from game_l10n.models import GlossaryEntry, Segment
 from game_l10n.store import stable_hash
-from game_l10n.validators import contains_term, protected_tokens, validate_integrity
+from game_l10n.validators import (
+    contains_term,
+    preflight_constraint_issues,
+    protected_tokens,
+    validate_integrity,
+)
 
 
 def optional_slot_fixture(
@@ -33,6 +38,32 @@ def optional_slot_fixture(
 
 
 class ValidatorTests(unittest.TestCase):
+    def test_longer_overlapping_glossary_phrase_suppresses_inner_term(self) -> None:
+        segment = Segment("fixture", "Ice Cream")
+        glossary = [
+            GlossaryEntry("Ice", "\uc5bc\uc74c"),
+            GlossaryEntry("Ice Cream", "\uc544\uc774\uc2a4\ud06c\ub9bc"),
+        ]
+        self.assertEqual(
+            validate_integrity(segment, "\uc544\uc774\uc2a4\ud06c\ub9bc", glossary), []
+        )
+
+    def test_standalone_short_glossary_occurrence_remains_required(self) -> None:
+        segment = Segment("fixture", "Ice Cream and Ice")
+        glossary = [
+            GlossaryEntry("Ice", "\uc5bc\uc74c"),
+            GlossaryEntry("Ice Cream", "\uc544\uc774\uc2a4\ud06c\ub9bc"),
+        ]
+        issues = validate_integrity(segment, "\uc544\uc774\uc2a4\ud06c\ub9bc", glossary)
+        self.assertIn("glossary-missing", {item.code for item in issues})
+
+    def test_impossible_protected_token_length_is_rejected_before_translation(self) -> None:
+        issues = preflight_constraint_issues(
+            Segment("fixture", "{player}", metadata={"ui_max_chars": 4})
+        )
+        self.assertEqual([item.code for item in issues], ["constraint-unsatisfiable"])
+        self.assertFalse(issues[0].retryable)
+
     def test_exact_whitespace_source_is_preserved_but_not_rewritten(self) -> None:
         segment = Segment("fixture-whitespace", "  \t")
         self.assertEqual(validate_integrity(segment, "  \t", []), [])
@@ -149,6 +180,7 @@ class ValidatorTests(unittest.TestCase):
                 self.assertTrue(contains_term(text.strip("0123456789"), text))
         self.assertFalse(contains_term("Jos\u00e9", "Jos\u00e9phine"))
         self.assertTrue(contains_term("Jos\u00e9", "Jos\u00e9, FIXTURE"))
+        self.assertTrue(contains_term("stra\u00dfe", "STRASSE"))
         self.assertTrue(contains_term("\u03a6\u03af\u03bb", "\u03a6\u03af\u03bb\u037e"))
     def test_crossed_markup_is_rejected_but_moved_spans_are_not(self) -> None:
         def codes(source: str, candidate: str) -> set[str]:

@@ -5,7 +5,7 @@ from dataclasses import asdict
 from typing import Any
 
 from .models import CharacterProfile, ContextPack, GlossaryEntry, ProjectContext, Segment
-from .validators import contains_term
+from .validators import applicable_glossary_entries, contains_term
 
 PROMPT_VERSION = "2026-11-04.2"
 
@@ -148,19 +148,19 @@ def retry_feedback(issues: list[Any]) -> list[dict[str, str]]:
 def _relevant_glossary(
     glossary: list[GlossaryEntry], source: str, candidate: str = ""
 ) -> list[GlossaryEntry]:
-    haystack = f"{source}\n{candidate}"
-    return [
-        item
-        for item in glossary
-        if item.source
-        and (
-            contains_term(item.source, haystack, case_sensitive=item.case_sensitive)
-            or any(
-                contains_term(target, candidate, case_sensitive=item.case_sensitive)
-                for target in item.allowed_targets
-            )
-        )
-    ]
+    source_entries = applicable_glossary_entries(glossary, source)
+    selected = list(source_entries)
+    selected_identities = {id(item) for item in selected}
+    for item in glossary:
+        if id(item) in selected_identities or not item.source:
+            continue
+        if any(
+            contains_term(target, candidate, case_sensitive=item.case_sensitive)
+            for target in item.allowed_targets
+        ):
+            selected.append(item)
+            selected_identities.add(id(item))
+    return selected
 
 
 def _focused_relationships(

@@ -616,6 +616,7 @@ def _orchestrator(
                 "grace_retry_codes",
                 [
                     "malformed_response",
+                    "output_truncated",
                     "provider_error",
                     "rate_limited",
                     "timeout",
@@ -1996,6 +1997,7 @@ def _codex_app_fallback_orchestrator(work_dir: Path) -> LocalizationOrchestrator
                     "grace_retry_codes",
                     [
                         "malformed_response",
+                        "output_truncated",
                         "provider_error",
                         "rate_limited",
                         "timeout",
