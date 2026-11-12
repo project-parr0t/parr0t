@@ -4,7 +4,7 @@ import json
 import unittest
 
 from game_l10n.models import CharacterProfile, ContextPack, GlossaryEntry, ProjectContext, Segment
-from game_l10n.prompts import REVIEW_ISSUE_CODES, review_judge_prompt, translation_prompt
+from game_l10n.prompts import REVIEW_ISSUE_CODES, review_judge_prompt, review_rewrite_prompt, translation_prompt
 
 
 class PromptTests(unittest.TestCase):
@@ -52,10 +52,10 @@ class PromptTests(unittest.TestCase):
             payload["narrative_context"]["relationship_timeline"], ["A RELATIONSHIP"]
         )
         self.assertEqual(
-            payload["narrative_context"]["relevant_reference_cues"][0]["recognition_cue"],
+            payload["relevant_reference_cues"][0]["recognition_cue"],
             "FIXTURE_RECOGNITION_PATTERN",
         )
-        self.assertEqual(len(payload["narrative_context"]["relevant_reference_cues"]), 1)
+        self.assertEqual(len(payload["relevant_reference_cues"]), 1)
         self.assertIn("compact", system)
         self.assertIn("Do not return, quote, or rewrite", system)
         self.assertIn("mechanically literal", system)
@@ -199,8 +199,10 @@ class PromptTests(unittest.TestCase):
         payload = json.loads(user)
 
         self.assertEqual(payload["localization_context"]["mode"], "hybrid")
+        # Job-wide blocks stay target-independent so providers can reuse the prompt prefix.
+        self.assertNotIn("relevant_reference_cues", payload["localization_context"])
         self.assertEqual(
-            payload["localization_context"]["relevant_reference_cues"][0]["kind"],
+            payload["relevant_reference_cues"][0]["kind"],
             "wordplay",
         )
         self.assertEqual(len(payload["functional_context"]["relevant_screens"]), 1)
@@ -245,6 +247,87 @@ class PromptTests(unittest.TestCase):
         self.assertEqual(list(payload)[-1], "translation_target")
         self.assertLess(len(user), 5_000)
 
+
+    def test_focus_terms_skip_latin_substrings_and_match_cjk_particles(self) -> None:
+        from game_l10n.prompts import _focused_relationships, _relevant_glossary
+
+        glossary = [GlossaryEntry("Ice", "TARGET_ICE"), GlossaryEntry("Potion", "TARGET_POTION")]
+        relevant = _relevant_glossary(glossary, "Device and potions")
+        self.assertEqual([item.source for item in relevant], ["Potion"])
+        speaker = "\u592a\u90ce"
+        timeline = ("FIXTURE_OTHER", speaker + "\u306f FIXTURE_EVENT")
+        self.assertEqual(
+            _focused_relationships(timeline, speaker=speaker, scene=""), [timeline[1]]
+        )
+
+    def test_character_profile_projects_every_authored_field(self) -> None:
+        profile = CharacterProfile(
+            "fixture-speaker",
+            formality="FIXTURE_FORMALITY",
+            address_rules="FIXTURE_ADDRESS",
+            speech_rules=("FIXTURE_RULE",),
+            example_lines=("FIXTURE_EXAMPLE",),
+        )
+        _, user = translation_prompt(
+            ProjectContext("FIXTURE", "src", "dst"),
+            Segment("fixture-1", "SOURCE", speaker="fixture-speaker"),
+            [],
+            profile,
+        )
+        character = json.loads(user)["character"]
+
+        self.assertEqual(character["formality"], "FIXTURE_FORMALITY")
+        self.assertEqual(character["address_rules"], "FIXTURE_ADDRESS")
+        self.assertEqual(character["speech_rules"], ["FIXTURE_RULE"])
+        self.assertEqual(character["example_lines"], ["FIXTURE_EXAMPLE"])
+        self.assertNotIn("personality", character)
+
+    def test_glossary_projection_lists_also_accepted_targets(self) -> None:
+        glossary = [GlossaryEntry("Potion", "TARGET_A", targets=("TARGET_B",)), GlossaryEntry("Ice", "TARGET_I")]
+        _, user = translation_prompt(
+            ProjectContext("FIXTURE", "src", "dst"), Segment("fixture-1", "Potion"), glossary, None
+        )
+        projected = json.loads(user)["glossary"]
+        self.assertEqual(projected[0]["also_accepted_targets"], ["TARGET_B"])
+        self.assertEqual(len(projected), 1)
+
+    def test_rewrite_prompt_retranslates_adequacy_issues_and_budgets_ui_length(self) -> None:
+        segment = Segment("fixture-ui", "SOURCE_LABEL", metadata={"ui_max_chars": 4})
+        project = ProjectContext("FIXTURE", "src", "ko")
+        system, user = review_rewrite_prompt(project, segment, "TARGET_TOO_LONG", ["omission"], [], None)
+        payload = json.loads(user)
+        self.assertIn("retranslate translation_target.source from scratch", system)
+        self.assertIn("length_budget is a hard UI limit", system)
+        self.assertEqual(payload["length_budget"], {"max_chars": 4, "candidate_chars": 15, "must_cut_chars": 11})
+        self.assertEqual(len(payload["compression_examples"]), 2)
+
+        system, user = review_rewrite_prompt(
+            ProjectContext("FIXTURE", "src", "dst"), segment, "OK", ["voice"], [], None
+        )
+        self.assertNotIn("from scratch", system)
+        self.assertNotIn("length_budget", json.loads(user))
+
+    def test_candidate_alternative_target_makes_glossary_entry_relevant(self) -> None:
+        from game_l10n.prompts import _relevant_glossary
+
+        entry = GlossaryEntry("Potion", "TARGET_A", targets=("TARGET_B",))
+        self.assertEqual(_relevant_glossary([entry], "OTHER", "TARGET_B"), [entry])
+        self.assertEqual(_relevant_glossary([entry], "OTHER", "TARGET_BROKEN"), [])
+
+    def test_zero_character_ui_slot_keeps_an_explicit_rewrite_budget(self) -> None:
+        _, user = review_rewrite_prompt(
+            ProjectContext("FIXTURE", "src", "ko"),
+            Segment("fixture-zero-slot", "SOURCE", metadata={"ui_max_chars": 0}),
+            "X",
+            ["length_risk"],
+            [],
+            None,
+        )
+
+        self.assertEqual(
+            json.loads(user)["length_budget"],
+            {"max_chars": 0, "candidate_chars": 1, "must_cut_chars": 1},
+        )
 
 if __name__ == "__main__":
     unittest.main()

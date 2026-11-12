@@ -2,11 +2,20 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from .models import AttemptRecord, Segment, TranslationResult
+
+
+def load_dataclass_list(path: Path, cls: type) -> list[Any]:
+    """Load a user JSON list (glossary, characters) into dataclasses; a missing file is empty."""
+    if not path.exists():
+        return []
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    allowed = {item.name for item in fields(cls)}
+    return [cls(**{key: value for key, value in row.items() if key in allowed}) for row in payload]
 
 
 def read_segments(path: Path) -> list[Segment]:

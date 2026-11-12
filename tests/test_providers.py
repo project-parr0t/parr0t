@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 from game_l10n.errors import ProviderFailure
-from game_l10n.providers import CompatibleChatProvider, OpenAIResponsesProvider
+from game_l10n.providers import CompatibleChatProvider, OpenAIResponsesProvider, _post_json
 
 
 class CompatibleProviderTests(unittest.TestCase):
-    def test_malformed_response_preserves_provider_usage(self) -> None:
+    def test_output_truncation_preserves_provider_usage(self) -> None:
         def fake_post(_url, _headers, _payload, _timeout):
             return {
                 "choices": [
@@ -44,11 +46,109 @@ class CompatibleProviderTests(unittest.TestCase):
                     schema_name="game_translation",
                 )
 
-        self.assertEqual(raised.exception.code, "malformed_response")
+        self.assertEqual(raised.exception.code, "output_truncated")
+        self.assertFalse(raised.exception.retryable)
         self.assertEqual(
             raised.exception.usage,
             {"input_tokens": 321, "output_tokens": 17, "total_tokens": 338},
         )
+
+    def test_dynamic_output_budget_grows_after_truncation(self) -> None:
+        limits: list[int] = []
+
+        def fake_post(_url, _headers, payload, _timeout):
+            limits.append(payload["max_tokens"])
+            if len(limits) == 1:
+                return {
+                    "choices": [
+                        {"finish_reason": "length", "message": {"content": ""}}
+                    ]
+                }
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": '{"status":"success","text":"T","reason":""}'
+                        },
+                    }
+                ]
+            }
+
+        provider = CompatibleChatProvider(
+            "fixture",
+            "fixture-model",
+            api_key_env="FIXTURE_API_KEY",
+            base_url="https://fixture.invalid",
+            response_format="json_object",
+            max_tokens_per_source_char=1.0,
+            min_output_tokens=16,
+            max_output_tokens=128,
+        )
+        kwargs = {
+            "system": "Translate.",
+            "user": '{"translation_target":{"source":"SHORT"}}',
+            "schema": {"type": "object"},
+            "schema_name": "game_translation",
+        }
+        with patch.dict(os.environ, {"FIXTURE_API_KEY": "fixture-key"}), patch(
+            "game_l10n.providers._post_json", side_effect=fake_post
+        ):
+            with self.assertRaises(ProviderFailure) as raised:
+                provider.generate_json(**kwargs)
+            self.assertEqual(raised.exception.code, "output_truncated")
+            self.assertTrue(raised.exception.retryable)
+            result = provider.generate_json(**kwargs)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(limits, [16, 32])
+
+    def test_dynamic_output_retry_state_is_bounded_and_cleared_at_cap(self) -> None:
+        provider = CompatibleChatProvider(
+            "fixture",
+            "fixture-model",
+            api_key_env="FIXTURE_API_KEY",
+            base_url="https://fixture.invalid",
+            max_tokens_per_source_char=1.0,
+            min_output_tokens=16,
+            max_output_tokens=32,
+        )
+        provider._MAX_OUTPUT_RETRY_STATES = 2
+        self.assertTrue(provider._prepare_output_retry("one", "translation", 16))
+        self.assertTrue(provider._prepare_output_retry("two", "translation", 16))
+        self.assertTrue(provider._prepare_output_retry("three", "translation", 16))
+        self.assertEqual(len(provider._output_retry_limits), 2)
+        self.assertFalse(provider._prepare_output_retry("three", "translation", 32))
+        self.assertEqual(len(provider._output_retry_limits), 1)
+
+    def test_retry_after_header_is_preserved_for_rate_limit(self) -> None:
+        error = urllib.error.HTTPError(
+            "https://fixture.invalid",
+            429,
+            "rate limited",
+            {"Retry-After": "3"},
+            io.BytesIO(b"busy"),
+        )
+        with patch("game_l10n.providers.urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(ProviderFailure) as raised:
+                _post_json("https://fixture.invalid", {}, {}, 1)
+        self.assertEqual(raised.exception.code, "rate_limited")
+        self.assertEqual(raised.exception.retry_after_seconds, 3.0)
+
+    def test_retry_after_header_is_preserved_for_retryable_server_error(self) -> None:
+        error = urllib.error.HTTPError(
+            "https://fixture.invalid",
+            503,
+            "temporarily unavailable",
+            {"Retry-After": "2"},
+            io.BytesIO(b"busy"),
+        )
+        with patch("game_l10n.providers.urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(ProviderFailure) as raised:
+                _post_json("https://fixture.invalid", {}, {}, 1)
+        self.assertEqual(raised.exception.code, "provider_error")
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual(raised.exception.retry_after_seconds, 2.0)
 
     def test_plain_review_verdict_uses_tiny_contract_without_json_format(self) -> None:
         captured = {}
@@ -360,6 +460,30 @@ class CompatibleProviderTests(unittest.TestCase):
 
         self.assertEqual(captured["payload"]["reasoning"], {"effort": "none"})
         self.assertEqual(captured["payload"]["max_output_tokens"], 512)
+
+    def test_openai_incomplete_output_is_classified_and_usage_preserved(self) -> None:
+        provider = OpenAIResponsesProvider("luna", "fixture-model", max_output_tokens=64)
+
+        def fake_post(_url, _headers, _payload, _timeout):
+            return {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {"input_tokens": 40, "output_tokens": 64, "total_tokens": 104},
+            }
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "fixture-key"}), patch(
+            "game_l10n.providers._post_json", side_effect=fake_post
+        ):
+            with self.assertRaises(ProviderFailure) as raised:
+                provider.generate_json(
+                    system="Translate.",
+                    user="FIXTURE",
+                    schema={"type": "object"},
+                    schema_name="game_translation",
+                )
+        self.assertEqual(raised.exception.code, "output_truncated")
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(raised.exception.usage["total_tokens"], 104)
 
 
 if __name__ == "__main__":
