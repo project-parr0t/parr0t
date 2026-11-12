@@ -1,18 +1,356 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from game_l10n.coverage import completion_attestation
 from game_l10n.errors import ProviderError, ProviderFailure
-from game_l10n.models import ContextPack, GlossaryEntry, ProjectContext, Segment
+from game_l10n.models import (
+    ContextPack,
+    GlossaryEntry,
+    ProjectContext,
+    Segment,
+    TranslationResult,
+)
 from game_l10n.orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from game_l10n.providers import ProviderRegistry, ScriptedProvider
+from game_l10n.store import stable_hash
 
 
 class OrchestratorTests(unittest.TestCase):
+    @staticmethod
+    def _optional_empty_segment() -> Segment:
+        source = "OPTIONAL_ARTICLE"
+        metadata = {
+            "ui_slot_role": "template_fragment",
+            "ui_composed_with_ids": ["fixture-label"],
+            "ui_render_pattern": "{prefix}{value}",
+            "ui_fixed_target_prefix": "\ub300\uc0c1 ",
+            "ui_fixed_target_suffix": "",
+        }
+        source_digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        composition = {
+            "target_id": "optional-empty",
+            "source_sha256": source_digest,
+            **metadata,
+        }
+        metadata["ui_empty_target"] = {
+            "schema": "parr0t.ui-empty-target/v1",
+            "reason_code": "optional_grammatical_slot",
+            "source_sha256": source_digest,
+            "composition_sha256": stable_hash(composition),
+            "evidence_sha256": hashlib.sha256(b"SYNTHETIC_BINDING").hexdigest(),
+        }
+        return Segment("optional-empty", source, metadata=metadata)
+
+    def test_single_and_deferred_paths_accept_bound_empty_candidate(self) -> None:
+        for deferred in (False, True):
+            with self.subTest(deferred=deferred), tempfile.TemporaryDirectory() as directory:
+                translator = ScriptedProvider(
+                    "fixture-translator",
+                    lambda **_: {"status": "success", "text": "", "reason": ""},
+                )
+                orchestrator = LocalizationOrchestrator(
+                    registry=ProviderRegistry({translator.name: translator}),
+                    config=OrchestratorConfig(
+                        [translator.name],
+                        [],
+                        require_review=False,
+                        defer_fallbacks_until_primary_complete=deferred,
+                    ),
+                    project=ProjectContext("TEST", "en", "ko"),
+                    work_dir=Path(directory),
+                )
+                segment = self._optional_empty_segment()
+                result = (
+                    orchestrator.translate_many([segment])[0]
+                    if deferred
+                    else orchestrator.translate_one(segment)
+                )
+                self.assertEqual(result.status, "translated")
+                self.assertEqual(result.text, "")
+
+    def test_wrong_language_candidate_reaches_next_route_in_all_paths(self) -> None:
+        for deferred in (False, True):
+            with self.subTest(deferred=deferred), tempfile.TemporaryDirectory() as directory:
+                primary = ScriptedProvider(
+                    "primary",
+                    lambda **_: {
+                        "status": "success",
+                        "text": "Save the current game now",
+                        "reason": "",
+                    },
+                )
+                fallback = ScriptedProvider(
+                    "fallback",
+                    lambda **_: {
+                        "status": "success",
+                        "text": "\uac8c\uc784 \uc800\uc7a5",
+                        "reason": "",
+                    },
+                )
+                orchestrator = LocalizationOrchestrator(
+                    registry=ProviderRegistry(
+                        {primary.name: primary, fallback.name: fallback}
+                    ),
+                    config=OrchestratorConfig(
+                        [primary.name, fallback.name],
+                        [],
+                        translator_retries={primary.name: 0, fallback.name: 0},
+                        require_review=False,
+                        defer_fallbacks_until_primary_complete=deferred,
+                    ),
+                    project=ProjectContext("TEST", "en", "ko"),
+                    work_dir=Path(directory),
+                )
+                segment = Segment("language-route", "Save the game")
+                result = (
+                    orchestrator.translate_many([segment])[0]
+                    if deferred
+                    else orchestrator.translate_one(segment)
+                )
+                self.assertEqual(result.status, "translated")
+                self.assertEqual(result.translator, fallback.name)
+                self.assertEqual(result.text, "\uac8c\uc784 \uc800\uc7a5")
+
+    def test_deferred_success_is_staged_before_later_target_interrupts(self) -> None:
+        calls: list[str] = []
+
+        def interrupted(**kwargs):
+            source = json.loads(kwargs["user"])["translation_target"]["source"]
+            calls.append(source)
+            if source == "SOURCE_2":
+                raise KeyboardInterrupt
+            return {"status": "success", "text": "TARGET_1", "reason": ""}
+
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            first = ScriptedProvider("fixture-translator", interrupted)
+            config = OrchestratorConfig(
+                [first.name],
+                [],
+                require_review=False,
+                defer_fallbacks_until_primary_complete=True,
+                max_workers=1,
+            )
+            segments = [Segment("one", "SOURCE_1"), Segment("two", "SOURCE_2")]
+            with self.assertRaises(KeyboardInterrupt):
+                LocalizationOrchestrator(
+                    registry=ProviderRegistry({first.name: first}),
+                    config=config,
+                    project=ProjectContext("TEST", "src", "dst"),
+                    work_dir=work,
+                ).translate_many(segments)
+
+            resumed_calls: list[str] = []
+
+            def resumed(**kwargs):
+                source = json.loads(kwargs["user"])["translation_target"]["source"]
+                resumed_calls.append(source)
+                return {"status": "success", "text": "TARGET_2", "reason": ""}
+
+            second = ScriptedProvider("fixture-translator", resumed)
+            results = LocalizationOrchestrator(
+                registry=ProviderRegistry({second.name: second}),
+                config=config,
+                project=ProjectContext("TEST", "src", "dst"),
+                work_dir=work,
+            ).translate_many(segments)
+
+        self.assertEqual(calls, ["SOURCE_1", "SOURCE_2"])
+        self.assertEqual(resumed_calls, ["SOURCE_2"])
+        self.assertEqual([item.status for item in results], ["translated", "translated"])
+
+    def test_unsatisfiable_ui_constraint_skips_every_provider(self) -> None:
+        for deferred in (False, True):
+            with self.subTest(deferred=deferred), tempfile.TemporaryDirectory() as directory:
+                translator = ScriptedProvider(
+                    "fixture-translator",
+                    lambda **_: {
+                        "status": "success",
+                        "text": "TARGET",
+                        "reason": "",
+                    },
+                )
+                orchestrator = LocalizationOrchestrator(
+                    registry=ProviderRegistry({translator.name: translator}),
+                    config=OrchestratorConfig(
+                        [translator.name],
+                        [],
+                        require_review=False,
+                        defer_fallbacks_until_primary_complete=deferred,
+                    ),
+                    project=ProjectContext("TEST", "src", "dst"),
+                    work_dir=Path(directory),
+                )
+                segment = Segment(
+                    "impossible", "{player}", metadata={"ui_max_chars": 4}
+                )
+                result = (
+                    orchestrator.translate_many([segment])[0]
+                    if deferred
+                    else orchestrator.translate_one(segment)
+                )
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(translator.call_count, 0)
+                self.assertNotIn("All translation routes were exhausted", result.errors)
+                self.assertIn(
+                    "constraint_unsatisfiable",
+                    {attempt.issue_code for attempt in result.attempts},
+                )
+
+    def test_unreviewed_results_do_not_become_approved_style_anchors(self) -> None:
+        observed_anchors: list[list[dict[str, str]]] = []
+
+        def translate(**kwargs):
+            observed_anchors.append(
+                json.loads(kwargs["user"])["approved_same_speaker_style_anchors"]
+            )
+            return {"status": "success", "text": "TARGET", "reason": ""}
+
+        translator = ScriptedProvider("fixture-translator", translate)
+        with tempfile.TemporaryDirectory() as directory:
+            orchestrator = LocalizationOrchestrator(
+                registry=ProviderRegistry({translator.name: translator}),
+                config=OrchestratorConfig(
+                    [translator.name], [], require_review=False, use_style_memory=True
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                work_dir=Path(directory),
+            )
+            orchestrator.translate_one(Segment("one", "SOURCE_1", speaker="A"))
+            orchestrator.translate_one(Segment("two", "SOURCE_2", speaker="A"))
+
+        self.assertEqual(observed_anchors, [[], []])
+
+    def test_deferred_fallback_preserves_manifest_order_after_reverse_completion(self) -> None:
+        class ReverseCompletionOrchestrator(LocalizationOrchestrator):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.stage_indexes: list[tuple[str, list[int]]] = []
+
+            def _run_deferred_stage(self, indexes, operation, *, stage):
+                self.stage_indexes.append((stage, list(indexes)))
+                completed = [(index, operation(index)) for index in indexes]
+                yield from reversed(completed)
+
+        primary = ScriptedProvider(
+            "primary",
+            lambda **_: {"status": "refused", "text": "", "reason": ""},
+        )
+        fallback = ScriptedProvider(
+            "fallback",
+            lambda **_: {"status": "success", "text": "TARGET", "reason": ""},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            orchestrator = ReverseCompletionOrchestrator(
+                registry=ProviderRegistry(
+                    {primary.name: primary, fallback.name: fallback}
+                ),
+                config=OrchestratorConfig(
+                    [primary.name, fallback.name],
+                    [],
+                    translator_retries={primary.name: 0, fallback.name: 0},
+                    require_review=False,
+                    defer_fallbacks_until_primary_complete=True,
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                work_dir=Path(directory),
+            )
+            results = orchestrator.translate_many(
+                [Segment("one", "SOURCE_1"), Segment("two", "SOURCE_2")]
+            )
+
+        self.assertEqual(
+            orchestrator.stage_indexes,
+            [("translation", [0, 1]), ("translation_fallback", [0, 1])],
+        )
+        self.assertEqual([result.status for result in results], ["translated", "translated"])
+
+    def test_provider_wait_rechecks_a_cooldown_extended_by_another_worker(self) -> None:
+        provider = ScriptedProvider(
+            "fixture",
+            lambda **_: {"status": "success", "text": "TARGET", "reason": ""},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            orchestrator = LocalizationOrchestrator(
+                registry=ProviderRegistry({provider.name: provider}),
+                config=OrchestratorConfig([provider.name], [], require_review=False),
+                project=ProjectContext("TEST", "src", "dst"),
+                work_dir=Path(directory),
+            )
+            clock = [0.0]
+            sleeps: list[float] = []
+            orchestrator._provider_cooldowns[provider.name] = 1.0
+
+            def fake_sleep(seconds: float) -> None:
+                sleeps.append(seconds)
+                clock[0] += seconds
+                if len(sleeps) == 1:
+                    orchestrator._provider_cooldowns[provider.name] = 3.0
+
+            with patch(
+                "game_l10n.orchestrator.time.monotonic", side_effect=lambda: clock[0]
+            ), patch("game_l10n.orchestrator.time.sleep", side_effect=fake_sleep):
+                orchestrator._wait_for_provider(provider.name)
+
+        self.assertEqual(sleeps, [1.0, 2.0])
+
+    def test_failed_or_deterministically_invalid_cache_is_reprocessed(self) -> None:
+        cases = [
+            ("failed", "", "dst", "TARGET"),
+            ("translated", "Still English", "ko", "\ubc88\uc5ed"),
+        ]
+        for cached_status, cached_text, target_language, fresh_text in cases:
+            for deferred in (False, True):
+                with self.subTest(
+                    status=cached_status, deferred=deferred
+                ), tempfile.TemporaryDirectory() as directory:
+                    translator = ScriptedProvider(
+                        "fixture",
+                        lambda text=fresh_text, **_: {
+                            "status": "success",
+                            "text": text,
+                            "reason": "",
+                        },
+                    )
+                    orchestrator = LocalizationOrchestrator(
+                        registry=ProviderRegistry({translator.name: translator}),
+                        config=OrchestratorConfig(
+                            [translator.name],
+                            [],
+                            require_review=False,
+                            defer_fallbacks_until_primary_complete=deferred,
+                        ),
+                        project=ProjectContext("TEST", "en", target_language),
+                        work_dir=Path(directory),
+                    )
+                    segment = Segment("cached", "SOURCE")
+                    cache_key = orchestrator._cache_key(segment, [])
+                    orchestrator.store.put(
+                        cache_key,
+                        TranslationResult(
+                            segment_id=segment.id,
+                            source=segment.source,
+                            text=cached_text,
+                            status=cached_status,
+                        ),
+                    )
+
+                    result = (
+                        orchestrator.translate_many([segment])[0]
+                        if deferred
+                        else orchestrator.translate_one(segment)
+                    )
+
+                self.assertEqual(translator.call_count, 1)
+                self.assertEqual(result.status, "translated")
+                self.assertEqual(result.text, fresh_text)
+
     def test_unrelated_context_and_parallelism_changes_reuse_target_cache(self) -> None:
         translator = ScriptedProvider(
             "fixture-translator",
@@ -494,6 +832,56 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(rewriter.call_count, 1)
         self.assertIn("review-confirm", [item.stage for item in result.attempts])
         self.assertIn("review-rewrite", [item.stage for item in result.attempts])
+
+    def test_strong_approval_cannot_waive_locked_target_language(self) -> None:
+        def rewrite_handler(**kwargs):
+            payload = json.loads(kwargs["user"])
+            self.assertEqual(payload["detected_issue_codes"], ["fluency"])
+            return {
+                "status": "success",
+                "text": "\ud55c\uad6d\uc5b4 \ud604\uc9c0\ud654 \uac80\uc218\ub97c \uc704\ud55c \uc815\uc0c1\uc801\uc778 \ubc88\uc5ed\ubb38\uc785\ub2c8\ub2e4.",
+            }
+
+        translator = ScriptedProvider(
+            "fixture-translator",
+            lambda **_: {
+                "status": "success",
+                "text": "This candidate is still written entirely in English.",
+                "reason": "",
+            },
+        )
+        judge = ScriptedProvider(
+            "fixture-judge", lambda **_: {"verdict": "ok", "issues": []}
+        )
+        rewriter = ScriptedProvider("fixture-rewriter", rewrite_handler)
+        registry = ProviderRegistry(
+            {item.name: item for item in [translator, judge, rewriter]}
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(
+                    [translator.name],
+                    [judge.name],
+                    rewriter_chain=[rewriter.name],
+                    strong_review_sample_percent=0,
+                    strong_review_high_risk_categories=[],
+                ),
+                project=ProjectContext("TEST", "en", "ko"),
+                context_pack=ContextPack(story_summary="STORY"),
+                work_dir=Path(directory),
+            ).translate_one(
+                Segment(
+                    "fixture-language-lock",
+                    "This is a source sentence for the Korean localization review.",
+                )
+            )
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn("target_script_absent", result.metadata["target_language_risk"])
+        self.assertEqual(judge.call_count, 0)
+        self.assertEqual(rewriter.call_count, 0)
 
     def test_rewriter_refusal_does_not_accept_a_candidate_flagged_for_rewrite(self) -> None:
         translator = ScriptedProvider(
@@ -1099,6 +1487,101 @@ class OrchestratorTests(unittest.TestCase):
             all(item.metadata["candidate_origin"] == "existing" for item in results)
         )
 
+
+    def test_integrity_retry_carries_validator_feedback_without_refusal_note(self) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        def handler(*, system: str, user: str, **_: object) -> dict:
+            calls.append((system, json.loads(user)))
+            text = "TARGET" if len(calls) == 1 else "TARGET {name}"
+            return {"status": "success", "text": text, "reason": ""}
+
+        translator = ScriptedProvider("fixture-translator", handler)
+        with tempfile.TemporaryDirectory() as directory:
+            result = LocalizationOrchestrator(
+                registry=ProviderRegistry({translator.name: translator}),
+                config=OrchestratorConfig(
+                    [translator.name], [], require_review=False, max_workers=1, grace_retries=1
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                work_dir=Path(directory),
+            ).translate_one(Segment("fixture-token", "SOURCE {name}"))
+
+        self.assertEqual(result.text, "TARGET {name}")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("previous_attempt_validation_failures", calls[0][1])
+        feedback = calls[1][1]["previous_attempt_validation_failures"]
+        self.assertEqual(feedback[0]["code"], "protected-token-mismatch")
+        self.assertIn("{name}", feedback[0]["detail"])
+        self.assertNotIn("retry after a refusal", calls[1][0])
+        self.assertIn("failed deterministic validation", calls[1][0])
+
+    def test_reference_cue_and_fallback_origin_escalate_past_triage(self) -> None:
+        failing = ScriptedProvider(
+            "fixture-primary", lambda **_: {"status": "error", "text": "", "reason": ""}
+        )
+        fallback = ScriptedProvider(
+            "fixture-fallback", lambda **_: {"status": "success", "text": "TARGET", "reason": ""}
+        )
+        triager = ScriptedProvider("fixture-triager", lambda **_: {"verdict": "ok", "issues": []})
+        strong = ScriptedProvider("fixture-strong", lambda **_: {"verdict": "ok", "issues": []})
+        registry = ProviderRegistry(
+            {item.name: item for item in (failing, fallback, triager, strong)}
+        )
+        cue = {"kind": "wordplay", "scene": "", "evidence_line_ids": ["cue-target"],
+               "recognition_cue": "CUE", "translation_goal": "GOAL", "confidence": "high"}
+        for chain, segment_id, reason in (
+            ([fallback.name], "cue-target", "context_reference_cue"),
+            ([failing.name, fallback.name], "fallback-target", "fallback_translation"),
+        ):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                result = LocalizationOrchestrator(
+                    registry=registry,
+                    config=OrchestratorConfig(
+                        chain, [strong.name], review_triager_chain=[triager.name],
+                        strong_review_sample_percent=0, strong_review_high_risk_categories=[],
+                    ),
+                    project=ProjectContext("TEST", "src", "dst"),
+                    context_pack=ContextPack(story_summary="STORY", reference_cues=(cue,)),
+                    work_dir=Path(directory),
+                ).translate_one(Segment(segment_id, "SOURCE"))
+                self.assertIn(reason, result.metadata["strong_review_reasons"])
+
+    def test_rewrite_retry_signals_follow_only_their_own_cause(self) -> None:
+        rewrites: list[tuple[str, dict]] = []
+        replies = iter([
+            {"status": "success", "text": "TARGET"},            # drops {name}: integrity retry
+            {"status": "refused", "text": ""},                  # refusal retry
+            {"status": "success", "text": "TARGET {name}"},
+        ])
+
+        def rewriter_handler(*, system: str, user: str, **_: object) -> dict:
+            rewrites.append((system, json.loads(user)))
+            return next(replies)
+
+        verdicts = iter([{"verdict": "rewrite", "issues": ["voice"]}, {"verdict": "ok", "issues": []}])
+        translator = ScriptedProvider(
+            "fixture-translator", lambda **_: {"status": "success", "text": "DRAFT {name}", "reason": ""}
+        )
+        judge = ScriptedProvider("fixture-judge", lambda **_: next(verdicts))
+        rewriter = ScriptedProvider("fixture-rewriter", rewriter_handler)
+        with tempfile.TemporaryDirectory() as directory:
+            result = LocalizationOrchestrator(
+                registry=ProviderRegistry({p.name: p for p in (translator, judge, rewriter)}),
+                config=OrchestratorConfig(
+                    [translator.name], [judge.name], rewriter_chain=[rewriter.name],
+                    grace_retries=1, max_workers=1,
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                work_dir=Path(directory),
+            ).translate_one(Segment("fixture-rewrite", "SOURCE {name}"))
+
+        self.assertEqual(result.text, "TARGET {name}")
+        self.assertEqual(len(rewrites), 3)
+        self.assertIn("previous_attempt_validation_failures", rewrites[1][1])
+        self.assertNotIn("previous_attempt_validation_failures", rewrites[2][1])
+        self.assertNotIn("correction target. If permitted", rewrites[1][0])
+        self.assertIn("correction target. If permitted", rewrites[2][0])
 
 if __name__ == "__main__":
     unittest.main()
