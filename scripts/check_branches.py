@@ -18,7 +18,12 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = "parr0t.branch-audit.v1"
-IMPACT_SCHEMA = "parr0t.branch-adapter-impact.v1"
+IMPACT_SCHEMA = "parr0t.branch-adapter-impact.v2"
+VALIDATION_RUNNER_FUNCTIONS = {
+    "_blob", "complete_cached_result", "dependency_tree_digest",
+    "external_environment_digest", "extract_snapshot", "git", "hash_file",
+    "initialize_snapshot", "run_checks", "unittest_summary", "validation_environment_files",
+}
 
 
 def digest(value: object) -> str:
@@ -69,6 +74,18 @@ def git(repo: Path, *args: str) -> bytes:
     if result.returncode:
         raise ValueError(f"Git audit failed: {args[0]}")
     return result.stdout
+
+
+def default_cache_dir(repo: Path) -> Path:
+    """Return one stable external cache shared by this repository's worktrees."""
+    repo = repo.resolve()
+    raw = git(repo, "rev-parse", "--git-common-dir").decode("utf-8").strip()
+    common = Path(raw)
+    if not common.is_absolute():
+        common = (repo / common).resolve()
+    base = common.parent.parent if common.name == ".git" else common.parent
+    identity = digest(["parr0t.branch-cache.v1", str(common)])[:16]
+    return base / ".parr0t-branch-cache" / identity
 
 
 def tree(repo: Path, commit: str) -> dict[str, str]:
@@ -139,10 +156,12 @@ def _module_paths(files: dict[str, str], module: str) -> list[str]:
         f"src/{base}.py", f"src/{base}/__init__.py",
         f"{base}.py", f"{base}/__init__.py",
     }
-    parts = module.split(".")
-    for index in range(1, len(parts)):
-        package = "/".join(parts[:index])
-        candidates.update({f"src/{package}/__init__.py", f"{package}/__init__.py"})
+    # Importing a submodule executes its parent package initializers, but those
+    # main-owned initializers are already covered by the complete core proof.
+    # Binding every adapter to every transitive import of the root initializer
+    # made unrelated provider/control-plane edits invalidate all engine proofs.
+    # An explicitly imported parent package is still included as the exact
+    # module candidate above.
     if "." not in module:
         candidates.update(
             path for path in files
@@ -234,16 +253,12 @@ def validation_runner_digest(repo: Path, commit: str) -> str | None:
         root = ast.parse(_blob(repo, files[checker]).decode("utf-8"), filename=checker)
     except (SyntaxError, UnicodeDecodeError):
         return None
-    required = {
-        "dependency_tree_digest", "external_environment_digest", "extract_snapshot",
-        "initialize_snapshot", "run_checks", "validation_environment_files",
-    }
     functions = {
         node.name: ast.dump(node, annotate_fields=True, include_attributes=False)
         for node in root.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name in required
+        and node.name in VALIDATION_RUNNER_FUNCTIONS
     }
-    if set(functions) != required:
+    if set(functions) != VALIDATION_RUNNER_FUNCTIONS:
         return None
     return digest([
         "parr0t.branch-adapter-runner.v1", functions,
@@ -390,8 +405,11 @@ def environment_digest(python: str, environment_key: str) -> str:
     probe = """import importlib.metadata as m,json,platform,sys
 print(json.dumps([sys.version,sys.executable,platform.platform(),sorted((d.metadata.get('Name',''),d.version,str(d.locate_file(''))) for d in m.distributions())]))"""
     result = subprocess.run([python, "-c", probe], capture_output=True, check=True, text=True)
-    return digest([result.stdout, environment_key, {key: os.environ.get(key, "") for key in
-                  ("PATH", "PYTHONPATH", "CSC", "CECIL", "GAME_L10N_CSC", "GAME_L10N_CECIL")}])
+    # Native SDK tools are bound per branch by external_environment_digest().
+    # PATH and branch-only tool variables must not invalidate the complete core
+    # proof or unrelated SDK evidence when signing/provisioning changes process
+    # context. PYTHONPATH remains relevant because run_checks inherits it.
+    return digest([result.stdout, environment_key, os.environ.get("PYTHONPATH", "")])
 
 
 def runtime_digest(python: str) -> str:
@@ -417,12 +435,24 @@ def complete_cached_result(value: object, *, sdk: bool) -> bool:
 
 
 def validator_digest() -> str:
-    return digest({path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest() for path in (
-        "scripts/check_branches.py", "scripts/check_repo_privacy.py", "scripts/check_engine_faq.py",
-    )})
+    checker = ROOT / "scripts/check_branches.py"
+    root = ast.parse(checker.read_text(encoding="utf-8"), filename=str(checker))
+    functions = {
+        node.name: ast.dump(node, annotate_fields=True, include_attributes=False)
+        for node in root.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in VALIDATION_RUNNER_FUNCTIONS
+    }
+    if set(functions) != VALIDATION_RUNNER_FUNCTIONS:
+        raise ValueError("E_BRANCH_VALIDATION_RUNNER_INCOMPLETE")
+    supporting = {
+        path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
+        for path in ("scripts/check_repo_privacy.py", "scripts/check_engine_faq.py")
+    }
+    return digest(["parr0t.branch-validator.v2", functions, supporting])
 
 
-def provision_requirements(repo: Path, state: Path, plan: dict, python: str, *, retry_failed: bool = False) -> tuple[list[Path], str]:
+def provision_requirements(repo: Path, state: Path, plan: dict, python: str, *, retry_failed: bool = False,
+                           reuse_states: list[Path] | None = None) -> tuple[list[Path], str]:
     """Install one branch's declared Python test requirements outside Git."""
     requirements = plan.get("validation_requirements", [])
     if not requirements:
@@ -444,6 +474,19 @@ def provision_requirements(repo: Path, state: Path, plan: dict, python: str, *, 
         if evidence.get("content_digest") != current_content:
             raise ValueError("E_BRANCH_DEPENDENCY_STATE_CHANGED")
         return [target], digest([key, current_content])
+    for reuse_state in reuse_states or []:
+        reused = reuse_state.resolve() / "dependencies" / key
+        reused_marker = reused / ".parr0t-dependencies.json"
+        try:
+            reused_evidence = json.loads(reused_marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(reused_evidence, dict) or reused_evidence.get("key") != key:
+            continue
+        current_content = dependency_tree_digest(reused)
+        if reused_evidence.get("content_digest") != current_content:
+            raise ValueError("E_BRANCH_DEPENDENCY_STATE_CHANGED")
+        return [reused], digest([key, current_content])
     if not retry_failed:
         try:
             failure = json.loads(failure_marker.read_text(encoding="utf-8"))
@@ -469,6 +512,7 @@ def provision_requirements(repo: Path, state: Path, plan: dict, python: str, *, 
     for requirement in requirement_paths:
         command.extend(["--requirement", str(requirement)])
     environment = os.environ.copy()
+    environment["PIP_CACHE_DIR"] = str(state / "pip-cache")
     temporary = state / "dependency-tmp" / key
     temporary.mkdir(parents=True, exist_ok=True)
     for variable in ("TMP", "TEMP", "TMPDIR"):
@@ -625,18 +669,34 @@ def run_checks(snapshot: Path, python: str, sdk: bool, log: Path,
 def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", refs: list[str] | None = None,
                    python: str = sys.executable, environment_key: str = "", jobs: int = 2, force: bool = False,
                    pinned_plans: list[dict] | None = None,
-                   provision_dependencies: bool = False) -> dict:
+                   provision_dependencies: bool = False, cache_dir: Path | None = None) -> dict:
     repo, state = repo.resolve(), state.resolve()
     if state.is_relative_to(repo):
         raise ValueError("Audit state must be outside the repository")
     state.mkdir(parents=True, exist_ok=True)
-    cache_path = state / "cache.json"
-    try:
-        cache = json.loads(cache_path.read_text(encoding="utf-8"))
-        if not isinstance(cache, dict) or cache.get("schema") != SCHEMA or not isinstance(cache.get("results"), dict):
-            cache = {}
-    except (OSError, ValueError):
-        cache = {}
+    cache_state = (cache_dir or state).resolve()
+    if cache_state.is_relative_to(repo):
+        raise ValueError("Audit cache must be outside the repository")
+    cache_state.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_state / "cache.json"
+
+    def load_cache(path: Path) -> dict:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return {}
+        if not isinstance(value, dict) or value.get("schema") != SCHEMA or not isinstance(value.get("results"), dict):
+            return {}
+        return value
+
+    legacy_cache = load_cache(state / "cache.json") if cache_state != state else {}
+    stable_cache = load_cache(cache_path)
+    cache = {
+        "results": {**legacy_cache.get("results", {}), **stable_cache.get("results", {})},
+        "impact_results": {
+            **legacy_cache.get("impact_results", {}), **stable_cache.get("impact_results", {}),
+        },
+    }
     cached = cache.get("results", {})
     impact_cached = cache.get("impact_results", {})
     if not isinstance(impact_cached, dict):
@@ -645,7 +705,8 @@ def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", re
     environment = environment_digest(python, environment_key)
     runtime = runtime_digest(python)
     plans = plan_branches(repo, main_ref, refs) if pinned_plans is None else pinned_plans
-    historical_cached = historical_impact_results(repo, state, plans) if not force else {}
+    history_state = state if (state / "last-report.json").is_file() else cache_state
+    historical_cached = historical_impact_results(repo, history_state, plans) if not force else {}
     dependency_bindings: dict[str, tuple[list[Path], str]] = {}
     dependency_errors: dict[str, str] = {}
     impact_hits: dict[str, tuple[str, dict, str]] = {}
@@ -691,7 +752,8 @@ def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", re
         elif provision_dependencies and plan.get("validation_requirements"):
             try:
                 paths, package_key = provision_requirements(
-                    repo, state, plan, python, retry_failed=force,
+                    repo, cache_state, plan, python, retry_failed=force,
+                    reuse_states=([state] if state != cache_state else []),
                 )
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 dependency_errors[plan["content_digest"]] = str(error)
@@ -808,14 +870,17 @@ def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", re
             "evidence_content_digest": plan["content_digest"],
             "impact_paths": plan.get("adapter_impact_paths", []),
         }
-    cache_path.write_text(json.dumps({
+    cache_payload = json.dumps({
         "schema": SCHEMA,
         "results": {**cached, **{
             key: {name: value for name, value in result.items() if name not in {"cached", "cache_scope"}}
             for key, result in results.items()
         }},
         "impact_results": impact_results,
-    }, indent=2) + "\n", encoding="utf-8")
+    }, indent=2) + "\n"
+    cache_path.write_text(cache_payload, encoding="utf-8")
+    if cache_state != state:
+        (state / "cache.json").write_text(cache_payload, encoding="utf-8")
     report = {"schema": SCHEMA, "main_commit": plans[0]["main_commit"], "branches": rows,
               "executed": len(pending), "reused": sum(row["cached"] for row in rows),
               "checks_passed": all(
@@ -823,7 +888,10 @@ def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", re
                   for row in rows
               ),
               "all_compatible": all(row["update_action"] == "skip_update" for row in rows)}
-    (state / "last-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    report_payload = json.dumps(report, indent=2) + "\n"
+    (state / "last-report.json").write_text(report_payload, encoding="utf-8")
+    if cache_state != state:
+        (cache_state / "last-report.json").write_text(report_payload, encoding="utf-8")
     return report
 
 
@@ -831,6 +899,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=ROOT)
     parser.add_argument("--state-dir", type=Path, required=True)
+    parser.add_argument("--cache-dir", type=Path,
+                        help="Stable external evidence/dependency cache; default: one repository-wide sibling cache")
     parser.add_argument("--main-ref", default="origin/main")
     parser.add_argument("--ref", action="append", help="Repeat for a subset; default: all origin tracking branches")
     parser.add_argument("--python", default=sys.executable)
@@ -840,9 +910,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--provision-dependencies", action="store_true",
                         help="Install required branch-declared Python test dependencies into the external state directory")
     args = parser.parse_args(argv)
+    cache_dir = args.cache_dir or default_cache_dir(args.repo)
     report = audit_branches(args.repo, args.state_dir, main_ref=args.main_ref, refs=args.ref,
                             python=args.python, environment_key=args.environment_key, jobs=args.jobs, force=args.force,
-                            provision_dependencies=args.provision_dependencies)
+                            provision_dependencies=args.provision_dependencies, cache_dir=cache_dir)
     print(json.dumps(report, indent=2))
     return 0 if report["checks_passed"] and report["all_compatible"] else 1
 
