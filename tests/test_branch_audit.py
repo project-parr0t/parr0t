@@ -385,6 +385,14 @@ class BranchAuditTests(unittest.TestCase):
                 second = environment_digest(sys.executable, "")
         self.assertEqual(first, second)
 
+    def test_ambient_python_path_does_not_invalidate_core_environment(self) -> None:
+        with patch("scripts.check_branches.subprocess.run", return_value=type("Probe", (), {"stdout": "fixture"})()):
+            with patch.dict("os.environ", {"PYTHONPATH": "fixture-site-a"}):
+                first = environment_digest(sys.executable, "")
+            with patch.dict("os.environ", {"PYTHONPATH": "fixture-site-b"}):
+                second = environment_digest(sys.executable, "")
+        self.assertEqual(first, second)
+
     def test_nested_sdk_requirements_are_discovered_and_provisioned_outside_repo(self) -> None:
         self.git("switch", "sdk-fixture-1.0")
         self.write("profiles/fixture-requirements.txt", "# no third-party fixture packages\n")
