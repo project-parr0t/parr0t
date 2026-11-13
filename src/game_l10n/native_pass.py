@@ -17,7 +17,7 @@ from .control_plane import (
 from .language_policy import DEFAULT_TARGET_LANGUAGE, language_policy_digest
 from .models import Segment
 from .native_followup import CANDIDATE_METADATA_KEY
-from .native_runtime import RUNTIME_ISSUES, launch_contract, native_launch_summary, native_runtime
+from .native_runtime import RUNTIME_ISSUES, launch_contract, native_launch_summary, native_runtime, _unstarted_launch_ledger
 from .store import stable_hash, stable_hash_sequence
 from .validators import validate_integrity
 
@@ -902,6 +902,9 @@ def prepare_native_tasks(
         raise ValueError("max_material_tokens must be between 256 and 1000000")
     if not 1 <= max_workers <= 64:
         raise ValueError("max_workers must be between 1 and 64")
+    from .native_runtime import native_worker_ceiling
+    max_workers = native_worker_ceiling(work_dir, (route_binding or {}).get("provider") or (
+        "native-luna" if pass_kind == "translation" else "native-sol"), max_workers)
     if _review_split is not None and pass_kind != "review":
         raise ValueError("Review split metadata is valid only for review passes")
     review_split = _review_split or (
@@ -1547,6 +1550,7 @@ def _write_wave_relay_dispatch(
     wave: int,
     tasks: list[dict[str, Any]],
     plan_fingerprint: str,
+    *, legacy_results: list[dict[str, str]] | None = None,
 ) -> str:
     """Write the only dispatch artifact the root may give to a wave relay."""
 
@@ -1607,6 +1611,11 @@ def _write_wave_relay_dispatch(
             "final_response": "workspace_relative_relay_receipt_path_only",
         },
     }
+    path = _wave_relay_dispatch_path(work_dir, plan_fingerprint, wave)
+    previous = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+    previous_launch = previous.get("launch_contract") if isinstance(previous, dict) else None
+    if legacy_results is None and isinstance(previous_launch, dict):
+        legacy_results = previous_launch.get("legacy_results", [])
     launch = launch_contract(
         work_dir,
         (manifest.get("route_binding") or {}).get("provider")
@@ -1614,9 +1623,25 @@ def _write_wave_relay_dispatch(
         [binding["task"] for binding in bindings],
     )
     if launch is not None:
+        if legacy_results:
+            preserved = {row["task"] for row in legacy_results}
+            launch["tasks"] = [task for task in launch["tasks"] if task not in preserved]
+            launch["legacy_results"] = legacy_results
+            unsigned["relay_contract"].update(
+                all_task_bindings_must_be_attempted_once=False,
+                launch_task_selection="unstarted_tasks_only",
+                legacy_results_must_not_be_reexecuted=True,
+                zero_launch_tasks_action="seal_existing_results_without_dispatch",
+            )
+        if isinstance(previous_launch, dict):
+            compatible = {**launch, "runtime_fingerprint": previous_launch.get("runtime_fingerprint")}
+            if compatible == previous_launch:
+                launch = compatible
         unsigned["launch_contract"] = launch
     payload = {**unsigned, "dispatch_fingerprint": stable_hash(unsigned)}
-    path = _wave_relay_dispatch_path(work_dir, plan_fingerprint, wave)
+    ledger_path = path.with_name(path.stem + "-launch.json")
+    if previous_launch is not None and payload != previous and ledger_path.is_file():
+        raise ValueError("E_NATIVE_LAUNCH_INVALID: preserve the recorded execution binding")
     _atomic_json(path, payload)
     return path.resolve().relative_to(work_dir.resolve()).as_posix()
 
@@ -1631,6 +1656,95 @@ def _wave_relay_dispatch_path(
         / "relay"
         / f"{plan_fingerprint[:24]}-wave-{wave:04d}.json"
     )
+
+
+def _repair_ended_wave_relay(
+    work_dir: Path, manifest_path: Path, manifest: dict[str, Any],
+    results_dir: Path, wave: int, tasks: list[dict[str, Any]], plan_fingerprint: str,
+) -> bool:
+    """Explicit ended-relay recovery; never turn old output into model evidence."""
+    path = _wave_relay_dispatch_path(work_dir, plan_fingerprint, wave)
+    if not path.is_file():
+        return False
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
+    old_launch = payload.get("launch_contract")
+    if "launch_contract" in payload and not isinstance(old_launch, dict):
+        raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
+    if isinstance(old_launch, dict):
+        runtime = native_runtime(work_dir, required=True)
+        if (old_launch.get("host") == runtime["host"]
+                and old_launch.get("model") == runtime["models"].get(old_launch.get("route"))
+                and old_launch.get("transport", "collaboration") == runtime.get("transport", "collaboration")
+                and old_launch.get("host_profile_fingerprint") == runtime.get("host_profile_fingerprint")):
+            return False
+        _unstarted_launch_ledger(path, payload)
+    unsigned = {key: value for key, value in payload.items() if key != "dispatch_fingerprint"}
+    relative_manifest = manifest_path.resolve().relative_to(work_dir.resolve()).as_posix()
+    bindings = payload.get("task_bindings")
+    if (
+        payload.get("schema") != NATIVE_WAVE_RELAY_SCHEMA
+        or payload.get("dispatch_fingerprint") != stable_hash(unsigned)
+        or payload.get("manifest") != relative_manifest
+        or payload.get("manifest_contract_fingerprint") != manifest["contract_fingerprint"]
+        or payload.get("plan_fingerprint") != plan_fingerprint or payload.get("wave") != wave
+        or payload.get("route_binding") != manifest.get("route_binding")
+        or payload.get("pass_kind") != manifest["pass_kind"]
+        or not isinstance(bindings, list) or len(bindings) != len(tasks)
+    ):
+        raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
+    for task, binding in zip(tasks, bindings):
+        _validate_manifest_task_file(manifest_path, manifest, task)
+        expected_task = (manifest_path.parent / task["file"]).resolve().relative_to(work_dir.resolve()).as_posix()
+        expected_result = (results_dir / task["file"]).resolve().relative_to(work_dir.resolve()).as_posix()
+        if (not isinstance(binding, dict) or binding.get("task") != expected_task
+                or binding.get("result") != expected_result or binding.get("records") != task["records"]):
+            raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
+    receipt_path = path.with_name(path.stem + "-receipt.json")
+    if receipt_path.is_file():
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if (not isinstance(receipt, dict) or receipt.get("dispatch_fingerprint") != payload["dispatch_fingerprint"]
+                or receipt.get("receipt_fingerprint") != stable_hash({k: v for k, v in receipt.items() if k != "receipt_fingerprint"})):
+            raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
+    bound_segments: dict[str, Segment] = {}
+
+    def validate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return _validate_manifest_rows(work_dir, manifest, rows, bound_segments=bound_segments)
+
+    legacy_results = []
+    previously_preserved = {row["task"] for row in (old_launch or {}).get("legacy_results", [])}
+    for task, binding in zip(tasks, bindings):
+        result = work_dir / binding["result"]
+        if result.is_file():
+            if old_launch is not None and binding["task"] not in previously_preserved:
+                # A result written without a recorded launch cannot be silently
+                # relabeled as the newly selected model's output.
+                archive = result.with_name(result.name + ".unstarted-original-" + _file_sha256(result))
+                if archive.exists() and archive.read_bytes() != result.read_bytes():
+                    raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
+                result.replace(archive)
+                continue
+            _complete_ended_task_result(
+                work_dir / binding["task"], result, expected_records=task["records"],
+                validate_rows=validate_rows,
+                expected_provider=(manifest.get("route_binding") or {}).get("provider"),
+            )
+            legacy_results.append({"task": binding["task"], "result_sha256": _file_sha256(result)})
+    # Archive before removing stale canonical metadata. A crash leaves the old
+    # dispatch resumable, and no completed result or imported shard is removed.
+    for metadata in (path, receipt_path, path.with_name(path.stem + "-launch.json")):
+        if metadata.is_file():
+            original = metadata.read_bytes()
+            archive = metadata.with_name(metadata.name + ".legacy-" + hashlib.sha256(original).hexdigest())
+            if archive.exists() and archive.read_bytes() != original:
+                raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
+            archive.write_bytes(original)
+            if metadata != path:
+                metadata.unlink()
+    _write_wave_relay_dispatch(work_dir, manifest_path, manifest, results_dir, wave, tasks,
+                               plan_fingerprint, legacy_results=legacy_results)
+    return True
 
 
 def _read_structurally_bound_result(
@@ -2795,6 +2909,10 @@ def _native_control_step_single(
         raise ValueError(
             "E_NATIVE_CONTROL_MANIFEST_UPGRADE_REQUIRED: deterministic stepping requires v6 or v7"
         )
+    # Probe the selected native API route before creating controller state.
+    from .native_runtime import native_worker_ceiling
+    native_worker_ceiling(work_dir, (manifest.get("route_binding") or {}).get("provider") or (
+        "native-luna" if manifest["pass_kind"] == "translation" else "native-sol"), 1)
     plan_fingerprint = _native_control_plan_fingerprint(manifest)
     state_path = _native_control_state_path(work_dir, manifest, plan_fingerprint)
     state = _load_native_control_state(state_path, manifest, plan_fingerprint)
@@ -2825,6 +2943,7 @@ def _native_control_step_single(
         if imported_tasks != state["imported_tasks"]:
             raise ValueError("E_NATIVE_CONTROL_STATE_INVALID: imported task count is invalid")
     import_summary: dict[str, Any] | None = None
+    rebound_relay = False
     next_wave = (
         waves[state["imported_wave_count"]]
         if state["imported_wave_count"] < len(waves)
@@ -2851,6 +2970,16 @@ def _native_control_step_single(
         relay_receipt_path = relay_dispatch_path.with_name(
             f"{relay_dispatch_path.stem}-receipt.json"
         )
+        rebound_relay = (
+            resume_relay and require_runtime and _repair_ended_wave_relay(
+                work_dir, manifest_path, manifest, results_dir, next_wave, tasks, plan_fingerprint,
+            )
+        )
+        if (resume_relay and require_runtime and not rebound_relay
+                and relay_dispatch_path.is_file() and not relay_receipt_path.is_file()):
+            # --resume-relay asserts that the old relay ended. Seal its actual
+            # outputs once; ordinary waits never make this assertion.
+            seal_native_wave_relay(work_dir, relay_dispatch_path, relay_ended=True)
         relay_receipt_fingerprint = (
             _file_sha256(relay_receipt_path)
             if relay_receipt_path.is_file()
@@ -2926,15 +3055,20 @@ def _native_control_step_single(
                     # files, launches, successful shards, route and attempt counts.
                     relay_receipt_path.unlink()
                     state["unchanged_observations"] = 0
+                    state["last_progress_marker"] = ""
                     ready_results = 0
                     relay_issue = ""
+        if rebound_relay:
+            state["unchanged_observations"] = 0
+            state["last_progress_marker"] = ""
+            ready_results = 0
+            relay_issue = ""
         budget_issue = _native_budget_issue(
             manifest["execution_contract"], state, next_wave
         )
         awaiting_live_relay = (
             relay_issue == "E_NATIVE_RELAY_RECEIPT_REQUIRED"
             and relay_dispatch_path.is_file()
-            and "launch_contract" in json.loads(relay_dispatch_path.read_text(encoding="utf-8"))
         )
         if awaiting_live_relay:
             if budget_issue:
@@ -3056,9 +3190,11 @@ def _native_control_step_single(
             selected_tasks,
             plan_fingerprint,
         )
-        if selected_tasks and next_wave is not None
+        if selected_tasks and next_wave is not None and not rebound_relay
         else ""
     )
+    if action == "dispatch_isolated_wave_relay" and rebound_relay:
+        relay_dispatch = relay_dispatch_path.resolve().relative_to(work_dir.resolve()).as_posix()
     if action == "repair_native_runtime" and next_wave is not None:
         # Return the existing dispatch without rewriting its launch evidence.
         # A host repair must not require the parent to reconstruct a task.
@@ -3092,6 +3228,12 @@ def _native_control_step_single(
             "--results-dir <results-dir> --resume-relay"
             if action == "repair_native_runtime" else None
         ),
+        "runtime_repair": (
+            {"scope": "host", "required_capability": "nested_native_dispatch",
+             "retry_after": "actual_host_tool_surface_change",
+             "automatic_rotation_allowed": False, "isolation_relaxation_allowed": False}
+            if "E_NATIVE_DISPATCH_UNAVAILABLE" in issue_codes else None
+        ),
         "relay": (
             {
                 "dispatch": relay_dispatch,
@@ -3100,6 +3242,10 @@ def _native_control_step_single(
                 "tasks": len(selected_tasks),
                 "records": sum(task["records"] for task in selected_tasks),
                 "final_response": "workspace_relative_relay_receipt_path_only",
+                "executor": "native-host-api" if (native_runtime(work_dir) or {}).get("transport") == "native-host-api" else "collaboration",
+                "broker_command": ["game-l10n", "run-native-broker", "--workspace", str(work_dir.resolve()),
+                                   "--relay", relay_dispatch]
+                    if (native_runtime(work_dir) or {}).get("transport") == "native-host-api" else None,
             }
             if relay_dispatch
             else None

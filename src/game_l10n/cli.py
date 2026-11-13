@@ -87,6 +87,8 @@ from .native_translation_retry import (
 from .native_runtime import (
     bind_data_plane_launch, configure_native_runtime, native_runtime, record_native_launch,
 )
+from .native_host import configure_native_host
+from .native_broker import probe_native_host, run_native_broker
 from .native_review import (collect_native_review, collect_native_rewrite,
                             collect_reviewed_candidates, process_native_review_followup)
 from .instance_release import validate_instance_release
@@ -1380,6 +1382,9 @@ def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
         sdk_activation=activation,
     )
     bind_data_plane_launch(work_dir, work_dir / result["relay_path"])
+    if native_runtime(work_dir).get("transport") == "native-host-api":
+        result.update(executor="native-host-api", broker_command=["game-l10n", "run-native-broker",
+                      "--workspace", str(work_dir), "--relay", result["relay_path"]])
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -1393,11 +1398,37 @@ def cmd_native_runtime(args: argparse.Namespace) -> int:
             if not separator or route in models:
                 raise ValueError("E_NATIVE_RUNTIME_INVALID: repeat --model route=exact-model once per route")
             models[route] = model
-        result = configure_native_runtime(work_dir, args.host, models)
+        result = configure_native_runtime(work_dir, args.host, models, transport=getattr(args, "transport", None))
     else:
-        if args.model:
+        if args.model or getattr(args, "transport", None):
             raise ValueError("E_NATIVE_RUNTIME_INVALID: model overrides require --host")
         result = native_runtime(work_dir, required=True)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_configure_native_host(args: argparse.Namespace) -> int:
+    result = configure_native_host(Path(args.workspace).resolve(), args.host, args.endpoint, args.api_key_env)
+    print(json.dumps(result))
+    return 0
+
+
+def cmd_probe_native_host(args: argparse.Namespace) -> int:
+    result = probe_native_host(Path(args.workspace).resolve(), args.route, live=args.live)
+    print(json.dumps(result))
+    return 0
+
+
+def cmd_run_native_broker(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    # Discovery has no active SDK yet; all other task roles retain their gate.
+    relay = _path_in_workspace(work_dir, args.relay, must_exist=True)
+    from .native_broker import broker_progress_metadata
+    metadata = broker_progress_metadata(work_dir, relay)
+    if metadata["requires_sdk"]:
+        require_sdk_activation(work_dir, load_config(work_dir))
+    with live_processing_ui(operation="native_broker", total_records=metadata["records"]) as progress:
+        result = run_native_broker(work_dir, relay, progress=progress.update)
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -3164,14 +3195,33 @@ def build_parser() -> argparse.ArgumentParser:
     native_step.add_argument("--input-tokens", type=int, default=0)
     native_step.add_argument("--provider-cost-usd", type=float, default=0.0)
     native_step.add_argument("--resume-relay", action="store_true",
-                             help="Reopen only a blocked relay after launcher repair; preserve results and attempt")
+                             help="Assert the prior relay ended; recover its missing receipt or legacy launch binding after host repair; preserve results and attempt")
     native_step.set_defaults(func=cmd_native_pass_step)
 
     native_host = sub.add_parser("native-runtime", help="Bind or inspect the native host and exact worker models")
     native_host.add_argument("--workspace", required=True)
-    native_host.add_argument("--host", choices=["codex", "omp"])
+    native_host.add_argument("--host", help="codex, omp, or an explicitly registered native API host")
+    native_host.add_argument("--transport", choices=["collaboration", "native-host-api"])
     native_host.add_argument("--model", action="append", help="Exact native-route=model-id override; repeatable")
     native_host.set_defaults(func=cmd_native_runtime)
+
+    register_host = sub.add_parser("configure-native-host", help="Register an existing native worker API service")
+    register_host.add_argument("--workspace", required=True)
+    register_host.add_argument("--host", required=True)
+    register_host.add_argument("--endpoint", required=True)
+    register_host.add_argument("--api-key-env")
+    register_host.set_defaults(func=cmd_configure_native_host)
+
+    probe_host = sub.add_parser("probe-native-host", help="Verify native API capabilities and optionally one synthetic worker")
+    probe_host.add_argument("--workspace", required=True)
+    probe_host.add_argument("--route", default="native-luna")
+    probe_host.add_argument("--live", action="store_true")
+    probe_host.set_defaults(func=cmd_probe_native_host)
+
+    broker = sub.add_parser("run-native-broker", help="Execute a bound relay through the selected native API service")
+    broker.add_argument("--workspace", required=True)
+    broker.add_argument("--relay", required=True)
+    broker.set_defaults(func=cmd_run_native_broker)
 
     native_launch = sub.add_parser("record-native-launch", help="Record relay preflight or actual worker spawn metadata")
     native_launch.add_argument("--workspace", required=True)
