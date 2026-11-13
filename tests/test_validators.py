@@ -6,6 +6,7 @@ import unittest
 from game_l10n.models import GlossaryEntry, Segment
 from game_l10n.store import stable_hash
 from game_l10n.validators import (
+    applicable_glossary_entries,
     contains_term,
     preflight_constraint_issues,
     protected_tokens,
@@ -57,12 +58,46 @@ class ValidatorTests(unittest.TestCase):
         issues = validate_integrity(segment, "\uc544\uc774\uc2a4\ud06c\ub9bc", glossary)
         self.assertIn("glossary-missing", {item.code for item in issues})
 
+    def test_glossary_overlap_uses_original_offsets_after_case_folding(self) -> None:
+        for short, short_sensitive, long_sensitive in (
+            ("Ice", True, False),
+            ("Cream", False, True),
+        ):
+            with self.subTest(short=short):
+                glossary = [
+                    GlossaryEntry(short, "TARGET_SHORT", case_sensitive=short_sensitive),
+                    GlossaryEntry("Ice Cream", "TARGET_LONG", case_sensitive=long_sensitive),
+                ]
+                segment = Segment("fixture-folded-overlap", "\u00df Ice Cream")
+                self.assertEqual(applicable_glossary_entries(glossary, segment.source), [glossary[1]])
+                self.assertEqual(validate_integrity(segment, "TARGET_LONG", glossary), [])
+
+    def test_case_fold_expansion_does_not_hide_a_separate_glossary_term(self) -> None:
+        glossary = [
+            GlossaryEntry("\u00df\u00df", "TARGET_FOLD"),
+            GlossaryEntry("X", "TARGET_X", case_sensitive=True),
+        ]
+        segment = Segment("fixture-folded-separate", "\u00df\u00df X")
+        self.assertEqual(applicable_glossary_entries(glossary, segment.source), glossary)
+        issues = validate_integrity(segment, "TARGET_FOLD", glossary)
+        self.assertEqual([item.code for item in issues], ["glossary-missing"])
+
     def test_impossible_protected_token_length_is_rejected_before_translation(self) -> None:
         issues = preflight_constraint_issues(
             Segment("fixture", "{player}", metadata={"ui_max_chars": 4})
         )
         self.assertEqual([item.code for item in issues], ["constraint-unsatisfiable"])
         self.assertFalse(issues[0].retryable)
+
+    def test_preflight_counts_full_quoted_tags_and_merges_custom_token_spans(self) -> None:
+        source = '<b title=">">'
+        for limit, expected in ((len(source) - 1, ["constraint-unsatisfiable"]), (len(source), [])):
+            with self.subTest(limit=limit):
+                segment = Segment("fixture-quoted-budget", source, metadata={"ui_max_chars": limit})
+                issues = preflight_constraint_issues(segment, extra_patterns=[r"title=(.*)"])
+                self.assertEqual([item.code for item in issues], expected)
+                integrity = validate_integrity(segment, source, [])
+                self.assertEqual("ui-length-limit" in {item.code for item in integrity}, limit < len(source))
 
     def test_exact_whitespace_source_is_preserved_but_not_rewritten(self) -> None:
         segment = Segment("fixture-whitespace", "  \t")
@@ -163,6 +198,41 @@ class ValidatorTests(unittest.TestCase):
                 issues = validate_integrity(Segment("fixture-token", source), candidate, [])
                 self.assertNotIn("protected-token-mismatch", {item.code for item in issues})
 
+    def test_custom_protected_patterns_preserve_full_matches_with_captures(self) -> None:
+        for pattern in (r"\[(item):\d+\]", r"\[(item):(\d+)\]", r"\[(?P<name>item):\d+\]"):
+            with self.subTest(pattern=pattern):
+                source = "[item:1] [item:1]"
+                self.assertEqual(dict(protected_tokens(source, [pattern])), {"[item:1]": 2})
+                segment = Segment("fixture-custom-token", source)
+                self.assertEqual(validate_integrity(segment, source, [], extra_patterns=[pattern]), [])
+                issues = validate_integrity(segment, "[item:1] [item:2]", [], extra_patterns=[pattern])
+                self.assertEqual([item.code for item in issues], ["protected-token-mismatch"])
+
+    def test_quoted_markup_attributes_are_protected_through_angle_brackets(self) -> None:
+        for quote in ('"', "'"):
+            with self.subTest(quote=quote):
+                tag = f"<b title = {quote}> <i>{quote}>"
+                source = f"{tag}SOURCE</b>"
+                candidate = f"{tag}TARGET</b>"
+                self.assertEqual(dict(protected_tokens(source)), {tag: 1, "</b>": 1})
+                self.assertEqual(validate_integrity(Segment("fixture-quoted-tag", source), candidate, []), [])
+                changed = candidate.replace("> <i>", "> <u>")
+                issues = validate_integrity(Segment("fixture-quoted-tag", source), changed, [])
+                self.assertIn("protected-token-mismatch", {item.code for item in issues})
+
+    def test_many_quoted_attributes_in_incomplete_tag_remain_plain_text(self) -> None:
+        incomplete = '<b' + ' x=""' * 256
+        self.assertEqual(dict(protected_tokens(incomplete)), {})
+        self.assertEqual(validate_integrity(Segment("fixture-incomplete-tag", incomplete), incomplete, []), [])
+        complete = incomplete + '>SOURCE</b>'
+        self.assertEqual(dict(protected_tokens(complete)), {incomplete + '>': 1, '</b>': 1})
+
+    def test_unquoted_apostrophes_do_not_consume_following_markup(self) -> None:
+        source = "<font=hero's>SOURCE</font> isn't"
+        candidate = "<font=hero's>TARGET</font> isn't"
+        self.assertEqual(dict(protected_tokens(source)), {"<font=hero's>": 1, "</font>": 1})
+        self.assertEqual(validate_integrity(Segment("fixture-unquoted-tag", source), candidate, []), [])
+
     def test_term_matching_respects_latin_words_but_not_cjk_particles(self) -> None:
         self.assertFalse(contains_term("Ice", "Device price"))
         self.assertTrue(contains_term("Ice", "Ice shard"))
@@ -194,6 +264,13 @@ class ValidatorTests(unittest.TestCase):
         # A source that is itself crossed is engine-specific markup; do not judge it.
         self.assertNotIn("markup-malformed", codes("<b>A<i>B</b></i>", "<b>A<i>B</b></i>"))
         self.assertIn("markup-malformed", codes("<b>A<br>B</b>", "</b>A<br>B<b>"))
+
+    def test_quoted_tag_content_is_not_treated_as_markup_structure(self) -> None:
+        tag = '<b title="> </b>">'
+        source = f"{tag}SOURCE</b>"
+        candidate = f"</b>TARGET{tag}"
+        issues = validate_integrity(Segment("fixture-quoted-nesting", source), candidate, [])
+        self.assertEqual([item.code for item in issues], ["markup-malformed"])
 
     def test_glossary_accepts_any_allowed_target_and_rejects_bad_lists(self) -> None:
         entry = GlossaryEntry("Potion", "TARGET_A", targets=["TARGET_B", " ", "TARGET_A"])
