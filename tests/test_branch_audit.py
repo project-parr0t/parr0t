@@ -20,6 +20,68 @@ from scripts.check_branches import (
 )
 
 
+class ValidationLifecycleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.log = self.root / "validation.log"
+
+    def test_no_deadline_and_process_error_preserves_completed_checks(self) -> None:
+        calls = 0
+
+        def execute(command: list[str], **kwargs: object):
+            nonlocal calls
+            calls += 1
+            self.assertIsNone(kwargs["timeout"])
+            if calls == 2:
+                progress = json.loads(self.log.with_suffix(".log.json").read_text())
+                self.assertTrue(progress["checks"]["privacy"]["passed"])
+                self.assertFalse(progress["passed"])
+                self.assertEqual(progress["checks"]["engine_faq"]["state"], "running")
+                self.assertNotIn("issue_code", progress["checks"]["engine_faq"])
+                kwargs["stderr"].write("fixture FAQ launch diagnostic\n")
+                raise OSError("fixture launch failure")
+            if calls == 3:
+                kwargs["stdout"].write("Ran 999 tests in 0s\nOK\n")
+                kwargs["stderr"].write("Ran 2 tests in 0s\nOK\n")
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch("scripts.check_branches.subprocess.run", side_effect=execute):
+            result = run_checks(self.root, sys.executable, True, self.log)
+        self.assertEqual(calls, 3)
+        self.assertFalse(result["passed"])
+        self.assertTrue(result["checks"]["privacy"]["passed"])
+        self.assertEqual(result["checks"]["engine_faq"]["issue_code"], "E_BRANCH_VALIDATION_LAUNCH_FAILED")
+        self.assertTrue(result["checks"]["tests"]["passed"])
+        self.assertEqual(result["checks"]["tests"]["count"], 2)
+        self.assertIn("fixture FAQ launch diagnostic", self.log.read_text())
+        self.assertEqual(json.loads(self.log.with_suffix(".log.json").read_text()), result)
+
+    def test_user_interrupt_keeps_live_output_and_partial_result(self) -> None:
+        calls = 0
+
+        def execute(command: list[str], **kwargs: object):
+            nonlocal calls
+            calls += 1
+            self.assertIsNone(kwargs["timeout"])
+            if calls == 2:
+                kwargs["stderr"].write("fixture test progress before interrupt\n")
+                raise KeyboardInterrupt()
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch("scripts.check_branches.subprocess.run", side_effect=execute):
+            with self.assertRaises(KeyboardInterrupt):
+                run_checks(self.root, sys.executable, False, self.log)
+        progress = json.loads(self.log.with_suffix(".log.json").read_text())
+        self.assertFalse(progress["passed"])
+        self.assertFalse(progress["complete"])
+        self.assertTrue(progress["checks"]["privacy"]["passed"])
+        self.assertEqual(progress["checks"]["tests"]["issue_code"], "E_BRANCH_VALIDATION_INTERRUPTED")
+        self.assertIn("fixture test progress before interrupt", self.log.read_text())
+        self.assertIn("fixture test progress before interrupt", self.log.with_name(self.log.name + ".tests.stderr").read_text())
+
+
 class BranchAuditTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -594,6 +656,66 @@ class BranchAuditTests(unittest.TestCase):
         dependencies = self.state / "dependencies"
         self.assertFalse(dependencies.exists() and any(dependencies.iterdir()))
 
+    def test_dependency_timeout_keeps_log_and_retries_without_force(self) -> None:
+        self.git("switch", "sdk-fixture-1.0")
+        self.write("profiles/fixture-requirements.txt", "fixture-package==1\n")
+        self.commit("Declare interrupted fixture dependency")
+        self.git("switch", "main")
+        plan = plan_branches(self.repo, "main", ["sdk-fixture-1.0"])[1]
+        actual_run = subprocess.run
+        pip_calls = 0
+
+        def install(command: list[str], **kwargs: object):
+            nonlocal pip_calls
+            if command[:3] != [sys.executable, "-m", "pip"]:
+                return actual_run(command, **kwargs)
+            pip_calls += 1
+            self.assertIsNone(kwargs["timeout"])
+            kwargs["stdout"].write("fixture install progress\n")
+            if pip_calls == 1:
+                raise subprocess.TimeoutExpired(command, 300)
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch("scripts.check_branches.subprocess.run", side_effect=install):
+            with self.assertRaisesRegex(ValueError, "INSTALL_TIMEOUT"):
+                provision_requirements(self.repo, self.state, plan, sys.executable)
+            self.assertIn("fixture install progress", next(self.state.glob("dependency-install-*.log")).read_text())
+            self.assertFalse(list((self.state / "dependency-failures").glob("*.json")))
+            paths, key = provision_requirements(self.repo, self.state, plan, sys.executable)
+            self.assertEqual(provision_requirements(self.repo, self.state, plan, sys.executable), (paths, key))
+        self.assertEqual(pip_calls, 2)
+
+    def test_historical_dependency_timeout_marker_does_not_hold_install(self) -> None:
+        self.git("switch", "sdk-fixture-1.0")
+        self.write("profiles/fixture-requirements.txt", "fixture-package==1\n")
+        self.commit("Declare historical timeout fixture dependency")
+        self.git("switch", "main")
+        plan = plan_branches(self.repo, "main", ["sdk-fixture-1.0"])[1]
+        actual_run = subprocess.run
+
+        def install(command: list[str], **kwargs: object):
+            if command[:3] == [sys.executable, "-m", "pip"]:
+                return subprocess.CompletedProcess(command, 1)
+            return actual_run(command, **kwargs)
+
+        with patch("scripts.check_branches.subprocess.run", side_effect=install):
+            with self.assertRaisesRegex(ValueError, "INSTALL_FAILED"):
+                provision_requirements(self.repo, self.state, plan, sys.executable)
+        marker = next((self.state / "dependency-failures").glob("*.json"))
+        failure = json.loads(marker.read_text())
+        failure["error"] = "E_BRANCH_DEPENDENCY_INSTALL_TIMEOUT"
+        marker.write_text(json.dumps(failure), encoding="utf-8")
+
+        def succeed(command: list[str], **kwargs: object):
+            if command[:3] == [sys.executable, "-m", "pip"]:
+                return subprocess.CompletedProcess(command, 0)
+            return actual_run(command, **kwargs)
+
+        with patch("scripts.check_branches.subprocess.run", side_effect=succeed):
+            paths, _ = provision_requirements(self.repo, self.state, plan, sys.executable)
+        self.assertEqual(len(paths), 1)
+        self.assertFalse(marker.exists())
+
     def test_dependency_change_during_tests_holds_result(self) -> None:
         self.git("switch", "sdk-fixture-1.0")
         self.write("profiles/fixture-requirements.txt", "# empty fixture environment\n")
@@ -610,6 +732,29 @@ class BranchAuditTests(unittest.TestCase):
             result = self.audit(force=True, provision_dependencies=True)
         self.assertFalse(result["branches"][1]["passed"])
         self.assertEqual(result["branches"][1]["error"], "E_BRANCH_DEPENDENCY_STATE_CHANGED")
+
+    def test_post_check_environment_error_keeps_completed_evidence(self) -> None:
+        completed = False
+
+        def check(*args: object, **kwargs: object) -> dict:
+            nonlocal completed
+            completed = True
+            return self.passed(*args, **kwargs)
+
+        def environment(names: list[str]) -> tuple[str, list[str]]:
+            if completed:
+                raise OSError("fixture post-check environment error")
+            return "none", []
+
+        with patch("scripts.check_branches.run_checks", side_effect=check), patch(
+            "scripts.check_branches.external_environment_digest", side_effect=environment
+        ):
+            result = self.audit()
+        for row in result["branches"]:
+            self.assertFalse(row["passed"])
+            self.assertEqual(row["error"], "OSError")
+            self.assertTrue(row["checks"]["privacy"]["passed"])
+            self.assertTrue(row["checks"]["tests"]["complete"])
 
     def test_invalid_sdk_validation_manifest_is_a_branch_hold(self) -> None:
         self.git("switch", "sdk-fixture-1.0")
