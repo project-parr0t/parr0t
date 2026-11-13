@@ -51,6 +51,14 @@ This marker is the first authority for whether a Parr0t patch is installed and w
 
 `parr0t-patch-status.txt` and `.parr0t/` are reserved and cannot be payload paths.
 
+Package paths must be unambiguous Windows-relative paths: no leading/trailing or repeated separators, dot segments, drive/stream syntax, control/invalid filename characters, trailing dots/spaces, or reserved device names (including device names with extensions). Specs may use backslashes; archive payload paths must use canonical forward slashes. Both archive validators reject framework-reserved payload roots, even when the manifest fingerprint and payload digests match.
+
+Payload collection rejects symlinks and Windows reparse points before descending into directories. The installer also rejects existing child reparse points along payload, replacement, backup, status, and receipt paths before using them; move linked child directories to ordinary directories before installation. The explicitly selected game root itself may be a resolved alias. These checks do not provide isolation against concurrent filesystem changes by another process.
+
+Installer staging uses atomically reserved, random sibling files for payload copies, original backups, receipts, status, restore, and automation-approval updates. Predictable names such as `<target>.parr0t-new`, `<target>.parr0t-restore`, and `<receipt>.tmp` are not owned merely because they resemble installer scratch files; existing files with those names remain untouched.
+
+The installer tracks only temporary paths atomically reserved by the current invocation and removes remaining scratch files on normal or exceptional exit. A failed Restore followed by a successful retry must not leave an untracked copy of an original file. Existing staging-lookalike files are never adopted or cleaned. Abrupt process termination or concurrent filesystem mutation is outside this cleanup guarantee.
+
 ## Declared original-file replacement
 
 An overlay payload normally refuses every unowned collision. If an adapter must replace an original file, such as putting a launcher wrapper at the original executable path, it must declare that exception in the private package spec:
