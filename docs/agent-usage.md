@@ -4,7 +4,7 @@
 
 ## Supported control paths
 
-Parr0t supports Codex App/CLI and OpenCodex-compatible proxies. Proxies change routing only.
+Supports Codex App/CLI, OMP native dispatch, and OpenCodex-compatible proxies. All preserve isolation and provider roles; proxies change routing only.
 
 ## Start or resume
 
@@ -21,7 +21,7 @@ For a new job:
 1. Confirm repository/workspace access and only that the source path exists; do not inspect its contents.
 2. Initialize with that path and run status. For `establish_text_free_control_plane`, read its contracts and run `game-l10n enter-control-plane --workspace <workspace> --contracts-read --source-unopened`. If the parent already saw game content, record a leak and stop.
 3. Ask once whether Git may be used for this game task; record only the answer. Disabled forbids Git mutation/publication in that workspace, not authenticated SDK access, download, inventory, or activation. Never infer the answer from transport or missing `.git`.
-4. Follow only status `next_actions` and contracts. If `data_plane_task` exists, run its prepare, relay, and seal commands; never request an exception. Only `local_patch_ready` is terminal.
+4. Bind `native-runtime --host codex|omp --workspace <workspace>`; follow host/model/launch rules in `control-plane-contract.md`. Follow status `next_actions`: prepare, relay, seal. Only `local_patch_ready` is terminal.
 
 For an existing job, start with status and reuse valid checkpoints. Do not repeat work with unchanged fingerprints.
 

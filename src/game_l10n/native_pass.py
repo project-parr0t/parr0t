@@ -17,6 +17,7 @@ from .control_plane import (
 from .language_policy import DEFAULT_TARGET_LANGUAGE, language_policy_digest
 from .models import Segment
 from .native_followup import CANDIDATE_METADATA_KEY
+from .native_runtime import RUNTIME_ISSUES, launch_contract, native_launch_summary, native_runtime
 from .store import stable_hash, stable_hash_sequence
 from .validators import validate_integrity
 
@@ -560,11 +561,15 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
         if language_binding is not None:
             fingerprint_payload["language_binding"] = language_binding
         expected_fingerprint = stable_hash(fingerprint_payload)
+        expected_detail = _detail_contract(pass_kind, manifest_version=version)
+        legacy_detail = json.loads(json.dumps(expected_detail))
+        # Host repair is execution-only. Preserve the immutable fingerprints and
+        # successes of manifests prepared before that control action was added.
+        legacy_detail["review_control"]["allowed_actions"].remove("repair_native_runtime")
         if (
             worker_contract
             != _worker_contract(pass_kind, manifest_version=version)
-            or detail_contract
-            != _detail_contract(pass_kind, manifest_version=version)
+            or detail_contract not in (expected_detail, legacy_detail)
         ):
             raise ValueError("E_DETAIL_CONTRACT_CONFLICT: native task contract was changed")
         if not isinstance(execution_contract, dict) or (
@@ -1441,6 +1446,12 @@ def import_native_wave(
         raise ValueError("Native wave result directory does not exist")
 
     manifest = _load_task_manifest(work_dir, manifest_path)
+    plan_fingerprint = _native_control_plan_fingerprint(manifest)
+    dispatch = _wave_relay_dispatch_path(work_dir, plan_fingerprint, wave)
+    if dispatch.is_file() and "launch_contract" in json.loads(dispatch.read_text(encoding="utf-8")):
+        receipt = _validated_native_wave_relay_receipt(work_dir, plan_fingerprint, wave, manifest=manifest)
+        if receipt["issue_codes"]:
+            raise ValueError("E_NATIVE_WORKER_NOT_STARTED: runtime repair must precede import")
     tasks = [task for task in manifest["tasks"] if task["wave"] == wave]
     if not tasks:
         raise ValueError("Native task manifest does not contain the requested wave")
@@ -1573,6 +1584,14 @@ def _write_wave_relay_dispatch(
             "final_response": "workspace_relative_relay_receipt_path_only",
         },
     }
+    launch = launch_contract(
+        work_dir,
+        (manifest.get("route_binding") or {}).get("provider")
+        or ("native-luna" if manifest["pass_kind"] == "translation" else "native-sol"),
+        [binding["task"] for binding in bindings],
+    )
+    if launch is not None:
+        unsigned["launch_contract"] = launch
     payload = {**unsigned, "dispatch_fingerprint": stable_hash(unsigned)}
     path = _wave_relay_dispatch_path(work_dir, plan_fingerprint, wave)
     _atomic_json(path, payload)
@@ -1758,6 +1777,7 @@ def seal_native_wave_relay(
     if not isinstance(payload, dict) or frozenset(payload) not in {
         frozenset(legacy_fields),
         frozenset(fields),
+        frozenset(fields | {"launch_contract"}),
     }:
         raise ValueError("E_NATIVE_RELAY_INVALID: dispatch shape is invalid")
     active_fields = set(payload)
@@ -1868,12 +1888,17 @@ def seal_native_wave_relay(
         bindings_by_name[task_name] = (task, result, binding["records"])
 
     effective_ended_tasks = ended_tasks
+    launch = native_launch_summary(work_dir, resolved) if "launch_contract" in payload else None
+    launch_blocked = bool(launch and launch["issue_codes"])
     if relay_ended:
         effective_ended_tasks = tuple(
             name
             for name, (task, result, _) in bindings_by_name.items()
+            if not launch_blocked
             if _read_structurally_bound_result(task, result, validate_rows=validate_rows) is None
         )
+    elif launch_blocked and ended_tasks:
+        raise ValueError("E_NATIVE_WORKER_NOT_STARTED: restore the relay before sealing worker errors")
 
     unknown_ended = [
         name for name in effective_ended_tasks if name not in bindings_by_name
@@ -1904,7 +1929,10 @@ def seal_native_wave_relay(
     )
 
     total = len(payload["task_bindings"])
-    issue_codes = [] if ready == total else ["E_NATIVE_WAVE_INCOMPLETE"]
+    issue_codes = (
+        launch["issue_codes"] if launch_blocked
+        else ([] if ready == total else ["E_NATIVE_WAVE_INCOMPLETE"])
+    )
     dispatch_relative = resolved.relative_to(work_dir.resolve()).as_posix()
     receipt_unsigned = {
         "schema": NATIVE_WAVE_RELAY_RECEIPT_SCHEMA,
@@ -1941,6 +1969,7 @@ def _validated_native_wave_relay_receipt(
     wave: int,
     *,
     manifest: dict[str, Any],
+    allow_runtime_repair: bool = False,
 ) -> dict[str, Any]:
     dispatch_path = _wave_relay_dispatch_path(work_dir, plan_fingerprint, wave).resolve()
     receipt_path = dispatch_path.with_name(f"{dispatch_path.stem}-receipt.json")
@@ -1973,6 +2002,20 @@ def _validated_native_wave_relay_receipt(
         or dispatch_revision not in {None, RELAY_DISPATCH_REVISION}
     ):
         raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
+    # A blocked receipt is an immutable observation. Capability may have been
+    # restored since it was sealed; resume may reopen only this bound blocker.
+    if (
+        allow_runtime_repair and "launch_contract" in dispatch
+        and isinstance(receipt.get("issue_codes"), list) and receipt["issue_codes"]
+        and set(receipt["issue_codes"]) <= RUNTIME_ISSUES
+        and receipt.get("schema") == NATIVE_WAVE_RELAY_RECEIPT_SCHEMA
+        and receipt.get("dispatch") == dispatch_relative
+        and receipt.get("dispatch_fingerprint") == dispatch.get("dispatch_fingerprint")
+        and receipt.get("wave") == wave
+        and receipt.get("receipt_fingerprint") == stable_hash(unsigned)
+    ):
+        native_launch_summary(work_dir, dispatch_path)
+        return receipt
     bound_segments: dict[str, Segment] = {}
 
     def validate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2016,7 +2059,11 @@ def _validated_native_wave_relay_receipt(
         "ready_tasks": ready,
         "pending_tasks": total - ready,
     }
-    expected_issues = [] if ready == total else ["E_NATIVE_WAVE_INCOMPLETE"]
+    launch = native_launch_summary(work_dir, dispatch_path) if "launch_contract" in dispatch else None
+    expected_issues = (
+        launch["issue_codes"] if launch and launch["issue_codes"]
+        else ([] if ready == total else ["E_NATIVE_WAVE_INCOMPLETE"])
+    )
     if (
         receipt.get("schema") != NATIVE_WAVE_RELAY_RECEIPT_SCHEMA
         or receipt.get("dispatch") != dispatch_relative
@@ -2704,10 +2751,14 @@ def _native_control_step_single(
     input_tokens: int = 0,
     provider_cost_usd: float = 0.0,
     require_relay_receipt: bool = False,
+    require_runtime: bool = False,
+    resume_relay: bool = False,
 ) -> dict[str, Any]:
     """Advance one manifest pass without asking a model to schedule or recover it."""
 
     require_control_plane_ready(work_dir)
+    if require_runtime:
+        native_runtime(work_dir, required=True)
     try:
         results_dir.resolve().relative_to(work_dir.resolve())
     except ValueError as exc:
@@ -2827,7 +2878,8 @@ def _native_control_step_single(
         ):
             try:
                 relay_receipt = _validated_native_wave_relay_receipt(
-                    work_dir, plan_fingerprint, next_wave, manifest=manifest
+                    work_dir, plan_fingerprint, next_wave, manifest=manifest,
+                    allow_runtime_repair=resume_relay,
                 )
             except ValueError as exc:
                 code = str(exc)
@@ -2842,12 +2894,36 @@ def _native_control_step_single(
                 )
             else:
                 if relay_receipt["issue_codes"]:
-                    relay_issue = "E_NATIVE_WAVE_INCOMPLETE"
+                    relay_issue = next(
+                        (code for code in relay_receipt["issue_codes"] if code in RUNTIME_ISSUES),
+                        "E_NATIVE_WAVE_INCOMPLETE",
+                    )
+                if resume_relay and relay_issue in RUNTIME_ISSUES:
+                    # Reopen the same transport after repair. Preserve all result
+                    # files, launches, successful shards, route and attempt counts.
+                    relay_receipt_path.unlink()
+                    state["unchanged_observations"] = 0
+                    ready_results = 0
+                    relay_issue = ""
         budget_issue = _native_budget_issue(
             manifest["execution_contract"], state, next_wave
         )
-        if relay_issue:
-            action = "checkpoint_and_stop"
+        awaiting_live_relay = (
+            relay_issue == "E_NATIVE_RELAY_RECEIPT_REQUIRED"
+            and relay_dispatch_path.is_file()
+            and "launch_contract" in json.loads(relay_dispatch_path.read_text(encoding="utf-8"))
+        )
+        if awaiting_live_relay:
+            if budget_issue:
+                action, issue_codes = "checkpoint_and_stop", [budget_issue]
+            elif max_root_calls is not None and state["control_steps_in_wave"] > max_root_calls:
+                action, issue_codes = "checkpoint_and_stop", ["E_NATIVE_WAVE_CONTROL_LIMIT"]
+            else:
+                # A bounded host wait is a polling interval, not a worker
+                # deadline. Only the relay's terminal seal ends this lifecycle.
+                action, issue_codes = "wait_for_active_wave", []
+        elif relay_issue:
+            action = "repair_native_runtime" if relay_issue in RUNTIME_ISSUES else "checkpoint_and_stop"
             issue_codes = [relay_issue]
         elif budget_issue and ready_results != len(tasks):
             action = "checkpoint_and_stop"
@@ -2945,6 +3021,8 @@ def _native_control_step_single(
     )
     for task in selected_tasks:
         _validate_manifest_task_file(manifest_path, manifest, task)
+    if selected_tasks and require_runtime:
+        native_runtime(work_dir, required=True)
     relay_dispatch = (
         _write_wave_relay_dispatch(
             work_dir,
@@ -2981,6 +3059,11 @@ def _native_control_step_single(
         },
         "issue_codes": issue_codes,
         "route_binding": manifest.get("route_binding"),
+        "resume_relay_command": (
+            "game-l10n native-pass-step --workspace <workspace> --manifest <manifest> "
+            "--results-dir <results-dir> --resume-relay"
+            if action == "repair_native_runtime" else None
+        ),
         "relay": (
             {
                 "dispatch": relay_dispatch,
@@ -3036,6 +3119,8 @@ def native_control_step(
     input_tokens: int = 0,
     provider_cost_usd: float = 0.0,
     require_relay_receipt: bool = False,
+    require_runtime: bool = False,
+    resume_relay: bool = False,
 ) -> dict[str, Any]:
     """Advance a pass and let the core isolate only failed review rows."""
 
@@ -3052,6 +3137,8 @@ def native_control_step(
             input_tokens=input_tokens,
             provider_cost_usd=provider_cost_usd,
             require_relay_receipt=require_relay_receipt,
+            require_runtime=require_runtime,
+            resume_relay=resume_relay,
         )
 
     root_plan_fingerprint = _native_control_plan_fingerprint(root_manifest)
@@ -3094,6 +3181,8 @@ def native_control_step(
         input_tokens=input_tokens,
         provider_cost_usd=provider_cost_usd,
         require_relay_receipt=require_relay_receipt,
+        require_runtime=require_runtime,
+        resume_relay=resume_relay,
     )
     split = current_manifest["review_split"]
     split_summary = {
@@ -3153,7 +3242,8 @@ def native_control_step(
     chain["complete"] = False
     _atomic_json(chain_path, chain)
     child_step = _native_control_step_single(
-        work_dir, child_manifest_path, child_results_dir
+        work_dir, child_manifest_path, child_results_dir,
+        require_relay_receipt=require_relay_receipt, require_runtime=require_runtime,
     )
     child_split = _load_task_manifest(work_dir, child_manifest_path)["review_split"]
     return {

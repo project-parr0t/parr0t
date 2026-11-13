@@ -84,6 +84,9 @@ from .native_translation_retry import (
     require_pre_fallback_retry_state,
     start_native_translation_retries,
 )
+from .native_runtime import (
+    bind_data_plane_launch, configure_native_runtime, native_runtime, record_native_launch,
+)
 from .native_review import (collect_native_review, collect_native_rewrite,
                             collect_reviewed_candidates, process_native_review_followup)
 from .instance_release import validate_instance_release
@@ -274,6 +277,8 @@ def _status_data_plane_task(work_dir: Path, action: str) -> dict[str, Any] | Non
         "failure_action": "seal_then_follow_status",
         "private_artifact_access": "parent_forbidden_rotate_on_access",
         "unchanged_progress_limit_scope": "native_pass_wave_only",
+        "runtime_setup_command": "game-l10n native-runtime --workspace <workspace> --host <codex|omp>",
+        "launch_record_command": "game-l10n record-native-launch --workspace <workspace> --relay <relay-path>",
     }
     if role == "context_analyzer":
         task["parallelism"] = "core_bound_disjoint_chunks_up_to_six_workers"
@@ -287,6 +292,8 @@ def _status_data_plane_task(work_dir: Path, action: str) -> dict[str, Any] | Non
     if receipt is not None and receipt.get("status") != "success":
         task["last_receipt"] = receipt
         task["continuation_required"] = True
+        if any(code.startswith("E_NATIVE_") for code in receipt.get("issue_codes", []) if isinstance(code, str)):
+            task["failure_action"] = "repair_native_runtime_then_resume_same_task"
     return task
 
 
@@ -1319,6 +1326,8 @@ def cmd_native_pass_step(args: argparse.Namespace) -> int:
         input_tokens=args.input_tokens,
         provider_cost_usd=args.provider_cost_usd,
         require_relay_receipt=True,
+        require_runtime=True,
+        resume_relay=getattr(args, "resume_relay", False),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -1358,6 +1367,7 @@ def cmd_validate_control_envelope(args: argparse.Namespace) -> int:
 def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
+    native_runtime(work_dir, required=True)
     activation = None
     if args.worker_role != "source_probe":
         activation = require_sdk_activation(work_dir, config)
@@ -1368,6 +1378,36 @@ def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
         worker_role=args.worker_role,
         config=config,
         sdk_activation=activation,
+    )
+    bind_data_plane_launch(work_dir, work_dir / result["relay_path"])
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_native_runtime(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    if args.host:
+        models = {}
+        for binding in args.model or []:
+            route, separator, model = binding.partition("=")
+            if not separator or route in models:
+                raise ValueError("E_NATIVE_RUNTIME_INVALID: repeat --model route=exact-model once per route")
+            models[route] = model
+        result = configure_native_runtime(work_dir, args.host, models)
+    else:
+        if args.model:
+            raise ValueError("E_NATIVE_RUNTIME_INVALID: model overrides require --host")
+        result = native_runtime(work_dir, required=True)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_record_native_launch(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    result = record_native_launch(
+        work_dir, _path_in_workspace(work_dir, args.relay, must_exist=True),
+        event=args.event, task=args.task, worker_id=args.worker_id,
+        model=args.model, observed_model=args.observed_model,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -3123,7 +3163,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     native_step.add_argument("--input-tokens", type=int, default=0)
     native_step.add_argument("--provider-cost-usd", type=float, default=0.0)
+    native_step.add_argument("--resume-relay", action="store_true",
+                             help="Reopen only a blocked relay after launcher repair; preserve results and attempt")
     native_step.set_defaults(func=cmd_native_pass_step)
+
+    native_host = sub.add_parser("native-runtime", help="Bind or inspect the native host and exact worker models")
+    native_host.add_argument("--workspace", required=True)
+    native_host.add_argument("--host", choices=["codex", "omp"])
+    native_host.add_argument("--model", action="append", help="Exact native-route=model-id override; repeatable")
+    native_host.set_defaults(func=cmd_native_runtime)
+
+    native_launch = sub.add_parser("record-native-launch", help="Record relay preflight or actual worker spawn metadata")
+    native_launch.add_argument("--workspace", required=True)
+    native_launch.add_argument("--relay", required=True)
+    native_launch.add_argument("--event", required=True, choices=[
+        "capability-available", "capability-unavailable", "model-unavailable", "worker-started",
+    ])
+    native_launch.add_argument("--task")
+    native_launch.add_argument("--worker-id")
+    native_launch.add_argument("--model")
+    native_launch.add_argument("--observed-model")
+    native_launch.set_defaults(func=cmd_record_native_launch)
 
     native_relay = sub.add_parser(
         "seal-native-wave-relay",
