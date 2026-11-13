@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import zipfile
 from importlib import resources
 from pathlib import Path, PurePosixPath
@@ -110,15 +111,19 @@ def _manifest_fingerprint(manifest: dict[str, Any]) -> str:
 
 
 def _safe_relative(value: str, *, field: str) -> str:
-    normalized = value.replace("\\", "/").strip("/")
-    path = PurePosixPath(normalized)
-    if not normalized or path.is_absolute() or ".." in path.parts or "." in path.parts:
+    normalized = value.replace("\\", "/")
+    parts = normalized.split("/")
+    if not normalized or any(part in {"", ".", ".."} for part in parts):
         raise SteamPackageError(f"{field} must be a safe relative path: {value!r}")
-    if ":" in normalized or any(not part for part in path.parts):
-        raise SteamPackageError(f"{field} must not contain a drive or empty component: {value!r}")
-    if any(ord(character) < 32 for character in normalized):
-        raise SteamPackageError(f"{field} must not contain control characters: {value!r}")
-    return path.as_posix()
+    if any(character in '<>:"|?*' or ord(character) < 32 for character in normalized):
+        raise SteamPackageError(f"{field} contains unsupported Windows path characters: {value!r}")
+    for part in parts:
+        device = part.split(".", 1)[0].rstrip(" ")
+        if part.endswith((".", " ")) or re.fullmatch(
+            r"CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³]", device, re.IGNORECASE
+        ):
+            raise SteamPackageError(f"{field} contains a Windows path alias or device: {value!r}")
+    return "/".join(parts)
 
 
 def _string(payload: dict[str, Any], key: str) -> str:
@@ -313,22 +318,27 @@ def _payload_files(root: Path) -> list[tuple[str, bytes]]:
         raise SteamPackageError(f"Payload directory does not exist: {root}")
     result: list[tuple[str, bytes]] = []
     seen: set[str] = set()
-    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix().casefold()):
-        if path.is_symlink():
-            raise SteamPackageError(f"Payload symlinks are not supported: {path}")
-        if not path.is_file():
-            continue
-        relative = _safe_relative(path.relative_to(root).as_posix(), field="payload path")
-        folded = relative.casefold()
-        if folded in seen:
-            raise SteamPackageError(f"Payload contains case-insensitive duplicate paths: {relative}")
-        if relative.split("/", 1)[0].casefold() in _RESERVED_ROOTS:
-            raise SteamPackageError(f"Payload path uses a reserved package name: {relative}")
-        seen.add(folded)
-        result.append((relative, path.read_bytes()))
+    pending = [root]
+    while pending:
+        for path in pending.pop().iterdir():
+            if path.is_symlink() or getattr(path.lstat(), "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                raise SteamPackageError(f"Payload symlinks and reparse points are not supported: {path}")
+            if path.is_dir():
+                pending.append(path)
+                continue
+            if not path.is_file():
+                continue
+            relative = _safe_relative(path.relative_to(root).as_posix(), field="payload path")
+            folded = relative.casefold()
+            if folded in seen:
+                raise SteamPackageError(f"Payload contains case-insensitive duplicate paths: {relative}")
+            if relative.split("/", 1)[0].casefold() in _RESERVED_ROOTS:
+                raise SteamPackageError(f"Payload path uses a reserved package name: {relative}")
+            seen.add(folded)
+            result.append((relative, path.read_bytes()))
     if not result:
         raise SteamPackageError("Payload directory contains no files")
-    return result
+    return sorted(result, key=lambda item: item[0].casefold())
 
 
 def _template(name: str) -> bytes:
@@ -559,6 +569,8 @@ def validate_steam_package(package_path: Path) -> dict[str, Any]:
             raise SteamPackageError("Package entries do not match the manifest")
         for item in files:
             relative = _safe_relative(str(item.get("path", "")), field="manifest file path")
+            if relative != item["path"] or relative.split("/", 1)[0].casefold() in _RESERVED_ROOTS:
+                raise SteamPackageError("Payload path is noncanonical or uses a reserved package name")
             data = archive.read(f"payload/{relative}")
             if len(data) != int(item.get("bytes", -1)) or _sha256(data) != item.get("sha256"):
                 raise SteamPackageError(f"Payload digest mismatch: {relative}")
