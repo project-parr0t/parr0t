@@ -15,6 +15,7 @@ from game_l10n.native_runtime import (
     bind_data_plane_launch, configure_native_runtime, native_runtime, record_native_launch,
 )
 from game_l10n.native_translation_retry import start_native_translation_retries, advance_native_translation_retries
+from game_l10n.store import stable_hash
 
 
 class NativeRuntimeTests(unittest.TestCase):
@@ -90,7 +91,12 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(sealed["issue_codes"], ["E_NATIVE_DISPATCH_UNAVAILABLE"])
         self.assertEqual(sealed["ended_tasks_recorded"], 0)
         self.assertEqual(list(self.results.glob("*.jsonl")), [])
-        self.assertEqual(self.step()["action"], "repair_native_runtime")
+        dispatch_bytes = relay.read_bytes()
+        blocked = self.step()
+        self.assertEqual(blocked["action"], "repair_native_runtime")
+        self.assertEqual(blocked["relay"]["dispatch"], relay.relative_to(self.root).as_posix())
+        self.assertEqual(blocked["relay"]["tasks"], 2)
+        self.assertEqual(relay.read_bytes(), dispatch_bytes)
         record_native_launch(self.root, relay, event="capability-available")
         resumed = self.step(resume_relay=True)
         self.assertEqual(resumed["action"], "dispatch_isolated_wave_relay")
@@ -171,6 +177,87 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertNotEqual(repaired["native_pass_output"], "retry/native-passes/run-0001")
         self.write_rows(failed, [self.row("b")])
         self.assertEqual(advance_native_translation_retries(self.root, state_dir, failed)["next_action"], "complete")
+
+    def test_new_execution_cannot_import_another_runs_errors(self) -> None:
+        options = {"max_records": 1, "max_workers": 2,
+                   "route_binding": {"provider": "native-luna", "attempt": 1}}
+        prepare_native_tasks(self.root, self.source, self.segments, self.tasks, **options)
+        first = native_control_step(self.root, self.tasks / "manifest.json", self.results, require_relay_receipt=True)
+        seal_native_wave_relay(self.root, self.root / first["relay"]["dispatch"], relay_ended=True)
+        ended = native_control_step(self.root, self.tasks / "manifest.json", self.results, require_relay_receipt=True)
+        self.assertEqual(ended["imported_wave"]["failed"], 2)
+        configure_native_runtime(self.root, "codex", {})
+        for index, route in enumerate((options["route_binding"],
+                                       {"provider": "native-luna", "attempt": 2},
+                                       {"provider": "native-sol", "attempt": 1})):
+            with self.subTest(route=route):
+                tasks, results = self.root / f"retry-{index}", self.root / f"retry-results-{index}"
+                prepare_native_tasks(self.root, self.source, self.segments, tasks,
+                                     **{**options, "route_binding": route})
+                step = native_control_step(self.root, tasks / "manifest.json", results,
+                                           require_relay_receipt=True, require_runtime=True)
+                self.assertEqual(step["action"], "dispatch_isolated_wave_relay")
+                self.assertEqual(step["counts"]["imported_tasks"], 0)
+                self.assertNotEqual(step["state"], ended["state"])
+                self.assertNotEqual(step["relay"]["dispatch"], first["relay"]["dispatch"])
+                self.assertEqual(list(results.glob("*.jsonl")), [])
+                self.assertTrue(prepare_native_tasks(self.root, self.source, self.segments, tasks,
+                                                     **{**options, "route_binding": route})["cached"])
+
+    def test_rebinding_same_directory_does_not_reuse_prior_route_receipts(self) -> None:
+        options = {"max_records": 1, "max_workers": 2,
+                   "route_binding": {"provider": "native-luna", "attempt": 1}}
+        prepare_native_tasks(self.root, self.source, self.segments, self.tasks, **options)
+        first = native_control_step(self.root, self.tasks / "manifest.json", self.results, require_relay_receipt=True)
+        seal_native_wave_relay(self.root, self.root / first["relay"]["dispatch"], relay_ended=True)
+        native_control_step(self.root, self.tasks / "manifest.json", self.results, require_relay_receipt=True)
+        original = {p.name: p.read_bytes() for p in self.results.glob("*.jsonl")}
+        options["route_binding"] = {"provider": "native-sol", "attempt": 1}
+        prepare_native_tasks(self.root, self.source, self.segments, self.tasks, **options)
+        step = native_control_step(self.root, self.tasks / "manifest.json", self.root / "sol-results", require_relay_receipt=True)
+        self.assertEqual(step["action"], "dispatch_isolated_wave_relay")
+        self.assertEqual(step["counts"]["imported_tasks"], 0)
+        self.assertEqual({p.name: p.read_bytes() for p in self.results.glob("*.jsonl")}, original)
+
+    def test_execution_namespace_is_immutable(self) -> None:
+        self.prepare()
+        path = self.tasks / "manifest.json"
+        original = path.read_text()
+        for namespace in ("another-run", None):
+            with self.subTest(namespace=namespace):
+                manifest = json.loads(original)
+                if namespace is None:
+                    manifest.pop("execution_namespace")
+                else:
+                    manifest["execution_namespace"] = namespace
+                path.write_text(json.dumps(manifest), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "E_DETAIL_CONTRACT_CONFLICT"):
+                    self.step()
+
+    def test_legacy_completed_checkpoint_remains_unchanged_and_resumable(self) -> None:
+        options = {"max_records": 1, "max_workers": 2,
+                   "route_binding": {"provider": "native-luna", "attempt": 1}}
+        prepare_native_tasks(self.root, self.source, self.segments, self.tasks, **options)
+        path = self.tasks / "manifest.json"
+        manifest = json.loads(path.read_text())
+        manifest.pop("execution_namespace")
+        manifest["contract_fingerprint"] = stable_hash({key: manifest[key] for key in (
+            "worker_contract", "detail_contract", "execution_contract", "result_contract",
+            "route_binding", "language_binding",
+        )})
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        first = native_control_step(self.root, path, self.results, require_relay_receipt=True)
+        for task, target in zip(manifest["tasks"], ("a", "b")):
+            self.write_rows(self.results / task["file"], [self.row(target)])
+        seal_native_wave_relay(self.root, self.root / first["relay"]["dispatch"], relay_ended=True)
+        ended = native_control_step(self.root, path, self.results, require_relay_receipt=True)
+        self.assertEqual(ended["imported_wave"]["success"], 2)
+        original = path.read_bytes()
+        configure_native_runtime(self.root, "codex", {})
+        self.assertTrue(prepare_native_tasks(self.root, self.source, self.segments, self.tasks, **options)["cached"])
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(self.step()["action"], "aggregate_completed_pass")
+        self.assertEqual(self.step()["counts"]["imported_tasks"], 2)
 
     def test_mixed_transport_failure_does_not_replay_already_attempted_failures(self) -> None:
         segments = [*self.segments, Segment("c", "SOURCE C")]
