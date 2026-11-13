@@ -356,11 +356,11 @@ class LocalizationOrchestrator:
         try:
             status = AgentStatus(raw.get("status"))
         except (ValueError, TypeError) as exc:
-            raise ProviderError("Translator returned an unknown status") from exc
+            raise ProviderFailure("malformed_response", retryable=True, usage=LocalizationOrchestrator._usage(raw)) from exc
         text = raw.get("text", "")
         reason = raw.get("reason", "")
         if not isinstance(text, str) or not isinstance(reason, str):
-            raise ProviderError("Translator response fields have invalid types")
+            raise ProviderFailure("malformed_response", retryable=True, usage=LocalizationOrchestrator._usage(raw))
         return AgentEnvelope(status=status, text=text, reason=reason, raw=raw)
 
     @staticmethod
@@ -368,13 +368,13 @@ class LocalizationOrchestrator:
         try:
             decision = ReviewDecision(raw.get("decision"))
         except (ValueError, TypeError) as exc:
-            raise ProviderError("Reviewer returned an unknown decision") from exc
+            raise ProviderFailure("malformed_response", retryable=True, usage=LocalizationOrchestrator._usage(raw)) from exc
         issues = raw.get("issues", [])
         text = raw.get("text", "")
         if not isinstance(issues, list) or not all(isinstance(item, str) for item in issues):
-            raise ProviderError("Reviewer issues must be a list of strings")
+            raise ProviderFailure("malformed_response", retryable=True, usage=LocalizationOrchestrator._usage(raw))
         if not isinstance(text, str):
-            raise ProviderError("Reviewer text must be a string")
+            raise ProviderFailure("malformed_response", retryable=True, usage=LocalizationOrchestrator._usage(raw))
         return ReviewEnvelope(
             decision=decision,
             text=text,
@@ -405,16 +405,16 @@ class LocalizationOrchestrator:
         try:
             verdict = ReviewVerdict(raw.get("verdict"))
         except (ValueError, TypeError) as exc:
-            raise ProviderError("Reviewer returned an unknown compact verdict") from exc
+            raise ProviderFailure("malformed_response", retryable=True, usage=LocalizationOrchestrator._usage(raw)) from exc
         issues = raw.get("issues", [])
         if not isinstance(issues, list) or not all(isinstance(item, str) for item in issues):
-            raise ProviderError("Reviewer issue codes must be a list of strings")
+            raise ProviderFailure("malformed_response", retryable=True, usage=LocalizationOrchestrator._usage(raw))
         if len(issues) > 4 or any(item not in REVIEW_ISSUE_CODES for item in issues):
-            raise ProviderError("Reviewer returned invalid compact issue codes")
+            raise ProviderFailure("malformed_response", retryable=True, usage=LocalizationOrchestrator._usage(raw))
         if verdict is ReviewVerdict.REWRITE and not issues:
-            raise ProviderError("Rewrite verdict requires at least one issue code")
+            raise ProviderFailure("malformed_response", retryable=True, usage=LocalizationOrchestrator._usage(raw))
         if verdict is not ReviewVerdict.REWRITE and issues:
-            raise ProviderError("Only rewrite verdicts may include issue codes")
+            raise ProviderFailure("malformed_response", retryable=True, usage=LocalizationOrchestrator._usage(raw))
         return ReviewVerdictEnvelope(verdict=verdict, issues=issues, raw=raw)
 
     @staticmethod
@@ -425,7 +425,7 @@ class LocalizationOrchestrator:
         return {
             str(key): int(value)
             for key, value in usage.items()
-            if isinstance(value, int) and value >= 0
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
         }
 
     @staticmethod
