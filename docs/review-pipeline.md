@@ -43,7 +43,7 @@ This is selective **strong** review, not selective review coverage. Every new or
 
 `routing.review_max_rounds` bounds judge/rewrite cycles. The recommended value is `2`: one initial judgment and one confirmation after at most one rewrite. Increase it only when representative evaluations show that another correction cycle improves accepted quality enough to justify the extra calls.
 
-After a complete review pass, freeze the flagged target set. If no more than `execution.residual_direct_records` remain, process them as one cached residual task in one fresh no-history worker, then aggregate once. Do not create a new controller, ownership/lease layer, proof bundle, or supplemental context workflow for the tail, and never reopen already approved candidates. A capacity failure preserves the exact residual task for resumption instead of restarting the control turn.
+After a complete review pass, freeze the flagged target set. If no more than `execution.residual_direct_records` remain, process them as one cached residual task through its isolated relay and one fresh no-history semantic worker, then aggregate once. The residual size does not waive the relay boundary. Do not create a new controller, ownership/lease layer, proof bundle, or supplemental context workflow for the tail, and never reopen already approved candidates. A capacity failure preserves the exact residual task for resumption instead of restarting the control turn.
 
 Once the final verdict is imported, review is over. Package construction, README/release metadata, and deterministic integrity checks must not spawn another reviewer or request semantic reassurance. A finalization defect reopens only the exact failed deterministic gate unless it changes candidate text.
 

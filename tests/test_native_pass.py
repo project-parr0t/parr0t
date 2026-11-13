@@ -182,7 +182,8 @@ class NativePassTests(unittest.TestCase):
             stopped = native_control_step(
                 root, tasks / "manifest.json", results, require_relay_receipt=True,
             )
-            self.assertEqual(stopped["issue_codes"], ["E_NATIVE_RELAY_RECEIPT_REQUIRED"])
+            self.assertEqual(stopped["action"], "wait_for_active_wave")
+            self.assertEqual(stopped["issue_codes"], [])
             self.assertEqual(result.read_bytes(), original)
             self.assertFalse(list(results.glob("*.ended-original-*")))
 
@@ -2029,9 +2030,9 @@ class NativePassTests(unittest.TestCase):
                 require_relay_receipt=True,
             )
 
-        self.assertEqual(
-            blocked["issue_codes"], ["E_NATIVE_RELAY_RECEIPT_REQUIRED"]
-        )
+        self.assertEqual(blocked["action"], "wait_for_active_wave")
+        self.assertEqual(blocked["issue_codes"], [])
+        self.assertEqual(blocked["counts"]["imported_tasks"], 0)
         self.assertEqual(resumed["action"], "aggregate_completed_pass")
 
     def test_native_control_step_stops_repeated_unchanged_observation(self) -> None:
