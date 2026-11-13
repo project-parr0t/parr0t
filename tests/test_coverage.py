@@ -17,7 +17,7 @@ from game_l10n.coverage import (
 from game_l10n.cli import _finalize_translation_results
 from game_l10n.errors import ConfigurationError
 from game_l10n.failure_queue import load_failure_queue, update_failure_queue
-from game_l10n.models import AttemptRecord, Segment, TranslationResult
+from game_l10n.models import AttemptRecord, FailureCode, Segment, TranslationResult
 from game_l10n.store import stable_hash
 
 
@@ -575,6 +575,65 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(state["terminal_count"], 1)
         self.assertFalse(
             loaded["terminal_entries"][0]["retryable_on_user_resume"]
+        )
+
+    def test_integrity_source_preservation_keeps_terminal_provenance(self) -> None:
+        segment = Segment("synthetic-integrity", "SOURCE_INTEGRITY")
+        result = TranslationResult(
+            segment_id=segment.id,
+            source=segment.source,
+            text=segment.source,
+            status="source_preserved",
+            resolution_code=FailureCode.INTEGRITY_INVALID.value,
+            attempts=[
+                AttemptRecord(
+                    stage="translate",
+                    provider="synthetic-provider",
+                    status="error",
+                    issue_code=FailureCode.TIMEOUT.value,
+                ),
+                AttemptRecord(
+                    stage="delivery-integrity",
+                    provider="core",
+                    status="rejected",
+                    issue_code=FailureCode.INTEGRITY_INVALID.value,
+                ),
+            ],
+        )
+        completion = completion_attestation(
+            [segment],
+            [result],
+            inventory_segments=[segment],
+            inventory={
+                "status": "static_verified",
+                "static_complete": True,
+                "primary_segments": 1,
+                "primary_fingerprint": "synthetic-fingerprint",
+            },
+            runtime={"runtime_complete": False, "issue_codes": []},
+            review_required=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            queue = update_failure_queue(
+                Path(directory),
+                [segment],
+                [result],
+                inventory_fingerprint="synthetic-fingerprint",
+            )
+
+        self.assertIn(
+            "SOURCE_PRESERVED_AFTER_INTEGRITY_REJECTION",
+            completion["issue_codes"],
+        )
+        self.assertNotIn(
+            "SOURCE_PRESERVED_AFTER_ROUTE_EXHAUSTION",
+            completion["issue_codes"],
+        )
+        self.assertEqual(queue["operational_count"], 0)
+        self.assertEqual(queue["terminal_entries"][0]["category"], "integrity")
+        self.assertEqual(
+            queue["terminal_entries"][0]["failure_codes"],
+            [FailureCode.INTEGRITY_INVALID.value, FailureCode.TIMEOUT.value],
         )
 
     def test_completion_rejects_reviewed_output_in_the_wrong_language(self) -> None:
