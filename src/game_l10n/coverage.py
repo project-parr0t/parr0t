@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .errors import ConfigurationError
-from .models import Segment, TranslationResult
+from .models import FailureCode, Segment, TranslationResult
 from .review_selection import target_language_review_reasons
 from .store import stable_hash
 
@@ -835,6 +835,16 @@ def completion_attestation(
             reviewed.append(item)
     reused = [item for item in rows if item.metadata.get("candidate_origin") == "existing"]
     source_preserved = [item for item in rows if item.status == "source_preserved"]
+    integrity_preserved = [
+        item
+        for item in source_preserved
+        if item.resolution_code == FailureCode.INTEGRITY_INVALID.value
+    ]
+    route_preserved = [
+        item
+        for item in source_preserved
+        if item.resolution_code != FailureCode.INTEGRITY_INVALID.value
+    ]
     accepted_unreviewed = [item for item in rows if item.status == "accepted_unreviewed"]
     failed = [item for item in rows if item.status == "failed"]
     target_language_mismatches = [
@@ -875,8 +885,10 @@ def completion_attestation(
         issue_codes.append("SEMANTIC_REVIEW_INCOMPLETE")
     if not full_inventory_scope:
         issue_codes.append("PARTIAL_TRANSLATION_SCOPE")
-    if source_preserved:
+    if route_preserved:
         issue_codes.append("SOURCE_PRESERVED_AFTER_ROUTE_EXHAUSTION")
+    if integrity_preserved:
+        issue_codes.append("SOURCE_PRESERVED_AFTER_INTEGRITY_REJECTION")
     if accepted_unreviewed:
         issue_codes.append("USER_ACCEPTED_UNREVIEWED_AFTER_ROUTE_EXHAUSTION")
     if target_language_mismatches:

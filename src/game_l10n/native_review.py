@@ -17,7 +17,14 @@ from typing import Any, Callable
 from .control_plane import require_control_plane_ready
 from .coverage import require_inventory_attestation
 from .formats import read_segments, read_translation_results, write_results
-from .models import AgentStatus, AttemptRecord, ReviewVerdict, Segment, TranslationResult
+from .models import (
+    AgentStatus,
+    AttemptRecord,
+    FailureCode,
+    ReviewVerdict,
+    Segment,
+    TranslationResult,
+)
 from .native_followup import CANDIDATE_METADATA_KEY, _atomic_json, _atomic_jsonl, _read_jsonl
 from .native_pass import _load_task_manifest, _require_candidate_bindings, merge_native_pass
 from .orchestrator import LocalizationOrchestrator
@@ -90,14 +97,13 @@ def materialize_delivery_candidates(
     extra_patterns: list[str] | None = None, max_length_ratio: float = 4.0,
     target_language: str = "",
 ) -> dict[str, Any]:
-    """Copy explicitly requested candidates for delivery without approving them.
+    """Materialize explicit delivery decisions without approving candidates.
 
     Original review results, failure queues, generations and attempts are never
-    changed. Missing targets must exactly match the declared translation queue.
+    changed. Pending candidates are included only with explicit authorization;
+    exhausted or deterministically unsafe targets preserve their exact source.
     """
     require_control_plane_ready(work_dir)
-    if not include_unreviewed:
-        raise ValueError("E_DELIVERY_UNREVIEWED_AUTHORIZATION_REQUIRED")
     work_dir = work_dir.resolve()
     paths = [source, approved, translation_failures, output, *pending]
     if report is not None:
@@ -116,6 +122,7 @@ def materialize_delivery_candidates(
     segments = read_segments(source)
     by_id = {s.id: s for s in segments}
     results = {}
+    pending_results: dict[str, TranslationResult] = {}
     for result in read_translation_results(approved):
         original = by_id.get(result.segment_id)
         if (original is None or result.segment_id in results or result.source != original.source
@@ -132,7 +139,12 @@ def materialize_delivery_candidates(
         _require_candidate_bindings(candidates, "rewrite")
         for segment in candidates:
             original = by_id.get(segment.id)
-            if original is None or segment.id in results or segment.source != original.source:
+            if (
+                original is None
+                or segment.id in results
+                or segment.id in pending_results
+                or segment.source != original.source
+            ):
                 raise ValueError("E_DELIVERY_CANDIDATE_SET_INVALID")
             result = _bound_result(segment)
             if not result.text.strip() or result.candidate_digest != stable_hash(result.text):
@@ -142,11 +154,14 @@ def materialize_delivery_candidates(
             result.review_outcome = "unresolved"
             result.metadata["delivery_review_status"] = "not_approved"
             result.metadata["delivery_inclusion_authority"] = "user"
-            results[segment.id] = result
+            pending_results[segment.id] = result
+    if include_unreviewed:
+        results.update(pending_results)
+    covered_ids = set(results) | set(pending_results)
     failures = read_segments(translation_failures)
     failure_ids = {s.id for s in failures}
     if (len(failure_ids) != len(failures)
-            or failure_ids != set(by_id) - set(results)
+            or failure_ids != set(by_id) - covered_ids
             or any(s.source != by_id[s.id].source for s in failures)):
         raise ValueError("E_DELIVERY_TRANSLATION_QUEUE_MISMATCH")
 
@@ -178,6 +193,50 @@ def materialize_delivery_candidates(
         integrity_rejections.append({"target_id": segment.id, "issue_codes": codes})
         for code in codes:
             issue_counts[code] = issue_counts.get(code, 0) + 1
+        preserved = replace(result)
+        preserved.text = segment.source
+        preserved.status = "source_preserved"
+        preserved.candidate_digest = stable_hash(segment.source)
+        preserved.review_outcome = "unresolved"
+        preserved.acceptance_authority = "integrity_gate"
+        preserved.resolution_code = FailureCode.INTEGRITY_INVALID.value
+        preserved.metadata = {
+            **result.metadata,
+            "delivery_review_status": "source_preserved",
+            "integrity_issue_codes": codes,
+        }
+        preserved.attempts = [
+            *result.attempts,
+            AttemptRecord(
+                stage="delivery-integrity",
+                provider="core",
+                status="rejected",
+                issues=codes,
+                issue_code=FailureCode.INTEGRITY_INVALID.value,
+                candidate_generation=result.candidate_generation,
+            ),
+        ]
+        safe_results[segment.id] = preserved
+
+    for segment in failures:
+        safe_results[segment.id] = TranslationResult(
+            segment_id=segment.id,
+            source=segment.source,
+            text=segment.source,
+            status="source_preserved",
+            candidate_digest=stable_hash(segment.source),
+            review_outcome="unresolved",
+            acceptance_authority="route_exhaustion",
+            resolution_code=FailureCode.SOURCE_PRESERVED.value,
+            metadata={
+                **{
+                    key: value
+                    for key, value in segment.metadata.items()
+                    if key not in {CANDIDATE_METADATA_KEY, REVIEW_STATE_KEY}
+                },
+                "delivery_review_status": "source_preserved",
+            },
+        )
 
     ordered = [safe_results[s.id] for s in segments if s.id in safe_results]
     reviewed_included = sum(result.status == "reviewed" for result in ordered)
@@ -191,7 +250,9 @@ def materialize_delivery_candidates(
         ),
         "translation_failed": len(failures),
         "integrity_rejected": len(integrity_rejections),
-        "source_preserved_total": len(failures) + len(integrity_rejections),
+        "source_preserved_total": sum(
+            result.status == "source_preserved" for result in ordered
+        ),
         "integrity_issue_counts": dict(sorted(issue_counts.items())),
         "integrity_rejections": integrity_rejections,
     }
