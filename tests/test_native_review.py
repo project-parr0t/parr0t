@@ -16,7 +16,7 @@ from tests.test_native_pass import review_segment
 
 
 class NativeReviewTests(unittest.TestCase):
-    def test_delivery_includes_unreviewed_without_promoting_it_and_only_omits_failures(self):
+    def test_delivery_preserves_failures_and_only_includes_pending_when_authorized(self):
         from game_l10n.models import AttemptRecord, TranslationResult
         from game_l10n.formats import write_results
         from game_l10n.native_review import (_bound_result, _pending_segment,
@@ -35,13 +35,39 @@ class NativeReviewTests(unittest.TestCase):
             pending.attempts = [AttemptRecord("review", "native-sol", "rewrite", candidate_generation=1)]
             (root / "pending.jsonl").write_text(json.dumps(asdict(_pending_segment(segments[1], pending)))+"\n")
             (root / "failures.jsonl").write_text(json.dumps(asdict(segments[2]))+"\n")
-            args = (root, source, root / "approved.json", [root / "pending.jsonl"],
-                    root / "failures.jsonl", root / "delivery.json")
+            default_args = (
+                root, source, root / "approved.json", [root / "pending.jsonl"],
+                root / "failures.jsonl", root / "delivery-default.json",
+            )
+            authorized_args = (
+                root, source, root / "approved.json", [root / "pending.jsonl"],
+                root / "failures.jsonl", root / "delivery-authorized.json",
+            )
             with patch("game_l10n.native_review.require_inventory_attestation"):
-                with self.assertRaisesRegex(ValueError, "AUTHORIZATION_REQUIRED"):
-                    materialize_delivery_candidates(*args)
-                summary = materialize_delivery_candidates(*args, include_unreviewed=True)
-                cached = materialize_delivery_candidates(*args, include_unreviewed=True)
+                default_summary = materialize_delivery_candidates(*default_args)
+                summary = materialize_delivery_candidates(
+                    *authorized_args, include_unreviewed=True
+                )
+                cached = materialize_delivery_candidates(
+                    *authorized_args, include_unreviewed=True
+                )
+            self.assertEqual(
+                (
+                    default_summary["included"],
+                    default_summary["reviewed"],
+                    default_summary["included_unreviewed"],
+                    default_summary["translation_failed"],
+                    default_summary["source_preserved_total"],
+                ),
+                (2, 1, 0, 1, 1),
+            )
+            default_rows = read_translation_results(root / "delivery-default.json")
+            self.assertEqual(
+                [row.status for row in default_rows],
+                ["reviewed", "source_preserved"],
+            )
+            self.assertEqual(default_rows[1].text, default_rows[1].source)
+            self.assertEqual(default_rows[1].acceptance_authority, "route_exhaustion")
             self.assertEqual(
                 (
                     summary["reviewed"],
@@ -53,12 +79,17 @@ class NativeReviewTests(unittest.TestCase):
             )
             self.assertFalse(summary["cached"])
             self.assertTrue(cached["cached"])
-            rows = read_translation_results(root / "delivery.json")
-            self.assertEqual([r.status for r in rows], ["reviewed", "accepted_unreviewed"])
+            rows = read_translation_results(root / "delivery-authorized.json")
+            self.assertEqual(
+                [row.status for row in rows],
+                ["reviewed", "accepted_unreviewed", "source_preserved"],
+            )
             self.assertEqual(rows[1].attempts[-1].status, "rewrite")
             self.assertEqual(rows[1].acceptance_authority, "user")
             self.assertEqual(rows[1].candidate_generation, 1)
             self.assertEqual(rows[1].metadata["delivery_review_status"], "not_approved")
+            self.assertEqual(rows[2].text, rows[2].source)
+            self.assertEqual(rows[2].resolution_code, "source_preserved")
             (root / "wrong.jsonl").write_text("")
             with patch("game_l10n.native_review.require_inventory_attestation"):
                 with self.assertRaisesRegex(ValueError, "QUEUE_MISMATCH"):
@@ -69,6 +100,7 @@ class NativeReviewTests(unittest.TestCase):
 
     def test_delivery_source_preserves_generic_integrity_rejections(self):
         from game_l10n.formats import write_results
+        from game_l10n.models import AttemptRecord, FailureCode
         from game_l10n.native_review import (
             _bound_result,
             _pending_segment,
@@ -86,6 +118,11 @@ class NativeReviewTests(unittest.TestCase):
             source.write_text(json.dumps(asdict(segment)) + "\n", encoding="utf-8")
             write_results(root / "approved.json", [])
             pending = _bound_result(segment)
+            pending.attempts = [
+                AttemptRecord(
+                    "review", "native-sol", "rewrite", candidate_generation=1
+                )
+            ]
             (root / "pending.jsonl").write_text(
                 json.dumps(asdict(_pending_segment(segment, pending))) + "\n",
                 encoding="utf-8",
@@ -104,10 +141,21 @@ class NativeReviewTests(unittest.TestCase):
                     report=root / "delivery-report.json",
                 )
 
-            self.assertEqual(summary["included"], 0)
+            self.assertEqual(summary["included"], 1)
             self.assertEqual(summary["integrity_rejected"], 1)
             self.assertEqual(summary["source_preserved_total"], 1)
-            self.assertEqual(read_translation_results(root / "delivery.json"), [])
+            preserved = read_translation_results(root / "delivery.json")
+            self.assertEqual([row.status for row in preserved], ["source_preserved"])
+            self.assertEqual(preserved[0].text, preserved[0].source)
+            self.assertEqual(preserved[0].acceptance_authority, "integrity_gate")
+            self.assertEqual(
+                preserved[0].resolution_code, FailureCode.INTEGRITY_INVALID.value
+            )
+            self.assertEqual(preserved[0].attempts[0].stage, "review")
+            self.assertEqual(
+                preserved[0].attempts[-1].issue_code,
+                FailureCode.INTEGRITY_INVALID.value,
+            )
             report = json.loads((root / "delivery-report.json").read_text())
             self.assertEqual(report["integrity_rejections"][0]["target_id"], "unsafe")
             self.assertTrue(report["integrity_rejections"][0]["issue_codes"])
