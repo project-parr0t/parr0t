@@ -584,6 +584,7 @@ class SteamPackageTests(unittest.TestCase):
                     command,
                     text=True,
                     encoding="utf-8",
+                    errors="replace",
                     capture_output=True,
                     check=False,
                 )
@@ -603,6 +604,7 @@ class SteamPackageTests(unittest.TestCase):
                     input=answers,
                     text=True,
                     encoding="utf-8",
+                    errors="replace",
                     capture_output=True,
                     check=False,
                 )
