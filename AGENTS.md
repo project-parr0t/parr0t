@@ -1,13 +1,13 @@
 # AGENTS.md — Parr0t repository
 
-Parr0t is engine-neutral. Keep all game, credential, title, and job data in an external workspace.
+Parr0t is engine-neutral. Keep game, credential, title, and job data in external workspaces.
 
 ## Read order
 
 1. Read this file before accessing game-root contents; path existence may be checked only for workspace initialization.
 2. Read `docs/agent-usage.md`, initialize or resume the workspace without content inspection, then read its `AGENTS.md`.
 3. Run `game-l10n status --workspace <workspace>`. For `establish_text_free_control_plane`, read its contracts and run `game-l10n enter-control-plane --workspace <workspace> --contracts-read --source-unopened` before other work.
-4. Resolve each `required_contracts` entry against `contract_base`; read only those contracts. For other user-requested routes, use the table.
+4. Resolve each `required_contracts` entry against `contract_base`; read only those contracts. For other routes, use the table.
 
 Only `local_patch_ready` is terminal; it requires static completion and an unchanged packed artifact bound to its attestation.
 
@@ -23,7 +23,7 @@ Only `local_patch_ready` is terminal; it requires static completion and an uncha
 8. **Keep source and runtime immutable by default.** Build in the workspace. Inspection or testing never authorizes install, update, restore/remove, launch, cleanup, or execution. Each runtime action needs explicit `docs/runtime-approval.md` approval.
 9. **Select and activate before implementing.** Follow `docs/sdk-selection.md`. Bind exact matches only to an inventoried Git checkout/worktree or authenticated snapshot with matching full-content fingerprint. Game-workspace Git choice is unrelated. Other identities are `derive-new`; pass-through tools are not adapters and `main` stays engine-neutral.
 10. **Publication is dormant.** Do not propose, prepare, mention, commit, push, tag, publish, deploy, or create a release unless the user first requests that exact external action. SDK promotion requires confirmed patch success. Its engine-only commit must not touch `main` paths; check paths with `game-l10n verify-sdk-promotion --working-tree`, pin its base, and verify the final commit before packaging. Per-game publication requires `docs/instance-release.md` and its release gate.
-11. **Keep review control deterministic.** Only `native-pass-step` advances waves; relay termination runs `--relay-ended`. Translation/rewrite uses one batch. Review starts at 256/65,536 within structural ceilings of 2,048/262,144. One call/worker. Core locks successes and emits smaller failed-only manifests; no model controllers or worker delegation. V7 workers never read full source; root sees metadata only.
+11. **Keep review control deterministic.** Bind `native-runtime --host codex|omp`; relays preflight dispatch/models and record explicit-model starts with `record-native-launch`. Unstarted work retains its attempt. Only `native-pass-step` advances waves; relay termination runs `--relay-ended`. Translation/rewrite uses one batch. Review starts at 256/65,536 within ceilings of 2,048/262,144. Core locks successes and emits smaller failed-only manifests; no model controllers or worker delegation. V7 workers never read full source; root sees metadata only.
 12. **Keep provider mode fixed.** A selected preset defines the authorized providers and roles. A key does not change mode or promote a fallback. Native App workers and API providers are distinct; never emulate a native worker with another Codex process or silently replace the locked route.
 13. **Bind every write to the current work lane.** Before writing, bind the turn to game, supervision, core, or SDK work and resolve its checkout and branch anew. Supervision and inspection stay read-only unless the current request names the mutation. Never inherit another lane's checkout or push plan; reject outgoing commits unrelated to the current request.
 14. **Start large jobs linearly.** At 10,000+ records, scan once per method, reconcile cached outputs, and continue reported gaps. Never repeat full scans or create per-record startup artifacts.
@@ -33,7 +33,7 @@ Only `local_patch_ready` is terminal; it requires static completion and an uncha
 ## Standard job sequence
 
 1. Initialize against the unopened, read-only game root; establish entry and record the user's game-workspace Git choice. Never infer it or apply it to SDK acquisition/activation.
-2. Follow status through discovery, SDK activation, inventories, and context; prepare, dispatch, and seal its `data_plane_task`. Context uses only bound claim/commit/finalize commands. Start every listed v4 slot before any ends and record slot/finalizer lifecycle; zero slots means finalizer only. No implicit timeout. Shrink chunks only after a no-progress cycle. Sealed failures and unchanged limits never terminate the job.
+2. Follow status through discovery, SDK activation, inventories, and context via its `data_plane_task`. Use bound claim/commit/finalize commands. Start all v4 slots before any ends; record slot/finalizer lifecycle. Zero slots means finalizer only. No implicit timeout. Shrink chunks only after a no-progress cycle. Sealed failures/unchanged limits never terminate the job.
 3. Translate through failed-only Luna retries, Sol retries, then external fallback. Lock successes. Run compact triage, selective strong review, flagged rewrite, and review fallback. Queue operational failures; blocking failures hold the patch.
 4. Build and verify a recoverable workspace patch without mutating or launching the game. Report states, counts, paths, queues, and next decision.
 
