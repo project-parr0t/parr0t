@@ -25,6 +25,7 @@ from .steam import (
     README_NAME,
     STATUS_FILE_NAME,
     SteamPackageError,
+    _RESERVED_ROOTS,
     _custom_errors,
     _payload_files,
     _replace_files,
@@ -344,6 +345,8 @@ def validate_filesystem_package(package_path: Path) -> dict[str, Any]:
         for item in files:
             relative = _safe_relative(str(item.get("path", "")), field="manifest file path")
             data = archive.read(f"payload/{relative}")
+            if relative != item["path"] or relative.split("/", 1)[0].casefold() in _RESERVED_ROOTS:
+                raise SteamPackageError("Payload path is noncanonical or uses a reserved package name")
             if len(data) != int(item.get("bytes", -1)) or _sha256(data) != item.get("sha256"):
                 raise SteamPackageError(f"Payload digest mismatch: {relative}")
     return {

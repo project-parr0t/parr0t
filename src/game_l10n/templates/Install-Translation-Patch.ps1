@@ -16,6 +16,7 @@ $PayloadRoot = Join-Path $PackageRoot "payload"
 $script:InteractiveRun = $Mode -eq "Menu"
 $script:MutationStarted = $false
 $script:PatchManifest = $null
+$script:TemporaryFiles = [Collections.Generic.List[string]]::new()
 
 function Write-PatchStatus([string]$Label, [string]$Message, [ConsoleColor]$Color = [ConsoleColor]::Gray) {
     Write-Host ("[{0}] {1}" -f $Label, $Message) -ForegroundColor $Color
@@ -139,12 +140,30 @@ function Read-PatchManifest {
 }
 
 function Get-SafeTarget([string]$Root, [string]$Relative) {
+    $normalized = $Relative.Replace('\', '/')
+    $parts = $normalized.Split('/')
+    foreach ($part in $parts) {
+        if ([string]::IsNullOrEmpty($part) -or $part -in @('.', '..') -or
+            $part -match '[<>:"|?*\x00-\x1f]' -or $part -match '[. ]$' -or
+            $part.Split('.')[0].TrimEnd(' ') -match '^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])$') {
+            throw "E_UNSAFE_PATH"
+        }
+    }
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
     $relativeNative = $Relative.Replace('/', [IO.Path]::DirectorySeparatorChar)
     $candidate = [IO.Path]::GetFullPath([IO.Path]::Combine($rootFull, $relativeNative))
     $prefix = $rootFull + [IO.Path]::DirectorySeparatorChar
     if (-not $candidate.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
         throw "E_UNSAFE_PATH"
+    }
+    # Existing child junctions/symlinks must not redirect reads or writes out of the owned tree.
+    $current = $rootFull
+    foreach ($part in $parts) {
+        $current = [IO.Path]::Combine($current, $part)
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+        if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "E_UNSAFE_PATH"
+        }
     }
     return $candidate
 }
@@ -294,13 +313,12 @@ function Resolve-GameRoot($Manifest) {
 }
 
 function Get-ReceiptPath([string]$Root, $Manifest) {
-    $stateRoot = Join-Path $Root ".parr0t"
-    return Join-Path $stateRoot ("{0}.json" -f $Manifest.patch_id)
+    return Get-SafeTarget $Root (".parr0t/{0}.json" -f $Manifest.patch_id)
 }
 
 function Get-StatusPath([string]$Root, $Manifest) {
     if ([string]$Manifest.installer.status_file -cne "parr0t-patch-status.txt") { throw "E_STATUS_INVALID" }
-    return Join-Path $Root "parr0t-patch-status.txt"
+    return Get-SafeTarget $Root "parr0t-patch-status.txt"
 }
 
 function Read-PatchStatus([string]$Root, $Manifest) {
@@ -328,9 +346,19 @@ function Read-PatchStatus([string]$Root, $Manifest) {
     }
 }
 
+function New-PatchTemporaryFile([string]$Destination) {
+    $parent = [IO.Path]::GetDirectoryName($Destination)
+    $temporary = [IO.Path]::Combine($parent, [IO.Path]::GetRandomFileName())
+    # CreateNew atomically reserves our own sibling; never overwrite a pre-existing file or link.
+    $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $stream.Dispose()
+    $script:TemporaryFiles.Add($temporary)
+    return $temporary
+}
+
 function Write-PatchState([string]$Root, $Manifest) {
     $statusPath = Get-StatusPath $Root $Manifest
-    $temporary = "$statusPath.tmp"
+    $temporary = New-PatchTemporaryFile $statusPath
     @(
         "contract=parr0t.patch-status/v1"
         "patch_id=$($Manifest.patch_id)"
@@ -451,7 +479,7 @@ function Use-RuntimeApproval([string]$Root, $Manifest, [string]$Action) {
     if ($expires -le [DateTimeOffset]::UtcNow) { throw "E_RUNTIME_APPROVAL_EXPIRED" }
 
     $approval.consumed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
-    $temporary = "$approvalPath.tmp"
+    $temporary = New-PatchTemporaryFile $approvalPath
     $approval | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporary -Encoding UTF8
     Move-Item -LiteralPath $temporary -Destination $approvalPath -Force
 }
@@ -582,7 +610,7 @@ function Install-Patch([string]$Root, $Manifest) {
                 $target = Get-SafeTarget $Root $replacement.path
                 $backup = Get-SafeTarget $Root $replacement.backup_path
                 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backup) | Out-Null
-                $temporaryBackup = "$backup.parr0t-new"
+                $temporaryBackup = New-PatchTemporaryFile $backup
                 Copy-Item -LiteralPath $target -Destination $temporaryBackup
                 Move-Item -LiteralPath $temporaryBackup -Destination $backup
                 $originals.Add([ordered]@{
@@ -598,7 +626,7 @@ function Install-Patch([string]$Root, $Manifest) {
             $target = Get-SafeTarget $Root $file.path
             $parent = Split-Path -Parent $target
             New-Item -ItemType Directory -Force -Path $parent | Out-Null
-            $temporary = "$target.parr0t-new"
+            $temporary = New-PatchTemporaryFile $target
             Copy-Item -LiteralPath $source -Destination $temporary -Force
             Move-Item -LiteralPath $temporary -Destination $target -Force
             $written.Add($target)
@@ -612,7 +640,7 @@ function Install-Patch([string]$Root, $Manifest) {
             files = @($Manifest.files)
             originals = @($originals)
         }
-        $temporaryReceipt = "$receiptPath.tmp"
+        $temporaryReceipt = New-PatchTemporaryFile $receiptPath
         $receipt | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporaryReceipt -Encoding UTF8
         if (Test-Path -LiteralPath $receiptPath -PathType Leaf) { Remove-Item -LiteralPath $receiptPath -Force }
         Move-Item -LiteralPath $temporaryReceipt -Destination $receiptPath -Force
@@ -658,7 +686,7 @@ function Restore-Patch([string]$Root, $Manifest) {
         if ($originalMap.ContainsKey([string]$file.path)) {
             $original = $originalMap[[string]$file.path]
             $backup = Get-SafeTarget $Root $original.backup_path
-            $temporary = "$target.parr0t-restore"
+            $temporary = New-PatchTemporaryFile $target
             Copy-Item -LiteralPath $backup -Destination $temporary -Force
             Move-Item -LiteralPath $temporary -Destination $target -Force
             Remove-Item -LiteralPath $backup -Force
@@ -709,4 +737,9 @@ try {
 } catch {
     Show-PublicFailure $_
     exit 1
+} finally {
+    foreach ($temporary in $script:TemporaryFiles) {
+        # Only paths atomically reserved by this run are eligible for cleanup.
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    }
 }
