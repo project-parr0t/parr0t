@@ -40,6 +40,12 @@ def _failure_category(result: TranslationResult) -> tuple[str, list[str]]:
             if item.issue_code
         }
     )
+    terminal_integrity_codes = {
+        FailureCode.INTEGRITY_INVALID.value,
+        FailureCode.CONSTRAINT_UNSATISFIABLE.value,
+    }
+    if result.resolution_code in terminal_integrity_codes:
+        return "integrity", sorted({*codes, result.resolution_code})
     if any(code in OPERATIONAL_FAILURE_CODES for code in codes):
         return "operational", codes
     if any(item.status == "refused" for item in result.attempts):

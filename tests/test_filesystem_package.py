@@ -10,8 +10,15 @@ import zipfile
 from pathlib import Path
 
 from game_l10n.filesystem_package import SCHEMA, build_filesystem_package, validate_filesystem_package
-from game_l10n.release_checkpoint import CHECKPOINT_SCHEMA
-from game_l10n.steam import MANIFEST_NAME, STATUS_FILE_NAME
+from game_l10n.release_checkpoint import CHECKPOINT_NAME, CHECKPOINT_SCHEMA
+from game_l10n.steam import (
+    INSTALLER_BAT,
+    INSTALLER_PS1,
+    MANIFEST_NAME,
+    README_NAME,
+    STATUS_FILE_NAME,
+    SteamPackageError,
+)
 
 
 def _digest(value: str) -> str:
@@ -152,6 +159,7 @@ class FilesystemPackageTests(unittest.TestCase):
                         input=answers,
                         text=True,
                         encoding="utf-8",
+                        errors="replace",
                         capture_output=True,
                         check=False,
                     )
@@ -190,6 +198,30 @@ class FilesystemPackageTests(unittest.TestCase):
                 self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
                 self.assertFalse((game / "localization.dat").exists())
 
+
+    def test_missing_fixed_contract_error_lists_every_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "incomplete.zip"
+            with zipfile.ZipFile(package, "w") as archive:
+                archive.writestr("payload/localization.dat", b"fixture")
+
+            required = sorted(
+                {
+                    INSTALLER_BAT,
+                    INSTALLER_PS1,
+                    MANIFEST_NAME,
+                    CHECKPOINT_NAME,
+                    README_NAME,
+                }
+            )
+            with self.assertRaises(SteamPackageError) as raised:
+                validate_filesystem_package(package)
+
+        self.assertEqual(
+            str(raised.exception),
+            "Package is missing fixed installer contract files: "
+            + ", ".join(required),
+        )
 
     def test_runtime_approval_binds_filesystem_package_fingerprint(self) -> None:
         from game_l10n.runtime_approval import create_runtime_approval
