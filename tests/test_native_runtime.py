@@ -13,6 +13,7 @@ from game_l10n.models import Segment
 from game_l10n.native_pass import import_native_wave, native_control_step, prepare_native_tasks, seal_native_wave_relay
 from game_l10n.native_runtime import (
     bind_data_plane_launch, configure_native_runtime, native_runtime, record_native_launch,
+    native_launch_summary,
 )
 from game_l10n.native_translation_retry import start_native_translation_retries, advance_native_translation_retries
 from game_l10n.store import stable_hash
@@ -96,6 +97,8 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(blocked["action"], "repair_native_runtime")
         self.assertEqual(blocked["relay"]["dispatch"], relay.relative_to(self.root).as_posix())
         self.assertEqual(blocked["relay"]["tasks"], 2)
+        self.assertEqual(blocked["runtime_repair"]["scope"], "host")
+        self.assertFalse(blocked["runtime_repair"]["isolation_relaxation_allowed"])
         self.assertEqual(relay.read_bytes(), dispatch_bytes)
         record_native_launch(self.root, relay, event="capability-available")
         resumed = self.step(resume_relay=True)
@@ -115,6 +118,147 @@ class NativeRuntimeTests(unittest.TestCase):
         seal_native_wave_relay(self.root, relay, relay_ended=True)
         self.assertEqual(self.step()["action"], "repair_native_runtime")
 
+    def test_ended_legacy_relay_resumes_and_preserves_unverified_peer_result(self) -> None:
+        prepare_native_tasks(self.root, self.source, self.segments, self.tasks,
+                             max_records=1, max_workers=2,
+                             route_binding={"provider": "native-luna", "attempt": 1})
+        initial = native_control_step(self.root, self.tasks / "manifest.json", self.results,
+                                      require_relay_receipt=True)
+        relay = self.root / initial["relay"]["dispatch"]
+        payload = json.loads(relay.read_text())
+        first, second = payload["task_bindings"]
+        self.write_rows(self.root / first["result"], [self.row("a")])
+        original = (self.root / first["result"]).read_bytes()
+        for _ in range(3):
+            native_control_step(self.root, self.tasks / "manifest.json", self.results,
+                                require_relay_receipt=True)
+        configure_native_runtime(self.root, "codex", {})
+        resumed = self.step(resume_relay=True)
+        self.assertEqual(resumed["action"], "dispatch_isolated_wave_relay")
+        self.assertEqual(resumed["route_binding"]["attempt"], 1)
+        updated = json.loads(relay.read_text())
+        self.assertEqual(updated["launch_contract"]["tasks"], [second["task"]])
+        self.assertTrue(updated["relay_contract"]["legacy_results_must_not_be_reexecuted"])
+        self.assertEqual(native_launch_summary(self.root, relay)["legacy_unverified_results"], 1)
+        record_native_launch(self.root, relay, event="capability-unavailable")
+        seal_native_wave_relay(self.root, relay, relay_ended=True)
+        self.assertEqual(self.step()["action"], "repair_native_runtime")
+        self.assertEqual(self.step(resume_relay=True)["action"], "dispatch_isolated_wave_relay")
+        record_native_launch(self.root, relay, event="capability-available")
+        record_native_launch(self.root, relay, event="worker-started", task=second["task"],
+                             worker_id="new-peer", model=updated["launch_contract"]["model"])
+        self.write_rows(self.root / second["result"], [self.row("b")])
+        seal_native_wave_relay(self.root, relay, relay_ended=True)
+        finished = self.step()
+        self.assertEqual(finished["action"], "aggregate_completed_pass")
+        self.assertEqual(finished["imported_wave"]["success"], 2)
+        self.assertEqual((self.root / first["result"]).read_bytes(), original)
+        self.assertTrue(list(relay.parent.glob(relay.name + ".legacy-*")))
+
+    def test_preserved_legacy_result_cannot_change_after_resume(self) -> None:
+        prepare_native_tasks(self.root, self.source, self.segments, self.tasks,
+                             max_records=1, max_workers=2)
+        initial = native_control_step(self.root, self.tasks / "manifest.json", self.results,
+                                      require_relay_receipt=True)
+        relay = self.root / initial["relay"]["dispatch"]
+        first = json.loads(relay.read_text())["task_bindings"][0]
+        self.write_rows(self.root / first["result"], [self.row("a")])
+        configure_native_runtime(self.root, "codex", {})
+        self.step(resume_relay=True)
+        self.write_rows(self.root / first["result"], [self.row("a", status="refused")])
+        with self.assertRaisesRegex(ValueError, "preserved legacy result changed"):
+            native_launch_summary(self.root, relay)
+
+    def test_partial_legacy_result_keeps_success_and_queues_only_missing_record(self) -> None:
+        prepare_native_tasks(self.root, self.source, self.segments, self.tasks,
+                             max_records=2, max_workers=1,
+                             route_binding={"provider": "native-luna", "attempt": 1})
+        initial = native_control_step(self.root, self.tasks / "manifest.json", self.results,
+                                      require_relay_receipt=True)
+        relay = self.root / initial["relay"]["dispatch"]
+        binding = json.loads(relay.read_text())["task_bindings"][0]
+        self.write_rows(self.root / binding["result"], [self.row("a")])
+        configure_native_runtime(self.root, "codex", {})
+        self.assertEqual(self.step(resume_relay=True)["action"], "dispatch_isolated_wave_relay")
+        launch = native_launch_summary(self.root, relay)
+        self.assertEqual(launch["expected_workers"], 0)
+        self.assertEqual(launch["issue_codes"], [])
+        seal_native_wave_relay(self.root, relay, relay_ended=True)
+        finished = self.step()
+        self.assertEqual(finished["imported_wave"]["success"], 1)
+        self.assertEqual(finished["imported_wave"]["failed"], 1)
+        rows = [json.loads(line) for line in (self.root / binding["result"]).read_text().splitlines()]
+        self.assertEqual(rows[1]["provider"], "native-control")
+        self.assertTrue(list(self.results.glob("*.ended-original-*")))
+
+    def test_explicit_ended_launch_recovers_missing_terminal_receipt(self) -> None:
+        _, relay, payload = self.prepare()
+        record_native_launch(self.root, relay, event="capability-available")
+        for binding, target in zip(payload["task_bindings"], ("a", "b")):
+            record_native_launch(self.root, relay, event="worker-started", task=binding["task"],
+                                 worker_id="worker-" + target, model=payload["launch_contract"]["model"])
+            self.write_rows(self.root / binding["result"], [self.row(target)])
+        self.assertEqual(self.step()["action"], "wait_for_active_wave")
+        self.assertEqual(self.step(resume_relay=True)["action"], "aggregate_completed_pass")
+
+    def test_runtime_refresh_keeps_custom_models_and_active_route_evidence(self) -> None:
+        _, relay, payload = self.prepare()
+        record_native_launch(self.root, relay, event="capability-available")
+        first = payload["task_bindings"][0]
+        record_native_launch(self.root, relay, event="worker-started", task=first["task"],
+                             worker_id="existing-peer", model=payload["launch_contract"]["model"])
+        original = relay.read_bytes()
+        configure_native_runtime(self.root, "omp", {"native-qwen": "fixture/approved-qwen"})
+        configure_native_runtime(self.root, "omp", {})
+        self.assertEqual(native_runtime(self.root)["models"]["native-qwen"], "fixture/approved-qwen")
+        self.assertEqual(native_launch_summary(self.root, relay)["started_workers"], 1)
+        self.assertEqual(relay.read_bytes(), original)
+        next_generation = native_runtime(self.root)["control_generation"] + 1
+        with patch("game_l10n.native_runtime.control_plane_state", return_value={"generation": next_generation}):
+            with self.assertRaisesRegex(ValueError, "E_NATIVE_RUNTIME_INVALID"):
+                native_runtime(self.root)
+            configure_native_runtime(self.root, "omp", {})
+            self.assertEqual(native_runtime(self.root)["models"]["native-qwen"], "fixture/approved-qwen")
+            self.assertEqual(native_launch_summary(self.root, relay)["started_workers"], 1)
+
+    def test_model_rebind_of_unstarted_wave_quarantines_unverified_output(self) -> None:
+        _, relay, payload = self.prepare()
+        record_native_launch(self.root, relay, event="model-unavailable")
+        seal_native_wave_relay(self.root, relay, relay_ended=True)
+        binding = payload["task_bindings"][0]
+        self.write_rows(self.root / binding["result"], [self.row("a")])
+        configure_native_runtime(self.root, "omp", {"native-luna": "fixture/approved-new-model"})
+        step = self.step(resume_relay=True)
+        self.assertEqual(step["action"], "dispatch_isolated_wave_relay")
+        self.assertEqual(step["route_binding"]["attempt"], 1)
+        self.assertEqual(json.loads(relay.read_text())["launch_contract"]["model"], "fixture/approved-new-model")
+        self.assertFalse((self.root / binding["result"]).exists())
+        self.assertTrue(list(self.results.glob("*.unstarted-original-*")))
+
+    def test_model_rebind_cannot_relabel_an_already_started_worker(self) -> None:
+        _, relay, payload = self.prepare()
+        record_native_launch(self.root, relay, event="capability-available")
+        binding = payload["task_bindings"][0]
+        record_native_launch(self.root, relay, event="worker-started", task=binding["task"],
+                             worker_id="started-peer", model=payload["launch_contract"]["model"])
+        configure_native_runtime(self.root, "omp", {"native-luna": "fixture/approved-new-model"})
+        original = relay.read_bytes()
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_LAUNCH_INVALID"):
+            self.step(resume_relay=True)
+        self.assertEqual(relay.read_bytes(), original)
+
+    def test_interrupted_unstarted_rebind_is_resumable_from_archived_evidence(self) -> None:
+        _, relay, _ = self.prepare()
+        record_native_launch(self.root, relay, event="model-unavailable")
+        seal_native_wave_relay(self.root, relay, relay_ended=True)
+        configure_native_runtime(self.root, "omp", {"native-luna": "fixture/approved-new-model"})
+        with patch("game_l10n.native_pass._write_wave_relay_dispatch", side_effect=OSError("fixture interrupted write")):
+            with self.assertRaises(OSError):
+                self.step(resume_relay=True)
+        resumed = self.step(resume_relay=True)
+        self.assertEqual(resumed["action"], "dispatch_isolated_wave_relay")
+        self.assertEqual(json.loads(relay.read_text())["launch_contract"]["model"], "fixture/approved-new-model")
+
     def test_partial_launch_preserves_success_and_only_starts_remaining_task(self) -> None:
         _, relay, payload = self.prepare()
         model = payload["launch_contract"]["model"]
@@ -127,6 +271,7 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(sealed["issue_codes"], ["E_NATIVE_WORKER_NOT_STARTED"])
         self.assertFalse((self.root / second["result"]).exists())
         self.assertEqual(self.step()["action"], "repair_native_runtime")
+        configure_native_runtime(self.root, "omp", {"native-extra": "fixture/approved-extra"})
         self.step(resume_relay=True)
         pending = record_native_launch(self.root, relay, event="capability-available")
         self.assertEqual(pending["unstarted_tasks"], [second["task"]])
@@ -300,3 +445,17 @@ class NativeRuntimeTests(unittest.TestCase):
         second = prepare_data_plane_task(self.root, output, worker_role="source_probe", config=config)
         self.assertEqual(second["task_id"], first["task_id"])
         self.assertEqual((output / "task.json").read_bytes(), original)
+
+    def test_discovery_accepts_equivalent_noncanonical_workspace_path(self) -> None:
+        game = self.root / "game"
+        game.mkdir()
+        alias = self.root / "alias"
+        alias.mkdir()
+        (self.root / "game-l10n.json").write_text("{}", encoding="utf-8")
+        establish_control_plane_entry(self.root)
+        config = {"game_roots": [str(game)], "sdk_root": str(self.root / "sdk"),
+                  "sdk_selection": {"inventory_fingerprint": "fixture-inventory"}}
+        output = self.root / ".game-l10n/data-plane/source_probe"
+        first = prepare_data_plane_task(alias / "..", output, worker_role="source_probe", config=config)
+        second = prepare_data_plane_task(self.root, output, worker_role="source_probe", config=config)
+        self.assertEqual(first["task_id"], second["task_id"])

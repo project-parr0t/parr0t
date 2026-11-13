@@ -44,6 +44,12 @@ def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str]) 
         raise ValueError("E_NATIVE_RUNTIME_INVALID: unsupported host")
     prefix = "openai-codex/" if host == "omp" else ""
     bindings = {"native-luna": prefix + "gpt-6-luna", "native-sol": prefix + "gpt-6.1-sol"}
+    try:
+        previous = native_runtime(work_dir, allow_stale_generation=True)
+    except ValueError:
+        previous = None  # An explicit bind may repair invalid runtime metadata.
+    if previous is not None and previous["host"] == host:
+        bindings.update(previous["models"])
     if (
         not all(re.fullmatch(r"native-[a-z0-9][a-z0-9._-]*", route) for route in models)
         or not all(_exact_model(value) for value in models.values())
@@ -58,7 +64,8 @@ def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str]) 
     return {**payload, "runtime_path": RUNTIME_PATH}
 
 
-def native_runtime(work_dir: Path, *, required: bool = False) -> dict[str, Any] | None:
+def native_runtime(work_dir: Path, *, required: bool = False,
+                   allow_stale_generation: bool = False) -> dict[str, Any] | None:
     path = work_dir / RUNTIME_PATH
     if not path.is_file():
         if required:
@@ -71,7 +78,7 @@ def native_runtime(work_dir: Path, *, required: bool = False) -> dict[str, Any] 
             set(value) == {"schema", "host", "models", "control_generation", "fingerprint"}
             and value["schema"] == RUNTIME_SCHEMA and value["host"] in {"codex", "omp"}
             and value["fingerprint"] == stable_hash(unsigned)
-            and value["control_generation"] == int(control_plane_state(work_dir).get("generation", 0))
+            and (allow_stale_generation or value["control_generation"] == int(control_plane_state(work_dir).get("generation", 0)))
             and {"native-luna", "native-sol"} <= set(value["models"])
             and all(re.fullmatch(r"native-[a-z0-9][a-z0-9._-]*", route) for route in value["models"])
             and all(_exact_model(model) for model in value["models"].values())
@@ -132,7 +139,27 @@ def _contract_for_relay(work_dir: Path, relay: dict) -> dict | None:
         if plan.get("finalizer_required"):
             tasks.append("finalizer")
         route = relay.get("worker_route") or "native-sol"
-    return launch_contract(work_dir, route, tasks)
+    legacy_results = (relay.get("launch_contract") or {}).get("legacy_results", [])
+    if legacy_results:
+        from hashlib import sha256
+        by_task = {binding["task"]: binding for binding in relay.get("task_bindings", [])}
+        if (not isinstance(legacy_results, list) or any(
+            not isinstance(row, dict) or set(row) != {"task", "result_sha256"}
+            or not isinstance(row["task"], str) or not isinstance(row["result_sha256"], str)
+            for row in legacy_results
+        ) or len({row["task"] for row in legacy_results}) != len(legacy_results)):
+            raise ValueError("E_NATIVE_LAUNCH_INVALID: legacy result bindings changed")
+        for row in legacy_results:
+            if not isinstance(row, dict) or set(row) != {"task", "result_sha256"} or row["task"] not in by_task:
+                raise ValueError("E_NATIVE_LAUNCH_INVALID: legacy result bindings changed")
+            result = (work_dir / by_task[row["task"]]["result"]).resolve()
+            if not result.is_relative_to(work_dir.resolve()) or not result.is_file() or sha256(result.read_bytes()).hexdigest() != row["result_sha256"]:
+                raise ValueError("E_NATIVE_LAUNCH_INVALID: preserved legacy result changed")
+        tasks = [task for task in tasks if task not in {row["task"] for row in legacy_results}]
+    contract = launch_contract(work_dir, route, tasks)
+    if legacy_results and contract is not None:
+        contract["legacy_results"] = legacy_results
+    return contract
 
 
 def _load(work_dir: Path, relay_path: Path) -> tuple[dict, dict, dict]:
@@ -145,6 +172,10 @@ def _load(work_dir: Path, relay_path: Path) -> tuple[dict, dict, dict]:
     if not isinstance(contract, dict):
         raise ValueError("E_NATIVE_LAUNCH_INVALID: legacy relay has no launch contract")
     expected = _contract_for_relay(work_dir, relay)
+    if isinstance(expected, dict):
+        # A mapping added for another route or a clean control-generation
+        # refresh does not change this wave's locked host/model/task binding.
+        expected["runtime_fingerprint"] = contract.get("runtime_fingerprint")
     if contract != expected:
         raise ValueError("E_NATIVE_LAUNCH_INVALID: runtime binding changed")
     path = _ledger_path(relay_path)
@@ -224,7 +255,7 @@ def native_launch_summary(work_dir: Path, relay_path: Path) -> dict[str, Any]:
         and row.get("observed_model") in {None, contract["model"]}
     )]
     issue = ledger["issue_code"]
-    if not issue and ledger["capability"] != "available":
+    if not issue and contract["tasks"] and ledger["capability"] != "available":
         issue = "E_NATIVE_RELAY_PREFLIGHT_REQUIRED"
     if not issue and len(valid) != len(contract["tasks"]):
         issue = "E_NATIVE_WORKER_NOT_STARTED"
@@ -233,6 +264,11 @@ def native_launch_summary(work_dir: Path, relay_path: Path) -> dict[str, Any]:
         "unstarted_tasks": [task for task in contract["tasks"] if task not in valid],
         "issue_codes": [issue] if issue else [],
         "model": contract["model"], "host": contract["host"],
+        "legacy_unverified_results": len(contract.get("legacy_results", [])),
         "observed_model_workers": sum(workers[task].get("observed_model") is not None for task in valid),
-        "model_evidence": "host_metadata_when_present_otherwise_explicit_spawn_arguments",
+        "model_evidence": (
+            "legacy_results_unverified_recorded_workers_separate"
+            if contract.get("legacy_results")
+            else "host_metadata_when_present_otherwise_explicit_spawn_arguments"
+        ),
     }

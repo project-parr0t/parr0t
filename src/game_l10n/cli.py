@@ -3164,7 +3164,7 @@ def build_parser() -> argparse.ArgumentParser:
     native_step.add_argument("--input-tokens", type=int, default=0)
     native_step.add_argument("--provider-cost-usd", type=float, default=0.0)
     native_step.add_argument("--resume-relay", action="store_true",
-                             help="Reopen only a blocked relay after launcher repair; preserve results and attempt")
+                             help="Assert the prior relay ended; recover its missing receipt or legacy launch binding after host repair; preserve results and attempt")
     native_step.set_defaults(func=cmd_native_pass_step)
 
     native_host = sub.add_parser("native-runtime", help="Bind or inspect the native host and exact worker models")

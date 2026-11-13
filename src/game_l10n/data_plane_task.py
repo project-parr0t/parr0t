@@ -420,7 +420,7 @@ def _relative(work_dir: Path, path: Path) -> str:
     resolved = path.resolve()
     if not is_within(resolved, work_dir):
         raise ConfigurationError("E_DATA_PLANE_TASK_PATH: task path left the workspace")
-    return resolved.relative_to(work_dir).as_posix()
+    return resolved.relative_to(work_dir.resolve()).as_posix()
 
 
 def _digest(path: Path) -> str:
@@ -1195,6 +1195,7 @@ def prepare_data_plane_task(
     exist only inside the task file handed to a fresh isolated relay.
     """
 
+    work_dir = work_dir.resolve()
     require_control_plane_ready(work_dir)
     require_control_plane_entry(work_dir)
     control_generation = int(control_plane_state(work_dir).get("generation", 0))
