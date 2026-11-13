@@ -13,7 +13,8 @@ DEFAULT_PROTECTED_PATTERNS = (
     r"\{[A-Za-z_][A-Za-z0-9_.:-]*\}",
     # No space flag: "50% off" is prose, not "% o". Add "% d" per project if an engine uses it.
     r"%(?:\d+\$)?[-+#0']*\d*(?:\.\d+)?[diouxXeEfFgGcrsa%]",
-    r"<\/?[A-Za-z][^>]*>",
+    # Commit quoted attributes so an unterminated tag cannot explore exponentially many parses.
+    r'''<\/?[A-Za-z](?>=\s*(?:"[^"]*"|'[^']*')|[^>])*?>''',
     # One alternation so "\nWord" yields only "\n" and no escape is counted twice.
     r"\\(?:[A-Za-z]+\[[^\]]*\]|[nrt]|[A-Za-z]+)",
     r"\$[A-Za-z_][A-Za-z0-9_]*",
@@ -45,16 +46,27 @@ def _term_spans(
 ) -> list[tuple[int, int]]:
     if not term:
         return []
+    original_text = text
     if not case_sensitive:
         term, text = term.casefold(), text.casefold()
     # Alphabetic letters only: digits ("HP100") and CJK particles still count as edges.
     letter = f"[{_ALPHABETIC}]"
     left = f"(?<!{letter})" if re.match(letter, term[0]) else ""
     right = f"(?:e?s)?(?!{letter})" if re.match(letter, term[-1]) else ""
-    return [
+    spans = [
         match.span()
         for match in re.finditer(left + re.escape(term) + right, text)
     ]
+    if spans and len(text) != len(original_text):
+        # Case folding can expand characters ("ß" -> "ss"). All glossary entries,
+        # including case-sensitive ones, must share the original source coordinates.
+        original_offsets = [
+            index
+            for index, char in enumerate(original_text)
+            for _ in char.casefold()
+        ]
+        return [(original_offsets[start], original_offsets[end - 1] + 1) for start, end in spans]
+    return spans
 
 
 def applicable_glossary_entries(
@@ -93,7 +105,9 @@ def applicable_glossary_entries(
     return [entry for index, entry in enumerate(glossary) if index in selected_indexes]
 
 
-_MARKUP_TAG = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9:_-]*)[^<>]*?(/?)>")
+_MARKUP_TAG = re.compile(
+    r'''<(/?)([A-Za-z][A-Za-z0-9:_-]*)(?>=\s*(?:"[^"]*"|'[^']*')|[^<>])*?(/?)>'''
+)
 
 
 def _paired_tag_names(text: str) -> set[str]:
@@ -122,9 +136,10 @@ def _markup_nesting_ok(text: str, paired: set[str]) -> bool:
 
 def protected_tokens(text: str, extra_patterns: list[str] | None = None) -> Counter[str]:
     # Defaults scan as one leftmost alternation, so nested matches ("$d" in "%1$d") never double-count.
-    tokens = _DEFAULT_PROTECTED_RE.findall(text)
+    tokens = [match.group(0) for match in _DEFAULT_PROTECTED_RE.finditer(text)]
     for pattern in extra_patterns or []:
-        tokens.extend(re.findall(pattern, text))
+        # Capturing groups describe a pattern, not the bytes protected by it.
+        tokens.extend(match.group(0) for match in re.finditer(pattern, text))
     return Counter(tokens)
 
 
