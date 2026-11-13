@@ -493,7 +493,8 @@ def provision_requirements(repo: Path, state: Path, plan: dict, python: str, *, 
             failure = json.loads(failure_marker.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             failure = None
-        if isinstance(failure, dict) and failure.get("key") == key:
+        if (isinstance(failure, dict) and failure.get("key") == key
+                and failure.get("error") != "E_BRANCH_DEPENDENCY_INSTALL_TIMEOUT"):
             raise ValueError(failure.get("error", "E_BRANCH_DEPENDENCY_INSTALL_FAILED"))
     if target.exists():
         raise ValueError("E_BRANCH_DEPENDENCY_STATE_UNTRUSTED")
@@ -514,24 +515,24 @@ def provision_requirements(repo: Path, state: Path, plan: dict, python: str, *, 
         command.extend(["--requirement", str(requirement)])
     environment = os.environ.copy()
     environment["PIP_CACHE_DIR"] = str(state / "pip-cache")
+    environment["PYTHONIOENCODING"] = "utf-8"
     temporary = state / "dependency-tmp" / key
     temporary.mkdir(parents=True, exist_ok=True)
     for variable in ("TMP", "TEMP", "TMPDIR"):
         environment[variable] = str(temporary)
+    install_log = state / f"dependency-install-{key}.log"
     try:
-        result = subprocess.run(
-            command, env=environment, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", shell=False, timeout=300,
-        )
+        # Write as pip runs so interruption cannot discard its diagnostics.
+        # Package builds have no implicit wall-clock deadline.
+        with install_log.open("w", encoding="utf-8") as output:
+            result = subprocess.run(
+                command, env=environment, stdout=output, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", shell=False, timeout=None,
+            )
     except subprocess.TimeoutExpired:
-        failure_marker.parent.mkdir(parents=True, exist_ok=True)
-        failure_marker.write_text(json.dumps({
-            "schema": "parr0t.branch-dependencies.failure.v1",
-            "key": key,
-            "error": "E_BRANCH_DEPENDENCY_INSTALL_TIMEOUT",
-        }, indent=2) + "\n", encoding="utf-8")
+        # A host interruption is not evidence that these dependencies fail.
+        # Keep the log/staging tree, but never persist a retry-blocking timeout.
         raise ValueError("E_BRANCH_DEPENDENCY_INSTALL_TIMEOUT") from None
-    (state / f"dependency-install-{key}.log").write_text(result.stdout + result.stderr, encoding="utf-8")
     if result.returncode:
         failure_marker.parent.mkdir(parents=True, exist_ok=True)
         failure_marker.write_text(json.dumps({
@@ -602,6 +603,7 @@ def run_checks(snapshot: Path, python: str, sdk: bool, log: Path,
         python_paths.append(environment["PYTHONPATH"])
     environment["PYTHONPATH"] = os.pathsep.join(python_paths)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONIOENCODING"] = "utf-8"
     # A Codex/Windows process can inherit an AppContainer TEMP directory that
     # subprocesses are allowed to name but cannot create files in.  Branch
     # tests use TemporaryDirectory extensively, so bind their temporary files
@@ -629,42 +631,78 @@ def run_checks(snapshot: Path, python: str, sdk: bool, log: Path,
         python, "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v",
     ]
     commands.append(("tests", test_command if test_paths != [] else None))
-    checks, transcript = {}, []
-    for name, command in commands:
-        started = time.monotonic()
-        if command is None:
-            checks[name] = {
-                "passed": False,
-                "seconds": 0.0,
-                "count": 0,
-                "skipped": 0,
-                "complete": False,
-                "scope": "adapter",
-                "issue_code": "E_BRANCH_VALIDATION_TESTS_INCOMPLETE",
-            }
-            transcript.append(f"[{name}]\nNo branch-owned adapter tests were declared.\n")
-            continue
-        result = subprocess.run(command, cwd=snapshot, env=environment, capture_output=True, text=True, encoding="utf-8", errors="replace", shell=False, timeout=600)
-        output = result.stdout + result.stderr
-        checks[name] = {"passed": result.returncode == 0, "seconds": round(time.monotonic() - started, 3)}
-        if name == "tests":
-            count, summary, skipped_count = unittest_summary(result.stderr)
-            checks[name].update({
-                "count": count,
-                "skipped": skipped_count,
-                "complete": bool(count > 0 and summary and skipped_count == 0),
-                "scope": "adapter" if test_paths is not None else "full",
-            })
-            if not checks[name]["complete"]:
-                checks[name]["passed"] = False
-                checks[name]["issue_code"] = (
-                    "E_BRANCH_VALIDATION_TESTS_SKIPPED"
-                    if isinstance(skipped_count, int) and skipped_count > 0
-                    else "E_BRANCH_VALIDATION_TESTS_INCOMPLETE"
+    checks = {}
+    progress = log.with_suffix(log.suffix + ".json")
+
+    def save(*, complete: bool = False) -> dict:
+        result = {"passed": complete and all(check["passed"] for check in checks.values()),
+                  "checks": checks, "log": str(log), "complete": complete}
+        pending = progress.with_suffix(progress.suffix + ".tmp")
+        pending.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        pending.replace(progress)
+        return result
+
+    with log.open("w", encoding="utf-8") as transcript:
+        for name, command in commands:
+            started = time.monotonic()
+            transcript.write(f"[{name}]\n")
+            transcript.flush()
+            checks[name] = {"passed": False, "seconds": 0.0, "complete": False,
+                            "state": "running"}
+            save()
+            if command is None:
+                checks[name].update(count=0, skipped=0, scope="adapter", state="incomplete",
+                                    issue_code="E_BRANCH_VALIDATION_TESTS_INCOMPLETE")
+                transcript.write("No branch-owned adapter tests were declared.\n")
+                transcript.flush()
+                save()
+                continue
+            # Separate streams preserve unittest's trusted stderr trailer.
+            # Files also retain live diagnostics if this process is killed.
+            stdout_path = log.with_name(log.name + f".{name}.stdout")
+            stderr_path = log.with_name(log.name + f".{name}.stderr")
+            try:
+                with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
+                    result = subprocess.run(
+                        command, cwd=snapshot, env=environment, stdout=stdout, stderr=stderr,
+                        text=True, encoding="utf-8", errors="replace", shell=False, timeout=None,
+                    )
+                checks[name] = {"passed": result.returncode == 0,
+                                "seconds": round(time.monotonic() - started, 3)}
+                if name == "tests":
+                    count, summary, skipped_count = unittest_summary(stderr_path.read_text(encoding="utf-8", errors="replace"))
+                    checks[name].update({
+                        "count": count,
+                        "skipped": skipped_count,
+                        "complete": bool(count > 0 and summary and skipped_count == 0),
+                        "scope": "adapter" if test_paths is not None else "full",
+                    })
+                    if not checks[name]["complete"]:
+                        checks[name]["passed"] = False
+                        checks[name]["issue_code"] = (
+                            "E_BRANCH_VALIDATION_TESTS_SKIPPED"
+                            if isinstance(skipped_count, int) and skipped_count > 0
+                            else "E_BRANCH_VALIDATION_TESTS_INCOMPLETE"
+                        )
+            except (OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+                checks[name].update(
+                    seconds=round(time.monotonic() - started, 3),
+                    state="interrupted" if not isinstance(error, OSError) else "failed",
+                    issue_code=("E_BRANCH_VALIDATION_LAUNCH_FAILED" if isinstance(error, OSError)
+                                else "E_BRANCH_VALIDATION_INTERRUPTED"),
                 )
-        transcript.append(f"[{name}]\n{output}")
-    log.write_text("\n".join(transcript), encoding="utf-8")
-    return {"passed": all(check["passed"] for check in checks.values()), "checks": checks, "log": str(log)}
+                if isinstance(error, KeyboardInterrupt):
+                    raise
+            finally:
+                for output_path in (stdout_path, stderr_path):
+                    if output_path.exists():
+                        transcript.write(output_path.read_text(encoding="utf-8", errors="replace"))
+                if "issue_code" in checks[name]:
+                    transcript.write(f"\n{checks[name]['issue_code']}\n")
+                transcript.write("\n")
+                transcript.flush()
+                save()
+        return save(complete=True)
 
 
 def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", refs: list[str] | None = None,
@@ -796,6 +834,7 @@ def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", re
     def execute(item: tuple[str, dict]) -> tuple[str, dict]:
         key, plan = item
         snapshot = Path(tempfile.mkdtemp(prefix=key[:12] + "-", dir=state))
+        result = {"passed": False, "checks": {}}
         try:
             extract_snapshot(repo, plan["source_commit"], snapshot)
             if plan["additions"]:
@@ -821,7 +860,7 @@ def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", re
             if plan["sdk"] and not plan["adapter_tests"]:
                 result.update({"passed": False, "error": "E_SDK_TESTS_MISSING"})
         except (OSError, ValueError, subprocess.SubprocessError) as error:
-            result = {"passed": False, "checks": {}, "error": type(error).__name__}
+            result.update(passed=False, error=type(error).__name__)
         return key, {**result, "cached": False}
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as executor:
         for key, result in executor.map(execute, pending.items()):

@@ -4,6 +4,14 @@ This file contains provenance-free troubleshooting for the engine-neutral Parr0t
 
 Engine branches do not append implementation bugs or ordinary engine questions here. Under `docs/engine-faq-contract.md`, they keep only SDK-external manual exception procedures in their branch-local `docs/engine-faq.md`. A condition the SDK can resolve deterministically belongs in code and regression tests instead.
 
+## A relay can run but cannot start its bound workers
+
+- **Symptom:** A native relay reports unavailable child dispatch, or ends with no actual worker starts.
+- **General cause:** The host exposes different tools or model permissions to a child than to the main session. Enabling top-level agents alone does not prove nested dispatch is available.
+- **Diagnosis:** Inspect only the relay's capability result and core launch metadata. Do not scrape worker sessions or substitute synthetic result rows for missing execution.
+- **Resolution:** Restore nested dispatch and access to the exact bound model in the host. Follow the runtime repair action and resume the same wave. Valid results remain reusable, and unstarted targets retain their provider attempt number. If the host still lacks the required capability, retain the checkpoint and report that external blocker once.
+- **Prevention:** Bind the current host through `native-runtime`; require explicit model arguments and recorded worker starts before accepting a new relay's results. Do not inherit a session model or remove the isolation layer.
+
 ## A private repository returns 404 even though it exists
 
 - **Symptom:** A browser, connector, or agent cannot open a known private repository and reports `404 Not Found`.
