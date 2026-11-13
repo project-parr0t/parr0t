@@ -229,8 +229,12 @@ def validate_filesystem_package(package_path: Path) -> dict[str, Any]:
         if len(names) != len(set(name.casefold() for name in names)):
             raise SteamPackageError("Package contains duplicate or case-colliding paths")
         required = {INSTALLER_BAT, INSTALLER_PS1, MANIFEST_NAME, CHECKPOINT_NAME, README_NAME}
-        if not required.issubset(names):
-            raise SteamPackageError("Package is missing its fixed installer contract files")
+        missing = sorted(required - set(names))
+        if missing:
+            raise SteamPackageError(
+                "Package is missing fixed installer contract files: "
+                + ", ".join(missing)
+            )
         manifest = json.loads(archive.read(MANIFEST_NAME).decode("utf-8"))
         if manifest.get("schema") != SCHEMA or "steam" in manifest:
             raise SteamPackageError("Package filesystem manifest schema is not supported")
