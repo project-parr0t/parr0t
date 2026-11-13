@@ -41,6 +41,7 @@ from .image_localization import (
 )
 from .language_policy import language_binding
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext, Segment
+from .native_runtime import RUNTIME_ISSUES, native_launch_summary
 from .privacy import is_within
 from .store import stable_hash
 
@@ -1293,6 +1294,18 @@ def prepare_data_plane_task(
                 and previous_receipt.get("stage") == profile["stage"]
                 and previous_receipt.get("control_generation") == control_generation
             )
+            runtime_blocked = bool(
+                receipt_closes_previous and set(previous_receipt.get("issue_codes", [])) & RUNTIME_ISSUES
+            )
+            if runtime_blocked:
+                previous_relay_path = output_dir / "relay.json"
+                previous_relay, _ = _load_bound_data_plane_relay(work_dir, previous_relay_path)
+                return {
+                    "schema": previous_relay["schema"], "status": "ready",
+                    "worker_role": worker_role, "stage": profile["stage"],
+                    "relay_path": _relative(work_dir, previous_relay_path),
+                    "task_id": previous_task["task_id"], "control_generation": control_generation,
+                }
             if valid_previous_attempt and receipt_closes_previous:
                 attempt = previous_attempt + 1
             elif valid_previous_attempt:
@@ -1944,7 +1957,7 @@ def _load_bound_data_plane_relay(
         or (
             relay_schema == DATA_PLANE_RELAY_SCHEMA
             and (
-                set(relay) != relay_fields
+                set(relay) - {"launch_contract"} != relay_fields
                 or not valid_contract
                 or not _valid_execution_plan(relay)
                 or not isinstance(relay.get("attempt"), int)
@@ -2644,6 +2657,12 @@ def seal_data_plane_task(
 
     relay, task = _load_bound_data_plane_relay(work_dir, relay_path)
     execution = _relay_execution_summary(work_dir, relay)
+    if "launch_contract" in relay:
+        launch = native_launch_summary(work_dir, relay_path)
+        if launch["issue_codes"]:
+            return _seal_ended_data_plane_task(
+                work_dir, relay, task, issue_code=launch["issue_codes"][0], execution=execution,
+            )
     if not execution["complete"]:
         if worker_ended:
             return _seal_ended_data_plane_task(
