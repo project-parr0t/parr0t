@@ -34,6 +34,20 @@ class NativeRuntimeTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
+    def prepare_probe(self) -> tuple[dict, Path, Path]:
+        game = self.root / "game"
+        game.mkdir()
+        (self.root / "game-l10n.json").write_text("{}", encoding="utf-8")
+        establish_control_plane_entry(self.root)
+        configure_native_runtime(self.root, "omp", {})
+        config = {"game_roots": [str(game)], "sdk_root": str(self.root / "sdk"),
+                  "sdk_selection": {"inventory_fingerprint": "fixture-inventory"}}
+        output = self.root / ".game-l10n/data-plane/source_probe"
+        prepared = prepare_data_plane_task(self.root, output, worker_role="source_probe", config=config)
+        relay = self.root / prepared["relay_path"]
+        bind_data_plane_launch(self.root, relay)
+        return config, output, relay
+
     def prepare(self, host: str = "omp") -> tuple[dict, Path, dict]:
         configure_native_runtime(self.root, host, {})
         prepare_native_tasks(
@@ -459,3 +473,64 @@ class NativeRuntimeTests(unittest.TestCase):
         first = prepare_data_plane_task(alias / "..", output, worker_role="source_probe", config=config)
         second = prepare_data_plane_task(self.root, output, worker_role="source_probe", config=config)
         self.assertEqual(first["task_id"], second["task_id"])
+
+    def test_ended_unstarted_probe_rebind_keeps_task_and_invalidates_stale_receipt(self) -> None:
+        config, output, relay = self.prepare_probe()
+        original = (output / "task.json").read_bytes()
+        payload = json.loads(relay.read_text())
+        envelope = self.root / payload["expected_envelope"]
+        envelope.write_text('{"stale":true}', encoding="utf-8")
+        record_native_launch(self.root, relay, event="model-unavailable")
+        seal_data_plane_task(self.root, relay, worker_ended=True)
+        configure_native_runtime(self.root, "omp", {"native-sol": "fixture/approved-new-model"})
+        prepared = prepare_data_plane_task(self.root, output, worker_role="source_probe", config=config)
+        self.assertEqual(prepared["task_id"], payload["task_id"])
+        bind_data_plane_launch(self.root, relay)
+        self.assertEqual((output / "task.json").read_bytes(), original)
+        self.assertFalse((output / "receipt.json").exists())
+        self.assertFalse(envelope.exists())
+        self.assertTrue(list(output.glob("receipt.json.legacy-*")))
+        self.assertTrue(list(output.glob(envelope.name + ".legacy-*")))
+        launch = native_launch_summary(self.root, relay)
+        self.assertEqual(launch["model"], "fixture/approved-new-model")
+        self.assertEqual(launch["started_workers"], 0)
+        record_native_launch(self.root, relay, event="capability-available")
+        record_native_launch(self.root, relay, event="worker-started", task="worker-0",
+                             worker_id="new-probe", model="fixture/approved-new-model")
+        self.assertEqual(native_launch_summary(self.root, relay)["started_workers"], 1)
+
+    def test_data_plane_rebind_requires_terminal_evidence(self) -> None:
+        _, _, relay = self.prepare_probe()
+        record_native_launch(self.root, relay, event="model-unavailable")
+        configure_native_runtime(self.root, "omp", {"native-sol": "fixture/approved-new-model"})
+        original = relay.read_bytes()
+        with self.assertRaisesRegex(ValueError, "ended data-plane receipt required"):
+            bind_data_plane_launch(self.root, relay)
+        self.assertEqual(relay.read_bytes(), original)
+
+    def test_data_plane_rebind_cannot_relabel_a_started_worker(self) -> None:
+        _, _, relay = self.prepare_probe()
+        model = json.loads(relay.read_text())["launch_contract"]["model"]
+        record_native_launch(self.root, relay, event="capability-available")
+        record_native_launch(self.root, relay, event="worker-started", task="worker-0",
+                             worker_id="existing-probe", model=model)
+        record_native_launch(self.root, relay, event="model-unavailable")
+        seal_data_plane_task(self.root, relay, worker_ended=True)
+        configure_native_runtime(self.root, "omp", {"native-sol": "fixture/approved-new-model"})
+        original = relay.read_bytes()
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_LAUNCH_INVALID"):
+            bind_data_plane_launch(self.root, relay)
+        self.assertEqual(relay.read_bytes(), original)
+
+    def test_interrupted_data_plane_rebind_recovers_archived_evidence(self) -> None:
+        _, output, relay = self.prepare_probe()
+        record_native_launch(self.root, relay, event="model-unavailable")
+        seal_data_plane_task(self.root, relay, worker_ended=True)
+        configure_native_runtime(self.root, "omp", {"native-sol": "fixture/approved-new-model"})
+        original = (output / "task.json").read_bytes()
+        with patch("game_l10n.native_runtime._write", side_effect=OSError("fixture interrupted binding")):
+            with self.assertRaises(OSError):
+                bind_data_plane_launch(self.root, relay)
+        bind_data_plane_launch(self.root, relay)
+        self.assertEqual(native_launch_summary(self.root, relay)["model"], "fixture/approved-new-model")
+        self.assertEqual((output / "task.json").read_bytes(), original)

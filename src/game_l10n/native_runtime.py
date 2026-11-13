@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -114,14 +115,83 @@ def _ledger_path(relay_path: Path) -> Path:
     return relay_path.with_name(relay_path.stem + "-launch.json")
 
 
+def _metadata_versions(path: Path) -> list[dict[str, Any]]:
+    """Use archives only when a repair already removed the canonical file."""
+    paths = [path] if path.is_file() else sorted(path.parent.glob(path.name + ".legacy-*"))
+    values = []
+    for candidate in paths:
+        original = candidate.read_bytes()
+        if candidate != path and candidate.name != path.name + ".legacy-" + sha256(original).hexdigest():
+            continue
+        value = json.loads(original)
+        if isinstance(value, dict):
+            values.append(value)
+    return values
+
+
+def _unstarted_launch_ledger(relay_path: Path, relay: dict) -> dict:
+    matched = []
+    for ledger in _metadata_versions(_ledger_path(relay_path)):
+        if ledger.get("relay_fingerprint") != stable_hash(relay):
+            continue
+        if (ledger.get("schema") != LAUNCH_SCHEMA or ledger.get("workers") != {}
+                or ledger.get("capability") not in {"unknown", "available", "unavailable"}
+                or ledger.get("issue_code", "") not in RUNTIME_ISSUES | {""}):
+            raise ValueError("E_NATIVE_LAUNCH_INVALID: cannot rebind a started or unverified worker")
+        matched.append(ledger)
+    if matched:
+        return matched[-1]
+    raise ValueError("E_NATIVE_LAUNCH_INVALID: cannot rebind a started or unverified worker")
+
+
+def _archive_metadata(path: Path) -> None:
+    if path.is_file():
+        original = path.read_bytes()
+        archive = path.with_name(path.name + ".legacy-" + sha256(original).hexdigest())
+        if archive.exists() and archive.read_bytes() != original:
+            raise ValueError("E_NATIVE_LAUNCH_INVALID: metadata archive changed")
+        archive.write_bytes(original)
+
+
 def bind_data_plane_launch(work_dir: Path, relay_path: Path) -> None:
     """Attach host routing to an existing core-bound task without rebuilding it."""
     if not relay_path.resolve().is_relative_to(work_dir.resolve() / ".game-l10n"):
         raise ValueError("E_NATIVE_LAUNCH_INVALID: relay escaped control metadata")
     relay = json.loads(relay_path.read_text(encoding="utf-8"))
     if "launch_contract" in relay:
-        _load(work_dir, relay_path)
-        return
+        try:
+            _load(work_dir, relay_path)
+            return
+        except ValueError as error:
+            if str(error) != "E_NATIVE_LAUNCH_INVALID: runtime binding changed":
+                raise
+        # Only an ended, operationally blocked task with evidence of zero
+        # starts can follow a newly approved host/model binding.
+        from .data_plane_task import _load_bound_data_plane_relay
+        _load_bound_data_plane_relay(work_dir, relay_path)
+        _unstarted_launch_ledger(relay_path, relay)
+        role = relay.get("worker_role")
+        if not isinstance(role, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", role):
+            raise ValueError("E_NATIVE_LAUNCH_INVALID: data-plane role changed")
+        receipt_path = work_dir / ".game-l10n/data-plane" / role / "receipt.json"
+        ended = any(
+            receipt.get("task_id") == relay["task_id"] and receipt.get("status") == "error"
+            and receipt.get("worker_role") == role and receipt.get("stage") == relay["stage"]
+            and receipt.get("control_generation") == int(control_plane_state(work_dir).get("generation", 0))
+            and isinstance(receipt.get("issue_codes"), list) and receipt["issue_codes"]
+            and all(isinstance(code, str) and code in RUNTIME_ISSUES for code in receipt["issue_codes"])
+            for receipt in _metadata_versions(receipt_path)
+        )
+        if not ended:
+            raise ValueError("E_NATIVE_LAUNCH_INVALID: ended data-plane receipt required")
+        envelope_path = (work_dir / relay["expected_envelope"]).resolve()
+        if not envelope_path.is_relative_to(work_dir.resolve()):
+            raise ValueError("E_NATIVE_LAUNCH_INVALID: data-plane envelope escaped workspace")
+        paths = (relay_path, receipt_path, _ledger_path(relay_path), envelope_path)
+        for path in paths:
+            _archive_metadata(path)
+        for path in paths[1:]:
+            path.unlink(missing_ok=True)
     relay["launch_contract"] = _contract_for_relay(work_dir, relay)
     _write(relay_path, relay)
 

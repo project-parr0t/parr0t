@@ -17,7 +17,7 @@ from .control_plane import (
 from .language_policy import DEFAULT_TARGET_LANGUAGE, language_policy_digest
 from .models import Segment
 from .native_followup import CANDIDATE_METADATA_KEY
-from .native_runtime import RUNTIME_ISSUES, launch_contract, native_launch_summary, native_runtime
+from .native_runtime import RUNTIME_ISSUES, launch_contract, native_launch_summary, native_runtime, _unstarted_launch_ledger
 from .store import stable_hash, stable_hash_sequence
 from .validators import validate_integrity
 
@@ -1674,23 +1674,7 @@ def _repair_ended_wave_relay(
         if (old_launch.get("host") == runtime["host"]
                 and old_launch.get("model") == runtime["models"].get(old_launch.get("route"))):
             return False
-        ledger_path = path.with_name(path.stem + "-launch.json")
-        ledger = json.loads(ledger_path.read_text(encoding="utf-8")) if ledger_path.is_file() else None
-        if ledger is None:
-            # A previous interrupted repair may already have archived the
-            # canonical ledger. Recover only content-bound evidence for this
-            # exact dispatch, never assume missing evidence means no starts.
-            for archived in path.parent.glob(ledger_path.name + ".legacy-*"):
-                original = archived.read_bytes()
-                if archived.name != ledger_path.name + ".legacy-" + hashlib.sha256(original).hexdigest():
-                    continue
-                saved = json.loads(original)
-                if isinstance(saved, dict) and saved.get("relay_fingerprint") == stable_hash(payload):
-                    ledger = saved
-                    break
-        if (not isinstance(ledger, dict) or ledger.get("relay_fingerprint") != stable_hash(payload)
-                or ledger.get("workers") != {}):
-            raise ValueError("E_NATIVE_LAUNCH_INVALID: cannot rebind a started worker")
+        _unstarted_launch_ledger(path, payload)
     unsigned = {key: value for key, value in payload.items() if key != "dispatch_fingerprint"}
     relative_manifest = manifest_path.resolve().relative_to(work_dir.resolve()).as_posix()
     bindings = payload.get("task_bindings")
