@@ -19,6 +19,7 @@ REVIEW_CONTROL_ALLOWED_ACTIONS = (
     "prepare_validated_manifest",
     "dispatch_isolated_wave_relay",
     "wait_for_active_wave",
+    "repair_native_runtime",
     "validate_control_envelope",
     "import_completed_wave",
     "aggregate_completed_pass",
