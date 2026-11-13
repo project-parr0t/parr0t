@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 
 class GameL10nError(Exception):
     """Base SDK error."""
@@ -25,11 +27,11 @@ class ProviderFailure(ProviderError):
         self.code = code
         self.retryable = retryable
         self.status_code = status_code
-        self.retry_after_seconds = (
-            max(0.0, float(retry_after_seconds))
-            if retry_after_seconds is not None
-            else None
-        )
+        try:
+            delay = float(retry_after_seconds) if not isinstance(retry_after_seconds, bool) else math.nan
+        except (TypeError, ValueError, OverflowError):
+            delay = math.nan
+        self.retry_after_seconds = max(0.0, delay) if math.isfinite(delay) else None
         self.usage = {
             str(key): int(value)
             for key, value in (usage or {}).items()
