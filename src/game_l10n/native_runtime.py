@@ -39,28 +39,38 @@ def _exact_model(value: str) -> bool:
     )
 
 
-def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str]) -> dict[str, Any]:
+def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str],
+                             *, transport: str | None = None) -> dict[str, Any]:
     require_control_plane_ready(work_dir)
-    if host not in {"codex", "omp"}:
-        raise ValueError("E_NATIVE_RUNTIME_INVALID: unsupported host")
     prefix = "openai-codex/" if host == "omp" else ""
-    bindings = {"native-luna": prefix + "gpt-6-luna", "native-sol": prefix + "gpt-6.1-sol"}
+    bindings = ({"native-luna": prefix + "gpt-6-luna", "native-sol": prefix + "gpt-6.1-sol"}
+                if host in {"codex", "omp"} else {})
     try:
         previous = native_runtime(work_dir, allow_stale_generation=True)
     except ValueError:
         previous = None  # An explicit bind may repair invalid runtime metadata.
     if previous is not None and previous["host"] == host:
         bindings.update(previous["models"])
+        if transport is None:
+            transport = previous.get("transport", "collaboration")
+    transport = transport or "collaboration"
+    if transport not in {"collaboration", "native-host-api"} or (transport == "collaboration" and host not in {"codex", "omp"}):
+        raise ValueError("E_NATIVE_RUNTIME_INVALID: unsupported host or transport")
     if (
         not all(re.fullmatch(r"native-[a-z0-9][a-z0-9._-]*", route) for route in models)
         or not all(_exact_model(value) for value in models.values())
     ):
         raise ValueError("E_NATIVE_RUNTIME_INVALID: use exact route=model bindings")
     bindings.update(models)
+    if not {"native-luna", "native-sol"} <= bindings.keys():
+        raise ValueError("E_NATIVE_RUNTIME_INVALID: registered hosts require both exact model bindings")
     payload = {
         "schema": RUNTIME_SCHEMA, "host": host, "models": bindings,
         "control_generation": int(control_plane_state(work_dir).get("generation", 0)),
     }
+    if transport == "native-host-api":
+        from .native_host import native_host_profile
+        payload.update(transport=transport, host_profile_fingerprint=native_host_profile(work_dir, host)["fingerprint"])
     _write(work_dir / RUNTIME_PATH, {**payload, "fingerprint": stable_hash(payload)})
     return {**payload, "runtime_path": RUNTIME_PATH}
 
@@ -75,9 +85,16 @@ def native_runtime(work_dir: Path, *, required: bool = False,
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
         unsigned = {key: item for key, item in value.items() if key != "fingerprint"}
+        broker = value.get("transport") == "native-host-api"
+        required_keys = {"schema", "host", "models", "control_generation", "fingerprint"}
+        if broker:
+            from .native_host import native_host_profile
+            required_keys |= {"transport", "host_profile_fingerprint"}
+            profile = native_host_profile(work_dir, value["host"])
         valid = (
-            set(value) == {"schema", "host", "models", "control_generation", "fingerprint"}
-            and value["schema"] == RUNTIME_SCHEMA and value["host"] in {"codex", "omp"}
+            set(value) == required_keys
+            and value["schema"] == RUNTIME_SCHEMA
+            and (value["host_profile_fingerprint"] == profile["fingerprint"] if broker else value["host"] in {"codex", "omp"})
             and value["fingerprint"] == stable_hash(unsigned)
             and (allow_stale_generation or value["control_generation"] == int(control_plane_state(work_dir).get("generation", 0)))
             and {"native-luna", "native-sol"} <= set(value["models"])
@@ -97,7 +114,7 @@ def launch_contract(work_dir: Path, route: str, tasks: list[str]) -> dict[str, A
         return None  # Legacy library/checkpoint compatibility; public CLI requires binding.
     if route not in runtime["models"]:
         raise ValueError("E_NATIVE_RUNTIME_INVALID: native route has no exact model")
-    return {
+    contract = {
         "host": runtime["host"], "runtime_fingerprint": runtime["fingerprint"],
         "route": route, "model": runtime["models"][route], "tasks": tasks,
         "history_mode": "none", "inherit_model_allowed": False,
@@ -109,6 +126,21 @@ def launch_contract(work_dir: Path, route: str, tasks: list[str]) -> dict[str, A
         "record_command": "game-l10n record-native-launch --workspace <workspace> --relay <relay-path>",
         "model_evidence": "explicit_spawn_arguments_and_host_model_metadata_when_available",
     }
+    if runtime.get("transport") == "native-host-api":
+        from .native_host import verified_host_probe
+        verified_host_probe(work_dir, runtime, route)
+        contract.update(transport="native-host-api", host_profile_fingerprint=runtime["host_profile_fingerprint"],
+                        spawn_model_parameter="model", preflight="verified_native_host_live_probe",
+                        model_evidence="native_host_explicit_model_and_observed_model")
+    return contract
+
+
+def native_worker_ceiling(work_dir: Path, route: str, requested: int) -> int:
+    runtime = native_runtime(work_dir)
+    if runtime and runtime.get("transport") == "native-host-api":
+        from .native_host import verified_host_probe
+        return min(requested, verified_host_probe(work_dir, runtime, route)["max_workers"])
+    return requested
 
 
 def _ledger_path(relay_path: Path) -> Path:
@@ -306,7 +338,11 @@ def record_native_launch(
         else:
             prior = ledger["workers"].get(task)
             worker = {"worker_id": worker_id, "model": model, "observed_model": observed_model}
-            if prior is not None and prior != worker:
+            if prior and prior["worker_id"] == worker_id and prior["model"] == model:
+                # Polling can add host evidence; it cannot replace a worker or
+                # erase a previously observed exact model.
+                worker["observed_model"] = prior["observed_model"] or observed_model
+            if prior is not None and (prior["worker_id"] != worker_id or prior["model"] != model):
                 raise ValueError("E_NATIVE_LAUNCH_INVALID: worker already started; do not replay it")
             if any(item.get("worker_id") == worker_id for key, item in ledger["workers"].items() if key != task):
                 raise ValueError("E_NATIVE_LAUNCH_INVALID: worker must be fresh for each task")

@@ -902,6 +902,9 @@ def prepare_native_tasks(
         raise ValueError("max_material_tokens must be between 256 and 1000000")
     if not 1 <= max_workers <= 64:
         raise ValueError("max_workers must be between 1 and 64")
+    from .native_runtime import native_worker_ceiling
+    max_workers = native_worker_ceiling(work_dir, (route_binding or {}).get("provider") or (
+        "native-luna" if pass_kind == "translation" else "native-sol"), max_workers)
     if _review_split is not None and pass_kind != "review":
         raise ValueError("Review split metadata is valid only for review passes")
     review_split = _review_split or (
@@ -1672,7 +1675,9 @@ def _repair_ended_wave_relay(
     if isinstance(old_launch, dict):
         runtime = native_runtime(work_dir, required=True)
         if (old_launch.get("host") == runtime["host"]
-                and old_launch.get("model") == runtime["models"].get(old_launch.get("route"))):
+                and old_launch.get("model") == runtime["models"].get(old_launch.get("route"))
+                and old_launch.get("transport", "collaboration") == runtime.get("transport", "collaboration")
+                and old_launch.get("host_profile_fingerprint") == runtime.get("host_profile_fingerprint")):
             return False
         _unstarted_launch_ledger(path, payload)
     unsigned = {key: value for key, value in payload.items() if key != "dispatch_fingerprint"}
@@ -2904,6 +2909,10 @@ def _native_control_step_single(
         raise ValueError(
             "E_NATIVE_CONTROL_MANIFEST_UPGRADE_REQUIRED: deterministic stepping requires v6 or v7"
         )
+    # Probe the selected native API route before creating controller state.
+    from .native_runtime import native_worker_ceiling
+    native_worker_ceiling(work_dir, (manifest.get("route_binding") or {}).get("provider") or (
+        "native-luna" if manifest["pass_kind"] == "translation" else "native-sol"), 1)
     plan_fingerprint = _native_control_plan_fingerprint(manifest)
     state_path = _native_control_state_path(work_dir, manifest, plan_fingerprint)
     state = _load_native_control_state(state_path, manifest, plan_fingerprint)
@@ -3233,6 +3242,10 @@ def _native_control_step_single(
                 "tasks": len(selected_tasks),
                 "records": sum(task["records"] for task in selected_tasks),
                 "final_response": "workspace_relative_relay_receipt_path_only",
+                "executor": "native-host-api" if (native_runtime(work_dir) or {}).get("transport") == "native-host-api" else "collaboration",
+                "broker_command": ["game-l10n", "run-native-broker", "--workspace", str(work_dir.resolve()),
+                                   "--relay", relay_dispatch]
+                    if (native_runtime(work_dir) or {}).get("transport") == "native-host-api" else None,
             }
             if relay_dispatch
             else None

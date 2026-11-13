@@ -1454,6 +1454,8 @@ def prepare_data_plane_task(
                 ),
             ),
         )
+        from .native_runtime import native_worker_ceiling
+        configured_context_workers = native_worker_ceiling(work_dir, worker_route, configured_context_workers)
         context_segments = read_segments(primary_path)
         context_preflight = build_context_preflight(context_segments)
         context_fingerprints = context_contract_fingerprints()
