@@ -2086,6 +2086,7 @@ class NativePassTests(unittest.TestCase):
                     "execution_contract": contract,
                     "result_contract": manifest["result_contract"],
                     "language_binding": manifest["language_binding"],
+                    "execution_namespace": manifest["execution_namespace"],
                 }
             )
             manifest_path.write_text(
@@ -2220,6 +2221,7 @@ class NativePassTests(unittest.TestCase):
                     "execution_contract": manifest["execution_contract"],
                     "result_contract": manifest["result_contract"],
                     "language_binding": manifest["language_binding"],
+                    "execution_namespace": manifest["execution_namespace"],
                 }
             )
             manifest_path.write_text(
