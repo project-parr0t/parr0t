@@ -558,6 +558,11 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
             fingerprint_payload["result_contract"] = result_contract
         if route_binding is not None:
             fingerprint_payload["route_binding"] = route_binding
+        if "execution_namespace" in payload:
+            namespace = manifest_path.parent.resolve().relative_to(work_dir.resolve()).as_posix()
+            if payload["execution_namespace"] != namespace:
+                raise ValueError("E_DETAIL_CONTRACT_CONFLICT: execution namespace changed")
+            fingerprint_payload["execution_namespace"] = namespace
         if language_binding is not None:
             fingerprint_payload["language_binding"] = language_binding
         expected_fingerprint = stable_hash(fingerprint_payload)
@@ -684,6 +689,12 @@ def _manifest_shard_path(
     }
     if manifest.get("version", 0) >= TASK_MANIFEST_VERSION:
         binding_source["task_sha256"] = task["sha256"]
+    if "execution_namespace" in manifest:
+        binding_source.update(
+            execution_namespace=manifest["execution_namespace"],
+            pass_kind=manifest.get("pass_kind", "translation"),
+            route_binding=manifest.get("route_binding"),
+        )
     binding = stable_hash(binding_source)[:16]
     stem = Path(task["file"]).stem
     return work_dir / ".game-l10n" / "native" / "shards" / f"{binding}-{stem}.jsonl"
@@ -695,6 +706,10 @@ def _wave_receipt_path(
     binding = stable_hash(
         {
             "source_fingerprint": manifest["source_fingerprint"],
+            **({"execution_namespace": manifest["execution_namespace"],
+                "pass_kind": manifest.get("pass_kind", "translation"),
+                "route_binding": manifest.get("route_binding")}
+               if "execution_namespace" in manifest else {}),
             "tasks": [
                 {"file": task["file"], "sha256": task["sha256"]} for task in tasks
             ],
@@ -990,6 +1005,7 @@ def prepare_native_tasks(
     )
     task_min_records = min(min_records, task_max_records)
     manifest_path = output_dir / "manifest.json"
+    execution_namespace = output_dir.resolve().relative_to(work_dir.resolve()).as_posix()
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if (
@@ -1005,6 +1021,7 @@ def prepare_native_tasks(
             == task_max_material_tokens
             and manifest.get("review_split") == review_split
             and manifest.get("route_binding") == route_binding
+            and manifest.get("execution_namespace", execution_namespace) == execution_namespace
             and manifest.get("language_binding") == language_binding
             and manifest.get("task_payload_schema") == TASK_PAYLOAD_SCHEMA
         ):
@@ -1037,6 +1054,8 @@ def prepare_native_tasks(
                         else {}
                     ),
                     "language_binding": language_binding,
+                    **({"execution_namespace": execution_namespace}
+                       if "execution_namespace" in manifest else {}),
                 }
             )
             valid = (
@@ -1203,6 +1222,7 @@ def prepare_native_tasks(
             "result_contract": result_contract,
             **({"route_binding": route_binding} if route_binding is not None else {}),
             "language_binding": language_binding,
+            "execution_namespace": execution_namespace,
         }
     )
     manifest = {
@@ -1220,6 +1240,7 @@ def prepare_native_tasks(
         "records": len(segments),
         "review_split": review_split,
         "route_binding": route_binding,
+        "execution_namespace": execution_namespace,
         "language_binding": language_binding,
         "worker_contract": worker_contract,
         "detail_contract": detail_contract,
@@ -1504,6 +1525,8 @@ def _native_control_plan_fingerprint(manifest: dict[str, Any]) -> str:
         yield {"pass_kind": manifest.get("pass_kind", "translation")}
         if manifest.get("route_binding") is not None:
             yield {"route_binding": manifest["route_binding"]}
+        if "execution_namespace" in manifest:
+            yield {"execution_namespace": manifest["execution_namespace"]}
         for task in manifest["tasks"]:
             yield {
                 "file": task["file"],
@@ -3036,6 +3059,11 @@ def _native_control_step_single(
         if selected_tasks and next_wave is not None
         else ""
     )
+    if action == "repair_native_runtime" and next_wave is not None:
+        # Return the existing dispatch without rewriting its launch evidence.
+        # A host repair must not require the parent to reconstruct a task.
+        relay_dispatch = relay_dispatch_path.resolve().relative_to(work_dir.resolve()).as_posix()
+        selected_tasks = wave_tasks[next_wave]
     imported_material_tokens = sum(
         int(task.get("estimated_material_tokens", 0))
         for wave in imported_waves
