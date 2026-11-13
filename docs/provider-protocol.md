@@ -8,6 +8,12 @@ Output sizing uses an explicit translation target or candidate when present. Con
 
 Text-bearing compatible requests also have a per-task input preflight bound. The bound measures the actual system message (including the JSON Schema instruction) plus user payload before network transmission. `budget_exhausted` is non-retryable for that provider attempt and preserves the target in the failure queue. It signals duplicated or unjustifiably broad context, not permission to omit the target. Preset adapters apply the current bound to older workspaces at runtime.
 
+## Waiting and timeouts
+
+API and command providers have no implicit generation timeout. Omitted `timeout`, JSON `null`, and zero disable the local timeout; a finite positive value in provider configuration preserves the operator's explicit setting. HTTP uses a socket timeout, while a command provider uses a process deadline. Negative, nonfinite, and boolean values are invalid. Server-returned timeouts and network errors remain categorical operational failures and use the existing resumable queues.
+
+The current JSON transports receive usage only after completion. They cannot observe live output tok/s, so neither core nor an agent may invent a throughput estimate, infer a stalled model from a quiet response, or create a deadline from historical elapsed time. Throughput-based timing requires live host-reported progress; completion-only usage is insufficient. Native host wait intervals likewise never authorize terminating a live relay; only its recorded terminal lifecycle or an explicit user deadline ends the wait.
+
 ## Command transport
 
 `type: command` is an integration point for explicitly selected `custom` provider workflows, including OpenCode-compatible, local-model, and internal runners. The SDK starts the configured argument array directly with `shell=False`.

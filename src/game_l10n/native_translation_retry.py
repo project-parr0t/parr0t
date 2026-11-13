@@ -199,8 +199,11 @@ def _load_state(work_dir: Path, state_dir: Path) -> dict[str, Any]:
         "final_results",
         "history",
     }
-    if not isinstance(state, dict) or set(state) != required:
+    if not isinstance(state, dict) or set(state) - {"deferred_failure_ids"} != required:
         raise NativeTranslationRetryError("Native translation retry state is malformed")
+    deferred = state.get("deferred_failure_ids", [])
+    if not isinstance(deferred, list) or not all(isinstance(item, str) for item in deferred) or len(set(deferred)) != len(deferred):
+        raise NativeTranslationRetryError("Native translation retry deferred targets are invalid")
     plan = _validated_route_plan(state["route_plan"])
     if (
         state.get("schema") != RETRY_SCHEMA
@@ -226,6 +229,9 @@ def _load_state(work_dir: Path, state_dir: Path) -> dict[str, Any]:
 def _state_summary(work_dir: Path, state_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
     pending_count = len(_read_jsonl(work_dir / state["pending_artifact"]))
     candidate_count = len(_read_jsonl(work_dir / state["candidate_artifact"]))
+    # A transport repair retains its semantic ordinal but needs fresh output
+    # locations; reusing that ordinal's completed manifest would replay errors.
+    run_name = f"run-{len(state['history']):04d}"
     return {
         "schema": RETRY_SCHEMA,
         "state": _relative(work_dir, state_dir / STATE_NAME),
@@ -233,9 +239,14 @@ def _state_summary(work_dir: Path, state_dir: Path, state: dict[str, Any]) -> di
         "next_provider": state["next_provider"],
         "next_attempt": state["next_attempt"],
         "pending_count": pending_count,
+        "deferred_failure_count": len(state.get("deferred_failure_ids", [])),
+        "unresolved_count": pending_count + len(state.get("deferred_failure_ids", [])),
+        "provider_attempt_consumed": state["history"][-1].get("execution_complete", True),
         "candidate_count": candidate_count,
         "pending_input": state["pending_artifact"],
         "pre_fallback_results": state["final_results"],
+        "native_pass_output": _relative(work_dir, state_dir / "native-passes" / run_name),
+        "native_pass_results": _relative(work_dir, state_dir / "native-passes" / (run_name + "-results")),
     }
 
 
@@ -255,7 +266,7 @@ def _write_stage(
         (candidates[segment.id] for segment in source_segments if segment.id in candidates),
     )
     _atomic_jsonl(pending_path, (asdict(segment) for segment in pending))
-    failure_ids = {segment.id for segment in pending}
+    failure_ids = {segment.id for segment in pending} | set(state.get("deferred_failure_ids", []))
     final_rows = []
     for segment in source_segments:
         if segment.id in candidates:
@@ -325,6 +336,13 @@ def start_native_translation_retries(
     next_provider, next_attempt, route_index, next_action = _next_route(
         plan, 0, 1, len(failures)
     )
+    transport_ids = {
+        row["target_id"] for row in _read_jsonl(first_results) if row.get("provider") == "native-control"
+    }
+    deferred = [segment.id for segment in failures if segment.id not in transport_ids] if transport_ids else []
+    if transport_ids:
+        next_provider, next_attempt, route_index, next_action = plan[0]["provider"], 1, 0, "native_retry"
+        failures = [segment for segment in failures if segment.id in transport_ids]
     state_dir.mkdir(parents=True, exist_ok=True)
     state = {
         "schema": RETRY_SCHEMA,
@@ -347,9 +365,13 @@ def start_native_translation_retries(
                 "attempt": 1,
                 "result_sha256": _sha256(first_results),
                 "success_count": len(successes),
-                "failure_count": len(failures),
+                "failure_count": len(failures) + len(deferred),
+                "transport_pending_count": len(transport_ids),
+                "deferred_failure_count": len(deferred),
+                "execution_complete": not bool(transport_ids),
             }
         ],
+        "deferred_failure_ids": deferred,
     }
     return {
         **_write_stage(work_dir, state_dir, segments, candidates, failures, state),
@@ -413,9 +435,25 @@ def advance_native_translation_retries(
     route_index = int(state["route_index"])
     if provider != plan[route_index]["provider"]:
         raise NativeTranslationRetryError("Native translation retry route binding changed")
-    next_provider, next_attempt, next_route_index, next_action = _next_route(
-        plan, route_index, attempt, len(failures)
-    )
+    transport_ids = {
+        row["target_id"] for row in _read_jsonl(attempt_results) if row.get("provider") == "native-control"
+    }
+    deferred_ids = set(state.get("deferred_failure_ids", []))
+    source_ids = {segment.id for segment in source_segments}
+    if not deferred_ids <= source_ids or deferred_ids.intersection(candidates):
+        raise NativeTranslationRetryError("Native retry deferred targets changed")
+    if transport_ids:
+        deferred_ids.update(segment.id for segment in failures if segment.id not in transport_ids)
+        failures = [segment for segment in failures if segment.id in transport_ids]
+        next_provider, next_attempt, next_route_index, next_action = provider, attempt, route_index, "native_retry"
+    else:
+        failed_ids = {segment.id for segment in failures} | deferred_ids
+        failures = [segment for segment in source_segments if segment.id in failed_ids]
+        deferred_ids.clear()
+        next_provider, next_attempt, next_route_index, next_action = _next_route(
+            plan, route_index, attempt, len(failures)
+        )
+    state["deferred_failure_ids"] = [segment.id for segment in source_segments if segment.id in deferred_ids]
     state.update(
         {
             "route_index": next_route_index,
@@ -432,7 +470,10 @@ def advance_native_translation_retries(
             "attempt": attempt,
             "result_sha256": _sha256(attempt_results),
             "success_count": len(successes),
-            "failure_count": len(failures),
+            "failure_count": len(failures) + len(deferred_ids),
+            "transport_pending_count": len(transport_ids),
+            "deferred_failure_count": len(deferred_ids),
+            "execution_complete": not bool(transport_ids),
         }
     )
     return _write_stage(

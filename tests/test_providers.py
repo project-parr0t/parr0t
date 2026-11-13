@@ -3,12 +3,63 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import unittest
 import urllib.error
 from unittest.mock import patch
 
-from game_l10n.errors import ProviderFailure
-from game_l10n.providers import CompatibleChatProvider, OpenAIResponsesProvider, _post_json
+from game_l10n.errors import ConfigurationError, ProviderFailure
+from game_l10n.providers import CommandProvider, CompatibleChatProvider, OpenAIResponsesProvider, ProviderRegistry, _post_json
+from game_l10n.provider_policy import CONTROL_OBSERVATION_POLICY
+
+
+class ProviderTimingTests(unittest.TestCase):
+    def test_provider_defaults_and_config_do_not_invent_timeouts(self) -> None:
+        entries = [
+            {"type": "openai_responses", "name": "responses", "model": "fixture"},
+            {"type": "compatible_chat", "name": "chat", "model": "fixture", "base_url": "https://fixture.invalid"},
+            {"type": "command", "name": "command", "command": ["fixture-command"]},
+        ]
+        from pathlib import Path
+        for timeout in (None, 0, 300.5):
+            with self.subTest(timeout=timeout):
+                config = {"provider_preset": "custom", "control_plane": CONTROL_OBSERVATION_POLICY,
+                          "providers": [{**item, "timeout": timeout} for item in entries]}
+                registry = ProviderRegistry.from_config(config, Path("."))
+                for item in entries:
+                    self.assertEqual(registry.get(item["name"]).timeout, timeout or None)
+        registry = ProviderRegistry.from_config({"provider_preset": "custom", "control_plane": CONTROL_OBSERVATION_POLICY,
+                                                 "providers": entries}, Path("."))
+        for item in entries:
+            self.assertIsNone(registry.get(item["name"]).timeout)
+        for timeout in (-1, float("inf"), True):
+            with self.subTest(invalid=timeout), self.assertRaises(ConfigurationError):
+                CommandProvider("fixture", ["fixture-command"], timeout=timeout)
+
+    def test_http_timeout_is_disabled_unless_explicitly_configured(self) -> None:
+        for timeout in (None, 0, 300):
+            with self.subTest(timeout=timeout), patch(
+                "game_l10n.providers.urllib.request.urlopen", return_value=io.BytesIO(b'{"ok":true}')
+            ) as request:
+                self.assertEqual(_post_json("https://fixture.invalid", {}, {}, timeout), {"ok": True})
+                self.assertEqual(request.call_args.kwargs["timeout"], timeout or None)
+
+    def test_command_deadline_is_opt_in_and_timeout_stays_categorical(self) -> None:
+        completed = subprocess.CompletedProcess(["fixture-command"], 0, stdout="{}", stderr="")
+        for timeout in (None, 0, 300):
+            with self.subTest(timeout=timeout), patch(
+                "game_l10n.providers.subprocess.run", return_value=completed
+            ) as run:
+                provider = CommandProvider("fixture", ["fixture-command"], timeout=timeout)
+                self.assertEqual(provider.generate_json(system="fixture", user="fixture", schema={}, schema_name="fixture"), {})
+                self.assertEqual(run.call_args.kwargs["timeout"], timeout or None)
+        with patch("game_l10n.providers.subprocess.run", side_effect=subprocess.TimeoutExpired(["fixture-command"], 3)):
+            with self.assertRaises(ProviderFailure) as raised:
+                CommandProvider("fixture", ["fixture-command"], timeout=3).generate_json(
+                    system="fixture", user="fixture", schema={}, schema_name="fixture",
+                )
+        self.assertEqual(raised.exception.code, "timeout")
+        self.assertTrue(raised.exception.retryable)
 
 
 class CompatibleProviderTests(unittest.TestCase):

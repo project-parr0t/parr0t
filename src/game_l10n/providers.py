@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import socket
 import subprocess
@@ -171,7 +172,20 @@ def _retry_after_seconds(headers: Any) -> float | None:
         return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
 
 
-def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeout: int) -> dict[str, Any]:
+def _provider_timeout(value: float | None) -> float | None:
+    """No implicit generation deadline; a configured positive value is explicit."""
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ConfigurationError("timeout must be null, zero, or positive seconds") from exc
+    if isinstance(value, bool) or not math.isfinite(seconds) or seconds < 0:
+        raise ConfigurationError("timeout must be null, zero, or positive seconds")
+    return seconds or None
+
+
+def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -179,7 +193,7 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeo
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=_provider_timeout(timeout)) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace").casefold()
@@ -224,7 +238,7 @@ class OpenAIResponsesProvider(ModelProvider):
         *,
         api_key_env: str = "OPENAI_API_KEY",
         base_url: str = "https://api.openai.com/v1",
-        timeout: int = 120,
+        timeout: float | None = None,
         reasoning_effort: str | None = None,
         max_output_tokens: int | None = None,
         task_max_output_tokens: dict[str, int] | None = None,
@@ -234,7 +248,7 @@ class OpenAIResponsesProvider(ModelProvider):
         self.model = model
         self.api_key_env = api_key_env
         self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
+        self.timeout = _provider_timeout(timeout)
         self.reasoning_effort = reasoning_effort
         self.max_output_tokens = max_output_tokens
         self.task_max_output_tokens = {
@@ -385,7 +399,7 @@ class CompatibleChatProvider(ModelProvider):
         *,
         api_key_env: str,
         base_url: str,
-        timeout: int = 120,
+        timeout: float | None = None,
         response_format: str = "json_schema",
         temperature: float | None = None,
         thinking: str | None = None,
@@ -407,7 +421,7 @@ class CompatibleChatProvider(ModelProvider):
         self.model = model
         self.api_key_env = api_key_env
         self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
+        self.timeout = _provider_timeout(timeout)
         self.response_format = response_format
         if temperature is not None and not 0 <= temperature <= 2:
             raise ConfigurationError(
@@ -662,12 +676,12 @@ class CommandProvider(ModelProvider):
     No shell is used. This prevents game text from becoming executable command text.
     """
 
-    def __init__(self, name: str, command: list[str], *, timeout: int = 180, cwd: str | None = None):
+    def __init__(self, name: str, command: list[str], *, timeout: float | None = None, cwd: str | None = None):
         super().__init__(name)
         if not command:
             raise ConfigurationError(f"Command provider {name!r} has an empty command")
         self.command = command
-        self.timeout = timeout
+        self.timeout = _provider_timeout(timeout)
         self.cwd = cwd
 
     def generate_json(
@@ -689,7 +703,9 @@ class CommandProvider(ModelProvider):
                 shell=False,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except subprocess.TimeoutExpired as exc:
+            raise ProviderFailure("timeout", retryable=True) from exc
+        except OSError as exc:
             raise ProviderError(f"Command provider {self.name!r} could not run: {exc}") from exc
         if completed.returncode != 0:
             raise ProviderError(
@@ -748,7 +764,7 @@ class ProviderRegistry:
                     model=item["model"],
                     api_key_env=item.get("api_key_env", "OPENAI_API_KEY"),
                     base_url=item.get("base_url", "https://api.openai.com/v1"),
-                    timeout=int(item.get("timeout", 120)),
+                    timeout=item.get("timeout"),
                     reasoning_effort=item.get("reasoning_effort"),
                     max_output_tokens=(
                         int(item["max_output_tokens"])
@@ -777,7 +793,7 @@ class ProviderRegistry:
                     model=item["model"],
                     api_key_env=item.get("api_key_env", "COMPATIBLE_API_KEY"),
                     base_url=item["base_url"],
-                    timeout=int(item.get("timeout", 120)),
+                    timeout=item.get("timeout"),
                     response_format=item.get("response_format", "json_schema"),
                     temperature=(
                         float(item["temperature"]) if item.get("temperature") is not None else None
@@ -808,7 +824,7 @@ class ProviderRegistry:
                 provider = CommandProvider(
                     **common,
                     command=[str(value) for value in item["command"]],
-                    timeout=int(item.get("timeout", 180)),
+                    timeout=item.get("timeout"),
                     cwd=cwd,
                 )
             else:
