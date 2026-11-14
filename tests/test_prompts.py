@@ -267,6 +267,9 @@ class PromptTests(unittest.TestCase):
             address_rules="FIXTURE_ADDRESS",
             speech_rules=("FIXTURE_RULE",),
             example_lines=("FIXTURE_EXAMPLE",),
+            source_language="synthetic-source",
+            register_shift_rules=("FIXTURE_SHIFT",),
+            evidence_line_ids=("fixture-1",),
         )
         _, user = translation_prompt(
             ProjectContext("FIXTURE", "src", "dst"),
@@ -280,16 +283,66 @@ class PromptTests(unittest.TestCase):
         self.assertEqual(character["address_rules"], "FIXTURE_ADDRESS")
         self.assertEqual(character["speech_rules"], ["FIXTURE_RULE"])
         self.assertEqual(character["example_lines"], ["FIXTURE_EXAMPLE"])
+        self.assertEqual(character["source_language"], "synthetic-source")
+        self.assertEqual(character["register_shift_rules"], ["FIXTURE_SHIFT"])
+        self.assertEqual(character["evidence_line_ids"], ["fixture-1"])
         self.assertNotIn("personality", character)
 
-    def test_glossary_projection_lists_also_accepted_targets(self) -> None:
-        glossary = [GlossaryEntry("Potion", "TARGET_A", targets=("TARGET_B",)), GlossaryEntry("Ice", "TARGET_I")]
-        _, user = translation_prompt(
-            ProjectContext("FIXTURE", "src", "dst"), Segment("fixture-1", "Potion"), glossary, None
+    def test_glossary_projection_carries_authority_and_entity_scope(self) -> None:
+        glossary = [
+            GlossaryEntry(
+                "Potion",
+                "TARGET_A",
+                targets=("TARGET_B",),
+                authority="official_localization",
+                concept_id="synthetic.concept",
+                target_ids=("fixture-1",),
+                source_language="src",
+            ),
+            GlossaryEntry("Ice", "TARGET_I"),
+        ]
+        segment = Segment(
+            "fixture-1",
+            "Potion",
+            metadata={"terminology_concept_ids": ["synthetic.concept"]},
+        )
+        system, user = translation_prompt(
+            ProjectContext("FIXTURE", "src", "dst"), segment, glossary, None
         )
         projected = json.loads(user)["glossary"]
         self.assertEqual(projected[0]["also_accepted_targets"], ["TARGET_B"])
+        self.assertEqual(projected[0]["authority"], "official_localization")
+        self.assertEqual(projected[0]["concept_id"], "synthetic.concept")
+        self.assertEqual(projected[0]["target_ids"], ["fixture-1"])
+        self.assertEqual(projected[0]["source_language"], "src")
         self.assertEqual(len(projected), 1)
+        self.assertIn("broad substring replacement", system)
+        self.assertIn("normalize all dialogue", system)
+
+    def test_prompt_projects_evidenced_source_language_authority(self) -> None:
+        segment = Segment(
+            "fixture-authority",
+            "SOURCE",
+            metadata={
+                "source_language_authority": {
+                    "schema": "parr0t.source-language-authority/v1",
+                    "language": "synthetic-original",
+                    "reason_code": "original_implementation",
+                    "evidence_sha256": "b" * 64,
+                }
+            },
+        )
+        _, user = translation_prompt(
+            ProjectContext("FIXTURE", "synthetic-default", "dst"),
+            segment,
+            [],
+            None,
+        )
+        authority = json.loads(user)["translation_target"][
+            "source_language_authority"
+        ]
+        self.assertEqual(authority["language"], "synthetic-original")
+        self.assertEqual(authority["reason_code"], "original_implementation")
 
     def test_rewrite_prompt_retranslates_adequacy_issues_and_budgets_ui_length(self) -> None:
         segment = Segment("fixture-ui", "SOURCE_LABEL", metadata={"ui_max_chars": 4})
