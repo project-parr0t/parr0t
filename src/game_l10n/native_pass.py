@@ -1010,7 +1010,7 @@ def prepare_native_tasks(
     manifest_path = output_dir / "manifest.json"
     execution_namespace = output_dir.resolve().relative_to(work_dir.resolve()).as_posix()
     if manifest_path.is_file():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = _load_task_manifest(work_dir, manifest_path)
         if (
             manifest.get("version") == TASK_MANIFEST_VERSION
             and manifest.get("source_fingerprint") == fingerprint
@@ -1045,44 +1045,8 @@ def prepare_native_tasks(
                 max_root_input_tokens_per_turn=max_root_input_tokens_per_turn,
                 control_turn_budget_user_approved=control_turn_budget_user_approved,
             )
-            expected_contract_fingerprint = stable_hash(
-                {
-                    "worker_contract": _worker_contract(pass_kind),
-                    "detail_contract": _detail_contract(pass_kind),
-                    "execution_contract": expected_execution_contract,
-                    "result_contract": _result_contract(),
-                    **(
-                        {"route_binding": route_binding}
-                        if route_binding is not None
-                        else {}
-                    ),
-                    "language_binding": language_binding,
-                    **({"execution_namespace": execution_namespace}
-                       if "execution_namespace" in manifest else {}),
-                }
-            )
             valid = (
-                bool(task_rows)
-                and manifest.get("worker_contract") == _worker_contract(pass_kind)
-                and manifest.get("detail_contract") == _detail_contract(pass_kind)
-                and manifest.get("execution_contract") == expected_execution_contract
-                and manifest.get("result_contract") == _result_contract()
-                and manifest.get("contract_fingerprint")
-                == expected_contract_fingerprint
-                and all(
-                    item.get("dispatch_authorized")
-                    == (
-                        expected_execution_contract["bulk_budget_gate"]["active"]
-                        is not True
-                        or expected_execution_contract["bulk_budget_gate"]["user_approved"]
-                        is True
-                        or item["wave"]
-                        <= expected_execution_contract["bulk_budget_gate"][
-                            "pilot_waves_without_approved_budget"
-                        ]
-                    )
-                    for item in task_rows
-                )
+                manifest["execution_contract"] == expected_execution_contract
                 and all(
                     (output_dir / item["file"]).is_file()
                     and isinstance(item.get("size"), int)
@@ -1106,7 +1070,7 @@ def prepare_native_tasks(
                     "fresh_worker_per_task": True,
                     "history_mode": "none",
                     "task_payload_schema": TASK_PAYLOAD_SCHEMA,
-                    "contract_fingerprint": expected_contract_fingerprint,
+                    "contract_fingerprint": manifest["contract_fingerprint"],
                     "execution_contract": execution_contract,
                     "manifest": str(manifest_path),
                     "artifacts": [
@@ -2764,6 +2728,7 @@ def _prepare_review_split_child(
             "root_source_fingerprint": split["root_source_fingerprint"],
         },
         language_binding=current_manifest.get("language_binding"),
+        route_binding=current_manifest.get("route_binding"),
     )
     child_manifest_path = child_tasks / "manifest.json"
     child_manifest = _load_task_manifest(work_dir, child_manifest_path)

@@ -28,6 +28,7 @@ from .models import (
 from .native_followup import CANDIDATE_METADATA_KEY, _atomic_json, _atomic_jsonl, _read_jsonl
 from .native_pass import _load_task_manifest, _require_candidate_bindings, merge_native_pass
 from .orchestrator import LocalizationOrchestrator
+from .providers import _parse_plain_review_verdict
 from .review_selection import (
     DEFAULT_STRONG_REVIEW_CATEGORIES, provenance_review_reasons, review_category,
     rewrite_issue_codes, strong_review_selection_reasons, target_language_review_reasons,
@@ -278,14 +279,7 @@ def materialize_delivery_candidates(
 
 def _compact_verdict(text: str) -> Any:
     stripped = text.strip()
-    if stripped in {"OK", "REFUSED", "ERROR"}:
-        raw = {"verdict": stripped.lower(), "issues": []}
-    elif stripped.startswith("REWRITE "):
-        raw = {"verdict": "rewrite", "issues": [
-            item.strip() for item in stripped[8:].split(",") if item.strip()
-        ]}
-    else:
-        raw = json.loads(stripped)
+    raw = json.loads(stripped) if stripped.startswith("{") else _parse_plain_review_verdict(text)
     if not isinstance(raw, dict) or set(raw) - {"verdict", "issues"}:
         raise ValueError("E_NATIVE_REVIEW_VERDICT_INVALID")
     return LocalizationOrchestrator._review_verdict_envelope(raw)

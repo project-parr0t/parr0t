@@ -68,7 +68,7 @@ def _atomic_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     try:
-        lines = path.read_text(encoding="utf-8-sig").splitlines()
+        lines = path.read_text(encoding="utf-8-sig").split("\n")
     except (OSError, UnicodeError) as exc:
         raise NativeTranslationRetryError("Native retry input is unreadable") from exc
     for line_number, line in enumerate(lines, start=1):

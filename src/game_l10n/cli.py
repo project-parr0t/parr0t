@@ -93,6 +93,7 @@ from .native_broker import probe_native_host, run_native_broker
 from .native_review import (collect_native_review, collect_native_rewrite,
                             collect_reviewed_candidates, process_native_review_followup)
 from .instance_release import validate_instance_release
+from .native_resume import native_resume_status
 from .native_pass import (
     DEFAULT_BULK_BUDGET_GATE_RECORDS,
     DEFAULT_MAX_MATERIAL_TOKENS,
@@ -234,6 +235,19 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
         "docs/provider-protocol.md",
         "docs/control-plane-contract.md",
         "docs/execution-budget.md",
+        "docs/detail-contract.md",
+    ),
+    "resume_native_checkpoint": (
+        "docs/control-plane-contract.md",
+        "docs/detail-contract.md",
+        "docs/native-host-api.md",
+    ),
+    "select_native_checkpoint": (
+        "docs/control-plane-contract.md",
+        "docs/detail-contract.md",
+    ),
+    "repair_native_checkpoint_metadata": (
+        "docs/control-plane-contract.md",
         "docs/detail-contract.md",
     ),
     "rebuild_current_inventory_translation_attestation": (
@@ -1354,6 +1368,18 @@ def cmd_native_pass_step(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_native_resume_status(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    manifest = (
+        _path_in_workspace(work_dir, args.manifest, must_exist=True)
+        if args.manifest else None
+    )
+    result = native_resume_status(work_dir, manifest_path=manifest)
+    result["core_runtime"] = {"module": str(Path(__file__).resolve()), "python": sys.executable}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result["status"] == "invalid" else 0
+
+
 def cmd_seal_native_wave_relay(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     require_sdk_activation(work_dir, load_config(work_dir))
@@ -2329,6 +2355,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         action = "fix_missing_game_root"
     sdk_selection = config.get("sdk_selection", {})
     sdk_activation: dict[str, Any] = {"status": "not_checked"}
+    if action is None and sdk_selection.get("status") == "selected":
+        discovery_receipt = current_data_plane_receipt(work_dir, "source_probe")
+        if discovery_receipt is not None and discovery_receipt.get("status") != "success":
+            action = "record_target_identity_evaluate_and_select_sdk"
     if action is None and sdk_selection.get("status") != "selected":
         if sdk_selection.get("inventory_source") == "portable_unidentified":
             action = "register_portable_sdk_snapshot"
@@ -2550,7 +2580,11 @@ def cmd_status(args: argparse.Namespace) -> int:
                             elif image_status == "localization_required":
                                 action = "run_requested_ui_image_localization"
                             else:
-                                local_artifact = cached_tool_state(work_dir, "pack")
+                                pack_command = config.get("tools", {}).get("pack")
+                                local_artifact = cached_tool_state(
+                                    work_dir, "pack",
+                                    command=[str(item) for item in pack_command] if isinstance(pack_command, list) else [],
+                                )
                                 action = (
                                     "local_patch_ready"
                                     if local_artifact.get("status") == "valid"
@@ -2565,10 +2599,33 @@ def cmd_status(args: argparse.Namespace) -> int:
             "run_primary_translation_review_pipeline": "run_native_translation_review_pipeline",
             "resolve_translation_review_gaps": "resolve_native_translation_review_gaps",
         }.get(action, action)
+    native_resume = None
+    if effective_execution_mode(config) == CODEX_APP_EXECUTION_MODE or (
+        config.get("provider_preset") == "custom" and _native_translation_route_plan(config)
+    ):
+        manifest_arg = getattr(args, "native_manifest", None)
+        manifest = (
+            _path_in_workspace(work_dir, manifest_arg, must_exist=True)
+            if manifest_arg else None
+        )
+        native_resume = native_resume_status(work_dir, manifest_path=manifest)
+        if action in {
+            "run_primary_translation_review_pipeline", "run_native_translation_review_pipeline",
+            "resolve_translation_review_gaps", "resolve_native_translation_review_gaps",
+        }:
+            selected = native_resume["selected"]
+            if native_resume["status"] == "ready" and selected and selected["compatible"]:
+                action = "resume_native_checkpoint"
+            elif native_resume["status"] == "selection_required":
+                action = "select_native_checkpoint"
+            elif native_resume["status"] == "invalid":
+                action = "repair_native_checkpoint_metadata"
+                state_issue_codes.extend(native_resume["issue_codes"])
     print(
         json.dumps(
             {
                 "workspace": str(work_dir),
+                "core_runtime": {"module": str(Path(__file__).resolve()), "python": sys.executable},
                 "sdk_root": contract_base,
                 "game_roots": [str(path) for path in game_roots],
                 "missing_game_roots": missing_roots,
@@ -2594,6 +2651,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "control_plane": public_control_plane_state(control_state),
                 "entry_gate": public_control_plane_entry_state(entry_state),
                 "local_artifact": local_artifact,
+                "native_resume": native_resume,
                 "inventory_gate": inventory_gate,
                 "state_issue_codes": state_issue_codes,
                 "data_plane_task": _status_data_plane_task(work_dir, action),
@@ -2615,6 +2673,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             "fix_missing_game_root",
             "repair_invalid_workspace_state",
             "reconcile_stale_failure_queue",
+            "repair_native_checkpoint_metadata",
         }
         else 0
     )
@@ -3281,6 +3340,14 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Assert the prior relay ended; recover its missing receipt or legacy launch binding after host repair; preserve results and attempt")
     native_step.set_defaults(func=cmd_native_pass_step)
 
+    native_resume = sub.add_parser(
+        "native-resume-status",
+        help="Locate existing native checkpoint commands without opening private task or result text",
+    )
+    native_resume.add_argument("--workspace", required=True)
+    native_resume.add_argument("--manifest", help="Select one existing bound checkpoint by manifest path")
+    native_resume.set_defaults(func=cmd_native_resume_status)
+
     native_host = sub.add_parser("native-runtime", help="Bind or inspect the native host and exact worker models")
     native_host.add_argument("--workspace", required=True)
     native_host.add_argument("--host", help="codex, omp, or an explicitly registered native API host")
@@ -3818,6 +3885,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="Report the next safe action for a Codex orchestrator")
     status.add_argument("--workspace", required=True)
+    status.add_argument("--native-manifest", help="Select an existing native checkpoint when several are pending")
     status.set_defaults(func=cmd_status)
 
     promote = sub.add_parser("promote-sdk", help="Prepare a game-data-free engine SDK profile")

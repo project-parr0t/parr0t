@@ -80,7 +80,7 @@ def _relative(work_dir: Path, path: Path) -> str:
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     try:
-        lines = path.read_text(encoding="utf-8-sig").splitlines()
+        lines = path.read_text(encoding="utf-8-sig").split("\n")
     except UnicodeError as exc:
         raise NativeFollowupError(f"Native follow-up input is not UTF-8: {path.name}") from exc
     for line_number, line in enumerate(lines, start=1):

@@ -1,12 +1,15 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { accessSync, appendFileSync, constants, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const TEMPLATE = fileURLToPath(import.meta.url);
-const CORE = path.resolve(path.dirname(TEMPLATE), "../../..");
-const CORE_SRC = path.join(CORE, "src");
+// The guard is a package resource in both src checkouts and installed wheels.
+const PACKAGE = path.resolve(path.dirname(TEMPLATE), "..");
+const CORE_SRC = path.dirname(PACKAGE);
+const CHECKOUT = path.basename(CORE_SRC) === "src" && existsSync(path.join(CORE_SRC, "../pyproject.toml"));
+const CORE = CHECKOUT ? path.dirname(CORE_SRC) : PACKAGE;
 const SCHEMA = "parr0t.omp-isolation.v1";
 const SESSION_ENV = "PARR0T_OMP_GUARD_SESSION";
 const WORKSPACE_ENV = "PARR0T_OMP_GUARD_WORKSPACE";

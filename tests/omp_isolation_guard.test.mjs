@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import guard from "../src/game_l10n/templates/omp-isolation-guard.mjs";
 
 const template = fileURLToPath(new URL("../src/game_l10n/templates/omp-isolation-guard.mjs", import.meta.url));
@@ -25,7 +25,7 @@ function writeJson(file, value) {
   mkdirSync(path.dirname(file), { recursive: true });
   writeFileSync(file, JSON.stringify(value));
 }
-function host(workspace, kind = "main", depth = 0, name = "Anything") {
+function host(workspace, kind = "main", depth = 0, name = "Anything", factory = guard) {
   const handlers = new Map();
   const tools = new Map();
   const shape = { optional() { return this; } };
@@ -42,7 +42,7 @@ function host(workspace, kind = "main", depth = 0, name = "Anything") {
     shutdownCount: 0,
     shutdown() { this.shutdownCount++; },
   };
-  guard(pi);
+  factory(pi);
   return {
     ctx, handlers, tools,
     emit: async (name, event = {}) => handlers.get(name)?.(event, ctx),
@@ -54,11 +54,11 @@ function host(workspace, kind = "main", depth = 0, name = "Anything") {
     exec(params, signal) { return tools.get("parr0t_exec").execute("synthetic-call", params, signal, undefined, ctx); },
   };
 }
-async function fixture() {
+async function fixture(factory = guard) {
   const workspace = mkdtempSync(path.join(os.tmpdir(), "parr0t-guard-synthetic-"));
   temporary.push(workspace);
   writeJson(path.join(workspace, ".game-l10n/control-plane-state.json"), { generation: 7 });
-  const root = host(workspace);
+  const root = host(workspace, "main", 0, "Anything", factory);
   await root.emit("session_start");
   const registrationPath = path.join(workspace, ".game-l10n/native/omp-isolation.json");
   const registration = JSON.parse(readFileSync(registrationPath, "utf8"));
@@ -72,7 +72,7 @@ async function fixture() {
   writeJson(relayPath, relayMetadata);
   const marker = `PARR0T_OMP_RELAY=${relayRelative}`;
   async function child(depth, name = "Anything") {
-    const session = host(workspace, "sub", depth, name);
+    const session = host(workspace, "sub", depth, name, factory);
     await session.emit("session_start");
     await session.emit("before_agent_start", { prompt: `${marker}\nSynthetic assignment; no game data.` });
     return session;
@@ -216,6 +216,50 @@ describe("file-backed OMP host/message isolation", () => {
     expect(result.details.totalBytes).toEqual(result.details.retainedBytes);
     await expect(worker.exec({ argv: ["-c", "pass"], cwd: "agent://Main" })).rejects.toThrow("virtual");
   });
+  for (const layout of ["checkout", "installed"]) {
+    test(`${layout} guard imports its adjacent Python package and keeps public read roots bounded`, async () => {
+      const directory = mkdtempSync(path.join(os.tmpdir(), "parr0t-package-synthetic-"));
+      temporary.push(directory);
+      const installation = path.join(directory, "synthetic package é");
+      const importRoot = path.join(installation, layout === "checkout" ? "src" : "site-packages");
+      const packageRoot = path.join(importRoot, "game_l10n");
+      const guardPath = path.join(packageRoot, "templates/omp-isolation-guard.mjs");
+      mkdirSync(path.dirname(guardPath), { recursive: true });
+      writeFileSync(guardPath, readFileSync(template));
+      writeFileSync(path.join(packageRoot, "__init__.py"), "");
+      const cliPath = path.join(packageRoot, "cli.py");
+      writeFileSync(cliPath, "import json, sys\nprint(json.dumps({'module': __file__, 'isolated': sys.flags.isolated, 'bytecode_disabled': sys.dont_write_bytecode, 'args': sys.argv[1:]}))\n");
+      if (layout === "checkout") writeFileSync(path.join(installation, "pyproject.toml"), "[project]\nname = 'synthetic'\n");
+      mkdirSync(path.join(installation, "docs"), { recursive: true });
+      const contract = path.join(installation, "docs/control-plane-contract.md");
+      writeFileSync(contract, "Synthetic public contract.\n");
+      writeFileSync(path.join(installation, "AGENTS.md"), "Synthetic public instructions.\n");
+      const factory = (await import(pathToFileURL(guardPath).href)).default;
+      const f = await fixture(factory);
+      expect(f.registration.guard_sha256).toBe(createHash("sha256").update(readFileSync(guardPath)).digest("hex"));
+      const worker = await f.child(2);
+      const coreDirectory = layout === "checkout" ? installation : packageRoot;
+      const workerResult = await worker.exec({ argv: ["-c", "import game_l10n,json;print(json.dumps(game_l10n.__file__))"], cwd: coreDirectory });
+      expect(workerResult.isError).toBe(false);
+      expect(path.resolve(JSON.parse(workerResult.details.stdout))).toBe(path.join(packageRoot, "__init__.py"));
+      // A workspace module must not shadow the fixed relay lifecycle CLI.
+      writeFileSync(path.join(f.workspace, "game_l10n.py"), "raise RuntimeError('synthetic workspace shadow')\n");
+      const relay = await f.child(1);
+      const argv = ["-m", "game_l10n.cli", "record-native-launch", "--workspace", f.workspace, "--relay", f.relayRelative, "--event", "capability-available"];
+      const result = await relay.exec({ argv });
+      expect(result.isError).toBe(false);
+      const observed = JSON.parse(result.details.stdout);
+      expect(path.resolve(observed.module)).toBe(cliPath);
+      expect(observed.isolated).toBe(1);
+      expect(observed.bytecode_disabled).toBe(true);
+      expect(observed.args).toEqual(argv.slice(2));
+      expect((await relay.call("read", { path: contract }))?.block === true).toBe(layout === "installed");
+      expect((await relay.call("read", { path: path.join(installation, "AGENTS.md") }))?.block === true).toBe(layout === "installed");
+      expect((await relay.call("read", { path: `${f.relayPath}:1-2:raw` }))?.block).not.toBe(true);
+      expect((await relay.call("read", { path: path.join(packageRoot, "cli.py") })).block).toBe(true);
+      expect((await relay.call("read", { path: path.join(f.workspace, "game_l10n.py") })).block).toBe(true);
+    });
+  }
   test("relay exec rejects free code/scripts, wrong workspace/relay and non-metadata CLI", async () => {
     const f = await fixture();
     const relay = await f.child(1);

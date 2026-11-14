@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 from game_l10n.models import AttemptRecord, Segment, TranslationResult
 from game_l10n.store import stable_hash
@@ -26,6 +27,333 @@ def _digest(value: str) -> str:
 
 
 class TranslationExchangeTests(unittest.TestCase):
+    def test_network_error_without_reported_usage_is_not_assumed_free(self) -> None:
+        for code in ("authentication_error", "quota_exhausted", "rate_limited"):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                bundle = root / "exchange"
+                prepare_translation_exchange(
+                    root, [Segment("line", "Source")], bundle,
+                    exchange_id="unknown-error-usage", mode="fallback",
+                    source_queue="translation_fallback_pending",
+                )
+                result = process_translation_exchange(
+                    root, bundle,
+                    lambda segments: [TranslationResult(
+                        "line", "Source",
+                        attempts=[AttemptRecord("translate", "fallback", "error", issue_code=code)],
+                    )],
+                    route="fallback", max_input_tokens=100, baseline_input_tokens=0,
+                )
+                self.assertEqual(result["issue_code"], "E_FALLBACK_BUDGET_ACCOUNTING_UNCERTAIN")
+                usage = json.loads((root / FALLBACK_USAGE_RELATIVE).read_text(encoding="utf-8"))
+                self.assertIsNotNone(usage["active_event"])
+
+    def test_usage_is_durable_before_a_progress_consumer_interrupts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "exchange"
+            prepare_translation_exchange(
+                root, [Segment("line", "Source")], bundle,
+                exchange_id="progress-interruption", mode="fallback",
+                source_queue="translation_fallback_pending",
+            )
+
+            def interrupt_progress(statistics: dict[str, object]) -> None:
+                if statistics["completed_records"]:
+                    raise RuntimeError("Synthetic consumer interruption")
+
+            with self.assertRaisesRegex(RuntimeError, "Synthetic consumer"):
+                process_translation_exchange(
+                    root, bundle,
+                    lambda segments: [TranslationResult(
+                        "line", "Source", "Target", "translated",
+                        attempts=[AttemptRecord("translate", "fallback", "success", usage={"input_tokens": 7})],
+                    )],
+                    route="fallback", max_input_tokens=100, baseline_input_tokens=0,
+                    progress_callback=interrupt_progress,
+                )
+            usage = json.loads((root / FALLBACK_USAGE_RELATIVE).read_text(encoding="utf-8"))
+            self.assertEqual(usage["provider_input_tokens"], 7)
+            self.assertIsNone(usage["active_event"])
+            self.assertEqual(seal_translation_exchange(root, bundle)["success_count"], 1)
+
+    def test_unlimited_policy_rejects_nonfinite_deadlines_before_provider_calls(self) -> None:
+        for started_at in (float("nan"), float("inf")):
+            with self.subTest(started_at=started_at), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                bundle = root / "exchange"
+                prepare_translation_exchange(
+                    root, [Segment("line", "Source")], bundle,
+                    exchange_id="invalid-unlimited-deadline", mode="fallback",
+                    source_queue="translation_fallback_pending",
+                )
+                with self.assertRaisesRegex(TranslationExchangeError, "UNLIMITED_POLICY_INVALID"):
+                    process_translation_exchange(
+                        root, bundle, lambda segments: self.fail("Invalid deadline must not call provider"),
+                        route="fallback", input_tokens_unlimited=True,
+                        max_elapsed_minutes=1, started_at_epoch=started_at,
+                    )
+
+    def test_unicode_line_separators_round_trip_through_requests_and_successes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "exchange"
+            source = "Synthetic\u0085source\u2028with\u2029separators"
+            target = "Synthetic\u2029target\u2028with\u0085separators"
+            prepare_translation_exchange(
+                root, [Segment("line", source, previous=source)], bundle,
+                exchange_id="unicode-separators", mode="fallback",
+                source_queue="translation_fallback_pending",
+            )
+
+            def translate(segments: list[Segment]) -> list[TranslationResult]:
+                self.assertEqual(segments[0].source, source)
+                self.assertEqual(segments[0].previous, source)
+                return [TranslationResult("line", source, target, "translated")]
+
+            result = process_translation_exchange(root, bundle, translate, route="fallback")
+            self.assertEqual(result["success_count"], 1)
+            self.assertEqual(
+                json.loads((bundle / SUCCESS_NAME).read_text(encoding="utf-8"))["text"],
+                target,
+            )
+            self.assertEqual(seal_translation_exchange(root, bundle)["status"], "complete")
+
+    def test_fallback_rejects_result_from_a_stale_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "exchange"
+            prepare_translation_exchange(
+                root, [Segment("line", "Current source")], bundle,
+                exchange_id="stale-result", mode="fallback",
+                source_queue="translation_fallback_pending",
+            )
+            with self.assertRaisesRegex(TranslationExchangeError, "immutable exchange sources"):
+                process_translation_exchange(
+                    root, bundle,
+                    lambda segments: [TranslationResult("line", "Old source", "Target", "translated")],
+                    route="fallback",
+                )
+            result = seal_translation_exchange(root, bundle)
+            self.assertEqual(result["success_count"], 0)
+            self.assertEqual(result["pending_count"], 1)
+
+    def test_budget_checkpoint_keeps_unattempted_failures_and_retry_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "exchange"
+            prepare_translation_exchange(
+                root, [Segment("first", "One"), Segment("second", "Two")], bundle,
+                exchange_id="failed-retry-checkpoint", mode="fallback",
+                source_queue="translation_fallback_pending",
+            )
+            process_translation_exchange(
+                root, bundle,
+                lambda segments: [
+                    TranslationResult(
+                        item.id, item.source,
+                        attempts=[AttemptRecord("translate", "fallback", "error", issue_code="timeout")],
+                    )
+                    for item in segments
+                ],
+                route="fallback",
+            )
+            original_failure = json.loads(
+                (bundle / "failure.jsonl").read_text(encoding="utf-8").splitlines()[1]
+            )
+            calls: list[str] = []
+
+            def translate(segments: list[Segment]) -> list[TranslationResult]:
+                calls.extend(item.id for item in segments)
+                return [
+                    TranslationResult(
+                        item.id, item.source, "Target", "translated",
+                        attempts=[AttemptRecord("translate", "fallback", "success", usage={"input_tokens": 10})],
+                    )
+                    for item in segments
+                ]
+
+            result = process_translation_exchange(
+                root, bundle, translate, route="fallback", retry_failures=True,
+                max_input_tokens=10, baseline_input_tokens=0, wave_size=1,
+            )
+            self.assertEqual(calls, ["first"])
+            self.assertEqual(result["success_count"], 1)
+            self.assertEqual(result["failure_count"], 1)
+            self.assertEqual(result["pending_count"], 0)
+            self.assertEqual(
+                json.loads((bundle / FAILURE_NAME).read_text(encoding="utf-8")),
+                original_failure,
+            )
+            resumed = process_translation_exchange(
+                root, bundle, translate, route="fallback", max_input_tokens=10,
+            )
+            self.assertEqual(resumed["processed"], 0)
+            self.assertEqual(calls, ["first"])
+
+    def test_interrupted_retry_checkpoint_does_not_leave_overlapping_results(self) -> None:
+        import game_l10n.translation_exchange as exchange
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "exchange"
+            prepare_translation_exchange(
+                root, [Segment("line", "Source")], bundle,
+                exchange_id="interrupted-retry", mode="fallback",
+                source_queue="translation_fallback_pending",
+            )
+            process_translation_exchange(
+                root, bundle, lambda segments: [TranslationResult("line", "Source")],
+                route="fallback",
+            )
+            atomic_bytes = exchange._atomic_bytes
+
+            def interrupt_success(path: Path, data: bytes) -> None:
+                if path.name == SUCCESS_NAME:
+                    raise OSError("Synthetic interrupted success commit")
+                atomic_bytes(path, data)
+
+            with patch.object(exchange, "_atomic_bytes", side_effect=interrupt_success):
+                with self.assertRaisesRegex(OSError, "Synthetic interrupted"):
+                    process_translation_exchange(
+                        root, bundle,
+                        lambda segments: [TranslationResult("line", "Source", "Target", "translated")],
+                        route="fallback", retry_failures=True,
+                    )
+            result = seal_translation_exchange(root, bundle)
+            self.assertEqual(result["success_count"], 0)
+            self.assertEqual(result["failure_count"], 0)
+            self.assertEqual(result["pending_count"], 1)
+
+    def test_cached_results_do_not_charge_historical_usage_again(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "exchange"
+            prepare_translation_exchange(
+                root, [Segment("line", "Source")], bundle,
+                exchange_id="cached-usage", mode="fallback",
+                source_queue="translation_fallback_pending",
+            )
+            result = process_translation_exchange(
+                root, bundle,
+                lambda segments: [
+                    TranslationResult(
+                        "line", "Source", "Target", "translated", from_cache=True,
+                        attempts=[AttemptRecord("translate", "fallback", "success", usage={"input_tokens": 40})],
+                    )
+                ],
+                route="fallback", max_input_tokens=100, baseline_input_tokens=40,
+            )
+            self.assertEqual(result["budget"]["input_tokens"], 40)
+            usage = json.loads((root / FALLBACK_USAGE_RELATIVE).read_text(encoding="utf-8"))
+            self.assertEqual(usage["provider_input_tokens"], 0)
+            self.assertIsNone(usage["active_event"])
+
+    def test_completed_bundle_can_reconcile_its_uncertain_usage_event(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "exchange"
+            prepare_translation_exchange(
+                root, [Segment("line", "Source")], bundle,
+                exchange_id="completed-reconciliation", mode="fallback",
+                source_queue="translation_fallback_pending",
+            )
+            first = process_translation_exchange(
+                root, bundle,
+                lambda segments: [TranslationResult("line", "Source", "Target", "translated")],
+                route="fallback", max_input_tokens=100, baseline_input_tokens=10,
+            )
+            self.assertEqual(first["status"], "complete")
+            self.assertEqual(first["issue_code"], "E_FALLBACK_BUDGET_ACCOUNTING_UNCERTAIN")
+            with self.assertRaisesRegex(TranslationExchangeError, "ACCOUNTING_UNCERTAIN"):
+                process_translation_exchange(
+                    root, bundle, lambda segments: self.fail("Cached success must not be called"),
+                    route="fallback", max_input_tokens=100,
+                )
+            result = process_translation_exchange(
+                root, bundle, lambda segments: self.fail("Cached success must not be called"),
+                route="fallback", max_input_tokens=100, resolve_uncertain_input_tokens=7,
+            )
+            self.assertEqual(result["processed"], 0)
+            self.assertEqual(result["budget"]["input_tokens"], 17)
+            usage = json.loads((root / FALLBACK_USAGE_RELATIVE).read_text(encoding="utf-8"))
+            self.assertIsNone(usage["active_event"])
+            self.assertEqual(usage["events"][0]["accounting"], "user_reconciled")
+
+    def test_omitting_an_existing_user_limit_does_not_start_unlimited_calls(self) -> None:
+        from game_l10n.translation_exchange import _fallback_usage_state
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "exchange"
+            prepare_translation_exchange(
+                root, [Segment("line", "Source")], bundle,
+                exchange_id="bound-user-limit", mode="fallback",
+                source_queue="translation_fallback_pending",
+            )
+            ledger, _ = _fallback_usage_state(
+                root, max_input_tokens=100, baseline_input_tokens=100,
+                max_elapsed_minutes=None, started_at_epoch=None,
+                resolve_uncertain_input_tokens=None,
+            )
+            original = ledger.read_bytes()
+            with self.assertRaisesRegex(TranslationExchangeError, "E_FALLBACK_BUDGET_REQUIRED"):
+                process_translation_exchange(
+                    root, bundle, lambda segments: self.fail("User limit must remain bound"),
+                    route="fallback",
+                )
+            self.assertEqual(ledger.read_bytes(), original)
+
+    def test_usage_limits_reject_invalid_types_and_nonfinite_deadlines(self) -> None:
+        from game_l10n.translation_exchange import _fallback_usage_state
+
+        invalid_options = [
+            {"max_input_tokens": True},
+            {"max_input_tokens": 10.5},
+            {"baseline_input_tokens": True},
+            {"baseline_input_tokens": 1.5},
+            {"max_elapsed_minutes": True},
+            {"max_elapsed_minutes": 1.5},
+            {"max_elapsed_minutes": 1},
+            {"started_at_epoch": float("nan")},
+            {"started_at_epoch": float("inf")},
+            {"started_at_epoch": 0},
+        ]
+        for invalid in invalid_options:
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                options = dict(
+                    max_input_tokens=100, baseline_input_tokens=0,
+                    max_elapsed_minutes=None, started_at_epoch=None,
+                    resolve_uncertain_input_tokens=None,
+                )
+                options.update(invalid)
+                with self.assertRaises(TranslationExchangeError):
+                    _fallback_usage_state(root, **options)
+                self.assertFalse((root / FALLBACK_USAGE_RELATIVE).exists())
+
+    def test_usage_ledger_retains_and_validates_the_original_deadline(self) -> None:
+        from game_l10n.translation_exchange import _fallback_usage_state
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            options = dict(
+                max_input_tokens=100, baseline_input_tokens=0,
+                max_elapsed_minutes=1, started_at_epoch=100.0,
+                resolve_uncertain_input_tokens=None,
+            )
+            ledger, state = _fallback_usage_state(root, **options)
+            original = ledger.read_bytes()
+            with self.assertRaisesRegex(TranslationExchangeError, "ELAPSED_BUDGET_MISMATCH"):
+                _fallback_usage_state(root, **{**options, "started_at_epoch": 200.0})
+            self.assertEqual(ledger.read_bytes(), original)
+            for invalid_start in (float("nan"), float("inf")):
+                state["started_at_epoch"] = invalid_start
+                ledger.write_text(json.dumps(state), encoding="utf-8")
+                with self.assertRaisesRegex(TranslationExchangeError, "USAGE_STATE_INVALID"):
+                    _fallback_usage_state(root, **{**options, "started_at_epoch": None})
+
     def test_bound_optional_ui_slot_accepts_empty_fallback_success(self) -> None:
         source = "SOURCE_OPTIONAL"
         metadata = {
