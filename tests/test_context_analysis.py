@@ -16,10 +16,11 @@ from game_l10n.context_analysis import (
     analyze_with_cache,
     build_context_preflight,
     classify_context_disposition,
+    chunk_localization_inputs,
     infer_context_mode,
 )
 from game_l10n.errors import ProviderError
-from game_l10n.models import Segment
+from game_l10n.models import GlossaryEntry, ProjectContext, Segment
 from game_l10n.providers import ProviderRegistry, ScriptedProvider
 
 
@@ -708,6 +709,43 @@ class ContextAnalysisTests(unittest.TestCase):
                 localization={"project": ProjectContext("T", "src", "ko", style_guide=style)},
             )["binding_id"]
         self.assertNotEqual(binding("FORMAL"), binding("CASUAL"))
+
+    def test_context_inputs_preserve_source_and_glossary_authority(self) -> None:
+        segment = Segment(
+            "synthetic-authority",
+            "SOURCE_TERM",
+            metadata={
+                "source_language_authority": {
+                    "schema": "parr0t.source-language-authority/v1",
+                    "language": "synthetic-original",
+                    "reason_code": "complete_source_catalog",
+                    "evidence_sha256": "e" * 64,
+                },
+                "terminology_concept_ids": ["synthetic.concept"],
+            },
+        )
+        glossary = [
+            GlossaryEntry(
+                "SOURCE_TERM",
+                "TARGET_TERM",
+                authority="official_localization",
+                concept_id="synthetic.concept",
+                source_language="synthetic-original",
+            )
+        ]
+
+        inputs = chunk_localization_inputs(
+            [segment],
+            ProjectContext("FIXTURE", "synthetic-default", "dst"),
+            glossary,
+        )
+
+        self.assertEqual(
+            inputs["source_language_authorities"][0]["language"],
+            "synthetic-original",
+        )
+        self.assertEqual(inputs["glossary"][0]["authority"], "official_localization")
+        self.assertEqual(inputs["glossary"][0]["concept_id"], "synthetic.concept")
 
 if __name__ == "__main__":
     unittest.main()
