@@ -28,6 +28,7 @@ from .models import (
 from .native_followup import CANDIDATE_METADATA_KEY, _atomic_json, _atomic_jsonl, _read_jsonl
 from .native_pass import _load_task_manifest, _require_candidate_bindings, merge_native_pass
 from .orchestrator import LocalizationOrchestrator
+from .providers import _parse_plain_review_verdict
 from .review_selection import (
     DEFAULT_STRONG_REVIEW_CATEGORIES, provenance_review_reasons, review_category,
     rewrite_issue_codes, strong_review_selection_reasons, target_language_review_reasons,
@@ -278,14 +279,7 @@ def materialize_delivery_candidates(
 
 def _compact_verdict(text: str) -> Any:
     stripped = text.strip()
-    if stripped in {"OK", "REFUSED", "ERROR"}:
-        raw = {"verdict": stripped.lower(), "issues": []}
-    elif stripped.startswith("REWRITE "):
-        raw = {"verdict": "rewrite", "issues": [
-            item.strip() for item in stripped[8:].split(",") if item.strip()
-        ]}
-    else:
-        raw = json.loads(stripped)
+    raw = json.loads(stripped) if stripped.startswith("{") else _parse_plain_review_verdict(text)
     if not isinstance(raw, dict) or set(raw) - {"verdict", "issues"}:
         raise ValueError("E_NATIVE_REVIEW_VERDICT_INVALID")
     return LocalizationOrchestrator._review_verdict_envelope(raw)
@@ -327,6 +321,31 @@ def _pending_segment(segment: Segment, result: TranslationResult) -> Segment:
         ) if key in result.metadata},
     }
     return replace(segment, metadata={**segment.metadata, REVIEW_STATE_KEY: state})
+
+
+def select_native_review_route(segments: list[Segment], routes: list[str], *, stage: str) -> str:
+    """Select the next ordered role route from current-candidate attempt evidence.
+
+    Callers pass only a collector's pending artifact, never its accepted rows.
+    An external next route is not silently skipped to reach a native provider.
+    """
+    selected = set()
+    for segment in segments:
+        result = _bound_result(segment)
+        attempted = {item.provider for item in result.attempts
+                     if item.stage == stage and item.candidate_generation == result.candidate_generation}
+        active_routes = routes
+        if stage == "review-rewrite" and not active_routes:
+            active_routes = [next((item.provider for item in reversed(result.attempts)
+                                  if item.stage == "review" and
+                                  item.candidate_generation == result.candidate_generation), "")]
+        selected.add(next((route for route in active_routes if route not in attempted), ""))
+    if len(selected) != 1:
+        raise ValueError("E_NATIVE_ROUTE_INVALID: pending targets require different role routes")
+    provider = selected.pop()
+    if not provider.startswith("native-"):
+        raise ValueError("E_NATIVE_ROUTE_INVALID: next role route is external or exhausted")
+    return provider
 
 
 def collect_native_review(
@@ -372,7 +391,8 @@ def collect_native_review(
         result = _bound_result(segment)
         if result.candidate_digest != stable_hash(result.text):
             raise ValueError("E_NATIVE_REVIEW_CANDIDATE_STALE")
-        provider = "native-luna" if tier == "triage" else "native-sol"
+        provider = (manifest.get("route_binding") or {}).get("provider") or (
+            "native-luna" if tier == "triage" else "native-sol")
         stage = "review-triage" if tier == "triage" else "review"
         verdict = None
         if row["status"] == "success":
@@ -508,7 +528,6 @@ def collect_native_rewrite(
         if result.candidate_digest != stable_hash(result.text):
             raise ValueError("E_NATIVE_REVIEW_CANDIDATE_STALE")
         native = [a for a in result.attempts if a.stage == "review"
-                  and a.provider == "native-sol"
                   and a.candidate_generation == result.candidate_generation]
         if not native or not result.metadata.get("rewrite_issues"):
             raise ValueError("E_NATIVE_REVIEW_REWRITE_NOT_FLAGGED")
@@ -522,6 +541,7 @@ def collect_native_rewrite(
     if not summary["complete"]:
         raise ValueError("E_NATIVE_REWRITE_PASS_INCOMPLETE")
     rows = _read_jsonl(merged)
+    provider = (manifest.get("route_binding") or {}).get("provider") or "native-sol"
     confirmation, unresolved, results = [], [], []
     for segment, result, row in zip(segments, initial, rows, strict=True):
         integrity = (validate_integrity(segment, row["text"], glossary or [],
@@ -529,9 +549,9 @@ def collect_native_rewrite(
                      if row["status"] == "success" else [])
         valid = row["status"] == "success" and not integrity
         result.attempts.append(AttemptRecord(
-            "review-rewrite", "native-sol", "success" if valid else "error",
+            "review-rewrite", provider, "success" if valid else "error",
             issues=[item.code for item in integrity] if integrity else list(row.get("issues", [])),
-            ordinal=1 + sum(a.stage == "review-rewrite" and a.provider == "native-sol"
+            ordinal=1 + sum(a.stage == "review-rewrite" and a.provider == provider
                             for a in result.attempts),
             candidate_generation=result.candidate_generation,
         ))
@@ -545,7 +565,7 @@ def collect_native_rewrite(
             result.metadata["native_confirmation_pending"] = True
             bound = replace(segment, metadata={**segment.metadata, CANDIDATE_METADATA_KEY: {
                 "text": result.text, "generation": result.candidate_generation,
-                "digest": result.candidate_digest, "provider": "native-sol",
+                "digest": result.candidate_digest, "provider": provider,
             }})
             confirmation.append(_pending_segment(bound, result))
         else:

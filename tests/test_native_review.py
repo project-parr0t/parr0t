@@ -304,6 +304,35 @@ class NativeReviewTests(unittest.TestCase):
             self.assertEqual(summary, again)
             self.assertEqual(len(read_translation_results(root / "collected/accepted.json")[0].attempts), 1)
 
+    def test_plain_verdict_grammar_preserves_rewrites_and_rejects_malformed_results(self):
+        from game_l10n.native_review import _bound_result
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            texts = ["ok", "rewrite VOICE,voice", "REWRITE voice,", "REWRITE ,voice",
+                     "REWRITE\nvoice", "OK\n", "REWRITE grammar"]
+            segments = [review_segment(f"fixture-{i}") for i in range(len(texts))]
+            source = root / "source.jsonl"
+            source.write_text("\n".join(json.dumps(asdict(s)) for s in segments) + "\n")
+            segments = read_segments(source)
+            tasks, results = root / "tasks", root / "results"
+            prepare_native_tasks(root, source, segments, tasks, pass_kind="review")
+            results.mkdir()
+            (results / "task-0001.jsonl").write_text("\n".join(
+                json.dumps({"target_id": s.id, "status": "success", "text": text})
+                for s, text in zip(segments, texts, strict=True)
+            ) + "\n")
+            import_native_wave(root, tasks / "manifest.json", results, 1)
+            summary = collect_native_review(root, source, tasks / "manifest.json",
+                                            root / "collected", tier="strong")
+            accepted = read_translation_results(root / "collected/accepted.json")
+            self.assertEqual([item.segment_id for item in accepted], [segments[0].id])
+            rewrite = read_segments(root / "collected/rewrite-input.jsonl")
+            self.assertEqual([item.id for item in rewrite], [segments[1].id])
+            self.assertEqual(_bound_result(rewrite[0]).metadata["rewrite_issues"], ["voice"])
+            fallback = read_segments(root / "collected/fallback-input.jsonl")
+            self.assertEqual([item.id for item in fallback], [s.id for s in segments[2:]])
+            self.assertEqual(summary["invalid_verdicts"], 5)
+
     def test_sample_and_high_risk_are_not_exempted_by_ok(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
