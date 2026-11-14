@@ -19,6 +19,11 @@ All fields are optional and belong in `Segment.metadata`. Emit them only from st
 - `target_language_exception`: only `proper_name`, `immutable_identifier`, `acronym`, `control_token`, or `required_foreign_text`, when the displayed value must intentionally remain outside the target script.
 - `target_language_exception_evidence_sha256`: SHA-256 of SDK/call-site evidence supporting that exact exception. Without both fields, foreign-language prose remains a blocking target-language defect.
 - `context_preflight`: optional positive adapter authority for a context-free UI slot. It is never inferred from wording or from `text_type=button` alone. The exact object is described below.
+- `source_language_authority`: an exact `parr0t.source-language-authority/v1` object when static evidence overrides the project source language.
+- `terminology_concept_ids`: unique stable concept identities used to scope ambiguous glossary forms to this target.
+- `source_absent_parenthetical_policy`: only `source_or_authoritative_glossary`, when the adapter can require source/glossary-backed parentheses.
+
+These localization-authority fields are defined in `docs/localization-authority.md`. Both independent inventories must agree on them. They bind semantic interpretation and therefore cannot be inferred from a candidate or changed during correction.
 
 ## Context preflight authority
 

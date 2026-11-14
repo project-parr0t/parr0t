@@ -11,8 +11,9 @@ from typing import Any
 from .errors import ProviderError
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext, Segment
 from .providers import ProviderRegistry
+from .localization_authority import effective_source_language
 from .store import stable_hash, stable_hash_sequence
-from .validators import contains_term
+from .validators import applicable_glossary_entries
 
 SUPPORTED_CONTEXT_MODES = {mode.value for mode in ContextMode}
 CONTEXT_DOMAINS = {
@@ -336,6 +337,11 @@ When localization_inputs is supplied, write formality, address and speech-rule g
 language's own register terms (for Korean, name the speech level such as hapsyo-che, haeyo-che or hae-che and
 who is addressed). Its glossary is authoritative: terminology_rules must not contradict it. Its
 speaker_profiles are user-authored and take precedence over inferred traits.
+When source_language_authorities are supplied, analyze each target from that evidenced original implementation,
+complete source catalog, or authoritative source metadata. Presentation, manifest, and display-language metadata
+cannot override it; secondary locales corroborate only. Derive personality and stable voice from that authoritative
+source. Do not normalize all speakers to one register, and record a register shift only when relationship,
+hierarchy, scene-state, or progression evidence supports it.
 Return only the requested JSON object."""
 
 _MODE_SYSTEM_PROMPTS = {
@@ -629,7 +635,6 @@ def chunk_localization_inputs(
     characters: list[CharacterProfile] | tuple[CharacterProfile, ...] = (),
 ) -> dict[str, Any]:
     """User-locked facts the analyzer must phrase guidance against; empty when none exist."""
-    text = "\n".join(item.source for item in chunk)
     speakers = {item.speaker.casefold() for item in chunk if item.speaker}
     inputs: dict[str, Any] = {}
     if project is not None:
@@ -639,15 +644,38 @@ def chunk_localization_inputs(
             "genre": project.genre,
             "style_guide": project.style_guide,
         }
+        authorities = [
+            {
+                "target_id": item.id,
+                **effective_source_language(item.metadata, project.source_language),
+            }
+            for item in chunk
+            if "source_language_authority" in item.metadata
+        ]
+        if authorities:
+            inputs["source_language_authorities"] = authorities
+    relevant_terms: dict[int, GlossaryEntry] = {}
+    glossary_rows = list(glossary)
+    for item in chunk:
+        for entry in applicable_glossary_entries(
+            glossary_rows,
+            item.source,
+            segment=item,
+            default_source_language=project.source_language if project else "",
+        ):
+            relevant_terms[id(entry)] = entry
     terms = [
         {
             "source": entry.source,
             "target": entry.target,
+            "authority": entry.authority,
+            **({"concept_id": entry.concept_id} if entry.concept_id else {}),
+            **({"target_ids": list(entry.target_ids)} if entry.target_ids else {}),
+            **({"source_language": entry.source_language} if entry.source_language else {}),
             **({"also_accepted_targets": list(entry.targets)} if entry.targets else {}),
             **({"note": entry.note} if entry.note else {}),
         }
-        for entry in glossary
-        if contains_term(entry.source, text, case_sensitive=entry.case_sensitive)
+        for entry in relevant_terms.values()
     ][:64]
     if terms:
         inputs["glossary"] = terms
