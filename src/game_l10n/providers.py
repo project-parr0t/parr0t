@@ -18,28 +18,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .errors import ConfigurationError, ProviderFailure
+from .prompts import REVIEW_ISSUE_CODES
 from .provider_policy import validate_provider_policy
-
-_REVIEW_ISSUE_CODES = {
-    "meaning",
-    "omission",
-    "addition",
-    "voice",
-    "register",
-    "terminology",
-    "consistency",
-    "formatting",
-    "fluency",
-    "literalism",
-    "reference_loss",
-    "tone_rhythm",
-    "function",
-    "condition",
-    "unit",
-    "knowledge_order",
-    "length_risk",
-    "slot_composition",
-}
 
 _DEFAULT_FOCUSED_TEXT_INPUT_CHARS = 24_000
 _FOCUSED_TEXT_SCHEMA_NAMES = (
@@ -63,7 +43,7 @@ def _parse_plain_review_verdict(value: str) -> dict[str, Any]:
     issues = [item.strip().casefold() for item in tail.split(",")] if tail else []
     if (verdict != "rewrite" and issues) or (verdict == "rewrite" and not issues):
         raise ProviderFailure("malformed_response", retryable=True)
-    if len(issues) > 4 or any(item not in _REVIEW_ISSUE_CODES for item in issues):
+    if len(issues) > 4 or any(item not in REVIEW_ISSUE_CODES for item in issues):
         raise ProviderFailure("malformed_response", retryable=True)
     return {"verdict": verdict, "issues": list(dict.fromkeys(issues))}
 

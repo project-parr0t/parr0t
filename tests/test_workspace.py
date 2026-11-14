@@ -74,6 +74,29 @@ def default_language_completion() -> dict:
     }
 
 
+def write_bound_completion(work: Path, result: Path) -> Path:
+    body = result.read_bytes()
+    path = work / ".game-l10n" / "completion-attestation.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "parr0t.completion-attestation.v3",
+                "target_completion": True,
+                "static_completion": True,
+                "target_language": default_language_completion(),
+                "result_artifact": {
+                    "path": str(result.resolve()),
+                    "sha256": hashlib.sha256(body).hexdigest(),
+                    "size": len(body),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def write_verified_inventory(work: Path) -> tuple[Path, dict]:
     rows = [{"id": "fixture-1", "source": "SOURCE"}]
     primary = work / "inputs" / "primary.json"
@@ -1114,6 +1137,339 @@ class WorkspaceTests(unittest.TestCase):
         self.assertNotIn("publish", json.dumps(manifest).lower())
         self.assertEqual(exported, {"profile.json", "tools/pack.py", "tools/unpack.py"})
 
+    def test_tool_cache_checks_content_without_reprocessing_timestamp_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            source = work / "source.bin"
+            source.write_bytes(b"original")
+            output = work / "output.bin"
+            tool = work / "copy-tool.py"
+            tool.write_text(
+                "import shutil, sys\nshutil.copyfile(sys.argv[1], sys.argv[2])\n",
+                encoding="utf-8",
+            )
+            arguments = {
+                "stage": "unpack",
+                "command": ["python", str(tool), "{input}", "{output}"],
+                "input_path": source,
+                "output_path": output,
+                "work_dir": work,
+            }
+            with patch("game_l10n.tooling.subprocess.run", wraps=subprocess.run) as run:
+                self.assertEqual(run_cached_tool(**arguments)["status"], "completed")
+                stat = source.stat()
+                os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+                self.assertEqual(cached_tool_state(work, "unpack")["status"], "valid")
+                self.assertEqual(run_cached_tool(**arguments)["status"], "skipped")
+                self.assertEqual(run.call_count, 1)
+                stat = source.stat()
+                source.write_bytes(b"modified")
+                os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+                self.assertEqual(
+                    cached_tool_state(work, "unpack"),
+                    {"status": "stale", "issue_code": "TOOL_INPUT_CHANGED"},
+                )
+                self.assertEqual(run_cached_tool(**arguments)["status"], "completed")
+                self.assertEqual(run.call_count, 2)
+            self.assertEqual(output.read_bytes(), b"modified")
+
+    def test_cached_tool_state_rechecks_adapter_bytes_and_configured_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            source = work / "source.bin"
+            source.write_bytes(b"fixture")
+            output = work / "output.bin"
+            tool = work / "copy-tool.py"
+            tool.write_text(
+                "import shutil, sys\nshutil.copyfile(sys.argv[1], sys.argv[2])\n",
+                encoding="utf-8",
+            )
+            command = ["python", str(tool), "{input}", "{output}"]
+            run_cached_tool(
+                stage="unpack", command=command, input_path=source, output_path=output, work_dir=work
+            )
+            self.assertEqual(cached_tool_state(work, "unpack", command=command)["status"], "valid")
+            self.assertEqual(
+                cached_tool_state(work, "unpack", command=[*command, "different-mode"]),
+                {"status": "stale", "issue_code": "TOOL_COMMAND_CHANGED"},
+            )
+            self.assertEqual(
+                cached_tool_state(work, "unpack", command=[]),
+                {"status": "invalid", "issue_code": "TOOL_COMMAND_INVALID"},
+            )
+            tool.write_text(tool.read_text(encoding="utf-8") + "# changed implementation\n", encoding="utf-8")
+            self.assertEqual(
+                cached_tool_state(work, "unpack"),
+                {"status": "stale", "issue_code": "TOOL_FINGERPRINT_CHANGED"},
+            )
+
+    def test_tool_recovers_malformed_stage_state_without_reusing_it(self) -> None:
+        for state_body in (
+            b'\xff',
+            json.dumps({"schema": "parr0t.tool-state.v2", "unpack": []}).encode("utf-8"),
+        ):
+            with self.subTest(state_body=state_body), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                source = work / "source.bin"
+                source.write_bytes(b"fixture")
+                output = work / "output.bin"
+                tool = work / "copy-tool.py"
+                tool.write_text(
+                    "import shutil, sys\nshutil.copyfile(sys.argv[1], sys.argv[2])\n",
+                    encoding="utf-8",
+                )
+                state_path = work / ".game-l10n" / "tool-state.json"
+                state_path.parent.mkdir()
+                state_path.write_bytes(state_body)
+                result = run_cached_tool(
+                    stage="unpack",
+                    command=["python", str(tool), "{input}", "{output}"],
+                    input_path=source,
+                    output_path=output,
+                    work_dir=work,
+                )
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(cached_tool_state(work, "unpack")["status"], "valid")
+
+    def test_failed_forced_tool_run_invalidates_previous_success(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            source = work / "source.bin"
+            source.write_bytes(b"fixture")
+            output = work / "output.bin"
+            tool = work / "copy-tool.py"
+            tool.write_text(
+                "import pathlib, shutil, sys\n"
+                "if pathlib.Path('fail.flag').exists():\n"
+                "    sys.stderr.write('PRIVATE_FAILURE_EVIDENCE')\n"
+                "    raise SystemExit(7)\n"
+                "shutil.copyfile(sys.argv[1], sys.argv[2])\n",
+                encoding="utf-8",
+            )
+            arguments = {
+                "stage": "unpack",
+                "command": ["python", str(tool), "{input}", "{output}"],
+                "input_path": source,
+                "output_path": output,
+                "work_dir": work,
+            }
+            run_cached_tool(**arguments)
+            (work / "fail.flag").touch()
+            with self.assertRaisesRegex(ToolExecutionError, "E_TOOL_EXECUTION_FAILED"):
+                run_cached_tool(**arguments, force=True)
+            self.assertEqual(cached_tool_state(work, "unpack"), {"status": "missing"})
+            self.assertEqual(output.read_bytes(), b"fixture")
+            evidence = json.loads(
+                (work / ".game-l10n" / "tool-logs" / "unpack-latest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(evidence["returncode"], 7)
+            self.assertEqual(evidence["stderr"], "PRIVATE_FAILURE_EVIDENCE")
+
+    def test_tool_normalizes_relative_paths_before_execution_and_cache_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            source = work / "source.bin"
+            source.write_bytes(b"fixture")
+            output = work / "output.bin"
+            tool = work / "copy-tool.py"
+            tool.write_text(
+                "import shutil, sys\nshutil.copyfile(sys.argv[1], sys.argv[2])\n",
+                encoding="utf-8",
+            )
+            command = ["python", str(tool), "{input}", "{output}"]
+            first = run_cached_tool(
+                stage="unpack",
+                command=command,
+                input_path=Path(os.path.relpath(source)),
+                output_path=Path(os.path.relpath(output)),
+                work_dir=Path(os.path.relpath(work)),
+            )
+            second = run_cached_tool(
+                stage="unpack", command=command, input_path=source, output_path=output, work_dir=work
+            )
+            self.assertEqual(first["status"], "completed")
+            self.assertEqual(second["status"], "skipped")
+            self.assertEqual(output.read_bytes(), b"fixture")
+
+    def test_tool_rejects_outside_output_and_hardlinked_input_without_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work = root / "work"
+            work.mkdir()
+            source = root / "source.bin"
+            source.write_bytes(b"fixture")
+            alias = work / "alias.bin"
+            os.link(source, alias)
+            for output in (root / "outside.bin", alias):
+                with self.subTest(output=output), patch("game_l10n.tooling.subprocess.run") as run:
+                    with self.assertRaises(ToolExecutionError):
+                        run_cached_tool(
+                            stage="unpack",
+                            command=["python", "unused.py", "{input}", "{output}"],
+                            input_path=source,
+                            output_path=output,
+                            work_dir=work,
+                        )
+                    run.assert_not_called()
+            self.assertEqual(source.read_bytes(), b"fixture")
+
+    def test_tool_rejects_missing_input_without_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            with patch("game_l10n.tooling.subprocess.run") as run:
+                with self.assertRaisesRegex(ToolExecutionError, "input does not exist"):
+                    run_cached_tool(
+                        stage="unpack",
+                        command=["python", "unused.py", "{input}", "{output}"],
+                        input_path=work / "missing.bin",
+                        output_path=work / "output.bin",
+                        work_dir=work,
+                    )
+                run.assert_not_called()
+
+    def test_tool_hashes_artifacts_without_whole_file_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            source = work / "source.bin"
+            source.write_bytes(b"fixture" * 200_000)
+            output = work / "output.bin"
+            tool = work / "copy-tool.py"
+            tool.write_text(
+                "import shutil, sys\nshutil.copyfile(sys.argv[1], sys.argv[2])\n",
+                encoding="utf-8",
+            )
+            arguments = {
+                "stage": "unpack",
+                "command": ["python", str(tool), "{input}", "{output}"],
+                "input_path": source,
+                "output_path": output,
+                "work_dir": work,
+            }
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("whole-file allocation")):
+                self.assertEqual(run_cached_tool(**arguments)["status"], "completed")
+                self.assertEqual(run_cached_tool(**arguments)["status"], "skipped")
+                self.assertEqual(cached_tool_state(work, "unpack")["status"], "valid")
+
+    def test_directory_cache_detects_empty_directory_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            source = work / "source"
+            source.mkdir()
+            (source / "fixture.bin").write_bytes(b"fixture")
+            output = work / "output"
+            tool = work / "copy-tool.py"
+            tool.write_text(
+                "import shutil, sys\nshutil.copytree(sys.argv[1], sys.argv[2], dirs_exist_ok=True)\n",
+                encoding="utf-8",
+            )
+            arguments = {
+                "stage": "unpack",
+                "command": ["python", str(tool), "{input}", "{output}"],
+                "input_path": source,
+                "output_path": output,
+                "work_dir": work,
+            }
+            run_cached_tool(**arguments)
+            (source / "empty").mkdir()
+            self.assertEqual(
+                cached_tool_state(work, "unpack"),
+                {"status": "stale", "issue_code": "TOOL_INPUT_CHANGED"},
+            )
+            self.assertEqual(run_cached_tool(**arguments)["status"], "completed")
+            (output / "empty").rmdir()
+            self.assertEqual(
+                cached_tool_state(work, "unpack"),
+                {"status": "stale", "issue_code": "TOOL_OUTPUT_CHANGED"},
+            )
+
+    def test_tool_binds_path_resolved_executable_to_cache_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            source = work / "source.bin"
+            source.write_bytes(b"fixture")
+            output = work / "output.bin"
+            tool = work / "copy-tool.py"
+            tool.write_text(
+                "import shutil, sys\nshutil.copyfile(sys.argv[1], sys.argv[2])\n",
+                encoding="utf-8",
+            )
+            command = ["synthetic-python", str(tool), "{input}", "{output}"]
+            with patch("game_l10n.tooling.shutil.which", return_value=sys.executable):
+                with patch("game_l10n.tooling.subprocess.run", wraps=subprocess.run) as run:
+                    run_cached_tool(
+                        stage="unpack", command=command, input_path=source, output_path=output, work_dir=work
+                    )
+                self.assertEqual(Path(run.call_args.args[0][0]), Path(sys.executable).resolve())
+                self.assertEqual(cached_tool_state(work, "unpack", command=command)["status"], "valid")
+            with patch("game_l10n.tooling.shutil.which", return_value=str(work / "other-python.exe")):
+                self.assertEqual(
+                    cached_tool_state(work, "unpack", command=command),
+                    {"status": "stale", "issue_code": "TOOL_COMMAND_CHANGED"},
+                )
+
+    def test_tool_rejects_output_alias_created_by_the_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            source = work / "source.bin"
+            source.write_bytes(b"fixture")
+            output = work / "output.bin"
+            tool = work / "alias-tool.py"
+            tool.write_text(
+                "import os, sys\nos.link(sys.argv[1], sys.argv[2])\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ToolExecutionError, "separate from its read-only input"):
+                run_cached_tool(
+                    stage="unpack",
+                    command=["python", str(tool), "{input}", "{output}"],
+                    input_path=source,
+                    output_path=output,
+                    work_dir=work,
+                )
+            self.assertFalse((work / ".game-l10n" / "tool-state.json").exists())
+            self.assertEqual(source.read_bytes(), b"fixture")
+
+    def test_tool_rejects_output_containing_or_overwriting_cache_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work = root / "work"
+            work.mkdir()
+            source = root / "source.bin"
+            source.write_bytes(b"fixture")
+            state_root = work / ".game-l10n"
+            for output in (work, state_root, state_root / "tool-state.json", state_root / "tool-state.json.tmp"):
+                with self.subTest(output=output), patch("game_l10n.tooling.subprocess.run") as run:
+                    with self.assertRaisesRegex(ToolExecutionError, "cache state"):
+                        run_cached_tool(
+                            stage="unpack",
+                            command=["python", "unused.py", "{input}", "{output}"],
+                            input_path=source,
+                            output_path=output,
+                            work_dir=work,
+                        )
+                    run.assert_not_called()
+
+    def test_tool_start_failure_preserves_private_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            source = work / "source.bin"
+            source.write_bytes(b"fixture")
+            with patch("game_l10n.tooling.subprocess.run", side_effect=OSError("PRIVATE_START_FAILURE")):
+                with self.assertRaisesRegex(ToolExecutionError, "E_TOOL_START_FAILED") as captured:
+                    run_cached_tool(
+                        stage="unpack",
+                        command=["python", "unused.py", "{input}", "{output}"],
+                        input_path=source,
+                        output_path=work / "output.bin",
+                        work_dir=work,
+                    )
+            evidence = json.loads(
+                (work / ".game-l10n" / "tool-logs" / "unpack-latest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(evidence["returncode"], -1)
+            self.assertEqual(evidence["stderr"], "PRIVATE_START_FAILURE")
+            self.assertNotIn("PRIVATE_START_FAILURE", str(captured.exception))
+
     def test_sdk_selection_separates_reference_reuse_from_branch_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1432,31 +1788,122 @@ class WorkspaceTests(unittest.TestCase):
                 verifier_fingerprint="synthetic-engine-verifier-v1",
             )
             cached = cached_tool_state(work, "pack")
+            cached_without_configured_tool = cached_tool_state(work, "pack", command=[])
 
         self.assertEqual(recorded["status"], "verified")
         self.assertEqual(cached["status"], "valid")
+        self.assertEqual(cached_without_configured_tool["status"], "valid")
 
-    def test_tool_detects_input_mutation_even_when_command_fails(self) -> None:
+    def test_verified_pack_rejects_result_aliases_and_containing_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
-            source = work / "source.bin"
-            source.write_bytes(b"original")
-            tool = work / "mutating-tool.py"
+            result = work / "result.json"
+            result.write_bytes(b"{}\n")
+            alias = work / "alias.json"
+            os.link(result, alias)
+            write_bound_completion(work, result)
+            for output in (result, alias, work):
+                with self.subTest(output=output), self.assertRaises(ToolExecutionError):
+                    record_verified_pack_artifact(
+                        input_path=result,
+                        output_path=output,
+                        work_dir=work,
+                        verifier_fingerprint="synthetic-verifier-v1",
+                    )
+            self.assertFalse((work / ".game-l10n" / "tool-state.json").exists())
+
+    def test_pack_rejects_malformed_completion_and_missing_bound_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            result = work / "result.json"
+            result.write_bytes(b"{}\n")
+            completion_path = write_bound_completion(work, result)
+            valid_completion = completion_path.read_bytes()
+            for completion_body in (b"[]", b"null", b"\xff"):
+                completion_path.write_bytes(completion_body)
+                with self.subTest(completion_body=completion_body), patch("game_l10n.tooling.subprocess.run") as run:
+                    with self.assertRaises(ToolExecutionError):
+                        run_cached_tool(
+                            stage="pack",
+                            command=["python", "unused.py", "{input}", "{output}"],
+                            input_path=result,
+                            output_path=work / "patch.bin",
+                            work_dir=work,
+                        )
+                    run.assert_not_called()
+            completion_path.write_bytes(valid_completion)
+            result.unlink()
+            package = work / "patch.bin"
+            package.write_bytes(b"fixture")
+            with self.assertRaises(ToolExecutionError):
+                record_verified_pack_artifact(
+                    input_path=result,
+                    output_path=package,
+                    work_dir=work,
+                    verifier_fingerprint="synthetic-verifier-v1",
+                )
+
+    def test_pack_rejects_attestation_changes_during_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            result = work / "result.json"
+            result.write_bytes(b"{}\n")
+            completion_path = write_bound_completion(work, result)
+            tool = work / "pack-tool.py"
             tool.write_text(
-                "import pathlib, sys\n"
-                "pathlib.Path(sys.argv[1]).write_bytes(b'mutated')\n"
-                "raise SystemExit(7)\n",
+                "import pathlib, shutil, sys\n"
+                "shutil.copyfile(sys.argv[1], sys.argv[2])\n"
+                "pathlib.Path(sys.argv[3]).write_text('[]', encoding='utf-8')\n"
+                "sys.stderr.write('PRIVATE_COMPLETION_CHANGE_EVIDENCE')\n",
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(Exception, "modified its declared read-only input"):
+            with self.assertRaisesRegex(ToolExecutionError, "attestation changed while packing"):
                 run_cached_tool(
-                    stage="unpack",
-                    command=["python", str(tool), "{input}", "{output}"],
-                    input_path=source,
-                    output_path=work / "output.bin",
+                    stage="pack",
+                    command=["python", str(tool), "{input}", "{output}", str(completion_path)],
+                    input_path=result,
+                    output_path=work / "patch.bin",
                     work_dir=work,
                 )
             self.assertFalse((work / ".game-l10n" / "tool-state.json").exists())
+            evidence = json.loads(
+                (work / ".game-l10n" / "tool-logs" / "pack-latest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(evidence["returncode"], 0)
+            self.assertEqual(evidence["stderr"], "PRIVATE_COMPLETION_CHANGE_EVIDENCE")
+
+    def test_tool_detects_input_mutation_with_restored_timestamp_and_preserves_failure_evidence(self) -> None:
+        for returncode in (0, 7):
+            with self.subTest(returncode=returncode), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                source = work / "source.bin"
+                source.write_bytes(b"original")
+                tool = work / "mutating-tool.py"
+                tool.write_text(
+                    "import os, pathlib, sys\n"
+                    "source = pathlib.Path(sys.argv[1])\n"
+                    "stat = source.stat()\n"
+                    "source.write_bytes(b'modified')\n"
+                    "os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns))\n"
+                    "sys.stderr.write('PRIVATE_MUTATION_EVIDENCE')\n"
+                    f"raise SystemExit({returncode})\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ToolExecutionError, "modified its declared read-only input") as captured:
+                    run_cached_tool(
+                        stage="unpack",
+                        command=["python", str(tool), "{input}", "{output}"],
+                        input_path=source,
+                        output_path=work / "output.bin",
+                        work_dir=work,
+                    )
+                self.assertFalse((work / ".game-l10n" / "tool-state.json").exists())
+                evidence = json.loads(
+                    (work / ".game-l10n" / "tool-logs" / "unpack-latest.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(evidence["returncode"], returncode)
+                self.assertEqual(evidence["stderr"], "PRIVATE_MUTATION_EVIDENCE")
+                self.assertNotIn("PRIVATE_MUTATION_EVIDENCE", str(captured.exception))
 
     def test_tool_failure_keeps_arbitrary_stderr_in_private_log(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1486,6 +1933,32 @@ class WorkspaceTests(unittest.TestCase):
 
         self.assertNotIn("PRIVATE_SOURCE_VALUE", str(captured.exception))
         self.assertEqual(private_log["stderr"], "PRIVATE_SOURCE_VALUE")
+
+    def test_tool_failure_keeps_non_utf8_output_in_private_log(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            source = work / "source.bin"
+            source.write_bytes(b"fixture")
+            tool = work / "failing-tool.py"
+            tool.write_text(
+                "import sys\n"
+                "sys.stderr.buffer.write(b'PRIVATE_FAILURE_\\xff')\n"
+                "raise SystemExit(7)\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ToolExecutionError, "E_TOOL_EXECUTION_FAILED") as captured:
+                run_cached_tool(
+                    stage="unpack",
+                    command=["python", str(tool), "{input}", "{output}"],
+                    input_path=source,
+                    output_path=work / "output.bin",
+                    work_dir=work,
+                )
+            evidence = json.loads(
+                (work / ".game-l10n" / "tool-logs" / "unpack-latest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(evidence["stderr"], "PRIVATE_FAILURE_\ufffd")
+            self.assertNotIn("PRIVATE_FAILURE_", str(captured.exception))
 
     def test_publish_approval_requires_initial_git_choice(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2055,6 +2528,17 @@ class WorkspaceTests(unittest.TestCase):
                 ready_exit = cmd_status(SimpleNamespace(workspace=str(work)))
             ready_status = json.loads(ready_output.getvalue())
 
+            config_path = work / "game-l10n.json"
+            original_config = json.loads(config_path.read_text(encoding="utf-8"))
+            modified_config = json.loads(config_path.read_text(encoding="utf-8"))
+            modified_config["tools"]["pack"].append("different-mode")
+            config_path.write_text(json.dumps(modified_config), encoding="utf-8")
+            changed_command_output = StringIO()
+            with redirect_stdout(changed_command_output):
+                changed_command_exit = cmd_status(SimpleNamespace(workspace=str(work)))
+            changed_command_status = json.loads(changed_command_output.getvalue())
+            config_path.write_text(json.dumps(original_config), encoding="utf-8")
+
             patch_path.write_text("changed\n", encoding="utf-8")
             changed_output = StringIO()
             with redirect_stdout(changed_output):
@@ -2079,6 +2563,11 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(
             ready_status["local_artifact"]["artifact_path"], str(patch_path.resolve())
         )
+        self.assertEqual(changed_command_exit, 0)
+        self.assertEqual(
+            changed_command_status["next_actions"], ["validate_and_pack_recoverable_patch"]
+        )
+        self.assertEqual(changed_command_status["state_issue_codes"], ["TOOL_COMMAND_CHANGED"])
         self.assertEqual(changed_exit, 0)
         self.assertEqual(
             changed_status["next_actions"], ["validate_and_pack_recoverable_patch"]

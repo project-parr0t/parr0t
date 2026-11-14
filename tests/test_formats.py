@@ -18,6 +18,25 @@ class FormatTests(unittest.TestCase):
         ]
         self.assertEqual(stable_hash_sequence(iter(values)), stable_hash(values))
 
+    def test_prior_and_correction_results_preserve_unicode_record_contents(self) -> None:
+        from game_l10n.formats import read_existing_translations
+        from game_l10n.corrections import _load_results
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.jsonl"
+            source = "SOURCE\u0085next\u2028line\u2029paragraph"
+            text = "TARGET\u0085next\u2028line\u2029paragraph"
+            rows = [{"segment_id": "fixture", "source": source, "text": text},
+                    {"segment_id": "peer", "source": "S", "text": "T"}]
+            path.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+                            encoding="utf-8")
+            self.assertEqual(read_existing_translations(path), {
+                "fixture": {"source": source, "text": text},
+                "peer": {"source": "S", "text": "T"},
+            })
+            corrected = _load_results(path)
+            self.assertEqual([(row.segment_id, row.source, row.text) for row in corrected],
+                             [("fixture", source, text), ("peer", "S", "T")])
+
     def test_jsonl_segments_are_streamed_without_path_read_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "segments.jsonl"
