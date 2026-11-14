@@ -156,8 +156,7 @@ def materialize_delivery_candidates(
             result.metadata["delivery_review_status"] = "not_approved"
             result.metadata["delivery_inclusion_authority"] = "user"
             pending_results[segment.id] = result
-    if include_unreviewed:
-        results.update(pending_results)
+
     covered_ids = set(results) | set(pending_results)
     failures = read_segments(translation_failures)
     failure_ids = {s.id for s in failures}
@@ -165,6 +164,8 @@ def materialize_delivery_candidates(
             or failure_ids != set(by_id) - covered_ids
             or any(s.source != by_id[s.id].source for s in failures)):
         raise ValueError("E_DELIVERY_TRANSLATION_QUEUE_MISMATCH")
+    if include_unreviewed:
+        results.update(pending_results)
 
     safe_results: dict[str, TranslationResult] = {}
     integrity_rejections: list[dict[str, Any]] = []

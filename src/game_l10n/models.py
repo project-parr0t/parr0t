@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
+from .localization_authority import GLOSSARY_AUTHORITY_RANK
 
 
 class AgentStatus(str, Enum):
@@ -59,6 +60,10 @@ class GlossaryEntry:
     case_sensitive: bool = False
     # Additional accepted renderings (e.g. honorific or inflected forms); target stays canonical.
     targets: tuple[str, ...] = ()
+    authority: str = "project_glossary"
+    concept_id: str = ""
+    target_ids: tuple[str, ...] = ()
+    source_language: str = ""
 
     def __post_init__(self) -> None:
         if isinstance(self.targets, str) or not isinstance(self.targets, (list, tuple)):
@@ -69,6 +74,19 @@ class GlossaryEntry:
         extra = dict.fromkeys(item.strip() for item in self.targets)
         object.__setattr__(
             self, "targets", tuple(item for item in extra if item and item != self.target)
+        )
+        if self.authority not in GLOSSARY_AUTHORITY_RANK:
+            raise ValueError(f"unsupported glossary authority: {self.authority!r}")
+        if not isinstance(self.concept_id, str) or not isinstance(self.source_language, str):
+            raise ValueError("glossary concept_id and source_language must be strings")
+        if isinstance(self.target_ids, str) or not isinstance(self.target_ids, (list, tuple)):
+            raise ValueError("glossary target_ids must be a list of strings")
+        if not all(isinstance(item, str) and item.strip() for item in self.target_ids):
+            raise ValueError("glossary target_ids must be nonempty strings")
+        object.__setattr__(self, "concept_id", self.concept_id.strip())
+        object.__setattr__(self, "source_language", self.source_language.strip())
+        object.__setattr__(
+            self, "target_ids", tuple(dict.fromkeys(item.strip() for item in self.target_ids))
         )
 
     @property
@@ -88,6 +106,9 @@ class CharacterProfile:
     example_lines: tuple[str, ...] = ()
     relationships: str = ""
     notes: str = ""
+    source_language: str = ""
+    register_shift_rules: tuple[str, ...] = ()
+    evidence_line_ids: tuple[str, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)

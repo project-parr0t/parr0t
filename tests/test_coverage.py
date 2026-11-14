@@ -292,6 +292,75 @@ class CoverageTests(unittest.TestCase):
         self.assertTrue(state["order_mismatch"])
         self.assertIn("INVENTORY_ORDER_MISMATCH", state["issue_codes"])
 
+    def test_inventory_requires_matching_localization_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            authority = {
+                "schema": "parr0t.source-language-authority/v1",
+                "language": "synthetic-original",
+                "reason_code": "original_implementation",
+                "evidence_sha256": "c" * 64,
+            }
+            primary_rows = [
+                {
+                    "id": "synthetic-1",
+                    "source": "SOURCE",
+                    "metadata": {
+                        "source_language_authority": authority,
+                        "terminology_concept_ids": ["synthetic.concept"],
+                    },
+                }
+            ]
+            independent_rows = [
+                {
+                    "id": "synthetic-1",
+                    "source": "SOURCE",
+                    "metadata": {
+                        "source_language_authority": authority,
+                        "terminology_concept_ids": ["synthetic.other"],
+                    },
+                }
+            ]
+            write_inventory(primary, "synthetic-ast", primary_rows)
+            write_inventory(independent, "synthetic-table", independent_rows)
+
+            state = verify_inventory_pair(primary, independent)
+
+        self.assertFalse(state["static_complete"])
+        self.assertEqual(state["localization_authority_mismatch_count"], 1)
+        self.assertIn(
+            "INVENTORY_LOCALIZATION_AUTHORITY_MISMATCH", state["issue_codes"]
+        )
+
+    def test_inventory_rejects_malformed_localization_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            rows = [
+                {
+                    "id": "synthetic-1",
+                    "source": "SOURCE",
+                    "metadata": {
+                        "source_language_authority": {
+                            "schema": "parr0t.source-language-authority/v1",
+                            "language": "synthetic-original",
+                            "reason_code": "presentation_language",
+                            "evidence_sha256": "d" * 64,
+                        }
+                    },
+                }
+            ]
+            write_inventory(primary, "synthetic-ast", rows)
+            write_inventory(independent, "synthetic-table", rows)
+
+            with self.assertRaisesRegex(
+                ConfigurationError, "localization authority is invalid"
+            ):
+                verify_inventory_pair(primary, independent)
+
     def test_method_specific_ids_can_share_a_canonical_comparison_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
