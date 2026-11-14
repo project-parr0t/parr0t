@@ -21,3 +21,15 @@ jobs:
           done < <(find . -type f \( -name 'requirements.txt' -o -name 'requirements-*.txt' -o -name '*-requirements.txt' \) -not -path './.git/*' -print0 | sort -z)
       - run: python scripts/check_repo_privacy.py
       - run: python -m unittest discover -s tests -t . -v
+
+  omp-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+      - run: bun test tests/omp_isolation_guard.test.mjs

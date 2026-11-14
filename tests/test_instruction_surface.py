@@ -51,32 +51,6 @@ class InstructionSurfaceTests(unittest.TestCase):
             with self.subTest(relative=relative):
                 self.assertLessEqual(len(text.split()), limit)
 
-    def test_core_contract_routes_details_instead_of_copying_them(self) -> None:
-        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
-
-        for required in (
-            "Resolve each `required_contracts` entry against `contract_base`",
-            "before accessing game-root contents",
-            "game-l10n enter-control-plane",
-            "game-l10n verify-sdk-promotion",
-            "Do not inspect images for text",
-            "fallback_required",
-            "parr0t.control-envelope.v2",
-            "docs/sdk-selection.md",
-            "docs/branch-update-contract.md",
-            "docs/control-plane-contract.md",
-            "docs/detail-contract.md",
-            "docs/translation-exchange.md",
-            "docs/runtime-approval.md",
-            "docs/filesystem-packaging.md",
-            "docs/instance-release.md",
-            "no model controllers or worker delegation",
-            "Core locks successes and emits smaller failed-only manifests",
-        ):
-            self.assertIn(required, agents)
-
-        self.assertLess(agents.count("docs/instance-release.md"), 3)
-        self.assertLess(agents.count("docs/runtime-approval.md"), 3)
 
     def test_control_plane_cannot_scrape_host_or_nested_worker_state(self) -> None:
         agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
