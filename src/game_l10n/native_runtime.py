@@ -13,6 +13,7 @@ from typing import Any
 
 from .control_plane import control_plane_state, require_control_plane_ready
 from .store import stable_hash
+from .omp_isolation import ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
 
 RUNTIME_PATH = ".game-l10n/native/runtime.json"
 RUNTIME_SCHEMA = "parr0t.native-runtime.v1"
@@ -21,6 +22,7 @@ RUNTIME_ISSUES = {
     "E_NATIVE_RELAY_PREFLIGHT_REQUIRED", "E_NATIVE_DISPATCH_UNAVAILABLE",
     "E_NATIVE_WORKER_NOT_STARTED", "E_NATIVE_WORKER_MODEL_MISMATCH",
     "E_NATIVE_WORKER_MODEL_UNAVAILABLE",
+    ISOLATION_ISSUE,
 }
 
 
@@ -71,6 +73,7 @@ def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str],
     if transport == "native-host-api":
         from .native_host import native_host_profile
         payload.update(transport=transport, host_profile_fingerprint=native_host_profile(work_dir, host)["fingerprint"])
+    runtime_isolation(work_dir, payload)
     _write(work_dir / RUNTIME_PATH, {**payload, "fingerprint": stable_hash(payload)})
     return {**payload, "runtime_path": RUNTIME_PATH}
 
@@ -109,6 +112,7 @@ def native_runtime(work_dir: Path, *, required: bool = False,
 
 
 def launch_contract(work_dir: Path, route: str, tasks: list[str]) -> dict[str, Any] | None:
+    require_control_plane_ready(work_dir)
     runtime = native_runtime(work_dir)
     if runtime is None:
         return None  # Legacy library/checkpoint compatibility; public CLI requires binding.
@@ -126,6 +130,9 @@ def launch_contract(work_dir: Path, route: str, tasks: list[str]) -> dict[str, A
         "record_command": "game-l10n record-native-launch --workspace <workspace> --relay <relay-path>",
         "model_evidence": "explicit_spawn_arguments_and_host_model_metadata_when_available",
     }
+    isolation = runtime_isolation(work_dir, runtime)
+    if isolation is not None:
+        contract.update(message_isolation=isolation, tool_transport=tool_transport_contract())
     if runtime.get("transport") == "native-host-api":
         from .native_host import verified_host_probe
         verified_host_probe(work_dir, runtime, route)
@@ -137,6 +144,8 @@ def launch_contract(work_dir: Path, route: str, tasks: list[str]) -> dict[str, A
 
 def native_worker_ceiling(work_dir: Path, route: str, requested: int) -> int:
     runtime = native_runtime(work_dir)
+    if runtime:
+        runtime_isolation(work_dir, runtime)
     if runtime and runtime.get("transport") == "native-host-api":
         from .native_host import verified_host_probe
         return min(requested, verified_host_probe(work_dir, runtime, route)["max_workers"])
@@ -144,7 +153,34 @@ def native_worker_ceiling(work_dir: Path, route: str, requested: int) -> int:
 
 
 def _ledger_path(relay_path: Path) -> Path:
-    return relay_path.with_name(relay_path.stem + "-launch.json")
+    legacy = relay_path.with_name(relay_path.stem + "-launch.json")
+    relay = json.loads(relay_path.read_text(encoding="utf-8"))
+    if not str(relay.get("schema", "")).startswith("parr0t.data-plane-relay."):
+        return legacy
+    task_id = relay.get("task_id", "")
+    if not isinstance(task_id, str) or not re.fullmatch(r"[a-f0-9]{64}", task_id):
+        raise ValueError("E_NATIVE_LAUNCH_INVALID: data-plane task binding changed")
+    current = relay_path.with_name(f"{relay_path.stem}-{task_id}-launch.json")
+    if current.is_file() or any(current.parent.glob(current.name + ".legacy-*")):
+        return current
+    old_ledgers = _metadata_versions(legacy)
+    if any(row.get("relay_fingerprint") == stable_hash(relay) for row in old_ledgers):
+        return legacy
+    if old_ledgers:
+        # A pre-namespace completed attempt may have left its canonical ledger.
+        # Preserve it; only an independently sealed earlier task permits a new key.
+        receipt_path = relay_path.with_name("receipt.json")
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8")) if receipt_path.is_file() else {}
+        if not (
+            receipt.get("schema") in {"parr0t.data-plane-receipt.v1", "parr0t.data-plane-receipt.v2"}
+            and isinstance(receipt.get("task_id"), str)
+            and receipt["task_id"] != task_id
+            and receipt.get("worker_role") == relay.get("worker_role")
+            and receipt.get("stage") == relay.get("stage")
+            and isinstance(relay.get("attempt"), int) and relay["attempt"] > 1
+        ):
+            raise ValueError("E_NATIVE_LAUNCH_INVALID: launcher evidence changed")
+    return current
 
 
 def _metadata_versions(path: Path) -> list[dict[str, Any]]:
@@ -189,13 +225,15 @@ def bind_data_plane_launch(work_dir: Path, relay_path: Path) -> None:
     """Attach host routing to an existing core-bound task without rebuilding it."""
     if not relay_path.resolve().is_relative_to(work_dir.resolve() / ".game-l10n"):
         raise ValueError("E_NATIVE_LAUNCH_INVALID: relay escaped control metadata")
+    runtime = native_runtime(work_dir, required=True)
+    runtime_isolation(work_dir, runtime)
     relay = json.loads(relay_path.read_text(encoding="utf-8"))
     if "launch_contract" in relay:
         try:
             _load(work_dir, relay_path)
             return
         except ValueError as error:
-            if str(error) != "E_NATIVE_LAUNCH_INVALID: runtime binding changed":
+            if str(error) not in {"E_NATIVE_LAUNCH_INVALID: runtime binding changed", ISOLATION_ISSUE}:
                 raise
         # Only an ended, operationally blocked task with evidence of zero
         # starts can follow a newly approved host/model binding.
@@ -224,11 +262,11 @@ def bind_data_plane_launch(work_dir: Path, relay_path: Path) -> None:
             _archive_metadata(path)
         for path in paths[1:]:
             path.unlink(missing_ok=True)
-    relay["launch_contract"] = _contract_for_relay(work_dir, relay)
+    relay["launch_contract"] = _contract_for_relay(work_dir, relay, relay_path)
     _write(relay_path, relay)
 
 
-def _contract_for_relay(work_dir: Path, relay: dict) -> dict | None:
+def _contract_for_relay(work_dir: Path, relay: dict, relay_path: Path) -> dict | None:
     if relay.get("schema") == "parr0t.native-wave-relay.v1":
         tasks = [binding["task"] for binding in relay["task_bindings"]]
         route = (relay.get("route_binding") or {}).get("provider") or (
@@ -259,6 +297,9 @@ def _contract_for_relay(work_dir: Path, relay: dict) -> dict | None:
                 raise ValueError("E_NATIVE_LAUNCH_INVALID: preserved legacy result changed")
         tasks = [task for task in tasks if task not in {row["task"] for row in legacy_results}]
     contract = launch_contract(work_dir, route, tasks)
+    if contract is not None and "message_isolation" in contract:
+        marker = "PARR0T_OMP_RELAY=" + relay_path.resolve().relative_to(work_dir.resolve()).as_posix()
+        contract.update(relay_prompt_line=marker, worker_prompt_line=marker)
     if legacy_results and contract is not None:
         contract["legacy_results"] = legacy_results
     return contract
@@ -272,8 +313,16 @@ def _load(work_dir: Path, relay_path: Path) -> tuple[dict, dict, dict]:
     relay = json.loads(relay_path.read_text(encoding="utf-8"))
     contract = relay.get("launch_contract")
     if not isinstance(contract, dict):
+        runtime = native_runtime(work_dir)
+        if runtime and runtime["host"] == "omp" and runtime.get("transport", "collaboration") == "collaboration":
+            raise ValueError(ISOLATION_ISSUE)
         raise ValueError("E_NATIVE_LAUNCH_INVALID: legacy relay has no launch contract")
-    expected = _contract_for_relay(work_dir, relay)
+    if contract.get("host") == "omp" and contract.get("transport", "collaboration") == "collaboration":
+        runtime = native_runtime(work_dir, required=True)
+        isolation = runtime_isolation(work_dir, runtime)
+        if isolation is None or contract.get("message_isolation") != isolation:
+            raise ValueError(ISOLATION_ISSUE)
+    expected = _contract_for_relay(work_dir, relay, relay_path)
     if isinstance(expected, dict):
         # A mapping added for another route or a clean control-generation
         # refresh does not change this wave's locked host/model/task binding.
@@ -354,7 +403,23 @@ def record_native_launch(
 
 
 def native_launch_summary(work_dir: Path, relay_path: Path) -> dict[str, Any]:
-    _, contract, ledger = _load(work_dir, relay_path)
+    try:
+        _, contract, ledger = _load(work_dir, relay_path)
+    except ValueError as error:
+        if str(error) != ISOLATION_ISSUE:
+            raise
+        # Inspection and categorical sealing remain possible, but old/stale
+        # evidence never certifies a launch or permits a result import.
+        relay = json.loads(relay_path.read_text(encoding="utf-8"))
+        contract = relay.get("launch_contract") or {}
+        tasks = contract.get("tasks", [binding["task"] for binding in relay.get("task_bindings", [])])
+        return {
+            "expected_workers": len(tasks), "started_workers": 0,
+            "unstarted_tasks": tasks, "issue_codes": [ISOLATION_ISSUE],
+            "model": contract.get("model"), "host": contract.get("host"),
+            "legacy_unverified_results": len(contract.get("legacy_results", [])),
+            "observed_model_workers": 0, "model_evidence": "message_isolation_unverified",
+        }
     workers = ledger["workers"]
     valid = [task for task, row in workers.items() if (
         isinstance(row, dict) and row.get("worker_id") and row.get("model") == contract["model"]

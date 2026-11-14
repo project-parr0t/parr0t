@@ -39,6 +39,26 @@ def stable_hash_sequence(values: Iterable[Any]) -> str:
     return digest.hexdigest()
 
 
+def _decode_cached_result(payload: str, *, from_cache: bool) -> TranslationResult | None:
+    """A damaged cache row is a miss, not authority to stop or reuse a result."""
+    try:
+        data = json.loads(payload)
+        if not isinstance(data, dict):
+            return None
+        if not all(isinstance(data.get(key, ""), str) for key in (
+            "segment_id", "source", "text", "status", "candidate_digest"
+        )) or not isinstance(data.get("metadata", {}), dict):
+            return None
+        attempts = data.get("attempts", [])
+        if not isinstance(attempts, list):
+            return None
+        data["attempts"] = [AttemptRecord(**item) for item in attempts]
+        data["from_cache"] = from_cache
+        return TranslationResult(**data)
+    except (TypeError, ValueError):
+        return None
+
+
 class ResultStore:
     """Content-addressed cache stored in the agent work directory, never the SDK repository."""
 
@@ -74,13 +94,17 @@ class ResultStore:
 
     def get(self, cache_key: str) -> TranslationResult | None:
         with self._lock, closing(self._connect()) as db:
-            row = db.execute("SELECT payload FROM results WHERE cache_key = ?", (cache_key,)).fetchone()
+            row = db.execute("SELECT segment_id, payload FROM results WHERE cache_key = ?", (cache_key,)).fetchone()
         if not row:
             return None
-        data = json.loads(row[0])
-        data["attempts"] = [AttemptRecord(**item) for item in data.get("attempts", [])]
-        data["from_cache"] = True
-        return TranslationResult(**data)
+        result = _decode_cached_result(row[1], from_cache=True)
+        if result is None or result.segment_id != row[0]:
+            return None
+        if result.status in {"translated", "reviewed", "accepted_unreviewed"} and (
+            result.candidate_digest and result.candidate_digest != stable_hash(result.text)
+        ):
+            return None
+        return result
 
     def put(self, cache_key: str, result: TranslationResult) -> None:
         payload = json.dumps(asdict(result), ensure_ascii=False, sort_keys=True)
@@ -104,20 +128,14 @@ class ResultStore:
             ).fetchall()
         staged: dict[int, tuple[TranslationResult, str]] = {}
         for index, segment_id, digest, candidate, payload in rows:
-            if not isinstance(candidate, str) or stable_hash(candidate) != digest:
+            if type(index) is not int or index < 0 or not isinstance(candidate, str) or stable_hash(candidate) != digest:
                 continue
-            try:
-                data = json.loads(payload)
-                data["attempts"] = [
-                    AttemptRecord(**item) for item in data.get("attempts", [])
-                ]
-                data["from_cache"] = False
-                result = TranslationResult(**data)
-            except (json.JSONDecodeError, TypeError, ValueError):
+            result = _decode_cached_result(payload, from_cache=False)
+            if result is None:
                 continue
             if result.segment_id != segment_id or result.candidate_digest != digest:
                 continue
-            staged[int(index)] = (result, candidate)
+            staged[index] = (result, candidate)
         return staged
 
     def put_staged_candidate(

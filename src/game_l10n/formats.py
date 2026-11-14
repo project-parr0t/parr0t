@@ -125,7 +125,7 @@ def read_existing_translations(path: Path) -> dict[str, dict[str, str]]:
     if suffix == ".jsonl":
         rows = [
             json.loads(line)
-            for line in path.read_text(encoding="utf-8-sig").splitlines()
+            for line in path.read_text(encoding="utf-8-sig").split("\n")
             if line.strip()
         ]
     elif suffix == ".json":

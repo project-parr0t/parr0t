@@ -56,6 +56,8 @@ Do not rename, add fields to, or replace these files with CSV, Markdown, a new J
 
 The source and relevant context travel together. Sentence-level failure isolation therefore does not remove character voice, scene flow, UI role, glossary-related metadata, or adjacent evidence.
 
+JSONL records are separated by LF, not Unicode text separators. Literal NEL (`U+0085`), line separator (`U+2028`), and paragraph separator (`U+2029`) remain part of source, context, and candidate strings through exchange collection, retries, prior-result review, and corrections. Adapter results must match both the bound target ID and exact source; a stale source cannot acquire the current request's digests.
+
 The exchange row is not itself a provider prompt. An authorized data-plane adapter resolves the workspace's typed context, projects only evidence relevant to this target, and calls the configured provider adapter. It must not copy the complete context pack or exchange bundle into `context.metadata`, build a job-local API request loop, or resend completed successes. The configured input preflight and usage telemetry apply to fallback exchange processing as they do to the direct pipeline.
 
 ## Success rows
@@ -123,6 +125,8 @@ game-l10n process-translation-exchange --workspace <workspace> --bundle <bundle>
 
 The command validates the unchanged request and any completed rows, invokes only the preset's configured `translation_fallback` compatible adapter, preserves completed successes, writes the same fixed success/failure rows, and seals the bundle. It never promotes DeepSeek to a primary role or performs review. Previously recorded failures are not called again unless a later user request is represented by `--user-requested-retry`.
 
+Failed-only retry checkpoints retain previously failed rows that have not yet been attempted. Completed successes replace their old failures; an interrupted two-file checkpoint remains resumable rather than leaving overlapping IDs. An ordinary resume does not clear failure history or authorize retrying those recorded failures.
+
 No whole-job usage limit is required by default. The configured DeepSeek adapter still applies its focused per-request input preflight automatically. Do not ask the user to choose a token, time, call, or cost ceiling before fallback or as a condition of starting the job.
 
 If the user independently requested a whole-job limit, bind that optional limit on the first bundle with its confirmed cumulative baseline:
@@ -138,5 +142,7 @@ game-l10n process-translation-exchange \
 ```
 
 Only in that opt-in mode, the core records provider-reported usage in `.game-l10n/provider-usage/translation-fallback.json`, processes waves, and seals each wave before continuing. Later bundles reuse that ledger, so omit `--usage-baseline-input-tokens`; keep the same user-set ceilings. If prior usage is absent or unverified, stop with `E_FALLBACK_BUDGET_BASELINE_REQUIRED` rather than treating it as zero. A provider event interrupted before usage can be proven stops with `E_FALLBACK_BUDGET_ACCOUNTING_UNCERTAIN`; reconcile that one event only with the exact provider-reported value and `--resolve-uncertain-input-tokens`. Never estimate either value from text length, task size, elapsed time, or an empty counter.
+
+Once bound, a limit cannot be silently dropped on a later call with pending targets. Cached results do not incur their historical usage again, and known usage is persisted before progress callbacks run. An event can be reconciled even when every candidate is already cached. Missing transport usage remains uncertain, including authentication, quota, and rate-limit failures; those categories alone do not prove a zero-token call. Processing and its usage ledger require a single writer.
 
 When an explicitly requested ceiling is reached, already sealed successes remain cached, untouched targets remain pending in the same exchange, and no further provider call starts. This budget checkpoint is not permission to narrow scope, preserve source early, or open a new format.

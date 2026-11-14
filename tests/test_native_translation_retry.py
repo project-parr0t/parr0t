@@ -54,14 +54,14 @@ class NativeTranslationRetryTests(unittest.TestCase):
             first = root / "first.jsonl"
             _write_jsonl(
                 first,
-                [_result("a", "success", "TA"), _result("b", "error")],
+                [_result("a", "success", "TA\u0085next\u2028line\u2029paragraph"), _result("b", "error")],
             )
             state_dir = root / "retry"
             start_native_translation_retries(
                 root, source, segments, first, state_dir
             )
             retry = root / "retry.jsonl"
-            _write_jsonl(retry, [_result("b", "success", "TB")])
+            _write_jsonl(retry, [_result("b", "success", "TB\u0085next\u2028line\u2029paragraph")])
 
             state = advance_native_translation_retries(root, state_dir, retry)
 

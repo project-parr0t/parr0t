@@ -32,13 +32,15 @@ class NativeFollowupTests(unittest.TestCase):
         from game_l10n.translation_exchange import prepare_translation_exchange
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            segments = [Segment("a", "S", scene="one"), Segment("b", "S", scene="two")]
+            text = "T\u0085line\u2028paragraph\u2029end"
+            segments = [Segment("a", "S\u0085line\u2028paragraph\u2029end", scene="one"),
+                        Segment("b", "S", scene="two")]
             bundle = root / "exchange"
             prepare_translation_exchange(root, segments, bundle, exchange_id="single-fixture",
                 mode="fallback", source_queue="translation_fallback_pending")
-            request = json.loads((bundle / REQUESTS_NAME).read_text().splitlines()[0])
+            request = json.loads((bundle / REQUESTS_NAME).read_text().split("\n")[0])
             _write_jsonl(bundle / SUCCESS_NAME, [{
-                "target_id": "a", "status": "success", "text": "T", "route": "fallback",
+                "target_id": "a", "status": "success", "text": text, "route": "fallback",
                 "attempt": 1, "source_sha256": request["source_sha256"],
                 "context_sha256": request["context_sha256"],
             }])
@@ -48,7 +50,9 @@ class NativeFollowupTests(unittest.TestCase):
             self.assertEqual(result["unresolved_count"], 1)
             bound = read_segments(root / "review.jsonl")[0]
             self.assertEqual(bound.metadata[CANDIDATE_METADATA_KEY]["generation"], 1)
-            self.assertEqual(bound.metadata[CANDIDATE_METADATA_KEY]["digest"], stable_hash("T"))
+            self.assertEqual(bound.metadata[CANDIDATE_METADATA_KEY]["digest"], stable_hash(text))
+            self.assertEqual(bound.metadata[CANDIDATE_METADATA_KEY]["text"], text)
+            self.assertEqual(bound.source, segments[0].source)
             self.assertEqual(read_segments(root / "unresolved.jsonl")[0].id, "b")
             with self.assertRaisesRegex(ValueError, "context is stale"):
                 collect_translation_exchange_candidates(root,
