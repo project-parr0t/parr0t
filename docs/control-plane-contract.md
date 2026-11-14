@@ -65,11 +65,27 @@ For a native wave, including a legacy dispatch, an absent terminal receipt means
 
 Before dispatch in each control generation, run `native-runtime --workspace <workspace> --host codex|omp`. This records metadata only. Codex defaults bind `native-luna` to `gpt-6-luna` and `native-sol` to `gpt-6.1-sol`; OMP uses the corresponding `openai-codex/` IDs. An operator-selected exact host mapping is passed through repeated `--model route=exact-id`; a proxy's endpoint choice does not authorize another semantic provider. Availability is checked against the actual host tool/model surface, never guessed from a model name. No credentials or global host settings are changed.
 
+OMP collaboration additionally requires the file-backed `templates/omp-isolation-guard.mjs` host extension. Start OMP with `--trusted-extension <absolute-guard-file> --parr0t-workspace <absolute-workspace>`; the exact-file allowlist makes an import failure fatal. A prompt, `worker_delegation_allowed=false`, or an envelope-only final response does not constrain the independent `write agent://...`/IRC channel. Every subagent, including the disposable relay, is forbidden to send agent messages; useful findings belong in its bound private artifact, never in a message to `Main`, an ancestor, or a sibling.
+
+The guard denies subagent virtual writers, built-in `bash`/`eval` bridges, and unknown tools before dispatch. Workers cannot delegate. `parr0t_exec` supplies a native Python subprocess with no OMP virtual-URL or IRC router; relay execution is limited to the core's metadata-only lifecycle commands and public-contract/relay reads. Normal worker-local artifact writes remain available. This is host tool/message isolation, not an adversarial operating-system, filesystem, or network sandbox.
+
+An OMP relay prompt carries a standalone `PARR0T_OMP_RELAY=<workspace-relative-core-relay-path>` line; the guard propagates that binding to its workers. `parr0t_exec` takes `{argv: [...], cwd?: "..."}`, excluding the Python executable. A relay's `argv` starts with `['-m', 'game_l10n.cli', <bound-lifecycle-verb>, '--workspace', <workspace>, '--relay', <relay>]` (native-wave sealing uses `--dispatch`). It is not an arbitrary shell. The root must use the exact metadata path returned by core, not invent or open a private task.
+
+Guarded localization sessions admit only built-in `task` spawns. Eval-origin `agent()`/`workpool()` spawns and shared eval callback tools are rejected before admission; a trusted root may still call the built-in `tool.task` through eval. This prevents an injected callback from shadowing an allowed worker tool. It changes neither the selected semantic provider nor target coverage.
+
+If OMP defers extension tools, read `xd://parr0t_exec` for its schema and write the fixed JSON arguments to that same device. This exact owned device is the sole virtual-writer exception: it invokes the guarded native Python executor, not a generic URI or message bridge. All role, workspace, relay, and command checks still run in the executor itself. Child sessions inherit only the host's opaque guard session/workspace environment; their first task initializes the inherited factory even when root CLI flags or `session_start` were not replayed.
+
+The root host writes only `.game-l10n/native/omp-isolation.json`, bound to its actual session, process, current control generation, and the exact guard file digest. Core launch binding and preflight require that evidence. Missing, stale, changed, or wrong-session evidence produces `E_NATIVE_MESSAGE_ISOLATION_REQUIRED`; it is host repair, not a semantic attempt, source exclusion, or permission to bypass the relay. Child registration hooks never replace the root registration; it is host evidence, not a model-authored capability declaration. Native host API and Codex transports retain their own contracts.
+
+The guarded [OMP entry](#omp-entry) starts a new control session from workspace metadata or the canonical rotation handoff. It never replays an old transcript, runs `resume-control-plane` on the caller's behalf, changes provider policy, or certifies its own isolation registration.
+
 An explicitly authorized independent native host API may instead use the deterministic transport in [native-host-api.md](native-host-api.md). It requires exact models, a shared private workspace, broker-only reply delivery, durable idempotent admission, and a successful route-bound live synthetic probe. Execute only the core-returned `broker_command`; the code broker privately receives responses and seals the existing receipt. This is a selected native transport, never an automatic provider switch or direct root-to-semantic compatibility mode. Default collaboration still requires actual nested dispatch tools.
 
 Rebinding the same host preserves its previously approved exact model mappings, including custom routes. Adding an unrelated route does not invalidate an existing wave's model evidence. A clean control-generation refresh requires rebinding the runtime but does not discard valid completed outputs or certify a different model. An explicitly changed model can replace an unstarted ended wave; it cannot relabel an already started worker.
 
 Discovery/context relays have the same protection. Re-preparing a blocked task may update its exact launch binding only when its bound ledger proves zero starts and its categorical terminal receipt records an operational runtime failure. Keep the immutable task, attempt, and valid context fragments; archive stale launch metadata, receipt, and response envelope before rebinding. An interrupted update resumes from content-bound archives. A live, started, completed, or unverified task cannot be silently relabeled for another model.
+
+Data-plane launch ledgers are keyed by the immutable task ID, so a completed attempt's recorded worker cannot satisfy or block the next attempt. Matching legacy ledgers remain authoritative; an obsolete legacy ledger is preserved and a fresh task receives its own ledger only when a sealed earlier-task receipt proves the prior lifecycle ended. Neither path clears or relabels a started worker's evidence.
 
 Every newly dispatched relay carries `launch_contract`. Before any worker starts, the relay verifies that it can dispatch children and use the exact model. It records `record-native-launch --workspace <workspace> --relay <relay-path> --event capability-available`. Missing nested dispatch records `capability-unavailable`; a missing/unauthorized model records `model-unavailable`. It then runs its normal terminal seal and returns only the receipt path. Never emulate the missing tool, ask to remove the relay, change model, or synthesize per-target failures.
 
@@ -84,6 +100,40 @@ Retry-state summaries return `native_pass_output` and `native_pass_results`. Use
 Legacy manifests without an execution namespace retain their original fingerprints and completed results. Do not rewrite those checkpoints or treat their completion as a fresh provider attempt. `--resume-relay` explicitly asserts that the previous relay ended; never pass it merely because a wait was quiet. It can recover a missing terminal receipt or upgrade an uncollected legacy dispatch without rewriting the manifest or imported shards. Complete legacy outputs remain content-bound and explicitly model-unverified; only missing tasks need new recorded launches. Partial legacy outputs retain their valid rows and queue missing records as operational failures. Old dispatch/receipt/launch metadata and rejected output are archived, so an interrupted repair can be retried. Normal waits never synthesize a terminal event.
 
 Runtime-repair status includes the exact existing dispatch path. For `E_NATIVE_DISPATCH_UNAVAILABLE`, `runtime_repair` identifies the external host's missing `nested_native_dispatch` capability and disallows automatic rotation or isolation relaxation. Verify the actual callable collaboration namespace inside a fresh relay; its absence from `functions.exec`'s tool registry alone proves nothing because collaboration tools are separate. A root spawn succeeding does not prove a relay can spawn children. Model registration, repeated validation, a capability record, and version updates cannot provide an absent tool. Preserve the checkpoint and report this blocker once; never bypass it with direct parent-to-semantic dispatch, another model-bearing process, or fabricated successful launch evidence.
+
+## Locating an existing native checkpoint
+
+After clean control-plane entry or rotation recovery, `game-l10n status --workspace <workspace>` exposes `native_resume` for native workflows. `resume_native_checkpoint` returns the selected checkpoint's exact `step_command` argument array; execute it without opening its manifest or results. `core_runtime` identifies the Python executable and actual core module separately from the configured SDK root. A downloaded snapshot alone does not change the executing core.
+
+`game-l10n native-resume-status --workspace <workspace>` performs the same read-only lookup without requiring SDK activation or healthy model/runtime bindings. It still requires a clean control plane. Discovery reads only existing core relay, manifest, controller, and split-chain metadata, not semantic task payloads, result rows, or session logs, and never rewrites a checkpoint. Missing or invalid metadata is categorical; result locations are never guessed from folder names.
+
+When multiple unfinished checkpoints remain, status returns `select_native_checkpoint` and validated candidate paths instead of choosing by modification time. Select the intended existing binding with `native-resume-status --manifest <candidate-manifest>` or `status --native-manifest <candidate-manifest>`. For a split review chain, `step_command` retains the root manifest and root results directory; `current_child` only describes the core-owned active subset. Do not resume a child as a replacement for the complete pass.
+
+Manifest compatibility is independent of control generation: v6/v7 checkpoints retain their original contracts, namespace presence, imported results, and usage. Readable v4/v5 metadata is not executable by the current deterministic scheduler. A noncanonical present contract, conflicting path binding, or unknown state must not be repaired by silently regenerating the manifest. Lookup does not authorize a provider/model change, bypass SDK/context/completion gates, or establish `local_patch_ready`.
+
+## OMP entry
+
+Codex remains the default workflow. OMP is an explicit host selection over the same core, SDKs, workspace, queues, and completion gates; it is not another provider preset or a fork of translation logic.
+
+Use a full core checkout and `python -m pip install -e .`, with Python 3.11+ and `omp` on PATH. A Python wheel includes the guard but not the repository's public `AGENTS.md` and `docs/`; it is not a substitute for the complete core checkout required by the workflow.
+
+Initialize the external workspace without inspecting game contents, then start the guarded host:
+
+```text
+game-l10n init-workspace "<workspace>" --sdk-root "<repository>" --game-root "<source-root>"
+python -m game_l10n.omp_session --workspace "<workspace>" --model "<approved-provider/model-id>" --mode workspace --foreground
+```
+
+- `--mode workspace` accepts an initialized workspace whose entry is pending or ready. It starts a fresh history-free session, preserves recorded policy, and asks for the current user request when intent is not recorded. It must not enter a rotation-required workspace or infer an existing-Korean stop, font task, or image task.
+- `--mode rotation` requires `rotation_required` plus the canonical handoff. Omitting `--mode` retains this legacy behavior. Only the new control session may confirm its freshness and complete rotation.
+- `--foreground` uses the current terminal on Windows or POSIX and returns the child exit code. Without it, Windows retains the separate-console launch and bound ready-proof startup observation. A startup observation limit does not terminate the child or become a generation deadline.
+- `--print-command` prints the validated JSON argument array without starting OMP, creating a session directory, writing registration, or changing state. Paths and prompts are separate argv elements, never shell-interpolated.
+
+The launcher's `--model` selects only the root model. Native worker routes remain separately bound through `native-runtime --host omp` and explicit `--model native-<route>=<exact-provider/model-id>` overrides when needed. Model syntax validation is not availability or approval evidence. Never infer a provider prefix, silently substitute a model, grant models through repository settings, or overwrite global OMP configuration.
+
+The actual host must permit nested built-in `task` dispatch and the exact per-call worker models. OMP's per-call model gate and operator allowlist, agent model overrides, recursion depth, and concurrency still apply. Root-to-relay success does not prove relay-to-worker availability. Relays use `tasks[].model` explicitly, the core `relay_prompt_line`, and only their bound `parr0t_exec` lifecycle calls. Workers neither delegate nor message other agents. Follow the existing capability/seal/repair path on a missing permission or tool; do not remove the relay.
+
+OMP guard tests run separately from the Python/Codex acceptance job: `bun test tests/omp_isolation_guard.test.mjs`. Neither registering a guard nor passing synthetic checks claims real game execution or semantic translation quality.
 
 ## Deterministic delivery selection
 

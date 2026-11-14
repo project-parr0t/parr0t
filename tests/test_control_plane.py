@@ -40,12 +40,57 @@ from game_l10n.data_plane_task import (
 from game_l10n.coverage import save_inventory_attestation
 from game_l10n.models import ContextPack, Segment
 from game_l10n.native_pass import _detail_contract, prepare_native_tasks
+from game_l10n.workspace import initialize_workspace, record_sdk_selection
 
 
 class ControlPlaneContractTests(unittest.TestCase):
     def test_preflight_constraint_failure_cannot_prove_provider_exhaustion(self) -> None:
         self.assertIn("constraint_unsatisfiable", ISSUE_CODES_BY_STAGE["translation"])
         self.assertNotIn("constraint_unsatisfiable", TERMINAL_ROUTE_STATUSES)
+
+    def test_failed_discovery_receipt_blocks_sdk_activation_until_recovered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk, game, work = root / "sdk", root / "game", root / "work"
+            sdk.mkdir()
+            game.mkdir()
+            initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+            establish_control_plane_entry(work)
+            record_sdk_selection(
+                work, "private-new", target_engine="fixture-engine", target_version="1.0"
+            )
+            generation = control_plane_state(work).get("generation", 0)
+            receipt_path = work / ".game-l10n/data-plane/source_probe/receipt.json"
+            receipt_path.parent.mkdir(parents=True)
+            for status, receipt_generation in (
+                ("partial", generation), ("error", generation),
+                ("success", generation), ("partial", generation - 1),
+            ):
+                with self.subTest(status=status, generation=receipt_generation):
+                    receipt_path.write_text(json.dumps({
+                        "schema": "parr0t.data-plane-receipt.v1",
+                        "task_id": "fixture-discovery", "worker_role": "source_probe",
+                        "stage": "discovery", "status": status,
+                        "counts": {"total": 1, "success": int(status == "success"),
+                                   "error": int(status != "success"), "pending": 0},
+                        "issue_codes": [] if status == "success" else ["worker_error"],
+                        "artifact_paths": ["game-l10n.json"], "queue_transitions": [],
+                        "control_generation": receipt_generation,
+                    }), encoding="utf-8")
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        self.assertEqual(main(["status", "--workspace", str(work)]), 0)
+                    result = json.loads(output.getvalue())
+                    if status != "success" and receipt_generation == generation:
+                        self.assertEqual(result["next_actions"],
+                                         ["record_target_identity_evaluate_and_select_sdk"])
+                        task = result["data_plane_task"]
+                        self.assertTrue(task["continuation_required"])
+                        self.assertEqual(task["last_receipt"]["status"], status)
+                        self.assertEqual(result["sdk_activation"]["status"], "not_checked")
+                    else:
+                        self.assertEqual(result["next_actions"],
+                                         ["activate_selected_sdk_implementation"])
 
     def test_discovery_cli_uses_a_core_bound_data_plane_relay(self) -> None:
         args = build_parser().parse_args(

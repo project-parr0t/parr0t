@@ -4,7 +4,7 @@
 
 ## Supported control paths
 
-Supports Codex App/CLI, OMP native dispatch, and OpenCodex-compatible proxies. All preserve isolation and provider roles; proxies change routing only.
+Supports Codex App/CLI, [guarded OMP](control-plane-contract.md#omp-entry), and OpenCodex-compatible proxies. All preserve isolation and provider roles; proxies change routing only.
 
 ## Start or resume
 
@@ -24,6 +24,8 @@ For a new job:
 4. Bind `native-runtime --host codex|omp --workspace <workspace>`; follow host/model/launch rules in `control-plane-contract.md`. Follow status `next_actions`: prepare, relay, seal. Only `local_patch_ready` is terminal.
 
 For an existing job, start with status and reuse valid checkpoints. Do not repeat work with unchanged fingerprints.
+
+Native continuation: `control-plane-contract.md`.
 
 ## State machine
 
