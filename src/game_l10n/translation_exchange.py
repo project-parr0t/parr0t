@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -81,11 +82,26 @@ def _fallback_usage_state(
     started_at_epoch: float | None,
     resolve_uncertain_input_tokens: int | None,
 ) -> tuple[Path, dict[str, Any]]:
-    if max_input_tokens < 1:
+    if not isinstance(max_input_tokens, int) or isinstance(max_input_tokens, bool) or max_input_tokens < 1:
         raise TranslationExchangeError("E_FALLBACK_BUDGET_INVALID")
-    if baseline_input_tokens is not None and baseline_input_tokens < 0:
+    if baseline_input_tokens is not None and (
+        not isinstance(baseline_input_tokens, int)
+        or isinstance(baseline_input_tokens, bool)
+        or baseline_input_tokens < 0
+    ):
         raise TranslationExchangeError("E_FALLBACK_BUDGET_BASELINE_INVALID")
-    if max_elapsed_minutes is not None and max_elapsed_minutes < 1:
+    if max_elapsed_minutes is not None and (
+        not isinstance(max_elapsed_minutes, int)
+        or isinstance(max_elapsed_minutes, bool)
+        or max_elapsed_minutes < 1
+    ):
+        raise TranslationExchangeError("E_FALLBACK_ELAPSED_BUDGET_INVALID")
+    if started_at_epoch is not None and (
+        not isinstance(started_at_epoch, (int, float))
+        or isinstance(started_at_epoch, bool)
+        or not math.isfinite(started_at_epoch)
+        or started_at_epoch <= 0
+    ):
         raise TranslationExchangeError("E_FALLBACK_ELAPSED_BUDGET_INVALID")
     path = work_dir / FALLBACK_USAGE_RELATIVE
     if path.is_file():
@@ -132,6 +148,8 @@ def _fallback_usage_state(
             )
             or not isinstance(state.get("started_at_epoch"), (int, float))
             or isinstance(state.get("started_at_epoch"), bool)
+            or not math.isfinite(state["started_at_epoch"])
+            or state["started_at_epoch"] <= 0
             or not isinstance(state.get("events"), list)
             or state.get("active_event") is not None
             and not isinstance(state.get("active_event"), dict)
@@ -146,9 +164,13 @@ def _fallback_usage_state(
             raise TranslationExchangeError("E_FALLBACK_BUDGET_BASELINE_MISMATCH")
         if max_elapsed_minutes is not None and state["max_elapsed_minutes"] != max_elapsed_minutes:
             raise TranslationExchangeError("E_FALLBACK_ELAPSED_BUDGET_MISMATCH")
+        if started_at_epoch is not None and state["started_at_epoch"] != started_at_epoch:
+            raise TranslationExchangeError("E_FALLBACK_ELAPSED_BUDGET_MISMATCH")
     else:
         if baseline_input_tokens is None:
             raise TranslationExchangeError("E_FALLBACK_BUDGET_BASELINE_REQUIRED")
+        if max_elapsed_minutes is not None and started_at_epoch is None:
+            raise TranslationExchangeError("E_FALLBACK_ELAPSED_BUDGET_INVALID")
         state = {
             "schema": FALLBACK_USAGE_SCHEMA,
             "max_input_tokens": max_input_tokens,
@@ -157,7 +179,7 @@ def _fallback_usage_state(
             "provider_output_tokens": 0,
             "cached_input_tokens": 0,
             "max_elapsed_minutes": max_elapsed_minutes,
-            "started_at_epoch": float(started_at_epoch or time.time()),
+            "started_at_epoch": float(time.time() if started_at_epoch is None else started_at_epoch),
             "next_event": 1,
             "events": [],
             "active_event": None,
@@ -166,9 +188,11 @@ def _fallback_usage_state(
 
     active = state["active_event"]
     if active is not None:
+        known = active.get("known_input_tokens", 0)
+        if not isinstance(known, int) or isinstance(known, bool) or known < 0:
+            raise TranslationExchangeError("E_FALLBACK_USAGE_STATE_INVALID")
         if resolve_uncertain_input_tokens is None:
             raise TranslationExchangeError("E_FALLBACK_BUDGET_ACCOUNTING_UNCERTAIN")
-        known = active.get("known_input_tokens", 0)
         if (
             not isinstance(resolve_uncertain_input_tokens, int)
             or isinstance(resolve_uncertain_input_tokens, bool)
@@ -224,13 +248,9 @@ def _begin_fallback_usage_event(
 def _result_usage(results: list[TranslationResult]) -> tuple[dict[str, int], bool]:
     totals = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
     complete = True
-    zero_usage_codes = {
-        FailureCode.BUDGET_EXHAUSTED.value,
-        FailureCode.AUTHENTICATION_ERROR.value,
-        FailureCode.QUOTA_EXHAUSTED.value,
-        FailureCode.RATE_LIMITED.value,
-    }
     for result in results:
+        if result.from_cache:
+            continue
         if not result.attempts:
             complete = False
             continue
@@ -239,7 +259,7 @@ def _result_usage(results: list[TranslationResult]) -> tuple[dict[str, int], boo
             input_tokens = usage.get("input_tokens")
             if isinstance(input_tokens, int) and not isinstance(input_tokens, bool) and input_tokens >= 0:
                 totals["input_tokens"] += input_tokens
-            elif attempt.issue_code not in zero_usage_codes:
+            elif attempt.issue_code != FailureCode.BUDGET_EXHAUSTED.value:
                 complete = False
             for field in ("output_tokens", "cached_input_tokens"):
                 value = usage.get(field, 0)
@@ -304,7 +324,9 @@ def _jsonl_bytes(rows: Iterable[dict[str, Any]]) -> bytes:
 def _read_jsonl(path: Path, *, allowed_keys: set[str]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8").split("\n")
+        if lines[-1] == "":
+            lines.pop()
     except UnicodeError as error:
         raise TranslationExchangeError(f"Exchange file is not UTF-8: {path.name}") from error
     for line_number, line in enumerate(lines, start=1):
@@ -630,6 +652,7 @@ def process_translation_exchange(
         or not isinstance(max_elapsed_minutes, int) or isinstance(max_elapsed_minutes, bool)
         or max_elapsed_minutes < 1
         or not isinstance(started_at_epoch, (int, float)) or isinstance(started_at_epoch, bool)
+        or not math.isfinite(started_at_epoch)
         or started_at_epoch <= 0
     ):
         raise TranslationExchangeError("E_FALLBACK_UNLIMITED_POLICY_INVALID")
@@ -650,7 +673,7 @@ def process_translation_exchange(
         )
 
     # Validate all immutable bindings and any already completed rows first.
-    seal_translation_exchange(work_dir, bundle)
+    sealed = seal_translation_exchange(work_dir, bundle)
     request_rows = _read_jsonl(
         bundle / REQUESTS_NAME,
         allowed_keys={"target_id", "ordinal", "source", "source_sha256", "context", "context_sha256"},
@@ -671,9 +694,6 @@ def process_translation_exchange(
         if row["target_id"] not in success_ids
         and (retry_failures or row["target_id"] not in prior_failures)
     ]
-    if not pending_rows:
-        sealed = seal_translation_exchange(work_dir, bundle)
-        return {**sealed, "processed": 0, "route": route}
 
     def report_progress(**statistics: int | str) -> None:
         if progress_callback is None:
@@ -712,11 +732,7 @@ def process_translation_exchange(
         segments.append(segment)
         requests_by_id[segment.id] = row
 
-    retained_failures = {
-        row["target_id"]: row
-        for row in failure_rows
-        if not retry_failures or row["target_id"] not in requests_by_id
-    }
+    retained_failures = dict(prior_failures)
     success_by_id = {row["target_id"]: row for row in success_rows}
     retryable_codes = {
         FailureCode.MALFORMED_RESPONSE.value,
@@ -729,6 +745,13 @@ def process_translation_exchange(
     request_order = {row["target_id"]: row["ordinal"] for row in request_rows}
     usage_path: Path | None = None
     usage_state: dict[str, Any] | None = None
+    if (
+        pending_rows
+        and not input_tokens_unlimited
+        and max_input_tokens is None
+        and (work_dir / FALLBACK_USAGE_RELATIVE).is_file()
+    ):
+        raise TranslationExchangeError("E_FALLBACK_BUDGET_REQUIRED")
     if max_input_tokens is not None:
         usage_path, usage_state = _fallback_usage_state(
             work_dir,
@@ -763,6 +786,8 @@ def process_translation_exchange(
         results = translator(wave)
         if [result.segment_id for result in results] != [segment.id for segment in wave]:
             raise TranslationExchangeError("Fallback results do not match exchange order and IDs")
+        if any(result.source != requests_by_id[result.segment_id]["source"] for result in results):
+            raise TranslationExchangeError("Fallback results do not match immutable exchange sources")
         for result in results:
             request = requests_by_id[result.segment_id]
             prior_attempt = int(prior_failures.get(result.segment_id, {}).get("attempt", 0))
@@ -812,17 +837,11 @@ def process_translation_exchange(
         ordered_failure = sorted(
             retained_failures.values(), key=lambda row: request_order[row["target_id"]]
         )
-        _atomic_bytes(bundle / SUCCESS_NAME, _jsonl_bytes(ordered_success))
+        # Remove superseded failures before committing their successes so an
+        # interrupted two-file checkpoint cannot leave overlapping result IDs.
         _atomic_bytes(bundle / FAILURE_NAME, _jsonl_bytes(ordered_failure))
-        seal_translation_exchange(work_dir, bundle)
-        processed += len(results)
-        report_progress(
-            completed_records=processed,
-            translation_completed=run_success,
-            fallback_pending=max(0, len(pending_rows) - processed),
-            failed_records=run_failed,
-            attempts=processed,
-        )
+        _atomic_bytes(bundle / SUCCESS_NAME, _jsonl_bytes(ordered_success))
+        sealed = seal_translation_exchange(work_dir, bundle)
         if usage_state is not None:
             assert usage_path is not None
             usage, complete = _result_usage(results)
@@ -831,9 +850,17 @@ def process_translation_exchange(
             )
             if not complete:
                 issue_code = "E_FALLBACK_BUDGET_ACCOUNTING_UNCERTAIN"
-                break
+        processed += len(results)
+        report_progress(
+            completed_records=processed,
+            translation_completed=run_success,
+            fallback_pending=max(0, len(pending_rows) - processed),
+            failed_records=run_failed,
+            attempts=processed,
+        )
+        if issue_code:
+            break
 
-    sealed = seal_translation_exchange(work_dir, bundle)
     budget = None
     if usage_state is not None:
         total = (
