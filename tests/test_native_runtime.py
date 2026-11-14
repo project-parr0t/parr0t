@@ -17,6 +17,7 @@ from game_l10n.native_runtime import (
 )
 from game_l10n.native_translation_retry import start_native_translation_retries, advance_native_translation_retries
 from game_l10n.store import stable_hash
+from tests.omp_isolation_fixture import bind_omp_isolation
 
 
 class NativeRuntimeTests(unittest.TestCase):
@@ -24,6 +25,7 @@ class NativeRuntimeTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        bind_omp_isolation(self, self.root)
         self.segments = [Segment("a", "SOURCE A"), Segment("b", "SOURCE B")]
         self.source = self.root / "source.jsonl"
         self.write_rows(self.source, [asdict(row) for row in self.segments])
@@ -459,6 +461,38 @@ class NativeRuntimeTests(unittest.TestCase):
         second = prepare_data_plane_task(self.root, output, worker_role="source_probe", config=config)
         self.assertEqual(second["task_id"], first["task_id"])
         self.assertEqual((output / "task.json").read_bytes(), original)
+
+    def test_completed_data_plane_attempt_keeps_distinct_launch_evidence(self) -> None:
+        for legacy_layout in (False, True):
+            with self.subTest(legacy_layout=legacy_layout), tempfile.TemporaryDirectory() as temporary:
+                previous_root, self.root = self.root, Path(temporary)
+                try:
+                    bind_omp_isolation(self, self.root)
+                    config, output, relay = self.prepare_probe()
+                    first_id = json.loads(relay.read_text())["task_id"]
+                    model = json.loads(relay.read_text())["launch_contract"]["model"]
+                    record_native_launch(self.root, relay, event="capability-available")
+                    record_native_launch(self.root, relay, event="worker-started", task="worker-0",
+                                         worker_id="fixture-first", model=model)
+                    first_ledger = next(output.glob("*-launch.json"))
+                    if legacy_layout:
+                        first_ledger = first_ledger.rename(output / "relay-launch.json")
+                    original_ledger = first_ledger.read_bytes()
+                    closed = seal_data_plane_task(self.root, relay, worker_ended=True)
+                    self.assertNotIn("E_NATIVE_WORKER_NOT_STARTED", closed["issue_codes"])
+                    prepared = prepare_data_plane_task(self.root, output, worker_role="source_probe", config=config)
+                    self.assertNotEqual(prepared["task_id"], first_id)
+                    bind_data_plane_launch(self.root, relay)
+                    fresh = native_launch_summary(self.root, relay)
+                    self.assertEqual(fresh["started_workers"], 0)
+                    self.assertEqual(fresh["unstarted_tasks"], ["worker-0"])
+                    record_native_launch(self.root, relay, event="capability-available")
+                    record_native_launch(self.root, relay, event="worker-started", task="worker-0",
+                                         worker_id="fixture-second", model=model)
+                    self.assertEqual(native_launch_summary(self.root, relay)["started_workers"], 1)
+                    self.assertEqual(first_ledger.read_bytes(), original_ledger)
+                finally:
+                    self.root = previous_root
 
     def test_discovery_accepts_equivalent_noncanonical_workspace_path(self) -> None:
         game = self.root / "game"

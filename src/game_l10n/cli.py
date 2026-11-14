@@ -87,6 +87,7 @@ from .native_translation_retry import (
 from .native_runtime import (
     bind_data_plane_launch, configure_native_runtime, native_runtime, record_native_launch,
 )
+from .omp_isolation import runtime_isolation, tool_transport_contract
 from .native_host import configure_native_host
 from .native_broker import probe_native_host, run_native_broker
 from .native_review import (collect_native_review, collect_native_rewrite,
@@ -200,6 +201,24 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
         "docs/control-plane-contract.md",
     ),
     "run_primary_translation_review_pipeline": (
+        "docs/coverage-gates.md",
+        "docs/review-pipeline.md",
+        "docs/fallback-routing.md",
+        "docs/provider-protocol.md",
+        "docs/control-plane-contract.md",
+        "docs/execution-budget.md",
+        "docs/detail-contract.md",
+    ),
+    "run_native_translation_review_pipeline": (
+        "docs/coverage-gates.md",
+        "docs/review-pipeline.md",
+        "docs/fallback-routing.md",
+        "docs/provider-protocol.md",
+        "docs/control-plane-contract.md",
+        "docs/execution-budget.md",
+        "docs/detail-contract.md",
+    ),
+    "resolve_native_translation_review_gaps": (
         "docs/coverage-gates.md",
         "docs/review-pipeline.md",
         "docs/fallback-routing.md",
@@ -1369,7 +1388,7 @@ def cmd_validate_control_envelope(args: argparse.Namespace) -> int:
 def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
-    native_runtime(work_dir, required=True)
+    runtime_isolation(work_dir, native_runtime(work_dir, required=True))
     activation = None
     if args.worker_role != "source_probe":
         activation = require_sdk_activation(work_dir, config)
@@ -1382,6 +1401,11 @@ def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
         sdk_activation=activation,
     )
     bind_data_plane_launch(work_dir, work_dir / result["relay_path"])
+    result.update(relay_prompt_line="PARR0T_OMP_RELAY=" + result["relay_path"],
+                  worker_prompt_policy="include_launch_contract_worker_prompt_line_verbatim_in_each_task")
+    runtime = native_runtime(work_dir)
+    if runtime["host"] == "omp" and runtime.get("transport", "collaboration") == "collaboration":
+        result["tool_transport"] = tool_transport_contract()
     if native_runtime(work_dir).get("transport") == "native-host-api":
         result.update(executor="native-host-api", broker_command=["game-l10n", "run-native-broker",
                       "--workspace", str(work_dir), "--relay", result["relay_path"]])
@@ -1576,7 +1600,39 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
     pass_kind = args.pass_kind
     route_binding = None
     codex_app_mode = effective_execution_mode(config) == CODEX_APP_EXECUTION_MODE
-    if pass_kind == "translation" and codex_app_mode:
+    custom_native_mode = config.get("provider_preset") == "custom"
+    segments = read_segments(source)
+    if custom_native_mode:
+        if pass_kind == "translation":
+            plan = _native_translation_route_plan(config)
+            provider = args.native_provider or (plan[0]["provider"] if plan else "")
+            limits = {item["provider"]: 1 + item["max_retries"] for item in plan}
+            attempt = args.route_attempt or 1
+            if args.review_tier is not None or provider not in limits or not 1 <= attempt <= limits[provider]:
+                raise ConfigurationError("E_NATIVE_ROUTE_INVALID: translation route/attempt is not configured")
+        else:
+            from .native_review import select_native_review_route
+            routing = config.get("routing", {})
+            if pass_kind == "review":
+                if args.review_tier not in {"triage", "strong"}:
+                    raise ConfigurationError("E_NATIVE_REVIEW_TIER_INVALID")
+                role = "review_triagers" if args.review_tier == "triage" else "reviewers"
+                stage = "review-triage" if args.review_tier == "triage" else "review"
+            else:
+                if args.review_tier is not None:
+                    raise ConfigurationError("E_NATIVE_REVIEW_TIER_INVALID")
+                role, stage = "rewriters", "review-rewrite"
+            routes = routing.get(role, [])
+            provider = select_native_review_route(segments, routes, stage=stage)
+            attempt = 1
+            if (args.native_provider is not None and args.native_provider != provider
+                    or args.route_attempt not in {None, 1}):
+                raise ConfigurationError("E_NATIVE_ROUTE_INVALID: review route must follow configured order")
+        from .native_runtime import native_runtime
+        if provider not in native_runtime(work_dir, required=True)["models"]:
+            raise ConfigurationError("E_NATIVE_RUNTIME_INVALID: native route has no exact model")
+        route_binding = {"provider": provider, "attempt": attempt}
+    elif pass_kind == "translation" and codex_app_mode:
         plan = _native_translation_route_plan(config)
         provider = args.native_provider or plan[0]["provider"]
         limits = {item["provider"]: 1 + item["max_retries"] for item in plan}
@@ -1607,6 +1663,8 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
                 f"Codex App {tier} review has no configured native route"
             )
         route_binding = {"provider": provider, "attempt": 1}
+        if args.native_provider is not None and args.native_provider != provider:
+            raise ConfigurationError("E_NATIVE_ROUTE_INVALID: review provider is not configured for this tier")
     elif (
         args.native_provider is not None
         or args.route_attempt is not None
@@ -1720,7 +1778,7 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
     result = prepare_native_tasks(
         work_dir,
         source,
-        read_segments(source),
+        segments,
         output,
         pass_kind=pass_kind,
         max_records=max_records,
@@ -1773,17 +1831,20 @@ def cmd_prepare_native_followup(args: argparse.Namespace) -> int:
     primary_results = _path_in_workspace(
         work_dir, args.primary_results, must_exist=True
     )
-    if effective_execution_mode(config) == CODEX_APP_EXECUTION_MODE:
+    if effective_execution_mode(config) == CODEX_APP_EXECUTION_MODE or (
+        config.get("provider_preset") == "custom" and _native_translation_route_plan(config)
+    ):
         if not args.retry_state:
             raise ConfigurationError(
-                "E_NATIVE_PRE_FALLBACK_RETRY_REQUIRED: complete the configured Luna "
-                "and Sol translation attempts before DeepSeek"
+                "E_NATIVE_PRE_FALLBACK_RETRY_REQUIRED: complete the configured native "
+                "translation attempts before follow-up"
             )
         require_pre_fallback_retry_state(
             work_dir,
             _path_in_workspace(work_dir, args.retry_state, must_exist=True),
             source,
             primary_results,
+            route_plan=_native_translation_route_plan(config),
         )
     result = prepare_native_followup(
         work_dir,
@@ -1792,6 +1853,9 @@ def cmd_prepare_native_followup(args: argparse.Namespace) -> int:
         primary_results,
         _path_in_workspace(work_dir, args.output),
         exchange_prefix=args.exchange_prefix,
+        external_fallback=(config.get("provider_preset") != "custom" or
+                           len(_native_translation_route_plan(config)) <
+                           len(config.get("routing", {}).get("translators", []))),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -1800,11 +1864,11 @@ def cmd_prepare_native_followup(args: argparse.Namespace) -> int:
 def _native_translation_route_plan(config: dict[str, Any]) -> list[dict[str, Any]]:
     routing = config.get("routing", {})
     retries = routing.get("translator_retries", {})
-    routes = [
-        route
-        for route in routing.get("translators", [])
-        if isinstance(route, str) and route.startswith("native-")
-    ]
+    routes = []
+    for route in routing.get("translators", []):
+        if not isinstance(route, str) or not route.startswith("native-"):
+            break  # Never promote a native route ahead of an earlier external route.
+        routes.append(route)
     return [
         {"provider": route, "max_retries": int(retries.get(route, 0))}
         for route in routes
@@ -1815,9 +1879,12 @@ def cmd_start_native_translation_retries(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     require_sdk_activation(work_dir, config)
-    if effective_execution_mode(config) != CODEX_APP_EXECUTION_MODE:
+    if not _native_translation_route_plan(config) or (
+        effective_execution_mode(config) != CODEX_APP_EXECUTION_MODE
+        and config.get("provider_preset") != "custom"
+    ):
         raise ConfigurationError(
-            "E_PROVIDER_MODE_DRIFT: native translation retries require Codex App mode"
+            "E_PROVIDER_MODE_DRIFT: native retries require configured native translation routes"
         )
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     result = start_native_translation_retries(
@@ -1836,9 +1903,12 @@ def cmd_advance_native_translation_retries(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     require_sdk_activation(work_dir, config)
-    if effective_execution_mode(config) != CODEX_APP_EXECUTION_MODE:
+    if not _native_translation_route_plan(config) or (
+        effective_execution_mode(config) != CODEX_APP_EXECUTION_MODE
+        and config.get("provider_preset") != "custom"
+    ):
         raise ConfigurationError(
-            "E_PROVIDER_MODE_DRIFT: native translation retries require Codex App mode"
+            "E_PROVIDER_MODE_DRIFT: native retries require configured native translation routes"
         )
     state = _path_in_workspace(work_dir, args.state, must_exist=True)
     if state.name != NATIVE_RETRY_STATE_NAME:
@@ -1847,6 +1917,7 @@ def cmd_advance_native_translation_retries(args: argparse.Namespace) -> int:
         work_dir,
         state.parent,
         _path_in_workspace(work_dir, args.results, must_exist=True),
+        route_plan=_native_translation_route_plan(config),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -1948,7 +2019,7 @@ def cmd_process_native_review_followup(args: argparse.Namespace) -> int:
     config = load_config(work_dir)
     require_sdk_activation(work_dir, config)
     role = "judge_fallback" if args.operation == "judge" else "selective_rewrite"
-    if role not in config["native_workflow"]["external_provider_roles"]:
+    if role not in config.get("native_workflow", {}).get("external_provider_roles", []):
         raise ConfigurationError("E_PROVIDER_MODE_DRIFT: review role is not authorized")
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     output = _path_in_workspace(work_dir, args.output)
@@ -2489,6 +2560,11 @@ def cmd_status(args: argparse.Namespace) -> int:
                                 if isinstance(issue_code, str):
                                     state_issue_codes.append(issue_code)
     action = action or "run_primary_translation_review_pipeline"
+    if config.get("provider_preset") == "custom" and _native_translation_route_plan(config):
+        action = {
+            "run_primary_translation_review_pipeline": "run_native_translation_review_pipeline",
+            "resolve_translation_review_gaps": "resolve_native_translation_review_gaps",
+        }.get(action, action)
     print(
         json.dumps(
             {
@@ -2500,6 +2576,15 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "provider_preset": config.get("provider_preset"),
                 "execution_mode": config.get("execution_mode"),
                 "native_workflow": config.get("native_workflow"),
+                "native_routes": ({
+                    "translators": _native_translation_route_plan(config),
+                    "review_triagers": config.get("routing", {}).get("review_triagers", []),
+                    "reviewers": config.get("routing", {}).get("reviewers", []),
+                    "rewriters": config.get("routing", {}).get("rewriters", []),
+                    "prepare_command": "game-l10n prepare-native-pass",
+                    "step_command": "game-l10n native-pass-step",
+                } if config.get("provider_preset") == "custom" and _native_translation_route_plan(config)
+                  else None),
                 "sdk_selection": sdk_selection,
                 "sdk_activation": sdk_activation,
                 "execution": config.get("execution", {}),
@@ -3097,20 +3182,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     native_prepare.add_argument(
         "--native-provider",
-        choices=["native-luna", "native-sol"],
-        help="Bind a Codex App translation pass to the reported native route",
+        help="Bind a native pass to its configured native route and exact runtime model",
     )
     native_prepare.add_argument(
         "--route-attempt",
         type=int,
-        help="Bind a Codex App translation pass to its configured attempt ordinal",
+        help="Bind a native translation pass to its configured attempt ordinal",
     )
     native_prepare.add_argument(
         "--review-tier",
         choices=["triage", "strong"],
         help=(
-            "Bind a Codex App review pass to the configured Luna triage or Sol "
-            "strong-review route"
+            "Bind native review to the configured triage or strong-review chain"
         ),
     )
     native_prepare.add_argument("--max-records", type=int)

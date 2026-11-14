@@ -156,6 +156,7 @@ def prepare_native_followup(
     output_dir: Path,
     *,
     exchange_prefix: str,
+    external_fallback: bool = True,
 ) -> dict[str, Any]:
     work_dir = work_dir.resolve()
     source_path = source_path.resolve()
@@ -182,6 +183,7 @@ def prepare_native_followup(
             manifest.get("schema") != FOLLOWUP_SCHEMA
             or manifest.get("source_fingerprint") != source_fingerprint
             or manifest.get("primary_results_sha256") != result_sha256
+            or manifest.get("external_fallback", True) != external_fallback
         ):
             raise NativeFollowupError("Existing native follow-up is bound to different inputs")
         artifact_paths = [
@@ -208,7 +210,7 @@ def prepare_native_followup(
     _atomic_jsonl(candidate_path, (asdict(segment) for segment in candidates))
 
     bundles: list[str] = []
-    for offset in range(0, len(failures), MAX_EXCHANGE_RECORDS):
+    for offset in range(0, len(failures) if external_fallback else 0, MAX_EXCHANGE_RECORDS):
         number = offset // MAX_EXCHANGE_RECORDS + 1
         bundle = output_dir / f"translation-fallback-{number:04d}"
         prepare_translation_exchange(
@@ -233,6 +235,8 @@ def prepare_native_followup(
         "primary_candidates": _relative(work_dir, candidate_path),
         "fallback_bundles": bundles,
     }
+    if not external_fallback:
+        manifest["external_fallback"] = False
     _atomic_json(manifest_path, manifest)
     return {
         "schema": FOLLOWUP_SCHEMA,

@@ -380,7 +380,8 @@ def start_native_translation_retries(
 
 
 def advance_native_translation_retries(
-    work_dir: Path, state_dir: Path, attempt_results: Path
+    work_dir: Path, state_dir: Path, attempt_results: Path, *,
+    route_plan: Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     work_dir = work_dir.resolve()
     state_dir = state_dir.resolve()
@@ -391,6 +392,8 @@ def advance_native_translation_retries(
                 "Native translation retry paths must stay inside the workspace"
             )
     state = _load_state(work_dir, state_dir)
+    if route_plan is not None and state["route_plan"] != _validated_route_plan(route_plan):
+        raise NativeTranslationRetryError("Configured native translation routes changed")
     if state["next_action"] != "native_retry":
         raise NativeTranslationRetryError("No native translation retry is pending")
     source_path = work_dir / state["source"]
@@ -482,7 +485,8 @@ def advance_native_translation_retries(
 
 
 def require_pre_fallback_retry_state(
-    work_dir: Path, state_path: Path, source_path: Path, final_results: Path
+    work_dir: Path, state_path: Path, source_path: Path, final_results: Path, *,
+    route_plan: Iterable[dict[str, Any]] = DEFAULT_ROUTE_PLAN,
 ) -> dict[str, Any]:
     work_dir = work_dir.resolve()
     state_path = state_path.resolve()
@@ -492,13 +496,13 @@ def require_pre_fallback_retry_state(
     state = _load_state(work_dir, state_dir)
     if state["next_action"] not in {"external_fallback", "complete"}:
         raise NativeTranslationRetryError(
-            "Luna and Sol pre-fallback translation attempts are not complete"
+            "Configured native pre-fallback translation attempts are not complete"
         )
     if (work_dir / state["source"]).resolve() != source_path.resolve():
         raise NativeTranslationRetryError("Native retry state targets another source")
     if (work_dir / state["final_results"]).resolve() != final_results.resolve():
         raise NativeTranslationRetryError("Native retry state targets another result set")
     plan = _validated_route_plan(state["route_plan"])
-    if plan != [dict(item) for item in DEFAULT_ROUTE_PLAN]:
-        raise NativeTranslationRetryError("Native retry route plan does not match the preset")
+    if plan != _validated_route_plan(route_plan):
+        raise NativeTranslationRetryError("Native retry route plan does not match configured routes")
     return _state_summary(work_dir, state_dir, state)

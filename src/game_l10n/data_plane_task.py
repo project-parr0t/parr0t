@@ -41,7 +41,8 @@ from .image_localization import (
 )
 from .language_policy import language_binding
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext, Segment
-from .native_runtime import RUNTIME_ISSUES, native_launch_summary
+from .native_runtime import RUNTIME_ISSUES, native_launch_summary, native_runtime
+from .omp_isolation import ISOLATION_ISSUE, runtime_isolation
 from .privacy import is_within
 from .store import stable_hash
 
@@ -1198,6 +1199,9 @@ def prepare_data_plane_task(
     work_dir = work_dir.resolve()
     require_control_plane_ready(work_dir)
     require_control_plane_entry(work_dir)
+    runtime = native_runtime(work_dir)
+    if runtime:
+        runtime_isolation(work_dir, runtime)
     control_generation = int(control_plane_state(work_dir).get("generation", 0))
     profile = DATA_PLANE_PROFILES.get(worker_role)
     if profile is None:
@@ -2150,6 +2154,9 @@ def record_data_plane_relay_event(
     """Record categorical relay lifecycle without observing semantic output."""
 
     relay, _ = _load_bound_data_plane_relay(work_dir, relay_path)
+    if event in {"worker-started", "finalizer-started"} and "launch_contract" in relay:
+        if ISOLATION_ISSUE in native_launch_summary(work_dir, relay_path)["issue_codes"]:
+            raise ValueError(ISOLATION_ISSUE)
     if relay.get("schema") != DATA_PLANE_RELAY_SCHEMA:
         raise ConfigurationError(
             "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: legacy relays do not use lifecycle events"

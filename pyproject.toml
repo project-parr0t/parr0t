@@ -19,7 +19,7 @@ game-l10n = "game_l10n.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-game_l10n = ["templates/*.bat", "templates/*.ps1"]
+game_l10n = ["templates/*.bat", "templates/*.ps1", "templates/*.mjs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

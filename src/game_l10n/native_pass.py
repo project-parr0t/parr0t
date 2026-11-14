@@ -18,6 +18,7 @@ from .language_policy import DEFAULT_TARGET_LANGUAGE, language_policy_digest
 from .models import Segment
 from .native_followup import CANDIDATE_METADATA_KEY
 from .native_runtime import RUNTIME_ISSUES, launch_contract, native_launch_summary, native_runtime, _unstarted_launch_ledger
+from .omp_isolation import ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
 from .store import stable_hash, stable_hash_sequence
 from .validators import validate_integrity
 
@@ -866,8 +867,7 @@ def prepare_native_tasks(
         raise ValueError(f"pass_kind must be one of: {', '.join(sorted(PASS_KINDS))}")
     language_binding = _normalized_language_binding(language_binding)
     if route_binding is not None and (
-        pass_kind not in {"translation", "review"}
-        or set(route_binding) != {"provider", "attempt"}
+        set(route_binding) != {"provider", "attempt"}
         or not isinstance(route_binding.get("provider"), str)
         or not route_binding["provider"]
         or not isinstance(route_binding.get("attempt"), int)
@@ -875,7 +875,7 @@ def prepare_native_tasks(
         or route_binding["attempt"] < 1
     ):
         raise ValueError(
-            "route_binding is valid only for a bound translation or review pass"
+            "route_binding requires an exact provider and positive attempt"
         )
     if max_records is None:
         max_records = (
@@ -1472,7 +1472,12 @@ def import_native_wave(
     manifest = _load_task_manifest(work_dir, manifest_path)
     plan_fingerprint = _native_control_plan_fingerprint(manifest)
     dispatch = _wave_relay_dispatch_path(work_dir, plan_fingerprint, wave)
-    if dispatch.is_file() and "launch_contract" in json.loads(dispatch.read_text(encoding="utf-8")):
+    runtime = native_runtime(work_dir) or {}
+    guarded_host = runtime.get("host") == "omp" and runtime.get("transport", "collaboration") == "collaboration"
+    if dispatch.is_file() and (guarded_host or "launch_contract" in json.loads(dispatch.read_text(encoding="utf-8"))):
+        isolation_summary = native_launch_summary(work_dir, dispatch)
+        if ISOLATION_ISSUE in isolation_summary["issue_codes"]:
+            raise ValueError(ISOLATION_ISSUE)
         receipt = _validated_native_wave_relay_receipt(work_dir, plan_fingerprint, wave, manifest=manifest)
         if receipt["issue_codes"]:
             raise ValueError("E_NATIVE_WORKER_NOT_STARTED: runtime repair must precede import")
@@ -1623,6 +1628,9 @@ def _write_wave_relay_dispatch(
         [binding["task"] for binding in bindings],
     )
     if launch is not None:
+        if "message_isolation" in launch:
+            marker = "PARR0T_OMP_RELAY=" + path.resolve().relative_to(work_dir.resolve()).as_posix()
+            launch.update(relay_prompt_line=marker, worker_prompt_line=marker)
         if legacy_results:
             preserved = {row["task"] for row in legacy_results}
             launch["tasks"] = [task for task in launch["tasks"] if task not in preserved]
@@ -1672,13 +1680,15 @@ def _repair_ended_wave_relay(
     old_launch = payload.get("launch_contract")
     if "launch_contract" in payload and not isinstance(old_launch, dict):
         raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
+    runtime = native_runtime(work_dir, required=True)
+    runtime_isolation(work_dir, runtime)
     if isinstance(old_launch, dict):
-        runtime = native_runtime(work_dir, required=True)
         if (old_launch.get("host") == runtime["host"]
                 and old_launch.get("model") == runtime["models"].get(old_launch.get("route"))
                 and old_launch.get("transport", "collaboration") == runtime.get("transport", "collaboration")
                 and old_launch.get("host_profile_fingerprint") == runtime.get("host_profile_fingerprint")):
-            return False
+            if old_launch.get("message_isolation") == runtime_isolation(work_dir, runtime):
+                return False
         _unstarted_launch_ledger(path, payload)
     unsigned = {key: value for key, value in payload.items() if key != "dispatch_fingerprint"}
     relative_manifest = manifest_path.resolve().relative_to(work_dir.resolve()).as_posix()
@@ -1717,7 +1727,9 @@ def _repair_ended_wave_relay(
     for task, binding in zip(tasks, bindings):
         result = work_dir / binding["result"]
         if result.is_file():
-            if old_launch is not None and binding["task"] not in previously_preserved:
+            if (old_launch is not None and binding["task"] not in previously_preserved
+                    or old_launch is None and runtime["host"] == "omp"
+                    and runtime.get("transport", "collaboration") == "collaboration"):
                 # A result written without a recorded launch cannot be silently
                 # relabeled as the newly selected model's output.
                 archive = result.with_name(result.name + ".unstarted-original-" + _file_sha256(result))
@@ -2025,7 +2037,9 @@ def seal_native_wave_relay(
         bindings_by_name[task_name] = (task, result, binding["records"])
 
     effective_ended_tasks = ended_tasks
-    launch = native_launch_summary(work_dir, resolved) if "launch_contract" in payload else None
+    runtime = native_runtime(work_dir) or {}
+    guarded_host = runtime.get("host") == "omp" and runtime.get("transport", "collaboration") == "collaboration"
+    launch = native_launch_summary(work_dir, resolved) if "launch_contract" in payload or guarded_host else None
     launch_blocked = bool(launch and launch["issue_codes"])
     if relay_ended:
         effective_ended_tasks = tuple(
@@ -2196,7 +2210,9 @@ def _validated_native_wave_relay_receipt(
         "ready_tasks": ready,
         "pending_tasks": total - ready,
     }
-    launch = native_launch_summary(work_dir, dispatch_path) if "launch_contract" in dispatch else None
+    runtime = native_runtime(work_dir) or {}
+    guarded_host = runtime.get("host") == "omp" and runtime.get("transport", "collaboration") == "collaboration"
+    launch = native_launch_summary(work_dir, dispatch_path) if "launch_contract" in dispatch or guarded_host else None
     expected_issues = (
         launch["issue_codes"] if launch and launch["issue_codes"]
         else ([] if ready == total else ["E_NATIVE_WAVE_INCOMPLETE"])
@@ -2911,8 +2927,13 @@ def _native_control_step_single(
         )
     # Probe the selected native API route before creating controller state.
     from .native_runtime import native_worker_ceiling
-    native_worker_ceiling(work_dir, (manifest.get("route_binding") or {}).get("provider") or (
-        "native-luna" if manifest["pass_kind"] == "translation" else "native-sol"), 1)
+    try:
+        native_worker_ceiling(work_dir, (manifest.get("route_binding") or {}).get("provider") or (
+            "native-luna" if manifest["pass_kind"] == "translation" else "native-sol"), 1)
+    except ValueError as error:
+        existing = _wave_relay_dispatch_path(work_dir, _native_control_plan_fingerprint(manifest), 1)
+        if str(error) != ISOLATION_ISSUE or not existing.is_file():
+            raise
     plan_fingerprint = _native_control_plan_fingerprint(manifest)
     state_path = _native_control_state_path(work_dir, manifest, plan_fingerprint)
     state = _load_native_control_state(state_path, manifest, plan_fingerprint)
@@ -3018,7 +3039,17 @@ def _native_control_step_single(
             )
         )
         relay_issue = ""
+        if relay_dispatch_path.is_file():
+            existing_dispatch = json.loads(relay_dispatch_path.read_text(encoding="utf-8"))
+            runtime = native_runtime(work_dir) or {}
+            guarded_host = runtime.get("host") == "omp" and runtime.get("transport", "collaboration") == "collaboration"
+            if "launch_contract" in existing_dispatch or guarded_host:
+                observed = native_launch_summary(work_dir, relay_dispatch_path)
+                if ISOLATION_ISSUE in observed["issue_codes"]:
+                    relay_issue = ISOLATION_ISSUE
         if (
+            not relay_issue
+            and
             require_relay_receipt
             and state["active_wave"] == next_wave
             and (
@@ -3232,11 +3263,15 @@ def _native_control_step_single(
             {"scope": "host", "required_capability": "nested_native_dispatch",
              "retry_after": "actual_host_tool_surface_change",
              "automatic_rotation_allowed": False, "isolation_relaxation_allowed": False}
-            if "E_NATIVE_DISPATCH_UNAVAILABLE" in issue_codes else None
+            if set(issue_codes) & {"E_NATIVE_DISPATCH_UNAVAILABLE", ISOLATION_ISSUE} else None
         ),
         "relay": (
             {
                 "dispatch": relay_dispatch,
+                "prompt": "PARR0T_OMP_RELAY=" + relay_dispatch,
+                "worker_prompt_policy": "include_launch_contract_worker_prompt_line_verbatim_in_each_task",
+                "tool_transport": tool_transport_contract() if (native_runtime(work_dir) or {}).get("host") == "omp"
+                    and (native_runtime(work_dir) or {}).get("transport", "collaboration") == "collaboration" else None,
                 "role": "isolated_wave_relay",
                 "history_mode": "none",
                 "tasks": len(selected_tasks),
