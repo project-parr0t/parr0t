@@ -3,6 +3,7 @@
 # Parr0t
 
 게임의 전체 문맥을 읽고 한국어 패치를 만드는 Codex용 프레임워크입니다.
+Codex 기본 사용법은 그대로 유지하며, OMP에서도 격리 가드를 적용한 네이티브 에이전트 실행을 지원합니다.
 
 ## 사용법
 
@@ -69,6 +70,20 @@ https://github.com/project-parr0t/parr0t
 Steam 게임이면 업데이트와 무결성 검사를 막지 말고 상태 확인·재설치·복원을 지원하라.
 ```
 
+## OMP에서 사용하기
+
+Python 3.11 이상과 OMP가 설치되어 있어야 합니다. 전체 코어 저장소를 내려받고 아래처럼 **게임 폴더를 열지 않은 상태에서 외부 작업 폴더부터** 초기화합니다.
+
+```text
+python -m pip install -e .
+game-l10n init-workspace "<external-workspace>" --sdk-root "<repository>" --game-root "<source-root>"
+python -m game_l10n.omp_session --workspace "<external-workspace>" --model "<approved-provider/model-id>" --mode workspace --foreground
+```
+
+`--model`에는 현재 OMP에서 허용된 정확한 최상위 모델 ID를 지정합니다. 새 세션에 위의 게임별 요청을 전달하세요. 실행 가드가 자동으로 연결되며, Codex의 기본 제공자 설정이나 전역 OMP 설정은 변경하지 않습니다. 이미 초기화된 작업은 첫 두 명령을 반복하지 않습니다.
+
+명령만 확인하려면 마지막 명령에 `--print-command`를 추가합니다. 이 옵션은 세션이나 파일을 만들지 않습니다. 제어 세션 회전이 요구되는 작업은 `--mode rotation`을 사용하며, 이전 대화 기록을 불러오는 `omp --resume`와는 다릅니다. 워커 모델 바인딩과 호스트 조건은 [OMP 진입 규약](docs/control-plane-contract.md#omp-entry)을 따릅니다.
+
 ## 하는 일
 
 - 전체 게임 흐름과 화면 구조를 먼저 분석하고, 대사가 있다면 장면·인물 관계·캐릭터별 말투까지 반영합니다.
@@ -80,13 +95,13 @@ Steam 게임이면 업데이트와 무결성 검사를 막지 말고 상태 확�
 
 ## 데이터와 SDK
 
-게임 파일, 추출문, 번역문, 로그와 API 키는 Parr0t 저장소에 넣지 않습니다. 게임별 데이터는 Codex의 외부 작업 폴더에만 남습니다.
+게임 파일, 추출문, 번역문, 로그와 API 키는 Parr0t 저장소에 넣지 않습니다. 게임별 데이터는 각 호스트의 외부 작업 폴더에만 남습니다.
 
 `main`은 엔진 중립 오케스트레이션 코어이며, 실제 게임 형식은 `sdk-<engine>-<version>` 브랜치가 담당합니다. 새 도구를 만들기 전에 기존 SDK를 확인하고, 성공이 검증된 재사용 코드만 게임 데이터를 제거한 뒤 SDK로 승격합니다.
 
 ## 에이전트 문서
 
-이 README는 사람을 위한 시작 안내입니다. Codex는 다음 문서를 실행 규약으로 사용합니다.
+이 README는 사람을 위한 시작 안내입니다. Codex와 OMP는 다음 문서를 공통 실행 규약으로 사용합니다.
 
 - [`AGENTS.md`](AGENTS.md)
 - [`docs/agent-usage.md`](docs/agent-usage.md)

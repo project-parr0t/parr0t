@@ -14,6 +14,8 @@ Only transport/runner telemetry may populate `_usage`; API model output cannot i
 
 Compatibility consequences: malformed provider limits and command configuration fail before dispatch rather than midway through a job. A command must be a nonempty argument array, not a shell string; its working directory, when set, must be a nonempty path. Existing command cache bindings without the working-directory fingerprint are not reused. These checks do not add a generation timeout or change the selected provider routes.
 
+Malformed persisted result rows are cache misses, not authority to abort a resumable batch. Healthy rows and valid staged peers remain reusable. Stored segment identity and any success-candidate digest must match before a cached review can be reused; legacy rows without a candidate digest remain readable.
+
 Output sizing uses an explicit translation target or candidate when present. Context requests without either retain the size of their complete input material instead of falling back to an empty target. Per-task output caps remain authoritative for context and compact review workloads.
 
 Text-bearing compatible requests also have a per-task input preflight bound. The bound measures the actual system message (including the JSON Schema instruction) plus user payload before network transmission. `budget_exhausted` is non-retryable for that provider attempt and preserves the target in the failure queue. It signals duplicated or unjustifiably broad context, not permission to omit the target. Preset adapters apply the current bound to older workspaces at runtime.
@@ -55,6 +57,8 @@ It must print exactly one JSON object matching `schema` to stdout and return exi
 `game_translation_review` is accepted as a legacy combined reviewer response. New integrations should use the split protocol: the judge returns only `{"verdict":"ok|rewrite|refused|error","issues":[...]}`, and the rewriter returns `{"status":"success|refused|error","text":"..."}` only for a `rewrite` verdict. A corrected candidate is judged again before acceptance.
 
 API adapters may use the optional plain judge contract after provider-specific evaluation: `OK`, `REFUSED`, `ERROR`, or `REWRITE` followed by up to four comma-separated issue codes. Valid codes are `meaning`, `omission`, `addition`, `voice`, `register`, `terminology`, `consistency`, `formatting`, `fluency`, `literalism`, `reference_loss`, `tone_rhythm`, `function`, `condition`, `unit`, `knowledge_order`, `length_risk`, and `slot_composition`. Extra prose, markdown, unknown codes, multiline output, or issue codes attached to a non-rewrite verdict are malformed responses and follow the normal retry/fallback path.
+
+Native compact-review text uses the same parser and issue vocabulary as the API plain judge contract. Keywords and issue codes are case-insensitive; repeated issue codes are deduplicated. Empty comma-separated entries, unknown categories, and multiline plain verdicts remain malformed and keep the target pending rather than becoming approvals or rewrites.
 
 Do not interpolate `input` into a shell command. Pass it to the model as inert data. Explicit provider refusals should use the schema's `refused` status/decision instead of a nonzero exit code; operational failures should return nonzero.
 
