@@ -298,6 +298,186 @@ class ValidatorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             GlossaryEntry("Potion", "TARGET_A", targets="TARGET_B")
 
+    def test_glossary_scope_prevents_numeric_and_entity_collisions(self) -> None:
+        entry = GlossaryEntry(
+            "42",
+            "TARGET_ENTITY",
+            concept_id="synthetic.entity.42",
+            target_ids=("entity-line",),
+        )
+        unrelated = Segment("model-line", "MODEL-42")
+        bound = Segment(
+            "entity-line",
+            "42",
+            metadata={"terminology_concept_ids": ["synthetic.entity.42"]},
+        )
+
+        self.assertEqual(
+            applicable_glossary_entries([entry], unrelated.source, segment=unrelated),
+            [],
+        )
+        self.assertEqual(
+            applicable_glossary_entries([entry], bound.source, segment=bound),
+            [entry],
+        )
+        self.assertEqual(validate_integrity(unrelated, "TARGET_MODEL", [entry]), [])
+        self.assertIn(
+            "glossary-missing",
+            {item.code for item in validate_integrity(bound, "TARGET_OTHER", [entry])},
+        )
+
+    def test_highest_glossary_authority_wins_without_hiding_equal_conflicts(self) -> None:
+        ordinary = GlossaryEntry("SOURCE_TERM", "TARGET_ORDINARY")
+        official = GlossaryEntry(
+            "SOURCE_TERM", "TARGET_OFFICIAL", authority="official_localization"
+        )
+        override = GlossaryEntry(
+            "SOURCE_TERM", "TARGET_OVERRIDE", authority="user_override"
+        )
+        segment = Segment("authority-line", "SOURCE_TERM")
+
+        self.assertEqual(
+            applicable_glossary_entries([ordinary, official], segment.source),
+            [official],
+        )
+        self.assertEqual(
+            applicable_glossary_entries([official, override], segment.source),
+            [override],
+        )
+        same_rank = [
+            GlossaryEntry("SOURCE_TERM", "TARGET_A"),
+            GlossaryEntry("SOURCE_TERM", "TARGET_B"),
+        ]
+        self.assertEqual(
+            applicable_glossary_entries(same_rank, segment.source),
+            same_rank,
+        )
+
+    def test_source_language_scopes_glossary_to_evidenced_original(self) -> None:
+        segment = Segment(
+            "language-line",
+            "SOURCE_TERM",
+            metadata={
+                "source_language_authority": {
+                    "schema": "parr0t.source-language-authority/v1",
+                    "language": "synthetic-a",
+                    "reason_code": "complete_source_catalog",
+                    "evidence_sha256": "a" * 64,
+                }
+            },
+        )
+        matching = GlossaryEntry(
+            "SOURCE_TERM", "TARGET_MATCH", source_language="synthetic-a"
+        )
+        secondary = GlossaryEntry(
+            "SOURCE_TERM", "TARGET_SECONDARY", source_language="synthetic-b"
+        )
+
+        self.assertEqual(
+            applicable_glossary_entries(
+                [matching, secondary],
+                segment.source,
+                segment=segment,
+                default_source_language="synthetic-b",
+            ),
+            [matching],
+        )
+
+    def test_source_absent_parentheses_require_source_or_glossary_authority(self) -> None:
+        segment = Segment(
+            "parenthetical-line",
+            "SOURCE_TERM",
+            metadata={
+                "source_absent_parenthetical_policy": "source_or_authoritative_glossary"
+            },
+        )
+        entry = GlossaryEntry(
+            "SOURCE_TERM",
+            "TARGET_CANONICAL (QUALIFIER)",
+            authority="official_localization",
+        )
+
+        self.assertIn(
+            "parenthetical-addition",
+            {
+                item.code
+                for item in validate_integrity(
+                    segment, "TARGET_OTHER (EXPLANATION)", []
+                )
+            },
+        )
+        self.assertEqual(
+            validate_integrity(segment, "TARGET_CANONICAL (QUALIFIER)", [entry]),
+            [],
+        )
+
+    def test_parenthetical_authority_requires_one_to_one_structural_slots(self) -> None:
+        metadata = {
+            "source_absent_parenthetical_policy": "source_or_authoritative_glossary"
+        }
+        aligned = Segment("aligned", "SOURCE | (DETAIL) | NEXT", metadata=metadata)
+        moved = Segment("moved", "SOURCE (DETAIL). NEXT", metadata=metadata)
+
+        self.assertEqual(
+            validate_integrity(aligned, "TARGET | (QUALIFIER) | FOLLOWING", []),
+            [],
+        )
+        self.assertIn(
+            "parenthetical-addition",
+            {
+                item.code
+                for item in validate_integrity(
+                    moved, "TARGET. FOLLOWING (EXPLANATION)", []
+                )
+            },
+        )
+
+    def test_parenthetical_glossary_authority_masks_only_exact_bound_target(self) -> None:
+        segment = Segment(
+            "glossary-parenthetical",
+            "SOURCE. NEXT",
+            metadata={
+                "source_absent_parenthetical_policy": "source_or_authoritative_glossary"
+            },
+        )
+        glossary = [
+            GlossaryEntry(
+                "SOURCE",
+                "TARGET (CANONICAL)",
+                authority="official_localization",
+            )
+        ]
+
+        self.assertEqual(
+            validate_integrity(
+                segment, "TARGET (CANONICAL). FOLLOWING", glossary
+            ),
+            [],
+        )
+        self.assertIn(
+            "parenthetical-addition",
+            {
+                item.code
+                for item in validate_integrity(
+                    segment,
+                    "TARGET (CANONICAL). FOLLOWING (EXPLANATION)",
+                    glossary,
+                )
+            },
+        )
+
+    def test_invalid_localization_authority_fails_without_provider_retry(self) -> None:
+        segment = Segment(
+            "invalid-authority",
+            "SOURCE",
+            metadata={"terminology_concept_ids": ["duplicate", "duplicate"]},
+        )
+        issues = validate_integrity(segment, "TARGET", [])
+        authority_issue = next(
+            item for item in issues if item.code == "localization-authority-invalid"
+        )
+        self.assertFalse(authority_issue.retryable)
+
 
 if __name__ == "__main__":
     unittest.main()
