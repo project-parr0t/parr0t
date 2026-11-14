@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .errors import ConfigurationError
+from .localization_authority import localization_authority_contract
 from .models import FailureCode, Segment, TranslationResult
 from .review_selection import target_language_review_reasons
 from .store import stable_hash
@@ -268,6 +269,32 @@ def _ui_contract_map(
         result[comparison_key] = contract
     return result
 
+def _localization_authority_map(
+    payload: dict[str, Any], *, use_comparison_key: bool = False
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for row in payload["segments"]:
+        target_id = str(row["id"])
+        metadata = row.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ConfigurationError(f"Inventory segment {target_id!r} metadata must be an object")
+        comparison_key = (
+            metadata.get(INVENTORY_COMPARISON_KEY, target_id)
+            if use_comparison_key
+            else target_id
+        )
+        if not isinstance(comparison_key, str) or not comparison_key.strip():
+            raise ConfigurationError(
+                f"Inventory segment {target_id!r} has an invalid {INVENTORY_COMPARISON_KEY}"
+            )
+        try:
+            result[comparison_key] = localization_authority_contract(metadata)
+        except ValueError as exc:
+            raise ConfigurationError(
+                f"Inventory segment {target_id!r} localization authority is invalid: {exc}"
+            ) from exc
+    return result
+
 
 def inventory_fingerprint(payload: dict[str, Any]) -> str:
     return stable_hash(
@@ -402,6 +429,12 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
     independent_ui_contracts = _ui_contract_map(
         independent, use_comparison_key=True
     )
+    primary_authority_contracts = _localization_authority_map(
+        primary, use_comparison_key=True
+    )
+    independent_authority_contracts = _localization_authority_map(
+        independent, use_comparison_key=True
+    )
     primary_order = list(primary_rows)
     independent_order = list(independent_rows)
     primary_ids = set(primary_rows)
@@ -435,6 +468,12 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
         for target_id in primary_ids & independent_ids
         if primary_ui_contracts[target_id] != independent_ui_contracts[target_id]
     }
+    authority_contract_mismatches = {
+        target_id
+        for target_id in primary_ids & independent_ids
+        if primary_authority_contracts[target_id]
+        != independent_authority_contracts[target_id]
+    }
     order_mismatch = primary_order != independent_order
     visible_exclusions = [
         item
@@ -461,6 +500,7 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
         or source_mismatches
         or ui_contract_mismatches
         or order_mismatch
+        or authority_contract_mismatches
         or visible_exclusions
         or scope_tracking_mismatch
         or not declared_complete
@@ -476,6 +516,8 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
         issue_codes.append("INVENTORY_SOURCE_MISMATCH")
     if ui_contract_mismatches:
         issue_codes.append("INVENTORY_UI_COMPOSITION_MISMATCH")
+    if authority_contract_mismatches:
+        issue_codes.append("INVENTORY_LOCALIZATION_AUTHORITY_MISMATCH")
     if order_mismatch:
         issue_codes.append("INVENTORY_ORDER_MISMATCH")
     if visible_exclusions:
@@ -493,6 +535,7 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
         missing_gap_score
         + len(source_mismatches)
         + len(ui_contract_mismatches)
+        + len(authority_contract_mismatches)
         + len(visible_exclusions)
         + int(order_mismatch)
         + int(scope_tracking_mismatch)
@@ -519,6 +562,7 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
         "missing_from_independent_count": len(missing_from_independent),
         "source_mismatch_count": len(source_mismatches),
         "ui_composition_mismatch_count": len(ui_contract_mismatches),
+        "localization_authority_mismatch_count": len(authority_contract_mismatches),
         "order_mismatch": order_mismatch,
         "user_visible_exclusion_count": len(visible_exclusions),
         "static_scope": primary_scope,

@@ -47,6 +47,7 @@ An exclusion has `reason_code` and `affects_user_visible_text`. If the latter is
 An engine SDK may reduce overcapture through the capability contract in `docs/engine-static-scope.md`. The inventory then records candidate, included, conservatively retained, and proven-unused counts in `coverage.static_scope`. Two differently implemented graph analyses must agree before an SDK removes a target. Dynamic or indirect references retain the affected targets; absence of a direct reference is not proof of non-display. Static reachability is not runtime observation and never satisfies the runtime coverage gate.
 
 When a target is one part of a composed UI string, both inventories must agree on the evidence-backed fields defined by `docs/segment-metadata.md`. A stable source ID without its slot role or composition dependencies is insufficient for safe reuse and review.
+The inventories must also agree on source-language authority, terminology concept IDs, and parenthetical policy from `docs/localization-authority.md`. These fields are immutable semantic inputs, not translator output. Malformed authority metadata fails inventory validation; a mismatch emits `INVENTORY_LOCALIZATION_AUTHORITY_MISMATCH` and prevents static completion.
 
 Run the gate before context analysis:
 
@@ -71,6 +72,7 @@ game-l10n review-existing --workspace <workspace> --input <primary.json> --exist
 ```
 
 Every existing target is re-triaged; selected flags/risk/sample targets also receive strong review. Integrity checks can trigger a focused repair first, but a matching ID, source hash, or candidate digest cannot substitute for the current verdict. Review completion records both the reused-candidate count and the freshly reviewed reused-candidate count.
+Correction and re-review may change target text only. They never rename a target, edit its source, reorder records, or rewrite authority metadata. Glossary, source-language authority, or speaker-profile changes invalidate the affected semantic binding and require fresh current-generation triage; selected targets still require strong review.
 
 ## Failure queue and held patches
 
