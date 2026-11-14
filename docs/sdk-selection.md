@@ -80,4 +80,6 @@ Reusing implementation does not transfer compatibility ownership. A tool proven 
 
 The inventory binds every evaluation to the candidate commit, complete content fingerprint, and recorded target engine/version identity. Refreshing the inventory preserves an evaluation only when both commit and content fingerprint still match and clears the selection decision. A ref update, snapshot change, or target-identity change therefore requires a new matching evaluation and selection before data-plane work resumes.
 
+Refresh inventory before preparing a `source_probe` task, not inside its bound discovery attempt. A non-success discovery receipt in the current control generation keeps status on discovery even if that attempt already wrote a selected SDK into configuration. Seal a successful continuation before advancing to implementation activation; receipts from earlier control generations do not block the current generation.
+
 The gate does not prove target compatibility by itself. It makes the agent expose and record its public-format comparison before implementation, while the selected SDK's own discovery and deterministic validators remain authoritative.
