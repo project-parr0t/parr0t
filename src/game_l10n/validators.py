@@ -4,6 +4,12 @@ import hashlib
 import re
 from collections import Counter
 
+from .localization_authority import (
+    GLOSSARY_AUTHORITY_RANK,
+    PARENTHETICAL_POLICY,
+    effective_source_language,
+    localization_authority_contract,
+)
 from .models import GlossaryEntry, Segment, ValidationIssue
 from .store import stable_hash
 
@@ -69,17 +75,82 @@ def _term_spans(
     return spans
 
 
-def applicable_glossary_entries(
-    glossary: list[GlossaryEntry], source: str
+def _glossary_entry_in_scope(
+    entry: GlossaryEntry,
+    segment: Segment | None,
+    *,
+    default_source_language: str,
+) -> bool:
+    if segment is None:
+        return not entry.target_ids and not entry.concept_id
+    if entry.target_ids and segment.id not in entry.target_ids:
+        return False
+    concept_ids = segment.metadata.get("terminology_concept_ids", [])
+    if entry.concept_id and entry.concept_id not in concept_ids:
+        return False
+    if entry.source_language:
+        effective = effective_source_language(
+            segment.metadata, default_source_language
+        )["language"]
+        if effective and effective.casefold() != entry.source_language.casefold():
+            return False
+    return True
+
+
+def scoped_glossary_entries(
+    glossary: list[GlossaryEntry],
+    *,
+    segment: Segment | None = None,
+    default_source_language: str = "",
 ) -> list[GlossaryEntry]:
-    """Select source terms by occurrence, preferring a longer overlapping phrase.
+    """Filter glossary rows by target/entity/language scope and authority."""
 
-    A short term remains applicable when it also occurs outside the longer phrase.
-    Equal-length conflicts remain visible instead of being silently resolved here.
-    """
+    scoped = [
+        entry
+        for entry in glossary
+        if _glossary_entry_in_scope(
+            entry, segment, default_source_language=default_source_language
+        )
+    ]
+    highest_authority: dict[tuple[str, bool], int] = {}
+    for entry in scoped:
+        identity = (
+            entry.source if entry.case_sensitive else entry.source.casefold(),
+            entry.case_sensitive,
+        )
+        highest_authority[identity] = max(
+            highest_authority.get(identity, -1),
+            GLOSSARY_AUTHORITY_RANK[entry.authority],
+        )
+    return [
+        entry
+        for entry in scoped
+        if GLOSSARY_AUTHORITY_RANK[entry.authority]
+        == highest_authority[
+            (
+                entry.source if entry.case_sensitive else entry.source.casefold(),
+                entry.case_sensitive,
+            )
+        ]
+    ]
 
+
+def applicable_glossary_entries(
+    glossary: list[GlossaryEntry],
+    source: str,
+    *,
+    segment: Segment | None = None,
+    default_source_language: str = "",
+) -> list[GlossaryEntry]:
+    """Select in-scope source terms, preferring longer overlapping phrases."""
+
+    scoped = scoped_glossary_entries(
+        glossary,
+        segment=segment,
+        default_source_language=default_source_language,
+    )
     matches: list[tuple[int, int, int]] = []
-    for index, entry in enumerate(glossary):
+    for index, entry in enumerate(scoped):
         for start, end in _term_spans(
             entry.source, source, case_sensitive=entry.case_sensitive
         ):
@@ -102,7 +173,7 @@ def applicable_glossary_entries(
             same_start_max_end = max(same_start_max_end, end)
         prior_max_end = max(prior_max_end, same_start_max_end)
         position = group_end
-    return [entry for index, entry in enumerate(glossary) if index in selected_indexes]
+    return [entry for index, entry in enumerate(scoped) if index in selected_indexes]
 
 
 _MARKUP_TAG = re.compile(
@@ -141,6 +212,83 @@ def protected_tokens(text: str, extra_patterns: list[str] | None = None) -> Coun
         # Capturing groups describe a pattern, not the bytes protected by it.
         tokens.extend(match.group(0) for match in re.finditer(pattern, text))
     return Counter(tokens)
+
+_PARENTHETICAL_MARKS = {"(": ")", "\uff08": "\uff09"}
+_PARENTHETICAL_CLOSE = set(_PARENTHETICAL_MARKS.values())
+_SENTENCE_BOUNDARY = re.compile(r"[.!?\u3002\uff01\uff1f]")
+
+
+def _parenthetical_slots(text: str) -> list[tuple[int, int, int, int, bool, bool]]:
+    """Describe balanced parentheticals by structural slot, not translated wording."""
+
+    stack: list[tuple[str, int, int]] = []
+    result: list[tuple[int, int, int, int, bool, bool]] = []
+    for index, char in enumerate(text):
+        if char in _PARENTHETICAL_MARKS:
+            stack.append((char, index, len(stack)))
+            continue
+        if char not in _PARENTHETICAL_CLOSE:
+            continue
+        if not stack or _PARENTHETICAL_MARKS[stack[-1][0]] != char:
+            # An unmatched target closer is an unsupported structural addition.
+            result.append((-1, -1, -1, -1, False, False))
+            continue
+        _, start, depth = stack.pop()
+        slot_start = max(text.rfind("\n", 0, start), text.rfind("|", 0, start)) + 1
+        line_end = text.find("\n", index + 1)
+        pipe_end = text.find("|", index + 1)
+        ends = [value for value in (line_end, pipe_end) if value >= 0]
+        slot_end = min(ends) if ends else len(text)
+        prefix = text[slot_start:start].strip()
+        suffix = text[index + 1 : slot_end].strip()
+        result.append(
+            (
+                text.count("\n", 0, start),
+                text.count("|", 0, start),
+                len(_SENTENCE_BOUNDARY.findall(text[:start])),
+                depth,
+                bool(prefix),
+                bool(suffix),
+            )
+        )
+    result.extend([(-1, -1, -1, depth, False, False) for _, _, depth in stack])
+    return result
+
+
+def _mask_glossary_parentheticals(
+    candidate: str, glossary: list[GlossaryEntry]
+) -> str:
+    characters = list(candidate)
+    for entry in glossary:
+        flags = 0 if entry.case_sensitive else re.IGNORECASE
+        for target in entry.allowed_targets:
+            if not any(mark in target for mark in (*_PARENTHETICAL_MARKS, *_PARENTHETICAL_CLOSE)):
+                continue
+            for match in re.finditer(re.escape(target), candidate, flags):
+                for index in range(match.start(), match.end()):
+                    if characters[index] in _PARENTHETICAL_MARKS or characters[index] in _PARENTHETICAL_CLOSE:
+                        characters[index] = " "
+    return "".join(characters)
+
+
+def _has_unlicensed_parenthetical_addition(
+    segment: Segment,
+    candidate: str,
+    glossary: list[GlossaryEntry],
+) -> bool:
+    if (
+        segment.metadata.get("source_absent_parenthetical_policy")
+        != PARENTHETICAL_POLICY
+    ):
+        return False
+    available = Counter(_parenthetical_slots(segment.source))
+    for slot in _parenthetical_slots(
+        _mask_glossary_parentheticals(candidate, glossary)
+    ):
+        if available[slot] <= 0:
+            return True
+        available[slot] -= 1
+    return False
 
 
 def preflight_constraint_issues(
@@ -230,6 +378,20 @@ def validate_integrity(
     max_length_ratio: float = 4.0,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
+    try:
+        localization_authority_contract(segment.metadata)
+        applicable_glossary = applicable_glossary_entries(
+            glossary, segment.source, segment=segment
+        )
+    except ValueError as exc:
+        issues.append(
+            ValidationIssue(
+                "localization-authority-invalid",
+                str(exc),
+                retryable=False,
+            )
+        )
+        applicable_glossary = []
     exact_nonprinting_source = (
         not segment.source.strip() and candidate == segment.source
     )
@@ -260,7 +422,7 @@ def validate_integrity(
             )
         )
 
-    for entry in applicable_glossary_entries(glossary, segment.source):
+    for entry in applicable_glossary:
         if not any(
             contains_term(target, candidate, case_sensitive=entry.case_sensitive)
             for target in entry.allowed_targets
@@ -272,6 +434,16 @@ def validate_integrity(
                     f"Required glossary target {allowed} is absent for {entry.source!r}",
                 )
             )
+
+    if _has_unlicensed_parenthetical_addition(
+        segment, candidate, applicable_glossary
+    ):
+        issues.append(
+            ValidationIssue(
+                "parenthetical-addition",
+                "Candidate introduced parenthetical text absent from the source and authoritative glossary",
+            )
+        )
 
     for pattern in SUSPICIOUS_ADDITIONS:
         if pattern.search(candidate) and not pattern.search(segment.source):
