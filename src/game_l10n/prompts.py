@@ -6,7 +6,12 @@ from typing import Any
 
 from .localization_authority import effective_source_language
 from .models import CharacterProfile, ContextPack, GlossaryEntry, ProjectContext, Segment
-from .validators import applicable_glossary_entries, contains_term, scoped_glossary_entries
+from .validators import (
+    applicable_glossary_entries,
+    applicable_scoped_glossary_entries,
+    contains_term,
+    scoped_glossary_entries,
+)
 
 PROMPT_VERSION = "2026-11-04.3"
 
@@ -154,19 +159,14 @@ def _relevant_glossary(
     segment: Segment | None = None,
     default_source_language: str = "",
 ) -> list[GlossaryEntry]:
-    source_entries = applicable_glossary_entries(
-        glossary,
-        source,
-        segment=segment,
-        default_source_language=default_source_language,
-    )
-    selected = list(source_entries)
-    selected_identities = {id(item) for item in selected}
     scoped_entries = scoped_glossary_entries(
         glossary,
         segment=segment,
         default_source_language=default_source_language,
     )
+    source_entries = applicable_scoped_glossary_entries(scoped_entries, source)
+    selected = list(source_entries)
+    selected_identities = {id(item) for item in selected}
     for item in scoped_entries:
         if id(item) in selected_identities or not item.source:
             continue
