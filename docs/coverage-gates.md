@@ -94,6 +94,10 @@ Tool-backed pack readiness also verifies the current configured command and reso
 
 The selected SDK must also account for each translated target at the application boundary. A target is either a direct display-safe replacement or an evidenced display projection that preserves any shared lookup, index, condition, animation, or script value. Unmapped display bindings and translated control values are blocking application defects even when inventory alignment and semantic review are complete. Compare original/patched functional groups and the actual package replacement set; file count or a successful pack command is not application evidence.
 
+For composed or dynamically formatted UI, application evidence must exercise the complete emitted value, not merely prove that each fragment exists in a translation table. Use the evidenced render pattern with representative dynamic values and verify that every static source fragment is replaced, dynamic values and formatting are preserved, and no replacement leaks into an unrelated slot. A whole-string lookup does not cover a value whose runtime shape can vary; each variable shape needs a fragment-safe binding or an equivalent evidenced display projection.
+
+Static inspectors must close source-file handles before handoff. Tools with uncertain lifetimes must inspect content-bound workspace snapshots because read-only handles can block an authorized replacement.
+
 When the user explicitly requests image translation, the separate gates in `docs/image-localization.md` run before packing. Text completion does not authorize OCR, and an image result cannot satisfy or weaken text inventory/review coverage.
 
 ## Runtime observations
