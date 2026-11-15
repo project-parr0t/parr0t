@@ -118,6 +118,7 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         ],
         "require_review": True,
         "review_max_rounds": 2,
+        "review_attempt_limits": {"openai-sol": 2},
         "max_workers": 8,
         "context_max_workers": 6,
         "retry_refusals_once": False,
@@ -1231,6 +1232,10 @@ def _apply_review_routing_defaults(config: dict[str, Any]) -> None:
     routing = config.setdefault("routing", {})
     if not isinstance(routing, dict):
         raise ConfigurationError("Workspace routing policy must be an object")
+    from .review_policy import validate_review_limits, validate_review_settings
+    limits = routing.setdefault("review_attempt_limits", {})
+    validate_review_limits(limits)
+    validate_review_settings(routing)
     preset = str(config.get("provider_preset", ""))
     if preset == CODEX_APP_PRESET:
         routing.setdefault("review_triagers", ["native-luna"])
@@ -1376,6 +1381,7 @@ def initialize_workspace(
             ],
             "require_review": True,
             "review_max_rounds": 2,
+            "review_attempt_limits": {"native-sol": 2},
             "max_workers": 8,
             "context_max_workers": 6,
             "retry_refusals_once": False,
