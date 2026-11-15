@@ -77,7 +77,7 @@ CONTEXT_RESULT_ISSUE_CODES = {
 }
 
 MIN_CONTEXT_CHUNK_CHARS = 2048
-MAX_CONTEXT_WORKERS = 6
+MAX_CONTEXT_WORKERS = 32
 
 
 def _chunk_localization(chunk: list[Segment], localization: dict[str, Any] | None) -> dict[str, Any]:

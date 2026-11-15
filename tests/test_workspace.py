@@ -2314,7 +2314,7 @@ class WorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(
             status["data_plane_task"]["parallelism"],
-            "core_bound_disjoint_chunks_up_to_six_workers",
+            "core_bound_disjoint_chunks_up_to_configured_ceiling",
         )
         self.assertEqual(
             status["data_plane_task"]["merge_policy"],
