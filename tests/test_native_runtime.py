@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 import json
 import tempfile
 import unittest
@@ -7,6 +9,8 @@ from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
 
+from game_l10n.cli import build_parser, main
+from game_l10n.errors import ConfigurationError
 from game_l10n.control_plane import establish_control_plane_entry
 from game_l10n.data_plane_task import prepare_data_plane_task, seal_data_plane_task
 from game_l10n.models import Segment
@@ -70,6 +74,55 @@ class NativeRuntimeTests(unittest.TestCase):
     def row(self, target_id: str, *, provider: str = "native-luna", status: str = "success") -> dict:
         return {"target_id": target_id, "status": status, "text": "TARGET" if status == "success" else "",
                 "provider": provider, "issues": []}
+
+    def invoke_argv(self, argv: list[str]) -> dict:
+        stdout, stderr = StringIO(), StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = main(argv[2:])
+        self.assertEqual(code, 0, stderr.getvalue())
+        return json.loads(stdout.getvalue())
+
+    def test_bound_data_plane_argv_records_real_launch_and_seals_missing_output(self) -> None:
+        _, output, relay = self.prepare_probe()
+        payload = json.loads(relay.read_text(encoding="utf-8"))
+        commands = payload["command_argv"]
+        self.invoke_argv(commands["capability-available"])
+        start = ["synthetic-worker" if value == "<worker-id>" else value
+                 for value in commands["worker-started"]["worker-0"]]
+        self.invoke_argv(start)
+        summary = native_launch_summary(self.root, relay)
+        self.assertEqual(summary["started_workers"], 1)
+        self.assertEqual(summary["model"], payload["launch_contract"]["model"])
+        sealed = self.invoke_argv(commands["seal"])
+        self.assertEqual(sealed["status"], "error")
+        self.assertIn("task_incomplete", sealed["issue_codes"])
+        self.assertTrue((output / "receipt.json").is_file())
+
+    def test_bound_native_argv_imports_only_completed_bound_results(self) -> None:
+        establish_control_plane_entry(self.root)
+        _, relay, payload = self.prepare()
+        commands = payload["command_argv"]
+        self.invoke_argv(commands["capability-available"])
+        for index, (binding, segment) in enumerate(zip(payload["task_bindings"], self.segments, strict=True)):
+            start = [f"synthetic-worker-{index}" if value == "<worker-id>" else value
+                     for value in commands["worker-started"][binding["task"]]]
+            self.invoke_argv(start)
+            self.write_rows(self.root / binding["result"], [self.row(segment.id)])
+        args = build_parser().parse_args(commands["seal"][2:])
+        seal_native_wave_relay(self.root, self.root / args.dispatch, relay_ended=args.relay_ended)
+        completed = self.step()
+        self.assertEqual(completed["action"], "aggregate_completed_pass")
+        self.assertEqual(completed["counts"]["imported_tasks"], 2)
+
+    def test_tampered_lifecycle_argv_cannot_change_a_bound_relay(self) -> None:
+        from game_l10n.data_plane_task import _load_bound_data_plane_relay
+        _, _, relay = self.prepare_probe()
+        payload = json.loads(relay.read_text(encoding="utf-8"))
+        payload["command_argv"]["capability-available"][-1] = "worker-started"
+        relay.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaises(ConfigurationError):
+            _load_bound_data_plane_relay(self.root, relay)
+        self.assertFalse((relay.parent / "receipt.json").exists())
 
     def test_host_specific_exact_models_and_explicit_override(self) -> None:
         configure_native_runtime(self.root, "codex", {})
