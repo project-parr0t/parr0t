@@ -10,10 +10,18 @@ from typing import Any
 
 from .control_plane import _atomic_json, suspend_control_plane
 from .errors import ConfigurationError
+from .store import exclusive_file_lock
 
 FRAMEWORK_SESSION_SCHEMA = "parr0t.framework-session.v1"
 FRAMEWORK_SESSION_PATH = ".game-l10n/framework-session.json"
 DIAGNOSTIC_LOG_DIRECTORY = ".game-l10n/diagnostics/logs"
+
+
+def _framework_session_lock(work_dir: Path):
+    return exclusive_file_lock(
+        work_dir / ".game-l10n/framework-session.lock",
+        issue_code="E_FRAMEWORK_TRANSITION_BUSY",
+    )
 
 
 def framework_session_state(work_dir: Path) -> dict[str, Any]:
@@ -103,27 +111,33 @@ def change_framework_mode(
         raise ConfigurationError("E_FRAMEWORK_ANALYSIS_REQUIRED: log access requires analysis mode")
     if not (work_dir / "game-l10n.json").is_file():
         raise ConfigurationError("E_FRAMEWORK_WORKSPACE_REQUIRED: initialized private workspace required")
-    previous = framework_session_state(work_dir)
-    state = {
-        "schema": FRAMEWORK_SESSION_SCHEMA, "mode": mode,
-        "revision": previous["revision"] + 1, "instructions_active": False,
-        "user_requested": True, "logs": [],
-    }
-    # Fail closed before inspecting logs or touching possibly broken control state.
-    _atomic_json(work_dir / FRAMEWORK_SESSION_PATH, state)
-    control_issue = ""
-    try:
-        suspend_control_plane(work_dir)
-    except (ConfigurationError, OSError, ValueError):
-        # Diagnostics must remain reachable precisely when control metadata is broken.
-        control_issue = "control_state_repair_required"
+    with _framework_session_lock(work_dir):
+        previous = framework_session_state(work_dir)
+        state = {
+            "schema": FRAMEWORK_SESSION_SCHEMA, "mode": mode,
+            "revision": previous["revision"] + 1, "instructions_active": False,
+            "user_requested": True, "logs": [],
+        }
+        # Suspend first, but do not hold the transaction lock while copying logs:
+        # a later shutdown must be able to revoke this request immediately.
+        _atomic_json(work_dir / FRAMEWORK_SESSION_PATH, state)
+        control_issue = ""
+        try:
+            suspend_control_plane(work_dir)
+        except (ConfigurationError, OSError, ValueError):
+            control_issue = "control_state_repair_required"
     snapshots = {}
     for selected in logs or []:
         source = selected if selected.is_absolute() else work_dir / selected
         binding = _snapshot_log(work_dir, source)
         snapshots[binding["sha256"]] = binding
-    state["logs"] = list(snapshots.values())
-    _atomic_json(work_dir / FRAMEWORK_SESSION_PATH, state)
+    with _framework_session_lock(work_dir):
+        if framework_session_state(work_dir) != state:
+            raise ConfigurationError(
+                "E_FRAMEWORK_MODE_CHANGED: a newer mode request superseded this log grant"
+            )
+        state = {**state, "logs": list(snapshots.values())}
+        _atomic_json(work_dir / FRAMEWORK_SESSION_PATH, state)
     return {"framework_session": state, "control_plane_issue": control_issue}
 
 
@@ -143,6 +157,11 @@ def diagnostic_log_bytes(work_dir: Path, relative: Path) -> bytes:
         raise ConfigurationError("E_DIAGNOSTIC_LOG_UNAVAILABLE: approved snapshot is unavailable") from exc
     if len(data) != binding["bytes"] or hashlib.sha256(data).hexdigest() != binding["sha256"]:
         raise ConfigurationError("E_DIAGNOSTIC_LOG_CHANGED: approved snapshot binding changed")
+    with _framework_session_lock(work_dir):
+        if framework_session_state(work_dir) != state:
+            raise ConfigurationError(
+                "E_DIAGNOSTIC_LOG_NOT_APPROVED: log access was revoked while reading"
+            )
     return data
 
 

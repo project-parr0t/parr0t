@@ -1,10 +1,8 @@
 """Deterministic native-host broker; semantic output stays in workspace artifacts."""
 from __future__ import annotations
 
-from contextlib import contextmanager
 import json
 import math
-import os
 from pathlib import Path
 import secrets
 import re
@@ -15,37 +13,8 @@ from .control_plane import require_control_plane_ready
 from .native_host import (HOST_PROTOCOL, PROBE_SCHEMA, OPAQUE_ID, NativeHostClient,
                           _write, native_host_profile, probe_path, verified_host_probe)
 from .native_runtime import native_runtime, record_native_launch, _load
-from .store import stable_hash
+from .store import exclusive_file_lock, stable_hash
 
-
-@contextmanager
-def _exclusive(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as lock:
-        # Windows byte locks reject reads as well as writes by a second broker.
-        # File size remains available before acquiring the first-byte lock.
-        lock.seek(0, os.SEEK_END)
-        if lock.tell() == 0:
-            lock.write(b"0")
-            lock.flush()
-        lock.seek(0)
-        try:
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            raise ValueError("E_NATIVE_BROKER_ALREADY_RUNNING") from None
-        try:
-            yield
-        finally:
-            lock.seek(0)
-            if os.name == "nt":
-                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _workers(value: dict, keys: set[str], model: str) -> list[dict]:
@@ -158,7 +127,7 @@ def _probe_native_host(work_dir: Path, route: str, *, live: bool = False,
     identity = {"profile_fingerprint": profile["fingerprint"], "model": model,
                 "route": route, "control_generation": runtime["control_generation"]}
     pending = target.with_suffix(".pending.json")
-    with _exclusive(target.with_suffix(".lock")):
+    with exclusive_file_lock(target.with_suffix(".lock"), issue_code="E_NATIVE_BROKER_ALREADY_RUNNING"):
         prior = json.loads(pending.read_text(encoding="utf-8")) if pending.exists() else None
         execution_path = target.with_suffix(".execution.json")
         if prior and prior.get("identity") != identity:
@@ -254,7 +223,7 @@ def _run_native_broker(work_dir: Path, relay_path: Path, *, poll_seconds: float 
             groups.append(["finalizer"])
     binding = stable_hash({"relay": relay, "profile": profile["fingerprint"]})
     state_dir = work_dir / ".game-l10n/native/broker" / binding[:24]
-    with _exclusive(state_dir / "broker.lock"):
+    with exclusive_file_lock(state_dir / "broker.lock", issue_code="E_NATIVE_BROKER_ALREADY_RUNNING"):
         admission = state_dir / "admission.json"
         if admission.is_file():
             planned = json.loads(admission.read_text())

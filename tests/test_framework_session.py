@@ -243,6 +243,45 @@ class FrameworkSessionTests(unittest.TestCase):
                     control_plane.require_control_plane_ready(self.workspace)
                 self.assertNotIn("PRIVATE_SYNTHETIC", str(error.exception))
 
+    def test_late_analysis_snapshot_cannot_overwrite_newer_shutdown(self) -> None:
+        original = framework_session._snapshot_log
+
+        def shutdown_during_copy(workspace: Path, source: Path) -> dict:
+            self.change("shutdown")
+            return original(workspace, source)
+
+        with patch.object(framework_session, "_snapshot_log", side_effect=shutdown_during_copy):
+            with self.assertRaisesRegex(ConfigurationError, "MODE_CHANGED"):
+                self.change(logs=[self.external_log])
+        state = framework_session.framework_session_state(self.workspace)
+        self.assertEqual(state["mode"], "shutdown")
+        self.assertEqual(state["logs"], [])
+
+    def test_log_revocation_during_read_returns_no_private_bytes(self) -> None:
+        result = self.change(logs=[self.external_log])
+        relative = Path(result["framework_session"]["logs"][0]["path"])
+        original = Path.read_bytes
+
+        def revoked(path: Path) -> bytes:
+            if path == self.workspace / relative:
+                self.change("shutdown")
+            return original(path)
+
+        with patch.object(Path, "read_bytes", revoked):
+            with self.assertRaisesRegex(ConfigurationError, "LOG_NOT_APPROVED"):
+                framework_session.diagnostic_log_bytes(self.workspace, relative)
+
+    def test_mode_and_recovery_mutations_share_one_exclusive_transaction(self) -> None:
+        self.change()
+        with framework_session._framework_session_lock(self.workspace):
+            with self.assertRaisesRegex(ValueError, "TRANSITION_BUSY"):
+                self.change("shutdown")
+            with self.assertRaisesRegex(ValueError, "TRANSITION_BUSY"):
+                control_plane.acknowledge_control_plane_rotation(
+                    self.workspace, self.workspace / control_plane.CONTROL_HANDOFF_PATH,
+                )
+        self.assertEqual(framework_session.framework_session_state(self.workspace)["mode"], "analysis")
+
 
 if __name__ == "__main__":
     unittest.main()

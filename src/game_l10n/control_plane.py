@@ -645,6 +645,17 @@ def accept_control_plane_exposure(
     contracts_read: bool = False,
 ) -> dict[str, Any]:
     """Admit one explicitly accepted incident without claiming a clean session."""
+    from .framework_session import _framework_session_lock
+
+    with _framework_session_lock(work_dir):
+        return _accept_control_plane_exposure_locked(
+            work_dir, handoff_path, user_confirmed=user_confirmed, contracts_read=contracts_read,
+        )
+
+
+def _accept_control_plane_exposure_locked(
+    work_dir: Path, handoff_path: Path, *, user_confirmed: bool, contracts_read: bool,
+) -> dict[str, Any]:
     if user_confirmed is not True or contracts_read is not True:
         raise ConfigurationError(
             "E_CONTROL_PLANE_ACCEPTANCE_REQUIRED: explicit user acceptance of this "
@@ -689,8 +700,6 @@ def accept_control_plane_exposure(
     })
     _atomic_json(work_dir / CONTROL_STATE_PATH, accepted)
     return accepted
-
-
 def _reset_native_control_observations(work_dir: Path) -> None:
     """Reset only generation-local polling state after a validated rotation."""
 
@@ -725,6 +734,15 @@ def _reset_native_control_observations(work_dir: Path) -> None:
 
 def acknowledge_control_plane_rotation(
     work_dir: Path, handoff_path: Path
+) -> dict[str, Any]:
+    from .framework_session import _framework_session_lock
+
+    with _framework_session_lock(work_dir):
+        return _acknowledge_control_plane_rotation_locked(work_dir, handoff_path)
+
+
+def _acknowledge_control_plane_rotation_locked(
+    work_dir: Path, handoff_path: Path,
 ) -> dict[str, Any]:
     state = control_plane_state(work_dir)
     if state["status"] != "rotation_required":
