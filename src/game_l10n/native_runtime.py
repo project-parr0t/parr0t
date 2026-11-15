@@ -221,6 +221,47 @@ def _archive_metadata(path: Path) -> None:
         archive.write_bytes(original)
 
 
+def _relay_command_argv(work_dir: Path, relay_path: Path, relay: dict) -> dict[str, Any]:
+    """Supply complete argv; only the returned worker ID remains host-provided."""
+    contract = relay.get("launch_contract")
+    if (not isinstance(contract, dict) or not isinstance(contract.get("model"), str)
+            or not isinstance(contract.get("tasks"), list)
+            or not all(isinstance(task, str) for task in contract["tasks"])
+            or len(set(contract["tasks"])) != len(contract["tasks"])):
+        raise ValueError("E_NATIVE_LAUNCH_INVALID: lifecycle commands need a bound model and tasks")
+    prefix = ["-m", "game_l10n.cli"]
+    workspace = ["--workspace", str(work_dir.resolve())]
+    relative = relay_path.resolve().relative_to(work_dir.resolve()).as_posix()
+    launch = [*prefix, "record-native-launch", *workspace, "--relay", relative]
+    commands: dict[str, Any] = {
+        event: [*launch, "--event", event]
+        for event in ("capability-available", "capability-unavailable", "model-unavailable")
+    }
+    commands["worker-started"] = {
+        task: [*launch, "--event", "worker-started", "--task", task,
+               "--model", contract["model"], "--worker-id", "<worker-id>"]
+        for task in contract["tasks"]
+    }
+    native = relay.get("schema") == "parr0t.native-wave-relay.v1"
+    commands["seal"] = [*prefix, "seal-native-wave-relay" if native else "seal-data-plane-task",
+                        *workspace, "--dispatch" if native else "--relay", relative,
+                        "--relay-ended" if native else "--worker-ended"]
+    plan = relay.get("execution_plan", {})
+    if not native and plan.get("tracking_required"):
+        base = [*prefix, "record-data-plane-relay-event", *workspace, "--relay", relative]
+        commands["relay-events"] = {
+            f"{event}:{slot}": [*base, "--event", event, "--slot", str(slot)]
+            for slot in plan["required_worker_slots"]
+            for event in ("worker-started", "worker-ended")
+        }
+        if plan.get("finalizer_required"):
+            commands["relay-events"].update({
+                event: [*base, "--event", event]
+                for event in ("finalizer-started", "finalizer-ended")
+            })
+    return commands
+
+
 def bind_data_plane_launch(work_dir: Path, relay_path: Path) -> None:
     """Attach host routing to an existing core-bound task without rebuilding it."""
     if not relay_path.resolve().is_relative_to(work_dir.resolve() / ".game-l10n"):
@@ -263,6 +304,8 @@ def bind_data_plane_launch(work_dir: Path, relay_path: Path) -> None:
         for path in paths[1:]:
             path.unlink(missing_ok=True)
     relay["launch_contract"] = _contract_for_relay(work_dir, relay, relay_path)
+    if relay.get("schema") == "parr0t.data-plane-relay.v4":
+        relay["command_argv"] = _relay_command_argv(work_dir, relay_path, relay)
     _write(relay_path, relay)
 
 
@@ -329,6 +372,8 @@ def _load(work_dir: Path, relay_path: Path) -> tuple[dict, dict, dict]:
         expected["runtime_fingerprint"] = contract.get("runtime_fingerprint")
     if contract != expected:
         raise ValueError("E_NATIVE_LAUNCH_INVALID: runtime binding changed")
+    if "command_argv" in relay and relay["command_argv"] != _relay_command_argv(work_dir, relay_path, relay):
+        raise ValueError("E_NATIVE_LAUNCH_INVALID: lifecycle commands changed")
     path = _ledger_path(relay_path)
     ledger = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {
         "schema": LAUNCH_SCHEMA, "relay_fingerprint": stable_hash(relay),

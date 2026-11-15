@@ -10,7 +10,6 @@ from typing import Any
 
 from .control_plane import control_plane_state
 
-ISOLATION_PATH = ".game-l10n/native/omp-isolation.json"
 ISOLATION_SCHEMA = "parr0t.omp-isolation.v1"
 ISOLATION_ENV = "PARR0T_OMP_GUARD_SESSION"
 ISOLATION_ISSUE = "E_NATIVE_MESSAGE_ISOLATION_REQUIRED"
@@ -21,11 +20,18 @@ def guard_sha256() -> str:
     return sha256(files("game_l10n").joinpath("templates", "omp-isolation-guard.mjs").read_bytes()).hexdigest()
 
 
+def isolation_path(work_dir: Path, session_id: str) -> Path:
+    """Address each root's proof independently without a shared mutable pointer."""
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError(ISOLATION_ISSUE)
+    return work_dir / ".game-l10n/native/omp-isolation" / (sha256(session_id.encode("utf-8")).hexdigest() + ".json")
+
+
 def require_omp_isolation(work_dir: Path) -> dict[str, Any]:
     """Fail categorically; registration data and filesystem errors never escape."""
     try:
-        proof = json.loads((work_dir / ISOLATION_PATH).read_text(encoding="utf-8"))
         session = os.environ.get(ISOLATION_ENV)
+        proof = json.loads(isolation_path(work_dir, session).read_text(encoding="utf-8"))
         generation = control_plane_state(work_dir).get("generation", 0)
         valid = (
             isinstance(proof, dict)
