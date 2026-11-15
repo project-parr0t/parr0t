@@ -14,7 +14,8 @@ from game_l10n.control_plane import establish_control_plane_entry
 from game_l10n.coverage import save_inventory_attestation
 from game_l10n.data_plane_task import prepare_data_plane_task
 from game_l10n.models import Segment
-from game_l10n.native_broker import _drive, _exclusive, probe_native_host, run_native_broker
+from game_l10n.native_broker import _drive, probe_native_host, run_native_broker
+from game_l10n.store import exclusive_file_lock
 from game_l10n.native_host import (
     HOST_PROTOCOL, NativeHostClient, configure_native_host, native_host_profile, verified_host_probe,
 )
@@ -270,11 +271,11 @@ class NativeBrokerTests(unittest.TestCase):
 
     def test_concurrent_broker_is_rejected_without_stale_lock_files(self):
         lock = self.root / "fixture.lock"
-        with _exclusive(lock):
+        with exclusive_file_lock(lock, issue_code="E_NATIVE_BROKER_ALREADY_RUNNING"):
             with self.assertRaisesRegex(ValueError, "E_NATIVE_BROKER_ALREADY_RUNNING"):
-                with _exclusive(lock):
+                with exclusive_file_lock(lock, issue_code="E_NATIVE_BROKER_ALREADY_RUNNING"):
                     self.fail("concurrent broker entered")
-        with _exclusive(lock):
+        with exclusive_file_lock(lock, issue_code="E_NATIVE_BROKER_ALREADY_RUNNING"):
             pass
 
     def test_missing_request_requires_explicit_retry_safe(self):
