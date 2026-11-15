@@ -58,4 +58,6 @@ Character interpretation follows the authoritative original-language source. A s
 
 Corrections mutate target text only. Segment IDs, source text, order, placeholders, markup, control codes, and inventory authority metadata remain immutable. A terminology or speaker-profile change invalidates affected candidate bindings and requires fresh current-generation triage; selected risk targets also require strong review. Sampling never approves unsampled text.
 
+When the locked target language is Korean, `docs/korean-localization.md` supplies the language-specific quality profile for terminology, names, register, morphology, composition, punctuation, and typography. It supplements this authority contract and cannot weaken source provenance, glossary scope, immutable metadata, or review coverage.
+
 Review checks entity scope, authority precedence, unsupported parenthetical additions, source-language provenance, stable speaker voice, and evidence-backed register shifts in addition to meaning, fluency, UI function, and format integrity. Provider refusal or operational failure routes only that target onward and never reduces scope.

@@ -108,7 +108,8 @@ reviewed, source-preserved, complete, or releasable.
 5. Treat `ui_state_semantics` as meaning evidence, not as target text. The target wording still follows locale, style, glossary, and space constraints.
 6. Never apply a translated candidate over `shared_control_value`, `lookup_key`, `index`, or `script_operand` storage. Require an evidenced `display_binding_id` and preserve the source storage value byte-for-byte.
 7. Before packing, an engine SDK must account for every translated target as a direct display-safe replacement or an evidenced display projection. Inventory coverage alone does not prove application coverage.
-8. Validate each `functional_group_ids` relationship against the original and patched structures. A translated label may not shift an item-description index, selection result, state producer/consumer, animation reference, or exception/return behavior.
+8. For a composed or dynamically formatted value, verify the complete render pattern with representative dynamic values. Every static source fragment must translate, dynamic values and formatting must remain intact, and unrelated slots must remain unchanged. Translation-table presence and exact whole-string matching are insufficient when the emitted value can vary.
+9. Validate each `functional_group_ids` relationship against the original and patched structures. A translated label may not shift an item-description index, selection result, state producer/consumer, animation reference, or exception/return behavior.
 
 ## Strong-review selection fields
 
