@@ -9,14 +9,14 @@ Parr0t is engine-neutral. Keep game, credential, title, and job data in external
 3. Run `game-l10n status --workspace <workspace>`. For `establish_text_free_control_plane`, read its contracts and run `game-l10n enter-control-plane --workspace <workspace> --contracts-read --source-unopened` before other work.
 4. Resolve each `required_contracts` entry against `contract_base`; read only those contracts. For other routes, use the table.
 
-Only `local_patch_ready` is terminal; it requires static completion and an unchanged packed artifact bound to its attestation.
+`local_patch_ready` ends localization only; user-requested shutdown/analysis withdraws localization directives under `docs/control-plane-contract.md`.
 
 ## Non-negotiable rules
 
 1. **Stay within the request.** Apply `skills/request-scope-guard/SKILL.md` whenever scope is limited, the task is inspection-only, or an action is optional, destructive, or externally consequential. Re-evaluate after every user message. Access and API-key availability are not authorization.
 2. **Separate locations.** This repository holds reusable code; the game root is read-only; generated work belongs in a `game-l10n init-workspace` workspace.
 3. **Text is the default scope.** Do not inspect images for text or run OCR unless the user requests image translation. Then record `image-localization-policy`, follow `docs/image-localization.md`, and process only definitively bound player-visible UI text regions; never scan all images.
-4. **Keep root metadata-only.** Never inspect private data, semantic text, transcripts, logs, trees, or nested-worker output/status. Observe only core status, validated envelopes/receipts, relay lifecycle, and core-owned usage. Record leaks; rotate by default. Explicit user acceptance follows `docs/control-plane-contract.md` when host rules permit. Accepted exposure grants no semantic/worker permissions.
+4. **During localization, keep root metadata-only.** Never inspect private data, semantic text, transcripts, logs, trees, or nested-worker output/status. Observe only core status, validated envelopes/receipts, relay lifecycle, and core-owned usage. Record leaks; rotate by default. Explicit user acceptance follows `docs/control-plane-contract.md` when host rules permit. Accepted exposure grants no semantic/worker permissions.
 5. **Preserve pipeline order.** Verify inventories/context; translate with failed-only Luna retries, Sol retries, then external fallback; complete low-cost triage, strong-review, flagged rewrite, review fallback, validate, pack. Defaults: Luna 5 retries, Sol 3.
 6. **Treat refusal as routing.** Parent-facing refusal state is only `fallback_required` / “폴백 처리 필요”. It is never a content judgment, exclusion, batch cancellation, or authority to shrink scope. Preserve source only after metadata proves every configured route was attempted and exhausted.
 7. **Use the locked target language; translate, do not invent.** Korean is the default; another language requires an explicit user policy change. Preserve target-scoped context, meaning, voice, formality, UI function, conditions, units, order, terminology, placeholders, markup, control codes, supported allusions, and natural effect.

@@ -429,8 +429,12 @@ def control_plane_state(work_dir: Path) -> dict[str, Any]:
         if (
             len(payload["incident_id"]) != 32
             or any(character not in "0123456789abcdef" for character in payload["incident_id"])
-            or payload["issue_code"] != "control_plane_leak"
-            or payload["incident_code"] not in LEAK_INCIDENT_CODES
+            or not (
+                (payload["issue_code"] == "control_plane_leak"
+                 and payload["incident_code"] in LEAK_INCIDENT_CODES)
+                or (payload["issue_code"] == "framework_suspended"
+                    and payload["incident_code"] == "framework_suspended")
+            )
         ):
             raise ConfigurationError("E_CONTROL_PLANE_STATE: invalid rotation marker")
     elif payload["incident_id"] or payload["issue_code"] or payload["incident_code"]:
@@ -467,6 +471,9 @@ def public_control_plane_state(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def require_control_plane_ready(work_dir: Path) -> dict[str, Any]:
+    from .framework_session import require_localization_mode
+
+    require_localization_mode(work_dir)
     state = control_plane_state(work_dir)
     if state["status"] != "ready":
         raise ConfigurationError(
@@ -479,6 +486,17 @@ def require_control_plane_ready(work_dir: Path) -> dict[str, Any]:
 def record_control_plane_leak(work_dir: Path, incident_code: str) -> dict[str, Any]:
     if incident_code not in LEAK_INCIDENT_CODES:
         raise ConfigurationError("E_CONTROL_PLANE_LEAK: unsupported incident code")
+    return _record_control_plane_incident(work_dir, incident_code, "control_plane_leak")
+
+
+def suspend_control_plane(work_dir: Path) -> dict[str, Any]:
+    """Invalidate localization admission without claiming an actual text leak."""
+    return _record_control_plane_incident(work_dir, "framework_suspended", "framework_suspended")
+
+
+def _record_control_plane_incident(
+    work_dir: Path, incident_code: str, issue_code: str,
+) -> dict[str, Any]:
     state = control_plane_state(work_dir)
     if state["status"] == "rotation_required":
         # Recovery after an interrupted leak record: replace a missing or prior-incident receipt.
@@ -497,7 +515,7 @@ def record_control_plane_leak(work_dir: Path, incident_code: str) -> dict[str, A
         "status": "rotation_required",
         "generation": state["generation"],
         "incident_id": uuid.uuid4().hex,
-        "issue_code": "control_plane_leak",
+        "issue_code": issue_code,
         "incident_code": incident_code,
     }
     _atomic_json(work_dir / CONTROL_STATE_PATH, contaminated)
@@ -522,7 +540,7 @@ def _write_control_plane_handoff(
         "from_generation": state["generation"],
         "to_generation": state["generation"] + 1,
         "incident_id": state["incident_id"],
-        "issue_code": "control_plane_leak",
+        "issue_code": state["issue_code"],
     }
     receipt = {**payload, "digest": _control_handoff_digest(payload)}
     _atomic_json(work_dir / CONTROL_HANDOFF_PATH, receipt)
@@ -561,7 +579,8 @@ def _validated_control_plane_handoff(
     if (
         receipt.get("schema") != CONTROL_HANDOFF_SCHEMA
         or receipt.get("status") != "rotation_required"
-        or receipt.get("issue_code") != "control_plane_leak"
+        or not isinstance(receipt.get("issue_code"), str)
+        or receipt["issue_code"] not in {"control_plane_leak", "framework_suspended"}
         or not isinstance(receipt.get("from_generation"), int)
         or isinstance(receipt.get("from_generation"), bool)
         or receipt["from_generation"] < 1
@@ -631,13 +650,17 @@ def accept_control_plane_exposure(
             "E_CONTROL_PLANE_ACCEPTANCE_REQUIRED: explicit user acceptance of this "
             "incident and the reduced-isolation contract are required"
         )
+    from .framework_session import require_localization_mode
+
+    require_localization_mode(work_dir)
     state = control_plane_state(work_dir)
-    if state["status"] != "rotation_required":
+    if state["status"] != "rotation_required" or state["issue_code"] != "control_plane_leak":
         raise ConfigurationError("E_CONTROL_PLANE_STATE: no exposure incident is pending")
     handoff = _validated_control_plane_handoff(work_dir, handoff_path)
     if (
         handoff["incident_id"] != state["incident_id"]
         or handoff["from_generation"] != state["generation"]
+        or handoff["issue_code"] != state["issue_code"]
     ):
         raise ConfigurationError(
             "E_CONTROL_PLANE_HANDOFF_INVALID: receipt does not match pending incident"
@@ -713,6 +736,7 @@ def acknowledge_control_plane_rotation(
         receipt["incident_id"] != state["incident_id"]
         or receipt["from_generation"] != state["generation"]
         or receipt["to_generation"] != state["generation"] + 1
+        or receipt["issue_code"] != state["issue_code"]
     ):
         raise ConfigurationError(
             "E_CONTROL_PLANE_HANDOFF_INVALID: receipt does not match pending rotation"
@@ -735,6 +759,9 @@ def acknowledge_control_plane_rotation(
     (work_dir / CONTROL_HANDOFF_PATH).unlink(missing_ok=True)
     _atomic_json(work_dir / CONTROL_ENTRY_PATH, initial_control_plane_entry_state())
     _reset_native_control_observations(work_dir)
+    from .framework_session import _restore_localization_after_rotation
+
+    _restore_localization_after_rotation(work_dir)
     _atomic_json(work_dir / CONTROL_STATE_PATH, resumed)
     return resumed
 

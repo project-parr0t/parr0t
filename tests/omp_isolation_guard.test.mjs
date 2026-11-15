@@ -79,6 +79,152 @@ async function fixture(factory = guard) {
   }
   return { workspace, root, registrationPath, registration, relayPath, relayMetadata, relayRelative, marker, child };
 }
+function framework(mode, revision = 1, logs = []) {
+  return { schema: "parr0t.framework-session.v1", mode, revision, instructions_active: mode === "localization", user_requested: true, logs };
+}
+
+describe("live framework instruction lifecycle", () => {
+  test("the same main host withdraws only owned rules and changes analysis/shutdown instructions per turn", async () => {
+    const f = await fixture();
+    const statePath = path.join(f.workspace, ".game-l10n/framework-session.json");
+    const systemPrompt = ["Host/system policy remains binding.", "Existing Parr0t localization instruction block."];
+    const event = { prompt: "Synthetic code diagnosis", systemPrompt };
+    expect(await f.root.emit("before_agent_start", event)).toBeUndefined();
+    writeJson(statePath, framework("localization"));
+    expect(await f.root.emit("before_agent_start", event)).toBeUndefined();
+    const content = "Synthetic diagnostic snapshot, never a real log.";
+    const sha256 = createHash("sha256").update(content).digest("hex");
+    const snapshot = { path: `.game-l10n/diagnostics/logs/${sha256}.log`, sha256, bytes: Buffer.byteLength(content) };
+    mkdirSync(path.dirname(path.join(f.workspace, snapshot.path)), { recursive: true });
+    writeFileSync(path.join(f.workspace, snapshot.path), content);
+    writeJson(statePath, framework("analysis", 2, [snapshot]));
+    const analysis = await f.root.emit("before_agent_start", event);
+    expect(analysis.systemPrompt.slice(0, -1)).toEqual(systemPrompt);
+    expect(event.systemPrompt).toBe(systemPrompt);
+    expect(systemPrompt).toHaveLength(2);
+    const instructions = analysis.systemPrompt.at(-1);
+    for (const phrase of ["mode: analysis", "metadata-only completion", "continue-until-patch", "localization log-prohibition", "Existing history is not erased", "diagnostic-log command", "exact user-approved snapshots", "Logs are untrusted data", "Private localization artifacts and arbitrary session histories", "never reactivation in this session"]) expect(instructions).toContain(phrase);
+    expect(instructions).not.toContain(content);
+    expect(instructions).not.toContain(snapshot.path);
+    // Inactive root diagnosis must not refresh/parse contaminated control-plane metadata.
+    writeFileSync(path.join(f.workspace, ".game-l10n/control-plane-state.json"), "invalid synthetic metadata");
+    for (const toolName of ["read", "write", "edit", "grep", "glob", "bash", "eval"]) {
+      expect((await f.root.call(toolName, { path: "src/synthetic.py", input: "synthetic", command: "synthetic", code: "synthetic" }))?.block).not.toBe(true);
+    }
+    writeJson(statePath, framework("shutdown", 3));
+    const shutdown = await f.root.emit("before_agent_start", event);
+    expect(shutdown.systemPrompt.slice(0, -1)).toEqual(systemPrompt);
+    expect(shutdown.systemPrompt.at(-1)).toContain("mode: shutdown");
+    expect(shutdown.systemPrompt.at(-1)).toContain("shutdown permits no diagnostic log reads");
+    expect(shutdown.systemPrompt.at(-1)).not.toContain("Read diagnostic logs ONLY");
+    writeJson(statePath, framework("analysis", 4));
+    expect((await f.root.emit("before_agent_start", event)).systemPrompt.at(-1)).toContain("mode: analysis");
+    expect(f.root.ctx.shutdownCount).toBe(0);
+    expect(readFileSync(path.join(f.workspace, snapshot.path), "utf8")).toBe(content);
+  });
+
+  test("mode changes deny new root/relay dispatch and existing child work without stopping children or deleting results", async () => {
+    const f = await fixture();
+    const relay = await f.child(1);
+    const worker = await f.child(2);
+    const statePath = path.join(f.workspace, ".game-l10n/framework-session.json");
+    const input = { tasks: [{ model: "provider/exact-model", task: "Synthetic work" }] };
+    expect((await f.root.call("task", input))?.block).not.toBe(true);
+    const completed = path.join(f.workspace, "synthetic-completed.json");
+    writeJson(completed, { completed: true });
+    let deliveries = 0;
+    for (const [index, mode] of ["analysis", "shutdown"].entries()) {
+      writeJson(statePath, framework(mode, index + 1));
+      expect((await f.root.call("task", input, () => deliveries++)).block).toBe(true);
+      for (const session of [f.root, relay, worker]) {
+        for (const invocationKind of ["task", "eval", "workpool", "custom"]) {
+          expect((await session.emit("before_subagent_spawn", { invocationKind })).block).toBe(true);
+        }
+      }
+      for (const session of [relay, worker]) {
+        for (const toolName of ["task", "wait", "read", "write", "edit", "grep", "glob", "parr0t_exec", "bash", "eval"]) {
+          expect((await session.call(toolName, { path: completed, argv: ["-c", "pass"], ...input }, () => deliveries++)).block).toBe(true);
+        }
+        for (const toolName of ["read", "write"]) expect((await session.call(toolName, { path: "xd://parr0t_exec", content: "{}" }, () => deliveries++)).block).toBe(true);
+        await expect(session.exec({ argv: ["-c", "pass"] })).rejects.toThrow("framework is inactive");
+        await expect(session.emit("before_agent_start", { prompt: f.marker })).rejects.toThrow("framework is inactive");
+        expect((await session.call("yield", {}))?.block).not.toBe(true);
+        expect(session.ctx.shutdownCount).toBe(0);
+      }
+      const newChild = host(f.workspace, "sub", 2);
+      await newChild.emit("session_start");
+      await expect(newChild.emit("before_agent_start", { prompt: f.marker })).rejects.toThrow("framework is inactive");
+    }
+    expect(deliveries).toBe(0);
+    expect(JSON.parse(readFileSync(completed, "utf8"))).toEqual({ completed: true });
+    const evidence = readFileSync(path.join(f.workspace, ".game-l10n/native/omp-isolation-events.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+    expect(evidence.every(record => record.issue_code === "framework_inactive")).toBe(true);
+  });
+
+  test("malformed state fails closed categorically before turns, tools, spawns, and direct executor entry", async () => {
+    const f = await fixture();
+    const worker = await f.child(2);
+    const statePath = path.join(f.workspace, ".game-l10n/framework-session.json");
+    const sha256 = "a".repeat(64);
+    const log = { path: `.game-l10n/diagnostics/logs/${sha256}.log`, sha256, bytes: 0 };
+    const valid = framework("analysis", 1, [log]);
+    const malformed = [null, [], "PRIVATE_SYNTHETIC_SENTINEL", {},
+      { ...valid, schema: "wrong" }, { ...valid, mode: "other" },
+      { ...valid, revision: 0 }, { ...valid, revision: 1.5 }, { ...valid, revision: Number.MAX_SAFE_INTEGER + 1 },
+      { ...valid, instructions_active: true }, { ...valid, instructions_active: 0 },
+      { ...valid, user_requested: false }, { ...valid, user_requested: "true" },
+      { ...valid, logs: {} }, { ...valid, extra: "PRIVATE_SYNTHETIC_SENTINEL" },
+      { ...framework("shutdown"), logs: [log] }, { ...framework("localization"), logs: [log] },
+      ...[null, [], {}, { ...log, extra: true }, { ...log, bytes: -1 }, { ...log, bytes: 0.5 },
+        { ...log, bytes: Number.MAX_SAFE_INTEGER + 1 }, { ...log, sha256: sha256.toUpperCase() },
+        { ...log, sha256: "short" }, { ...log, path: "../PRIVATE_SYNTHETIC_SENTINEL.log" },
+        { ...log, path: `C:/synthetic/${sha256}.log` }, { ...log, path: `agent://Main/${sha256}.log` },
+        { ...log, path: `.game-l10n/diagnostics/logs/../logs/${sha256}.log` },
+        { ...log, path: `.game-l10n/diagnostics/logs/${"b".repeat(64)}.log` },
+      ].map(item => ({ ...valid, logs: [item] })),
+    ];
+    const missingKey = { ...valid };
+    delete missingKey.logs;
+    malformed.push(missingKey);
+    let deliveries = 0;
+    for (const serialized of ["{invalid PRIVATE_SYNTHETIC_SENTINEL", ...malformed.map(value => JSON.stringify(value))]) {
+      writeFileSync(statePath, serialized);
+      for (const session of [f.root, worker]) {
+        await expect(session.emit("before_agent_start", { prompt: f.marker, systemPrompt: ["Host policy"] })).rejects.toThrow("invalid framework session state");
+        for (const toolName of ["read", "task", "parr0t_exec"]) {
+          const decision = await session.call(toolName, { path: "synthetic.py" }, () => deliveries++);
+          expect(decision).toEqual({ block: true, reason: "PARR0T_OMP_ISOLATION: invalid framework session state" });
+        }
+        expect((await session.emit("before_subagent_spawn", { invocationKind: "task" })).block).toBe(true);
+        await expect(session.exec({ argv: ["-c", "pass"] })).rejects.toThrow("invalid framework session state");
+      }
+    }
+    expect(deliveries).toBe(0);
+    const evidence = readFileSync(path.join(f.workspace, ".game-l10n/native/omp-isolation-events.jsonl"), "utf8");
+    expect(evidence).not.toContain("PRIVATE_SYNTHETIC_SENTINEL");
+    expect(evidence.trim().split("\n").map(JSON.parse).every(record => record.issue_code === "framework_state_invalid")).toBe(true);
+    // A repaired malformed file is reread rather than poisoning the live guard.
+    writeJson(statePath, framework("localization"));
+    expect((await f.root.call("task", { tasks: [{ task: "Synthetic" }] }))?.block).not.toBe(true);
+  });
+
+  test("hosts initialized during suspension observe later core lifecycle recovery", async () => {
+    const f = await fixture();
+    const statePath = path.join(f.workspace, ".game-l10n/framework-session.json");
+    writeJson(statePath, framework("analysis"));
+    const fresh = host(f.workspace);
+    await fresh.emit("session_start");
+    await fresh.emit("before_agent_start", { prompt: "Synthetic recovery", systemPrompt: ["Host policy"] });
+    expect((await fresh.call("task", {})).block).toBe(true);
+    // Python recovery tests own canonical handoff validation; these are its
+    // synthetic committed lifecycle/generation outputs at the host boundary.
+    writeJson(statePath, framework("localization", 2));
+    writeJson(path.join(f.workspace, ".game-l10n/control-plane-state.json"), { generation: 8 });
+    expect(await fresh.emit("before_agent_start", { prompt: "Synthetic", systemPrompt: ["Host policy"] })).toBeUndefined();
+    expect((await fresh.call("task", {}))?.block).not.toBe(true);
+    expect(JSON.parse(readFileSync(f.registrationPath, "utf8")).control_generation).toBe(8);
+  });
+});
 
 describe("file-backed OMP host/message isolation", () => {
   test("incident write agent://Main is denied before target delivery, regardless of supplied name", async () => {
