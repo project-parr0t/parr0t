@@ -144,11 +144,20 @@ def applicable_glossary_entries(
 ) -> list[GlossaryEntry]:
     """Select in-scope source terms, preferring longer overlapping phrases."""
 
-    scoped = scoped_glossary_entries(
-        glossary,
-        segment=segment,
-        default_source_language=default_source_language,
+    return applicable_scoped_glossary_entries(
+        scoped_glossary_entries(
+            glossary,
+            segment=segment,
+            default_source_language=default_source_language,
+        ),
+        source,
     )
+
+
+def applicable_scoped_glossary_entries(
+    scoped: list[GlossaryEntry], source: str
+) -> list[GlossaryEntry]:
+    """Select source terms from glossary rows already filtered by scope and authority."""
     matches: list[tuple[int, int, int]] = []
     for index, entry in enumerate(scoped):
         for start, end in _term_spans(
