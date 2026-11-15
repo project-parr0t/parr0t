@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, TypeVar
 
 from .errors import ProviderError, ProviderFailure
+from .framework_session import require_localization_mode
 from .models import (
     AgentEnvelope,
     AgentStatus,
@@ -143,6 +144,7 @@ class LocalizationOrchestrator:
         self.characters = {item.name: item for item in (characters or [])}
         self.context_pack = context_pack
         self.work_dir = work_dir.resolve()
+        require_localization_mode(self.work_dir)
         self.store = ResultStore(self.work_dir / ".game-l10n" / "cache.sqlite3")
         self.audit = AuditLog(self.work_dir / ".game-l10n" / "audit.jsonl")
         self._style_memory: dict[str, list[dict[str, str]]] = {}
@@ -532,6 +534,7 @@ class LocalizationOrchestrator:
         refusal_retry: bool = False,
         retry_feedback: list[dict[str, str]] | None = None,
     ) -> AgentEnvelope:
+        require_localization_mode(self.work_dir)
         system, user = translation_prompt(
             self.project,
             segment,
@@ -560,6 +563,7 @@ class LocalizationOrchestrator:
         *,
         refusal_retry: bool = False,
     ) -> ReviewVerdictEnvelope:
+        require_localization_mode(self.work_dir)
         plain_verdict = provider.fingerprint().get("review_verdict_format") == "plain"
         system, user = review_judge_prompt(
             self.project,
@@ -592,6 +596,7 @@ class LocalizationOrchestrator:
         refusal_retry: bool = False,
         retry_feedback: list[dict[str, str]] | None = None,
     ) -> AgentEnvelope:
+        require_localization_mode(self.work_dir)
         system, user = review_rewrite_prompt(
             self.project,
             segment,
@@ -1178,6 +1183,7 @@ class LocalizationOrchestrator:
         return candidate
 
     def translate_one(self, segment: Segment, *, force: bool = False) -> TranslationResult:
+        require_localization_mode(self.work_dir)
         anchors = self._anchors(segment.speaker)
         cache_key = self._cache_key(segment, anchors)
         if not force:
@@ -1258,6 +1264,7 @@ class LocalizationOrchestrator:
         candidate identity; the independent reviewer must approve the current text under
         the current context pack.
         """
+        require_localization_mode(self.work_dir)
 
         if not self.config.require_review:
             raise ValueError("Existing candidates require an enabled independent review route")
@@ -1340,6 +1347,7 @@ class LocalizationOrchestrator:
         segments: Iterable[Segment],
         candidates: dict[str, dict[str, str]],
     ) -> list[TranslationResult]:
+        require_localization_mode(self.work_dir)
         items = list(segments)
         expected_ids = {item.id for item in items}
         candidate_ids = set(candidates)
@@ -1953,6 +1961,7 @@ class LocalizationOrchestrator:
         return final_results
 
     def translate_many(self, segments: Iterable[Segment], *, force: bool = False) -> list[TranslationResult]:
+        require_localization_mode(self.work_dir)
         items = list(segments)
         if self.config.defer_fallbacks_until_primary_complete:
             return self._translate_many_deferred(items, force=force)
