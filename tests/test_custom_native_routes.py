@@ -35,6 +35,7 @@ class CustomNativeRouteTests(unittest.TestCase):
                 "translator_retries": {"native-luna": 5, "native-sol": 3},
                 "review_triagers": ["native-luna"],
                 "reviewers": ["native-sol", "native-qwen"],
+                "review_attempt_limits": {"native-qwen": 2},
                 "rewriters": ["native-qwen", "native-sol"],
                 "max_workers": 1,
             },
@@ -61,6 +62,7 @@ class CustomNativeRouteTests(unittest.TestCase):
 
     def run_pass(self, source, directory, rows, *, kind="translation", provider=None,
                  attempt=1, tier=None):
+        (self.root / "game-l10n.json").write_text(json.dumps(self.config), encoding="utf-8")
         arguments = ["--input", source, "--output", directory, "--pass-kind", kind,
                      "--route-attempt", str(attempt)]
         if provider:

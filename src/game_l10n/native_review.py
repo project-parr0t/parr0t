@@ -33,6 +33,7 @@ from .review_selection import (
     DEFAULT_STRONG_REVIEW_CATEGORIES, provenance_review_reasons, review_category,
     rewrite_issue_codes, strong_review_selection_reasons, target_language_review_reasons,
 )
+from .review_policy import judge_calls, review_call_limit, is_sol_route, review_worker_limit
 from .store import stable_hash
 from .validators import validate_integrity
 
@@ -335,6 +336,9 @@ def select_native_review_route(segments: list[Segment], routes: list[str], *, st
         result = _bound_result(segment)
         attempted = {item.provider for item in result.attempts
                      if item.stage == stage and item.candidate_generation == result.candidate_generation}
+        if stage == "review":
+            attempted.update(route for route in routes
+                             if is_sol_route(route) and judge_calls(result.attempts, route) >= 2)
         active_routes = routes
         if stage == "review-rewrite" and not active_routes:
             active_routes = [next((item.provider for item in reversed(result.attempts)
@@ -388,6 +392,8 @@ def collect_native_review(
     invalid_verdicts = 0
     verdict_counts: Counter[str] = Counter()
     issue_counts: Counter[str] = Counter()
+    from .native_runtime import native_runtime
+    runtime = native_runtime(work_dir)
     for segment, row in zip(segments, rows, strict=True):
         result = _bound_result(segment)
         if result.candidate_digest != stable_hash(result.text):
@@ -411,9 +417,10 @@ def collect_native_review(
         issue_counts.update(dict.fromkeys(issues, 1))
         result.attempts.append(AttemptRecord(
             stage, provider, status, issues=issues,
-            ordinal=1 + sum(item.stage == stage and item.provider == provider
-                            for item in result.attempts),
+            ordinal=judge_calls(result.attempts, provider, stage_prefix=stage)
+                    + int(row.get("native_review_attempts", row.get("semantic_attempts", 1))),
             candidate_generation=result.candidate_generation,
+            model=(runtime or {}).get("models", {}).get(provider, ""),
         ))
         integrity = validate_integrity(segment, result.text, glossary or [],
             extra_patterns=extra_patterns, max_length_ratio=max_length_ratio)
@@ -466,12 +473,14 @@ def collect_native_review(
             result.metadata["rewrite_issues"] = rewrite_issue_codes(
                 issues, integrity, language_risk=True
             )
-            rewrite.append(_pending_segment(segment, result))
+            (fallback if is_sol_route(provider) and judge_calls(result.attempts, provider) >= 2
+             else rewrite).append(_pending_segment(segment, result))
             continue
         if verdict.verdict is ReviewVerdict.REWRITE or integrity:
             result.metadata["review_tier"] = "strong_pending"
             result.metadata["rewrite_issues"] = rewrite_issue_codes(issues, integrity)
-            rewrite.append(_pending_segment(segment, result))
+            (fallback if is_sol_route(provider) and judge_calls(result.attempts, provider) >= 2
+             else rewrite).append(_pending_segment(segment, result))
             continue
         # Only a parsed current-candidate OK and clean integrity can approve.
         if verdict is None or verdict.verdict is not ReviewVerdict.OK or integrity:
@@ -600,18 +609,22 @@ def process_native_review_followup(
     output.resolve().relative_to(work_dir)
     segments = read_segments(source)
     _require_candidate_bindings(segments, "review")
+    fallback_limit = review_call_limit("deepseek", orchestrator.config.reviewer_chain,
+                                     orchestrator.config.review_attempt_limits,
+                                     tier_limit=orchestrator.config.strong_max_calls) if operation == "judge" else None
+    wave_size = review_worker_limit(asdict(orchestrator.config), wave_size, tier="strong")
     provider = orchestrator.registry.get("deepseek")
     prepared: list[tuple[Segment, TranslationResult, str]] = []
     for segment in segments:
         result = _bound_result(segment)
         native = [a for a in result.attempts
-                  if a.provider == "native-sol" and a.stage == "review"
-                  and a.candidate_generation == result.candidate_generation]
+                  if a.provider == "native-sol" and a.stage == "review"]
         if not native or result.status == "reviewed":
             raise ValueError("E_NATIVE_REVIEW_PRIMARY_BARRIER_REQUIRED")
         if operation == "rewrite" and not result.metadata.get("rewrite_issues"):
             raise ValueError("E_NATIVE_REVIEW_REWRITE_NOT_FLAGGED")
-        if operation == "judge" and native[-1].status not in {"error", "refused"}:
+        if (operation == "judge" and native[-1].status not in {"error", "refused"}
+                and judge_calls(result.attempts, "native-sol") < 2):
             raise ValueError("E_NATIVE_REVIEW_FALLBACK_NOT_FAILED")
         fingerprint = stable_hash({
             "segment": asdict(segment), "operation": operation,
@@ -665,7 +678,13 @@ def process_native_review_followup(
         else:
             rewrites_done = sum(a.stage.startswith("review-rewrite") and a.status == "success"
                                 for a in result.attempts)
-            if rewrites_done >= max(0, orchestrator.config.review_max_rounds - 1):
+            fallback_calls = judge_calls(result.attempts, provider.name)
+            limit_reached = (
+                fallback_calls >= review_call_limit(provider.name, orchestrator.config.reviewer_chain,
+                    orchestrator.config.review_attempt_limits)
+                if fallback_calls else rewrites_done >= max(0, orchestrator.config.review_max_rounds - 1)
+            )
+            if limit_reached:
                 result.metadata["native_rewrite_limit_reached"] = True
                 return result
             response = orchestrator._rewrite_with_refusal_retry(
@@ -678,7 +697,12 @@ def process_native_review_followup(
                 result.metadata["native_confirmation_pending"] = True
         return result
 
-    pending = [item for item in prepared if item[0].id not in cached]
+    pending = [item for item in prepared if item[0].id not in cached or (
+        operation == "judge" and cached[item[0].id].status != "reviewed"
+        and judge_calls(cached[item[0].id].attempts, provider.name) < fallback_limit
+    )]
+    pending = [(segment, cached.get(segment.id, result), fingerprint)
+               for segment, result, fingerprint in pending]
     executed = 0
     if progress_callback is not None:
         try:
