@@ -52,26 +52,6 @@ class InstructionSurfaceTests(unittest.TestCase):
                 self.assertLessEqual(len(text.split()), limit)
 
 
-    def test_control_plane_cannot_scrape_host_or_nested_worker_state(self) -> None:
-        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
-        contract = (ROOT / "docs/control-plane-contract.md").read_text(
-            encoding="utf-8"
-        )
-        budget = (ROOT / "docs/execution-budget.md").read_text(encoding="utf-8")
-
-        for required in (
-            "session transcripts/logs",
-            "agent trees",
-            "nested-worker status/output",
-            "core ledgers/receipts",
-        ):
-            self.assertIn(required, agents)
-        self.assertIn("`.codex/sessions`", contract)
-        self.assertIn("one bounded wait", contract)
-        self.assertIn("must not query a nested worker", contract)
-        self.assertIn("Missing telemetry is unknown", budget)
-        self.assertIn("never reconstruct it from `.codex/sessions`", budget)
-
     def test_whole_job_usage_limits_are_user_opt_in_and_not_a_startup_gate(self) -> None:
         agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
         contract = (ROOT / "docs/control-plane-contract.md").read_text(

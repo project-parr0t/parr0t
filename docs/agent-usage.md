@@ -19,13 +19,13 @@ Text-only default: images require `image-localization.md` policy; target languag
 For a new job:
 
 1. Confirm repository/workspace access and only that the source path exists; do not inspect its contents.
-2. Initialize with that path and run status. For `establish_text_free_control_plane`, read its contracts and run `game-l10n enter-control-plane --workspace <workspace> --contracts-read --source-unopened`. If the parent already saw game content, record a leak and stop.
+2. Initialize and follow status contracts. Clean entry: `enter-control-plane --workspace <workspace> --contracts-read --source-unopened`. Record exposure before recovery. Rotate by default; explicit user acceptance follows `control-plane-contract.md` when host rules permit. Never auto-launch replacements.
 3. Ask once whether Git may be used for this game task; record only the answer. Disabled forbids Git mutation/publication in that workspace, not authenticated SDK access, download, inventory, or activation. Never infer the answer from transport or missing `.git`.
-4. Bind `native-runtime --host codex|omp --workspace <workspace>`; follow host/model/launch rules in `control-plane-contract.md`. Follow status `next_actions`: prepare, relay, seal. Only `local_patch_ready` is terminal.
+4. Bind `native-runtime --host codex|omp --workspace <workspace>` per `control-plane-contract.md`; follow status relays through `local_patch_ready`.
 
 For an existing job, start with status and reuse valid checkpoints. Do not repeat work with unchanged fingerprints.
 
-Native continuation: `control-plane-contract.md`.
+Continuation, shutdown/analysis, and approved log diagnosis: `control-plane-contract.md`.
 
 ## State machine
 
@@ -106,7 +106,7 @@ A data-plane relay never reads or forwards child responses. At termination it ru
 
 ## Completion
 
-The final control-plane report contains only categorical coverage states, counts, deterministic issue codes, unresolved queue sizes, artifact paths, and the next required decision. Do not claim runtime coverage without separately authorized or user-executed observation.
+Localization reports contain categorical coverage, issue codes, queues, counts, and paths only. Diagnostic reports may explain framework defects, not reproduce private logs. Never claim unobserved runtime coverage.
 
 For repository changes, run:
 

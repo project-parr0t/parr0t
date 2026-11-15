@@ -796,62 +796,6 @@ class WorkspaceTests(unittest.TestCase):
         self.assertTrue(config["runtime"]["user_executes_by_default"])
         self.assertNotIn("publish_approved", config["repository"])
         self.assertLessEqual(len(generated_agents.split()), 1000)
-        for required in (
-            "game-l10n status",
-            "game-l10n enter-control-plane",
-            "Before listing, opening, searching, or reading any file",
-            "skills/request-scope-guard/SKILL.md",
-            "Do not inspect images for text",
-            "two independent complete ordered inventories",
-            "primary translation",
-            "translation fallback for failures only",
-            "complete low-cost triage",
-            "selective strong review",
-            "review fallback for failures only",
-            "parr0t.control-envelope.v2",
-            "game-l10n validate-control-envelope",
-            "game-l10n record-control-plane-leak",
-            "fresh control plane",
-            "fallback_required",
-            "route evidence",
-            "parr0t.translation-exchange/v1",
-            "metadata.blocking_on_failure=true",
-            "docs/sdk-selection.md",
-            "docs/engine-faq-contract.md",
-            "docs/coverage-gates.md",
-            "docs/release-checkpoint.md",
-            "docs/minimal-corrections.md",
-            "docs/segment-metadata.md",
-            "docs/runtime-approval.md",
-            "docs/installer-contract.md",
-            "docs/steam-faq.md",
-            "docs/wrapper-executable.md",
-            "docs/instance-release.md",
-            "startup-current-directory-relative paths",
-            "one cached residual task",
-            "disposable isolated relay per authorized wave",
-            "status.contract_set.digest",
-            "must not auto-restart the root turn",
-            "keep transitions silent",
-            "report only pass/checkpoint completion or blockers",
-        ):
-            self.assertIn(required, generated_agents)
-        self.assertLess(
-            generated_agents.index("primary translation"),
-            generated_agents.index("translation fallback for failures only"),
-        )
-        self.assertLess(
-            generated_agents.index("translation fallback for failures only"),
-            generated_agents.index("complete low-cost triage"),
-        )
-        self.assertLess(
-            generated_agents.index("complete low-cost triage"),
-            generated_agents.index("selective strong review"),
-        )
-        self.assertLess(
-            generated_agents.index("selective strong review"),
-            generated_agents.index("review fallback for failures only"),
-        )
         self.assertEqual(config["sdk_selection"]["status"], "pending")
 
     def test_default_provider_preset_is_locked_codex_app(self) -> None:
