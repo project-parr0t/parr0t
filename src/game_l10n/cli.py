@@ -153,6 +153,18 @@ from .workspace import (
 )
 
 
+def _core_runtime() -> dict[str, Any]:
+    module = Path(__file__).resolve()
+    return {
+        "module": str(module),
+        "python": sys.executable,
+        "cli_argv": [
+            sys.executable, "-I", "-B",
+            str(module.with_name("templates") / "native-python.py"),
+        ],
+    }
+
+
 STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
     "stop_current_control_plane": ("docs/control-plane-contract.md",),
     "establish_text_free_control_plane": (
@@ -1384,7 +1396,7 @@ def cmd_native_resume_status(args: argparse.Namespace) -> int:
         if args.manifest else None
     )
     result = native_resume_status(work_dir, manifest_path=manifest)
-    result["core_runtime"] = {"module": str(Path(__file__).resolve()), "python": sys.executable}
+    result["core_runtime"] = _core_runtime()
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 1 if result["status"] == "invalid" else 0
 
@@ -1646,6 +1658,7 @@ def cmd_accept_control_plane_exposure(args: argparse.Namespace) -> int:
 def cmd_framework_status(args: argparse.Namespace) -> int:
     print(json.dumps({
         "framework_session": framework_session_state(Path(args.workspace).resolve()),
+        "core_runtime": _core_runtime(),
     }, ensure_ascii=False))
     return 0
 
@@ -1656,6 +1669,7 @@ def cmd_framework_mode(args: argparse.Namespace) -> int:
         user_requested=args.user_requested,
         logs=[Path(value) for value in args.log],
     )
+    result["core_runtime"] = _core_runtime()
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -2356,6 +2370,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(json.dumps({
             "workspace": str(work_dir),
             "framework_session": session,
+            "core_runtime": _core_runtime(),
             "next_actions": [
                 "analyze_framework_logs" if session["mode"] == "analysis" else "framework_shutdown"
             ],
@@ -2373,6 +2388,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             json.dumps(
                 {
                     "workspace": str(work_dir),
+                    "core_runtime": _core_runtime(),
                     "control_plane": public_control_plane_state(control_state),
                     "contract_base": contract_base,
                     "next_actions": [action],
@@ -2393,6 +2409,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             json.dumps(
                 {
                     "workspace": str(work_dir),
+                    "core_runtime": _core_runtime(),
                     "control_plane": public_control_plane_state(control_state),
                     "entry_gate": public_control_plane_entry_state(entry_state),
                     "contract_base": contract_base,
@@ -2695,7 +2712,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         json.dumps(
             {
                 "workspace": str(work_dir),
-                "core_runtime": {"module": str(Path(__file__).resolve()), "python": sys.executable},
+                "core_runtime": _core_runtime(),
                 "sdk_root": contract_base,
                 "game_roots": [str(path) for path in game_roots],
                 "missing_game_roots": missing_roots,

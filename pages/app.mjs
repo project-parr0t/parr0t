@@ -34,7 +34,7 @@ async function refreshCatalog() {
   const request = new AbortController();
   catalogRequest = request;
   try {
-    const response = await fetch("http://127.0.0.1:10100/v1/models", { credentials: "omit", cache: "no-store", signal: request.signal });
+    const response = await fetch("http://localhost:10100/v1/models", { credentials: "omit", cache: "no-store", targetAddressSpace: "loopback", signal: request.signal });
     if (!response.ok) throw new Error("unavailable");
     const groups = proxyModelGroups(await response.json());
     if (request.signal.aborted) return;
