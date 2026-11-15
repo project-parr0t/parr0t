@@ -11,7 +11,7 @@ repair/rebind the SDK, change model/batch/budget choices, or resume a halted
 review autonomously. Checkpoint unknown or incomplete state. Never invent a
 budget or replace a manifest; only user-set limits execute.
 
-Use `game-l10n` as the execution boundary. Read the repository `AGENTS.md`, `docs/agent-usage.md`, and the workspace `AGENTS.md`; afterward resolve only the status response's `required_contracts` against its `contract_base`.
+`game-l10n` owns execution; read core/workspace instructions and status contracts. Explicit shutdown/diagnosis uses `framework-mode` under `docs/control-plane-contract.md`, suspending localization directives but not host safety/privacy.
 
 ## Run
 
