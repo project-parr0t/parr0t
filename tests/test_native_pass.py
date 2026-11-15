@@ -512,6 +512,7 @@ class NativePassTests(unittest.TestCase):
                 segments,
                 tasks,
                 pass_kind="review",
+                route_binding={"provider": "native-luna", "attempt": 1},
                 max_records=4,
                 max_workers=8,
             )
@@ -526,7 +527,7 @@ class NativePassTests(unittest.TestCase):
                 self._write_rows(
                     root / binding["result"],
                     [
-                        {"target_id": row["target_id"], "status": "refused", "text": ""}
+                        {"target_id": row["target_id"], "status": "refused", "text": "", "provider": "native-luna"}
                         for row in rows
                     ],
                 )
@@ -543,7 +544,7 @@ class NativePassTests(unittest.TestCase):
                 self._write_rows(
                     root / binding["result"],
                     [
-                        {"target_id": row["target_id"], "status": "refused", "text": ""}
+                        {"target_id": row["target_id"], "status": "refused", "text": "", "provider": "native-luna"}
                         for row in rows
                     ],
                 )

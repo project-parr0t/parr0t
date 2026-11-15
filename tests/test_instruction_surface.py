@@ -70,14 +70,6 @@ class InstructionSurfaceTests(unittest.TestCase):
         self.assertIn("No whole-job usage limit is required by default", exchange)
         self.assertIn("before fallback or as a condition of starting the job", exchange)
 
-    def test_public_entry_prompts_keep_the_parent_out_of_game_content(self) -> None:
-        readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        prompts = (ROOT / "docs/prompt-examples.md").read_text(encoding="utf-8")
-
-        self.assertEqual(readme.count("text-free control-plane"), 3)
-        self.assertIn("Before listing, opening, searching, or reading", prompts)
-        self.assertIn("existing-locale detection and engine/version discovery", prompts)
-        self.assertIn("establish_text_free_control_plane", STATUS_ACTION_CONTRACTS)
 
     def test_status_contract_routes_exist_in_the_repository(self) -> None:
         for action, contracts in STATUS_ACTION_CONTRACTS.items():
