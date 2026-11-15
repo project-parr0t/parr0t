@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -12,6 +12,7 @@ const temporary = [];
 const originalSession = process.env.PARR0T_OMP_GUARD_SESSION;
 const originalWorkspace = process.env.PARR0T_OMP_GUARD_WORKSPACE;
 const originalControlDirectory = process.env.PARR0T_OMP_CONTROL_DIRECTORY;
+beforeEach(() => { delete process.env.PARR0T_OMP_CONTROL_DIRECTORY; });
 afterEach(() => {
   for (const directory of temporary.splice(0)) rmSync(directory, { recursive: true, force: true });
   if (originalSession === undefined) delete process.env.PARR0T_OMP_GUARD_SESSION;
@@ -25,7 +26,7 @@ function writeJson(file, value) {
   mkdirSync(path.dirname(file), { recursive: true });
   writeFileSync(file, JSON.stringify(value));
 }
-function host(workspace, kind = "main", depth = 0, name = "Anything", factory = guard) {
+function host(workspace, kind = "main", depth = 0, name = "Anything", factory = guard, sessionId = "synthetic-root-session") {
   const handlers = new Map();
   const tools = new Map();
   const shape = { optional() { return this; } };
@@ -38,7 +39,7 @@ function host(workspace, kind = "main", depth = 0, name = "Anything", factory = 
   const ctx = {
     cwd: workspace,
     agent: { kind, depth, name, id: kind === "main" ? "Main" : `synthetic-${depth}`, parentId: "synthetic-parent" },
-    sessionManager: { getSessionId: () => kind === "main" ? "synthetic-root-session" : "synthetic-child-session" },
+    sessionManager: { getSessionId: () => kind === "main" ? sessionId : "synthetic-child-session" },
     shutdownCount: 0,
     shutdown() { this.shutdownCount++; },
   };
@@ -60,13 +61,14 @@ async function fixture(factory = guard) {
   writeJson(path.join(workspace, ".game-l10n/control-plane-state.json"), { generation: 7 });
   const root = host(workspace, "main", 0, "Anything", factory);
   await root.emit("session_start");
-  const registrationPath = path.join(workspace, ".game-l10n/native/omp-isolation.json");
+  const registrationPath = path.join(workspace, ".game-l10n/native/omp-isolation", `${createHash("sha256").update("synthetic-root-session").digest("hex")}.json`);
   const registration = JSON.parse(readFileSync(registrationPath, "utf8"));
   const relayRelative = ".game-l10n/data-plane/synthetic/relay.json";
   const relayPath = path.join(workspace, relayRelative);
   const relayMetadata = {
     schema: "parr0t.data-plane-relay.v4", task_id: "synthetic-task-id",
     task_path: ".game-l10n/data-plane/synthetic/task.json",
+    expected_envelope: ".game-l10n/data-plane/synthetic/control-envelope.g7.attempt-1.json",
     launch_contract: { message_isolation: registration, tasks: ["worker-0"] },
   };
   writeJson(relayPath, relayMetadata);
@@ -429,12 +431,13 @@ describe("file-backed OMP host/message isolation", () => {
     test(`${layout} guard imports its adjacent Python package and keeps public read roots bounded`, async () => {
       const directory = mkdtempSync(path.join(os.tmpdir(), "parr0t-package-synthetic-"));
       temporary.push(directory);
-      const installation = path.join(directory, "synthetic package é");
+      const installation = path.join(directory, "synthetic 'package é");
       const importRoot = path.join(installation, layout === "checkout" ? "src" : "site-packages");
       const packageRoot = path.join(importRoot, "game_l10n");
       const guardPath = path.join(packageRoot, "templates/omp-isolation-guard.mjs");
       mkdirSync(path.dirname(guardPath), { recursive: true });
       writeFileSync(guardPath, readFileSync(template));
+      writeFileSync(path.join(packageRoot, "templates/native-python.py"), readFileSync(path.join(path.dirname(template), "native-python.py")));
       writeFileSync(path.join(packageRoot, "__init__.py"), "");
       const cliPath = path.join(packageRoot, "cli.py");
       writeFileSync(cliPath, "import json, sys\nprint(json.dumps({'module': __file__, 'isolated': sys.flags.isolated, 'bytecode_disabled': sys.dont_write_bytecode, 'args': sys.argv[1:]}))\n");
@@ -526,6 +529,85 @@ describe("file-backed OMP host/message isolation", () => {
     expect((await running).details.cancelled).toBe(true);
     await expect(worker.exec({ argv: ["-c", "pass"] }, controller.signal)).rejects.toThrow("cancelled");
   });
+  test("independent roots retain separate registration during interleaved calls", async () => {
+    const f = await fixture();
+    const before = readFileSync(f.registrationPath, "utf8");
+    const other = host(f.workspace, "main", 0, "Anything", guard, "synthetic-other-root");
+    await other.emit("session_start");
+    const otherPath = path.join(f.workspace, ".game-l10n/native/omp-isolation", `${createHash("sha256").update("synthetic-other-root").digest("hex")}.json`);
+    const otherProof = readFileSync(otherPath, "utf8");
+    await f.root.call("read", { path: "trusted-root" });
+    const worker = await f.child(2);
+    await other.call("read", { path: "trusted-root" });
+    expect(readFileSync(f.registrationPath, "utf8")).toBe(before);
+    expect(readFileSync(otherPath, "utf8")).toBe(otherProof);
+    await f.root.call("read", { path: "trusted-root" });
+    expect((await worker.call("read", { path: "synthetic-input.json" }))?.block).not.toBe(true);
+  });
+  test("only loaded guard bytes can be certified after the file is replaced", async () => {
+    const f = await fixture();
+    const copied = path.join(f.workspace, "synthetic-core/src/game_l10n/templates/omp-isolation-guard.mjs");
+    mkdirSync(path.dirname(copied), { recursive: true });
+    const original = readFileSync(template);
+    writeFileSync(copied, original);
+    const loaded = (await import(pathToFileURL(copied).href)).default;
+    const root = host(f.workspace, "main", 0, "Anything", loaded);
+    await root.emit("session_start");
+    writeFileSync(copied, Buffer.concat([original, Buffer.from("\n// Synthetic replacement.\n")]));
+    await root.call("read", { path: "trusted-root" });
+    const proof = JSON.parse(readFileSync(f.registrationPath, "utf8"));
+    expect(proof.guard_sha256).toBe(createHash("sha256").update(original).digest("hex"));
+    expect(proof.guard_sha256).not.toBe(createHash("sha256").update(readFileSync(copied)).digest("hex"));
+  });
+  test("localization final prose and yield payloads expose only bound replies", async () => {
+    const f = await fixture();
+    for (const depth of [1, 2]) {
+      const child = await f.child(depth);
+      const expected = depth === 1 ? ".game-l10n/data-plane/synthetic/receipt.json" : f.relayMetadata.expected_envelope;
+      const message = { content: [{ type: "text", text: "PRIVATE_SYNTHETIC_FINAL" }, { type: "text", text: "PRIVATE_SYNTHETIC_MORE" }] };
+      const rewritten = await child.emit("assistant_message", { message });
+      expect(rewritten.content.map(block => block.text).join("")).toBe(expected);
+      expect(message.content[0].text).toBe("PRIVATE_SYNTHETIC_FINAL");
+      let delivered;
+      await child.call("yield", { data: { text: "PRIVATE_SYNTHETIC_YIELD" }, error: "PRIVATE_SYNTHETIC_ERROR", type: "PRIVATE_SECTION" }, input => { delivered = input; });
+      expect(delivered).toEqual({ data: expected });
+      const call = { type: "toolCall", id: "synthetic-call", name: "read", arguments: { path: "synthetic-input.json" } };
+      const work = await child.emit("assistant_message", { message: { content: [{ type: "text", text: "PRIVATE_COMMENTARY" }, call] } });
+      expect(work.content).toEqual([{ type: "text", text: "" }, call]);
+    }
+    const unbound = host(f.workspace, "sub", 2);
+    const reply = await unbound.emit("assistant_message", { message: { content: [{ type: "text", text: "PRIVATE_SYNTHETIC_FINAL" }] } });
+    expect(reply.content).toEqual([{ type: "text", text: "E_NATIVE_MESSAGE_ISOLATION_REQUIRED" }]);
+  });
+  test("diagnostic prose and yield remain available to an admitted analysis child", async () => {
+    const f = await fixture();
+    writeJson(path.join(f.workspace, ".game-l10n/framework-session.json"), framework("analysis"));
+    await f.root.emit("before_subagent_spawn", { invocationKind: "task", spawnKey: "SyntheticDiagnostic" });
+    const child = host(f.workspace, "sub", 1);
+    Object.assign(child.ctx.agent, { id: "SyntheticDiagnostic", parentId: f.root.ctx.agent.id });
+    await child.emit("session_start");
+    await child.emit("before_agent_start", { prompt: "Synthetic code diagnosis", systemPrompt: [] });
+    const message = { content: [{ type: "text", text: "Synthetic public code finding" }] };
+    expect(await child.emit("assistant_message", { message })).toBeUndefined();
+    let delivered;
+    await child.call("yield", { data: "Synthetic public code finding" }, input => { delivered = input; });
+    expect(delivered).toEqual({ data: "Synthetic public code finding" });
+  });
+  test("invalid launch events and missing worker arguments never start Python", async () => {
+    const f = await fixture();
+    const relay = await f.child(1);
+    const base = ["-m", "game_l10n.cli", "record-native-launch", "--workspace", f.workspace, "--relay", f.relayRelative];
+    let deliveries = 0;
+    for (const tail of [[], ["--event", "synthetic-invalid"], ["--event", "worker-started"],
+      ["--event", "capability-available", "--worker-id", "synthetic-worker"]]) {
+      const decision = await relay.call("parr0t_exec", { argv: [...base, ...tail] }, () => deliveries++);
+      expect(decision.block).toBe(true);
+    }
+    expect(deliveries).toBe(0);
+    const allowed = [...base, "--event", "capability-available"];
+    expect((await relay.call("parr0t_exec", { argv: allowed }, () => deliveries++))?.block).not.toBe(true);
+    expect(deliveries).toBe(1);
+  });
   test("only root registers actual session/PID/digest and refreshes generation", async () => {
     const f = await fixture();
     expect(Object.keys(f.registration).sort()).toEqual(["schema", "control_generation", "session_id", "process_id", "guard_sha256"].sort());
@@ -579,7 +661,7 @@ describe("file-backed OMP host/message isolation", () => {
     expect((await child.call("write", { path: "synthetic.json", content: "no" })).block).toBe(true);
     delete process.env.PARR0T_OMP_GUARD_SESSION;
     const stale = host(f.workspace, "sub", 2);
-    await expect(stale.emit("session_start")).rejects.toThrow("stale");
+    await expect(stale.emit("session_start")).rejects.toMatchObject({ issueCode: "isolation_policy_denied" });
     expect(stale.ctx.shutdownCount).toBe(1);
     expect((await stale.call("read", { path: "synthetic.json" })).block).toBe(true);
   });

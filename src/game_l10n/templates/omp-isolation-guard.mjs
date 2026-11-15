@@ -5,9 +5,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const TEMPLATE = fileURLToPath(import.meta.url);
+const GUARD_SHA256 = createHash("sha256").update(readFileSync(TEMPLATE)).digest("hex");
 // The guard is a package resource in both src checkouts and installed wheels.
 const PACKAGE = path.resolve(path.dirname(TEMPLATE), "..");
 const CORE_SRC = path.dirname(PACKAGE);
+const PYTHON_ENTRY = path.join(PACKAGE, "templates", "native-python.py");
 const CHECKOUT = path.basename(CORE_SRC) === "src" && existsSync(path.join(CORE_SRC, "../pyproject.toml"));
 const CORE = CHECKOUT ? path.dirname(CORE_SRC) : PACKAGE;
 const SCHEMA = "parr0t.omp-isolation.v1";
@@ -81,6 +83,10 @@ function generation(workspace) {
   if (!Number.isSafeInteger(state.generation) || state.generation < 0) fail("invalid control generation");
   return state.generation;
 }
+function isolationPath(workspace, sessionId = process.env[SESSION_ENV]) {
+  if (typeof sessionId !== "string" || !sessionId.trim()) fail("root session identity is unavailable");
+  return path.join(workspace, ".game-l10n/native/omp-isolation", `${createHash("sha256").update(sessionId, "utf8").digest("hex")}.json`);
+}
 function frameworkState(workspace) {
   let serialized;
   try { serialized = readFileSync(path.join(workspace, ".game-l10n/framework-session.json"), "utf8"); }
@@ -153,10 +159,10 @@ function relayFromPrompt(prompt, workspace) {
   const metadata = JSON.parse(readFileSync(relayPath, "utf8"));
   if (native && (metadata.schema !== "parr0t.native-wave-relay.v1" || !Array.isArray(metadata.task_bindings))) fail("invalid native relay metadata");
   if (data && (!/^parr0t\.data-plane-relay\.v[1-4]$/.test(metadata.schema) || typeof metadata.task_id !== "string")) fail("invalid data-plane relay metadata");
-  const registration = JSON.parse(readFileSync(path.join(workspace, ".game-l10n/native/omp-isolation.json"), "utf8"));
+  const registration = JSON.parse(readFileSync(isolationPath(workspace), "utf8"));
   const proof = metadata.launch_contract?.message_isolation;
   const keys = ["schema", "control_generation", "session_id", "process_id", "guard_sha256"];
-  if (!proof || Object.keys(proof).length !== keys.length || Object.keys(registration).length !== keys.length || keys.some(key => proof[key] !== registration[key]) || registration.schema !== SCHEMA || registration.session_id !== process.env[SESSION_ENV] || registration.control_generation !== generation(workspace) || registration.guard_sha256 !== createHash("sha256").update(readFileSync(TEMPLATE)).digest("hex")) fail("relay isolation proof is absent or stale");
+  if (!proof || Object.keys(proof).length !== keys.length || Object.keys(registration).length !== keys.length || keys.some(key => proof[key] !== registration[key]) || registration.schema !== SCHEMA || registration.session_id !== process.env[SESSION_ENV] || registration.control_generation !== generation(workspace) || registration.guard_sha256 !== GUARD_SHA256) fail("relay isolation proof is absent or stale");
   return { path: relayPath, metadata, native };
 }
 function relayRead(value, cwd, relay) {
@@ -196,8 +202,20 @@ function relayArguments(argv, cwd, workspace, relay) {
   if (typeof options.get("--workspace") !== "string" || resolvedLocal(options.get("--workspace"), cwd) !== workspace) fail("workspace mismatch");
   const relayOption = verb === "seal-native-wave-relay" ? "--dispatch" : "--relay";
   if (typeof options.get(relayOption) !== "string" || resolvedLocal(options.get(relayOption), workspace) !== relay.path) fail("relay mismatch");
-  const bootstrap = `import runpy,sys;sys.path.insert(0,${JSON.stringify(CORE_SRC)});runpy.run_module('game_l10n.cli',run_name='__main__')`;
-  return ["-I", "-B", "-c", bootstrap, ...argv.slice(2)];
+  const event = options.get("--event");
+  if (verb === "record-native-launch") {
+    if (!["capability-available", "capability-unavailable", "model-unavailable", "worker-started"].includes(event)) fail("use a core command_argv launch event", "relay_arguments_invalid");
+    const fields = ["--task", "--worker-id", "--model"];
+    if (event === "worker-started") {
+      if (fields.some(key => !options.has(key)) || options.get("--worker-id") === "<worker-id>") fail("worker start requires the actual task, worker ID and requested model", "relay_arguments_invalid");
+    } else if ([...fields, "--observed-model"].some(key => options.has(key))) fail("preflight must not contain worker fields", "relay_arguments_invalid");
+  } else if (verb === "record-data-plane-relay-event") {
+    if (!["worker-started", "worker-ended", "finalizer-started", "finalizer-ended"].includes(event)) fail("use a core command_argv relay event", "relay_arguments_invalid");
+    if (event.startsWith("worker-")) {
+      if (!/^\d+$/.test(options.get("--slot") ?? "")) fail("worker lifecycle requires a numeric slot", "relay_arguments_invalid");
+    } else if (options.has("--slot")) fail("finalizer lifecycle takes no slot", "relay_arguments_invalid");
+  }
+  return ["-I", "-B", PYTHON_ENTRY, ...argv.slice(2)];
 }
 async function executePython(executable, argv, cwd, signal) {
   if (signal?.aborted) fail("execution cancelled");
@@ -308,9 +326,9 @@ export default function isolationGuard(pi) {
         control_generation: generation(workspace),
         session_id: sessionId,
         process_id: process.pid,
-        guard_sha256: createHash("sha256").update(readFileSync(TEMPLATE)).digest("hex"),
+        guard_sha256: GUARD_SHA256,
       };
-      const registrationPath = path.join(workspace, ".game-l10n/native/omp-isolation.json");
+      const registrationPath = isolationPath(workspace, sessionId);
       let current;
       try { current = readFileSync(registrationPath, "utf8"); } catch (error) { if (error.code !== "ENOENT") throw error; }
       const serialized = `${JSON.stringify(registration)}\n`;
@@ -335,9 +353,9 @@ export default function isolationGuard(pi) {
         }
       }
     } else {
-      const registration = JSON.parse(readFileSync(path.join(workspace, ".game-l10n/native/omp-isolation.json"), "utf8"));
+      const registration = JSON.parse(readFileSync(isolationPath(workspace), "utf8"));
       if (childRole === undefined) childRole = isDiagnosticChild(ctx) ? "diagnostic" : "localization";
-      if (registration.schema !== SCHEMA || registration.session_id !== process.env[SESSION_ENV] || (childRole !== "diagnostic" && registration.control_generation !== generation(workspace)) || registration.guard_sha256 !== createHash("sha256").update(readFileSync(TEMPLATE)).digest("hex")) fail("root guard registration is absent or stale");
+      if (registration.schema !== SCHEMA || registration.session_id !== process.env[SESSION_ENV] || (childRole !== "diagnostic" && registration.control_generation !== generation(workspace)) || registration.guard_sha256 !== GUARD_SHA256) fail("root guard registration is absent or stale");
     }
     ready = true;
   }
@@ -383,6 +401,34 @@ export default function isolationGuard(pi) {
         : frameworkInstructions(state) };
     } catch { return { additionalContext: "Parr0t lifecycle metadata is invalid: stop localization and delegation; do not infer a mode or permission from tool output." }; }
   });
+  function replyPath(ctx) {
+    if (!ready || fatal || !relay) return "E_NATIVE_MESSAGE_ISOLATION_REQUIRED";
+    try {
+      const bound = relayFromPrompt(`PARR0T_OMP_RELAY=${relay.path}`, workspace);
+      if (ctx.agent.depth === 1) {
+        return path.relative(workspace, bound.native
+          ? bound.path.replace(/\.json$/, "-receipt.json")
+          : path.join(path.dirname(bound.path), "receipt.json")).split(path.sep).join("/");
+      }
+      if (bound.native) return "worker_ended";
+      const envelope = bound.metadata.expected_envelope;
+      if (typeof envelope !== "string" || !/^(?:[A-Za-z0-9._-]+\/)*control-envelope\.g\d+\.attempt-\d+\.json$/.test(envelope)
+          || path.dirname(resolvedLocal(envelope, workspace)) !== path.dirname(bound.path)) return "E_NATIVE_MESSAGE_ISOLATION_REQUIRED";
+      return envelope;
+    } catch { return "E_NATIVE_MESSAGE_ISOLATION_REQUIRED"; }
+  }
+  pi.on("assistant_message", (event, ctx) => {
+    if (ctx.agent?.kind !== "sub" || childRole === "diagnostic") return;
+    const working = event.message.content.some(block => block.type === "toolCall");
+    const reply = working ? "" : replyPath(ctx);
+    let emitted = false;
+    return { content: event.message.content.map(block => {
+      if (block.type !== "text") return block;
+      const text = emitted ? "" : reply;
+      emitted = true;
+      return { ...block, text };
+    }) };
+  });
   function deny(ctx, toolName, error) {
     // Categorical evidence only: no inputs, targets, commands or error prose.
     if (workspace) {
@@ -425,7 +471,7 @@ export default function isolationGuard(pi) {
         return;
       }
       if (ctx.agent.kind !== "sub") fail("unknown host identity");
-      if (event.toolName === "yield") return;
+      if (event.toolName === "yield") return childRole === "diagnostic" ? undefined : { input: { data: replyPath(ctx) } };
       if (childRole === "diagnostic") return diagnosticTool(event, ctx, state);
       requireLocalization(state);
       if (!relay) fail("relay binding is unavailable");
@@ -493,7 +539,8 @@ export default function isolationGuard(pi) {
       if (!Array.isArray(params.argv) || !params.argv.length || params.argv.some(arg => typeof arg !== "string" || arg.includes("\0"))) fail("Python argv is required");
       const cwd = resolvedLocal(params.cwd ?? workspace, ctx.cwd);
       if (!inside(workspace, cwd) && cwd !== CORE) fail("execution cwd must be inside workspace or the exact core root");
-      let argv = ["-B", ...params.argv];
+      let argv = params.argv[0] === "-m" && params.argv[1] === "game_l10n.cli"
+        ? ["-I", "-B", PYTHON_ENTRY, ...params.argv.slice(2)] : ["-B", ...params.argv];
       if (ctx.agent.kind === "sub" && childRole !== "diagnostic") {
         if (!relay) fail("relay binding is unavailable");
         relay = relayFromPrompt(`PARR0T_OMP_RELAY=${relay.path}`, workspace);
