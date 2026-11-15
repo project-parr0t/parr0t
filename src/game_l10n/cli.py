@@ -42,6 +42,7 @@ from .correction_ui import CorrectionWorkspace, serve_correction_ui
 from .data_plane_task import (
     DATA_PLANE_PROFILES,
     DATA_PLANE_RELAY_SCHEMA,
+    MAX_CONTEXT_WORKERS,
     claim_context_chunk,
     commit_context_fragment,
     current_data_plane_receipt,
@@ -316,7 +317,7 @@ def _status_data_plane_task(work_dir: Path, action: str) -> dict[str, Any] | Non
         "launch_record_command": "game-l10n record-native-launch --workspace <workspace> --relay <relay-path>",
     }
     if role == "context_analyzer":
-        task["parallelism"] = "core_bound_disjoint_chunks_up_to_six_workers"
+        task["parallelism"] = "core_bound_disjoint_chunks_up_to_configured_ceiling"
         task["merge_policy"] = "single_fresh_finalizer_source_order"
         task["execution_accounting"] = "core_recorded_slot_and_finalizer_lifecycle"
         task["implicit_timeout_policy"] = "forbidden"
@@ -769,7 +770,7 @@ def _analyze_context(
         chain,
         max_chunk_chars=int(routing.get("context_chunk_chars", 30000)),
         max_workers=min(
-            6,
+            MAX_CONTEXT_WORKERS,
             max(
                 1,
                 int(
