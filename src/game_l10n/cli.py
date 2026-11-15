@@ -16,6 +16,7 @@ from .control_plane import (
     ROLE_STAGES,
     WORKER_ROLES,
     acknowledge_control_plane_rotation,
+    accept_control_plane_exposure,
     control_plane_entry_state,
     control_plane_state,
     establish_control_plane_entry,
@@ -1614,6 +1615,24 @@ def cmd_resume_control_plane(args: argparse.Namespace) -> int:
             ensure_ascii=False,
         )
     )
+    return 0
+
+
+def cmd_accept_control_plane_exposure(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    handoff = Path(args.handoff_receipt)
+    if not handoff.is_absolute():
+        handoff = work_dir / handoff
+    result = accept_control_plane_exposure(
+        work_dir,
+        handoff,
+        user_confirmed=args.user_confirmed_exposure_acceptance,
+        contracts_read=args.contracts_read,
+    )
+    print(json.dumps({
+        "control_plane": public_control_plane_state(result),
+        "entry_gate": public_control_plane_entry_state(control_plane_entry_state(work_dir)),
+    }, ensure_ascii=False))
     return 0
 
 
@@ -3788,6 +3807,20 @@ def build_parser() -> argparse.ArgumentParser:
     control_resume.add_argument("--source-unopened", action="store_true")
     control_resume.set_defaults(func=cmd_resume_control_plane)
 
+    control_accept = sub.add_parser(
+        "accept-control-plane-exposure",
+        help="Record explicit user acceptance of one incident without claiming a text-free session",
+    )
+    control_accept.add_argument("--workspace", required=True)
+    control_accept.add_argument("--handoff-receipt", default=CONTROL_HANDOFF_PATH)
+    control_accept.add_argument("--contracts-read", action="store_true")
+    control_accept.add_argument(
+        "--user-confirmed-exposure-acceptance",
+        action="store_true",
+        help="Assert the user explicitly accepted this incident and reduced isolation",
+    )
+    control_accept.set_defaults(func=cmd_accept_control_plane_exposure)
+
     sdk_inventory = sub.add_parser(
         "sdk-inventory",
         help="Refresh the read-only inventory of existing sdk-* branches",
@@ -4018,6 +4051,7 @@ def main(argv: list[str] | None = None) -> int:
             cmd_enter_control_plane,
             cmd_record_control_plane_leak,
             cmd_resume_control_plane,
+            cmd_accept_control_plane_exposure,
         }
         if args.func not in recovery_commands:
             workspace = getattr(args, "workspace", None)

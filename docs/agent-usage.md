@@ -19,7 +19,7 @@ Text-only default: images require `image-localization.md` policy; target languag
 For a new job:
 
 1. Confirm repository/workspace access and only that the source path exists; do not inspect its contents.
-2. Initialize with that path and run status. For `establish_text_free_control_plane`, read its contracts and run `game-l10n enter-control-plane --workspace <workspace> --contracts-read --source-unopened`. If the parent already saw game content, record a leak and stop.
+2. Initialize and follow status contracts. Clean entry: `enter-control-plane --workspace <workspace> --contracts-read --source-unopened`. Record exposure before recovery. Rotate by default; explicit user acceptance follows `control-plane-contract.md` when host rules permit. Never auto-launch replacements.
 3. Ask once whether Git may be used for this game task; record only the answer. Disabled forbids Git mutation/publication in that workspace, not authenticated SDK access, download, inventory, or activation. Never infer the answer from transport or missing `.git`.
 4. Bind `native-runtime --host codex|omp --workspace <workspace>`; follow host/model/launch rules in `control-plane-contract.md`. Follow status `next_actions`: prepare, relay, seal. Only `local_patch_ready` is terminal.
 

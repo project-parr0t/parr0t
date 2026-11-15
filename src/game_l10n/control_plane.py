@@ -118,6 +118,8 @@ CONTROL_ENTRY_SCHEMA = "parr0t.control-plane-entry.v1"
 CONTROL_ENTRY_PATH = ".game-l10n/control-plane-entry.json"
 CONTROL_HANDOFF_SCHEMA = "parr0t.control-plane-handoff.v1"
 CONTROL_HANDOFF_PATH = ".game-l10n/control-plane-handoff.json"
+CONTROL_ACCEPTANCE_SCHEMA = "parr0t.control-plane-exposure-acceptance.v1"
+CONTROL_ACCEPTANCE_DIRECTORY = ".game-l10n/control-plane-acceptances"
 
 _CONTROL_STATE_FIELDS = {
     "schema",
@@ -128,6 +130,7 @@ _CONTROL_STATE_FIELDS = {
     "incident_code",
 }
 _CONTROL_STATE_RESUMED_FIELDS = _CONTROL_STATE_FIELDS | {"resumed_from_incident"}
+_CONTROL_STATE_ACCEPTED_FIELDS = _CONTROL_STATE_FIELDS | {"exposure_acceptance"}
 
 WORKER_ROLES = {
     "source_probe",
@@ -410,6 +413,7 @@ def control_plane_state(work_dir: Path) -> dict[str, Any]:
     allowed_shapes = [_CONTROL_STATE_FIELDS]
     if status == "ready":
         allowed_shapes.append(_CONTROL_STATE_RESUMED_FIELDS)
+        allowed_shapes.append(_CONTROL_STATE_ACCEPTED_FIELDS)
     if not any(set(payload) == shape for shape in allowed_shapes):
         raise ConfigurationError("E_CONTROL_PLANE_STATE: state contains unsupported fields")
     if payload.get("schema") != CONTROL_STATE_SCHEMA:
@@ -439,19 +443,27 @@ def control_plane_state(work_dir: Path) -> dict[str, Any]:
             or any(character not in "0123456789abcdef" for character in resumed)
         ):
             raise ConfigurationError("E_CONTROL_PLANE_STATE: invalid resumed incident marker")
+    if "exposure_acceptance" in payload:
+        _validated_exposure_acceptance(work_dir, payload)
     return dict(payload)
 
 
 def public_control_plane_state(state: dict[str, Any]) -> dict[str, Any]:
     """Return the fixed parent-safe projection of an already validated state."""
 
-    return {
+    public = {
         "schema": state["schema"],
         "status": state["status"],
         "generation": state["generation"],
         "issue_code": state["issue_code"],
         "incident_code": state["incident_code"],
     }
+    if "exposure_acceptance" in state:
+        public["boundary_mode"] = "user_accepted_exposure"
+        public["acceptance_receipt"] = (
+            f"{CONTROL_ACCEPTANCE_DIRECTORY}/{state['exposure_acceptance']}.json"
+        )
+    return public
 
 
 def require_control_plane_ready(work_dir: Path) -> dict[str, Any]:
@@ -566,6 +578,94 @@ def _validated_control_plane_handoff(
             "E_CONTROL_PLANE_HANDOFF_INVALID: handoff receipt binding is invalid"
         )
     return receipt
+
+
+def _validated_exposure_acceptance(work_dir: Path, state: dict[str, Any]) -> None:
+    digest = state["exposure_acceptance"]
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ConfigurationError("E_CONTROL_PLANE_ACCEPTANCE_INVALID: invalid receipt binding")
+    path = work_dir / CONTROL_ACCEPTANCE_DIRECTORY / f"{digest}.json"
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ConfigurationError(
+            "E_CONTROL_PLANE_ACCEPTANCE_INVALID: acceptance receipt is unavailable"
+        ) from exc
+    fields = {
+        "schema", "generation", "incident_id", "incident_code", "handoff_digest",
+        "workspace_fingerprint", "boundary_mode", "user_confirmed", "contracts_read",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != fields:
+        raise ConfigurationError("E_CONTROL_PLANE_ACCEPTANCE_INVALID: invalid receipt shape")
+    if (
+        receipt["schema"] != CONTROL_ACCEPTANCE_SCHEMA
+        or type(receipt["generation"]) is not int
+        or receipt["generation"] != state["generation"]
+        or not isinstance(receipt["incident_id"], str)
+        or not re.fullmatch(r"[0-9a-f]{32}", receipt["incident_id"])
+        or not isinstance(receipt["incident_code"], str)
+        or receipt["incident_code"] not in LEAK_INCIDENT_CODES
+        or not isinstance(receipt["handoff_digest"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", receipt["handoff_digest"])
+        or receipt["workspace_fingerprint"] != _control_handoff_digest(
+            {"workspace": str(work_dir.resolve())}
+        )
+        or receipt["boundary_mode"] != "user_accepted_exposure"
+        or receipt["user_confirmed"] is not True
+        or receipt["contracts_read"] is not True
+        or _control_handoff_digest(receipt) != digest
+    ):
+        raise ConfigurationError("E_CONTROL_PLANE_ACCEPTANCE_INVALID: invalid receipt binding")
+
+
+def accept_control_plane_exposure(
+    work_dir: Path,
+    handoff_path: Path,
+    *,
+    user_confirmed: bool = False,
+    contracts_read: bool = False,
+) -> dict[str, Any]:
+    """Admit one explicitly accepted incident without claiming a clean session."""
+    if user_confirmed is not True or contracts_read is not True:
+        raise ConfigurationError(
+            "E_CONTROL_PLANE_ACCEPTANCE_REQUIRED: explicit user acceptance of this "
+            "incident and the reduced-isolation contract are required"
+        )
+    state = control_plane_state(work_dir)
+    if state["status"] != "rotation_required":
+        raise ConfigurationError("E_CONTROL_PLANE_STATE: no exposure incident is pending")
+    handoff = _validated_control_plane_handoff(work_dir, handoff_path)
+    if (
+        handoff["incident_id"] != state["incident_id"]
+        or handoff["from_generation"] != state["generation"]
+    ):
+        raise ConfigurationError(
+            "E_CONTROL_PLANE_HANDOFF_INVALID: receipt does not match pending incident"
+        )
+    receipt = {
+        "schema": CONTROL_ACCEPTANCE_SCHEMA,
+        "generation": state["generation"],
+        "incident_id": state["incident_id"],
+        "incident_code": state["incident_code"],
+        "handoff_digest": handoff["digest"],
+        "workspace_fingerprint": _control_handoff_digest(
+            {"workspace": str(work_dir.resolve())}
+        ),
+        "boundary_mode": "user_accepted_exposure",
+        "user_confirmed": True,
+        "contracts_read": True,
+    }
+    digest = _control_handoff_digest(receipt)
+    accepted = {**initial_control_plane_state(), "generation": state["generation"],
+                "exposure_acceptance": digest}
+    # Write the durable audit and entry gate first; the rotation marker remains
+    # authoritative until the final replace. Interrupted acceptance is retryable.
+    _atomic_json(work_dir / CONTROL_ACCEPTANCE_DIRECTORY / f"{digest}.json", receipt)
+    _atomic_json(work_dir / CONTROL_ENTRY_PATH, {
+        "schema": CONTROL_ENTRY_SCHEMA, "status": "ready", "issue_code": "",
+    })
+    _atomic_json(work_dir / CONTROL_STATE_PATH, accepted)
+    return accepted
 
 
 def _reset_native_control_observations(work_dir: Path) -> None:

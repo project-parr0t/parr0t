@@ -103,9 +103,9 @@ Runtime-repair status includes the exact existing dispatch path. For `E_NATIVE_D
 
 ## Locating an existing native checkpoint
 
-After clean control-plane entry or rotation recovery, `game-l10n status --workspace <workspace>` exposes `native_resume` for native workflows. `resume_native_checkpoint` returns the selected checkpoint's exact `step_command` argument array; execute it without opening its manifest or results. `core_runtime` identifies the Python executable and actual core module separately from the configured SDK root. A downloaded snapshot alone does not change the executing core.
+After clean control-plane entry, rotation recovery, or a validated incident-scoped user acceptance, `game-l10n status --workspace <workspace>` exposes `native_resume` for native workflows. `resume_native_checkpoint` returns the selected checkpoint's exact `step_command` argument array; execute it without opening its manifest or results. `core_runtime` identifies the Python executable and actual core module separately from the configured SDK root. A downloaded snapshot alone does not change the executing core.
 
-`game-l10n native-resume-status --workspace <workspace>` performs the same read-only lookup without requiring SDK activation or healthy model/runtime bindings. It still requires a clean control plane. Discovery reads only existing core relay, manifest, controller, and split-chain metadata, not semantic task payloads, result rows, or session logs, and never rewrites a checkpoint. Missing or invalid metadata is categorical; result locations are never guessed from folder names.
+`game-l10n native-resume-status --workspace <workspace>` performs the same read-only lookup without requiring SDK activation or healthy model/runtime bindings. It still requires an admitted control plane; accepted exposure remains explicitly distinct from text-free entry. Discovery reads only existing core relay, manifest, controller, and split-chain metadata, not semantic task payloads, result rows, or session logs, and never rewrites a checkpoint. Missing or invalid metadata is categorical; result locations are never guessed from folder names.
 
 When multiple unfinished checkpoints remain, status returns `select_native_checkpoint` and validated candidate paths instead of choosing by modification time. Select the intended existing binding with `native-resume-status --manifest <candidate-manifest>` or `status --native-manifest <candidate-manifest>`. For a split review chain, `step_command` retains the root manifest and root results directory; `current_child` only describes the core-owned active subset. Do not resume a child as a replacement for the complete pass.
 
@@ -153,7 +153,7 @@ The task fixes source roots, SDK binding, output artifact, generation-and-attemp
 
 The top-level agent may observe only core CLI metadata, a validated control-envelope path, a sealed relay-receipt path, and the categorical lifecycle of its direct relay. It may perform one bounded wait at a time on that relay, continuing bounded waits while it remains active and returning to the core state machine when new terminal evidence arrives. A wait interval is not a lifetime limit. It must not inspect `.codex/sessions`, chat transcripts, agent trees, nested-worker status or output, semantic-worker logs, terminal previews of semantic work, or another session to reconstruct progress. It must not query a nested worker even when the worker is visible to the host.
 
-Usage accounting comes only from the core-owned usage ledger or a sealed relay receipt populated at the event boundary. Missing telemetry is unknown, not permission to scrape host/session logs. The relay may observe only bound task lifecycle categories needed to seal an ended task and must never forward child output. Any forbidden detail that reaches root is a control-plane leak: do not interpret it; record the fixed incident and rotate.
+Usage accounting comes only from the core-owned usage ledger or a sealed relay receipt populated at the event boundary. Missing telemetry is unknown, not permission to scrape host/session logs. The relay may observe only bound task lifecycle categories needed to seal an ended task and must never forward child output. Any forbidden detail that reaches root is a control-plane leak: do not interpret it; record the fixed incident. Default recovery is rotation; only the explicit incident-scoped acceptance below provides a same-session alternative.
 
 A non-success receipt cannot be hidden by an empty or partial artifact at the expected path. Status routes that role back to a fresh bound attempt. Inventory workers use the parent-safe `sdk_identity_mismatch` code when selected and observed engine identities conflict; status then routes to the private source probe/SDK selection step instead of inviting the parent to diagnose engine files.
 
@@ -166,7 +166,7 @@ game-l10n enter-control-plane \
   --source-unopened
 ```
 
-All ordinary CLI operations reject a pending gate with `E_CONTROL_PLANE_ENTRY_REQUIRED`. The assertion is invalid after any game-content exposure; record a leak and stop instead. Leak recording and fresh-session rotation reset the entry gate to pending so the replacement control plane must establish its own clean boundary.
+All ordinary CLI operations reject a pending gate with `E_CONTROL_PLANE_ENTRY_REQUIRED`. The assertion is invalid after any game-content exposure; record a leak and stop ordinary work instead. Leak recording and fresh-session rotation reset the entry gate to pending so the replacement control plane must establish its own clean boundary. The incident acceptance command below establishes admission separately without asserting `source-unopened` or a text-free history.
 
 ## Data-plane stages
 
@@ -263,9 +263,9 @@ game-l10n record-control-plane-leak \
   --incident-code <fixed-code>
 ```
 
-This writes a text-free `rotation_required` marker. All non-recovery CLI work, including native task preparation, import, merge, and envelope validation, then stops with `E_CONTROL_PLANE_ROTATION_REQUIRED`. Metadata-only status, diagnostics, incident recording, and rotation acknowledgment remain available. Preserve completed data-plane artifacts and queue metadata; do not delete or redo them.
+This writes a text-free `rotation_required` marker. All non-recovery CLI work, including native task preparation, import, merge, and envelope validation, then stops with `E_CONTROL_PLANE_ROTATION_REQUIRED`. Metadata-only status, diagnostics, incident recording, rotation acknowledgment, and explicit incident acceptance remain available. Preserve completed data-plane artifacts and queue metadata; do not delete or redo them.
 
-The contaminated top-level agent must stop and must not run or confirm the resume command. `record-control-plane-leak` writes the only valid, digest-bound, metadata-only handoff receipt at `.game-l10n/control-plane-handoff.json`; status output intentionally omits its internal incident identifier. Do not write or read a prose `continuation.txt`, summary, or alternate handoff file. A fresh control plane, with no inherited game-content history, acknowledges the exact receipt and establishes its entry gate atomically:
+By default, the contaminated top-level agent must stop and must not run or confirm the resume command. `record-control-plane-leak` writes the only valid, digest-bound, metadata-only handoff receipt at `.game-l10n/control-plane-handoff.json`; status output intentionally omits its internal incident identifier. Do not write or read a prose `continuation.txt`, summary, or alternate handoff file. A fresh control plane, with no inherited game-content history, acknowledges the exact receipt and establishes its entry gate atomically:
 
 ```text
 game-l10n resume-control-plane \
@@ -278,4 +278,23 @@ game-l10n resume-control-plane \
 
 The confirmation flag is necessary but insufficient: the command rejects any receipt path, schema, digest, incident, or generation not bound to the pending rotation. Acknowledgment advances the generation, resets only generation-local polling observations, and preserves queues, completed results, usage, and pass checkpoints. It does not approve omitted targets or discard pending work. A successful command returns an already-ready entry gate; do not run a second entry or resume sequence.
 
-Use `game-l10n control-plane-status --workspace <workspace>` to inspect the text-free generation and rotation state.
+Use `game-l10n control-plane-status --workspace <workspace>` to inspect the generation, rotation state, and any accepted-exposure boundary mode.
+
+### Explicit user acceptance of one exposure incident
+
+When the user explicitly accepts a recorded exposure and requests continuation in the same session, the core supports a narrowly scoped recovery exception:
+
+```text
+game-l10n accept-control-plane-exposure \
+  --workspace <workspace> \
+  --handoff-receipt .game-l10n/control-plane-handoff.json \
+  --contracts-read \
+  --user-confirmed-exposure-acceptance
+```
+
+This exception is available only when higher-priority host/operator instructions permit it. It cannot override a mandatory host rotation rule. The confirmation flag is an operator attestation of actual user consent, not an authentication mechanism; an agent must not infer consent from a request to update a translation, elapsed time, repeated failures, or a desire to avoid another session. Do not solicit acceptance automatically as a way around the default boundary. Record the incident before accepting it. Do not use `resume-control-plane`, `--fresh-session-confirmed`, or `--source-unopened` to describe an exposed session.
+
+The command validates the canonical handoff against the pending incident and generation, records a content-addressed metadata-only `parr0t.control-plane-exposure-acceptance.v1` audit receipt under `.game-l10n/control-plane-acceptances/`, and establishes both admission gates. Status explicitly reports `boundary_mode: user_accepted_exposure` and the acceptance receipt path. The receipt binds the workspace, generation, original incident/code, handoff digest, and explicit consent/contract assertions. Missing, modified, or foreign receipts block ordinary operations. No source text, translation, user prose, credentials, or session history belongs in that audit.
+
+This is an admission exception, not retroactive isolation or permission for new semantic work by root. The generation, active launches, exact models, worker/message isolation, task contracts, review order, usage limits, queues, and completed results remain unchanged. The command does not reset polling observations or launch a replacement session. Continue only metadata orchestration through the existing core-issued relays. A later exposure creates a new blocking incident and requires new explicit consent or normal rotation; acceptance is not a standing workspace policy. Interrupted acceptance remains blocked until its durable audit, entry gate, and final state update complete.
+
