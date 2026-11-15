@@ -13,7 +13,7 @@ from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, P
 from .providers import ProviderRegistry
 from .localization_authority import effective_source_language
 from .store import stable_hash, stable_hash_sequence
-from .validators import applicable_glossary_entries
+from .validators import applicable_glossary_entries, contains_term
 
 SUPPORTED_CONTEXT_MODES = {mode.value for mode in ContextMode}
 CONTEXT_DOMAINS = {
@@ -635,6 +635,7 @@ def chunk_localization_inputs(
     characters: list[CharacterProfile] | tuple[CharacterProfile, ...] = (),
 ) -> dict[str, Any]:
     """User-locked facts the analyzer must phrase guidance against; empty when none exist."""
+    text = "\n".join(item.source for item in chunk)
     speakers = {item.speaker.casefold() for item in chunk if item.speaker}
     inputs: dict[str, Any] = {}
     if project is not None:
@@ -656,9 +657,17 @@ def chunk_localization_inputs(
             inputs["source_language_authorities"] = authorities
     relevant_terms: dict[int, GlossaryEntry] = {}
     glossary_rows = list(glossary)
+    # One chunk-wide source pass removes terms that cannot match any segment.
+    # Segment-level filtering remains authoritative for target, concept, language,
+    # authority, and overlap rules without rescanning the complete glossary N times.
+    potential_rows = [
+        entry
+        for entry in glossary_rows
+        if contains_term(entry.source, text, case_sensitive=entry.case_sensitive)
+    ]
     for item in chunk:
         for entry in applicable_glossary_entries(
-            glossary_rows,
+            potential_rows,
             item.source,
             segment=item,
             default_source_language=project.source_language if project else "",
