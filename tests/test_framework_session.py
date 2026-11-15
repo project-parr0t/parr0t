@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -91,6 +93,37 @@ class FrameworkSessionTests(unittest.TestCase):
         self.assertNotIn("PRIVATE_SYNTHETIC_INVALID_JSON", output)
         with self.assertRaisesRegex(ConfigurationError, "FRAMEWORK_INACTIVE"):
             control_plane.require_control_plane_ready(self.workspace)
+
+    def test_reported_cli_stays_bound_despite_stale_import_paths(self) -> None:
+        code, output, error = self.call("framework-mode", "--mode", "analysis", "--user-requested")
+        self.assertEqual((code, error), (0, ""))
+        command = json.loads(output)["core_runtime"]["cli_argv"]
+        shadow = self.workspace.parent / "stale core \ud55c\uae00 & $"
+        package = shadow / "game_l10n"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(
+            "raise RuntimeError('SYNTHETIC_STALE_CORE_IMPORTED')\n", encoding="utf-8",
+        )
+        environment = {**os.environ, "PYTHONPATH": str(shadow)}
+        result = subprocess.run(
+            [*command, "framework-mode", "--workspace", str(self.workspace),
+             "--mode", "shutdown", "--user-requested"],
+            cwd=shadow, env=environment, capture_output=True, text=True, check=True,
+        )
+        state = json.loads(result.stdout)
+        self.assertEqual(state["framework_session"]["mode"], "shutdown")
+        self.assertFalse(state["framework_session"]["instructions_active"])
+        result = subprocess.run(
+            [*state["core_runtime"]["cli_argv"], "status", "--workspace", str(self.workspace)],
+            cwd=shadow, env=environment, capture_output=True, text=True, check=True,
+        )
+        status = json.loads(result.stdout)
+        self.assertEqual(status["next_actions"], ["framework_shutdown"])
+        result = subprocess.run(
+            [*status["core_runtime"]["cli_argv"], "framework-status", "--workspace", str(self.workspace)],
+            cwd=shadow, env=environment, capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(json.loads(result.stdout)["framework_session"], state["framework_session"])
 
     def test_log_grant_is_exact_and_original_changes_do_not_change_evidence(self) -> None:
         result = self.change(logs=[self.external_log])
