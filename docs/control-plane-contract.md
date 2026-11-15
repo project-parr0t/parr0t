@@ -318,6 +318,16 @@ game-l10n framework-mode --workspace <workspace> --mode analysis --user-requeste
 game-l10n framework-status --workspace <workspace>
 ```
 
+`framework-mode`, `framework-status`, and every `status` branch report `core_runtime` with the actual CLI module, Python executable, and `cli_argv`. Append the intended verb and arguments to that array and execute it directly, without shell interpolation. The prefix uses the adjacent packaged `native-python.py` under `-I -B`, so a stale editable installation, current-directory package, or `PYTHONPATH` cannot silently select another core. Reporting or using this prefix does not authorize a mode change or localization recovery.
+
+If the installed CLI does not recognize `framework-mode`, invoke the selected full core checkout explicitly rather than retrying the unchanged installation or starting a replacement session:
+
+```text
+python -I -B <core>/src/game_l10n/templates/native-python.py framework-mode --workspace <workspace> --mode analysis --user-requested
+```
+
+Omit `--log` when no exact logs were approved. Preserve the old checkout, provider policy, and checkpoints; do not change the global Python installation merely to enter diagnostics. An explicit core entry selects code but does not load or hot-upgrade the current OMP host's isolation guard.
+
 Shutdown withdraws localization instructions and admits no diagnostic logs. Analysis does the same withdrawal and authorizes only the exact selected logs. `--log` is repeatable; omitted logs means no log-read grant. Selection can use workspace-relative or absolute paths, including an explicitly selected host log outside the workspace; it is not permission to discover other sessions, traverse agent trees, scan log directories, or read unrelated private artifacts. Never infer consent from contamination alone: record contamination, then honor the user's requested shutdown or analysis scope. No new OMP session is started.
 
 The core atomically writes `.game-l10n/framework-session.json` (`parr0t.framework-session.v1`) before touching control metadata or opening logs. Missing lifecycle state retains the existing localization default. An inactive state has `instructions_active: false`; normal CLI operations, native admission, and workspace-bound direct translation/review reject new work with `E_FRAMEWORK_INACTIVE`. `status` reports `framework_shutdown` or `analyze_framework_logs`, not an unfinished translation action. It does not require healthy game configuration or control-plane metadata. An unreadable selected log leaves localization disabled and grants no partial log access.
