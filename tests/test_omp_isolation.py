@@ -23,7 +23,7 @@ from game_l10n.native_runtime import (
     record_native_launch,
 )
 from game_l10n.omp_isolation import (
-    ISOLATION_ENV, ISOLATION_ISSUE, ISOLATION_PATH, guard_sha256, require_omp_isolation,
+    ISOLATION_ENV, ISOLATION_ISSUE, guard_sha256, isolation_path, require_omp_isolation,
 )
 from game_l10n.store import stable_hash
 from tests.omp_isolation_fixture import bind_omp_isolation, install_omp_isolation
@@ -35,7 +35,7 @@ class OmpIsolationTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.proof = bind_omp_isolation(self, self.root)
-        self.registration = self.root / ISOLATION_PATH
+        self.registration = isolation_path(self.root, self.proof["session_id"])
         self.tasks, self.results = self.root / "tasks", self.root / "results"
         self.source = self.root / "source.jsonl"
         self.segments = [Segment("synthetic-a", "SYNTHETIC SOURCE")]
@@ -87,6 +87,17 @@ class OmpIsolationTests(unittest.TestCase):
         self.write_proof(self.proof)
         with patch.dict(os.environ, {ISOLATION_ENV: ""}):
             self.assert_isolation_error(lambda: require_omp_isolation(self.root))
+
+    def test_independent_session_proofs_do_not_overwrite_each_other(self):
+        original = self.registration.read_bytes()
+        other = install_omp_isolation(self.root, session_id="synthetic-independent-session")
+        self.assertEqual(self.registration.read_bytes(), original)
+        self.assertEqual(require_omp_isolation(self.root), self.proof)
+        with patch.dict(os.environ, {ISOLATION_ENV: other["session_id"]}):
+            self.assertEqual(require_omp_isolation(self.root), other)
+            isolation_path(self.root, other["session_id"]).unlink()
+            self.assert_isolation_error(lambda: require_omp_isolation(self.root))
+        self.assertEqual(require_omp_isolation(self.root), self.proof)
 
     def test_current_actual_template_proof_and_parent_transport_contract(self):
         template = files("game_l10n").joinpath("templates", "omp-isolation-guard.mjs").read_bytes()
