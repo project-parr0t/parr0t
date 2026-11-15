@@ -16,6 +16,7 @@ from .control_plane import (
     ROLE_STAGES,
     WORKER_ROLES,
     acknowledge_control_plane_rotation,
+    accept_control_plane_exposure,
     control_plane_entry_state,
     control_plane_state,
     establish_control_plane_entry,
@@ -27,6 +28,11 @@ from .control_plane import (
     validate_control_envelope,
 )
 from .errors import ConfigurationError, GameL10nError, ToolExecutionError
+from .framework_session import (
+    change_framework_mode,
+    diagnostic_log_bytes,
+    framework_session_state,
+)
 from .coverage import (
     COMPLETION_SCHEMA,
     completion_attestation,
@@ -1617,6 +1623,47 @@ def cmd_resume_control_plane(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_accept_control_plane_exposure(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    handoff = Path(args.handoff_receipt)
+    if not handoff.is_absolute():
+        handoff = work_dir / handoff
+    result = accept_control_plane_exposure(
+        work_dir,
+        handoff,
+        user_confirmed=args.user_confirmed_exposure_acceptance,
+        contracts_read=args.contracts_read,
+    )
+    print(json.dumps({
+        "control_plane": public_control_plane_state(result),
+        "entry_gate": public_control_plane_entry_state(control_plane_entry_state(work_dir)),
+    }, ensure_ascii=False))
+    return 0
+
+
+def cmd_framework_status(args: argparse.Namespace) -> int:
+    print(json.dumps({
+        "framework_session": framework_session_state(Path(args.workspace).resolve()),
+    }, ensure_ascii=False))
+    return 0
+
+
+def cmd_framework_mode(args: argparse.Namespace) -> int:
+    result = change_framework_mode(
+        Path(args.workspace).resolve(), args.mode,
+        user_requested=args.user_requested,
+        logs=[Path(value) for value in args.log],
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_diagnostic_log(args: argparse.Namespace) -> int:
+    data = diagnostic_log_bytes(Path(args.workspace).resolve(), Path(args.input))
+    sys.stdout.buffer.write(data)
+    return 0
+
+
 def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
@@ -2293,6 +2340,17 @@ def cmd_seal_translation_exchange(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
+    session = framework_session_state(work_dir)
+    if not session["instructions_active"]:
+        print(json.dumps({
+            "workspace": str(work_dir),
+            "framework_session": session,
+            "next_actions": [
+                "analyze_framework_logs" if session["mode"] == "analysis" else "framework_shutdown"
+            ],
+            "required_contracts": ["docs/control-plane-contract.md"],
+        }, ensure_ascii=False))
+        return 0
     config = load_config(work_dir)
     target_language_policy = public_target_language_policy(work_dir, config)
     image_localization = public_image_localization_state(work_dir)
@@ -3788,6 +3846,40 @@ def build_parser() -> argparse.ArgumentParser:
     control_resume.add_argument("--source-unopened", action="store_true")
     control_resume.set_defaults(func=cmd_resume_control_plane)
 
+    control_accept = sub.add_parser(
+        "accept-control-plane-exposure",
+        help="Record explicit user acceptance of one incident without claiming a text-free session",
+    )
+    control_accept.add_argument("--workspace", required=True)
+    control_accept.add_argument("--handoff-receipt", default=CONTROL_HANDOFF_PATH)
+    control_accept.add_argument("--contracts-read", action="store_true")
+    control_accept.add_argument(
+        "--user-confirmed-exposure-acceptance",
+        action="store_true",
+        help="Assert the user explicitly accepted this incident and reduced isolation",
+    )
+    control_accept.set_defaults(func=cmd_accept_control_plane_exposure)
+
+    framework_status = sub.add_parser("framework-status", help="Report framework instruction lifecycle")
+    framework_status.add_argument("--workspace", required=True)
+    framework_status.set_defaults(func=cmd_framework_status)
+
+    framework_mode = sub.add_parser(
+        "framework-mode", help="Withdraw localization instructions for shutdown or private analysis",
+    )
+    framework_mode.add_argument("--workspace", required=True)
+    framework_mode.add_argument("--mode", choices=["analysis", "shutdown"], required=True)
+    framework_mode.add_argument("--user-requested", action="store_true")
+    framework_mode.add_argument("--log", action="append", default=[], help="Exact user-approved log file")
+    framework_mode.set_defaults(func=cmd_framework_mode)
+
+    diagnostic_log = sub.add_parser(
+        "diagnostic-log", help="Read one approved, integrity-checked log snapshot in analysis mode",
+    )
+    diagnostic_log.add_argument("--workspace", required=True)
+    diagnostic_log.add_argument("--input", required=True, help="Approved snapshot path from framework-mode")
+    diagnostic_log.set_defaults(func=cmd_diagnostic_log)
+
     sdk_inventory = sub.add_parser(
         "sdk-inventory",
         help="Refresh the read-only inventory of existing sdk-* branches",
@@ -4018,6 +4110,10 @@ def main(argv: list[str] | None = None) -> int:
             cmd_enter_control_plane,
             cmd_record_control_plane_leak,
             cmd_resume_control_plane,
+            cmd_accept_control_plane_exposure,
+            cmd_framework_status,
+            cmd_framework_mode,
+            cmd_diagnostic_log,
         }
         if args.func not in recovery_commands:
             workspace = getattr(args, "workspace", None)
