@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' http://127.0.0.1:10100; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Parr0t · 프롬프트 조합기</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./app.mjs"></script>
+</head>
+<body>
+  <main>
+    <header><h1>Parr0t</h1><p>프롬프트 조합기</p></header>
+    <form id="composer">
+      <div class="fields">
+        <label class="wide">작업<select name="operation"><option value="localize">한국어 패치 제작</option><option value="migrate">프로젝트 업데이트·마이그레이션</option></select></label>
+        <label class="wide" id="repository-field" hidden>이전 레포지토리 URL<input name="repositoryUrl" type="url" placeholder="https://github.com/owner/project" autocomplete="off" spellcheck="false" disabled></label>
+        <label data-localization>게임 유형<select name="gameType"><option value="dialogue">대사와 UI</option><option value="logic">UI와 게임 로직</option></select></label>
+        <label data-localization>기존 한국어<select name="koreanPolicy"><option value="check">있으면 확인 후 중단</option><option value="skip">존재 여부 검사 생략</option><option value="rewrite">원어부터 재번역</option></select></label>
+        <label data-localization>제작 방식<select name="delivery"><option value="patch">복원 가능한 패치</option><option value="mod">모드</option></select></label>
+        <label class="toggle" data-localization><input type="checkbox" name="fonts">게임에 맞는 한국어 폰트 설정</label>
+        <label class="toggle wide" data-localization><input type="checkbox" name="images">UI 이미지 속 글자 번역</label>
+        <label class="wide">게임 폴더 <span class="optional">선택</span><input name="gamePath" type="text" placeholder="경로를 입력하거나, 요청할 때 게임 폴더 첨부" autocomplete="off" spellcheck="false"></label>
+      </div>
+      <details class="settings" id="model-settings">
+        <summary>모델·문맥</summary>
+        <div class="fields">
+          <label>기초 사용 모델<input name="baseModel" type="text" placeholder="번역 모델 ID · 기존 설정 유지" autocomplete="off" spellcheck="false"></label>
+          <label>약검수 모델<input name="triageModel" type="text" placeholder="정확한 모델 ID · 기존 설정 유지" autocomplete="off" spellcheck="false"></label>
+          <label>강검수 모델<input name="strongModel" type="text" placeholder="정확한 모델 ID · 기존 설정 유지" autocomplete="off" spellcheck="false"></label>
+          <label class="toggle"><input type="checkbox" name="analyzeContext" checked>문맥 파악</label>
+          <label id="context-model-field" class="wide">문맥 파악 모델<input name="contextModel" type="text" placeholder="정확한 모델 ID · 기존 설정 유지" autocomplete="off" spellcheck="false"></label>
+        </div>
+      </details>
+      <fieldset>
+        <legend>검수 <span class="optional">Sol 최대 2회 · 최초 호출 포함</span></legend>
+        <div class="fields">
+          <label>폴백 모델<select id="fallback-preset" aria-label="폴백 모델 목록"></select></label>
+          <label>폴백 최대 횟수<input name="fallbackAttempts" type="number" min="1" step="1" placeholder="직접 지정"></label>
+          <label class="wide" id="fallback-model-field" hidden>직접 입력한 폴백 모델 ID<input name="fallbackModel" type="text" placeholder="정확한 모델 ID" autocomplete="off" spellcheck="false"></label>
+        </div>
+        <div class="catalog-control"><label class="toggle"><input type="checkbox" id="use-proxy" checked>OpenCodex 모델 목록</label><span id="catalog-status" role="status" aria-live="polite"></span></div>
+        <details class="settings" id="review-settings">
+          <summary>검수 제한</summary>
+          <div class="fields">
+            <label>최대 약검수<input name="triageMaxCalls" type="number" min="1" step="1" placeholder="횟수 · 기존 설정 유지"></label>
+            <label>최대 강검수<input name="strongMaxCalls" type="number" min="1" step="1" placeholder="횟수 · Sol은 최대 2회"></label>
+            <label class="wide">검수 최대 동시 실행 서브에이전트<input name="reviewMaxWorkers" type="number" min="1" max="64" step="1" placeholder="기존 설정 유지"></label>
+            <label>약검수 최대 동시 실행 서브에이전트<input name="triageMaxWorkers" type="number" min="1" max="64" step="1" placeholder="기존 설정 유지"></label>
+            <label>강검수 최대 동시 실행 서브에이전트<input name="strongMaxWorkers" type="number" min="1" max="64" step="1" placeholder="기존 설정 유지"></label>
+          </div>
+        </details>
+      </fieldset>
+    </form>
+    <section aria-label="생성된 프롬프트">
+      <div class="output-heading"><label for="prompt">프롬프트</label><div class="actions"><button id="copy" type="button">복사</button><button id="download" type="button">저장</button></div></div>
+      <textarea id="prompt" readonly spellcheck="false" aria-describedby="status"></textarea>
+      <p id="status" role="status" aria-live="polite"></p>
+    </section>
+    <footer><span>입력은 브라우저 안에서만 처리합니다.</span><a href="https://github.com/project-parr0t/parr0t">GitHub</a></footer>
+    <noscript>프롬프트를 조합하려면 JavaScript를 켜세요.</noscript>
+  </main>
+</body>
+</html>

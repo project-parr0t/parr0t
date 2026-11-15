@@ -57,6 +57,7 @@ Do not reorder barriers. Failures affect only their target and route; they canno
 - The text-free parent handles only IDs, counts, states, queues, paths, and codes. It dispatches only core relays and never inspects game-root contents; a missing SDK changes nothing.
 - Presets fix provider roles. Keys do not change mode, role, or service. Parent sees only `fallback_required`, never rationale.
 - Recommended presets retry failed Luna targets 5 times, then Sol targets 3 times, before DeepSeek. Counts exclude each route's first attempt; authentication/quota exhaustion advances immediately.
+- Sol: ≤2 strong-judge attempts/target (retries/confirmation/resume). Preserve user/template fallback model/count; missing→pending. `review-pipeline.md`.
 - Translation is faithful transformation, not content generation. Independent review checks meaning, omission, voice, tone, function, conditions, units, terminology, allusions, placeholders, markup, control codes, ordering, and material layout risk.
 - Build only in the workspace; synthetic checks never install or launch games.
 - Apply proportional verification and stop after the changed layer passes. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.

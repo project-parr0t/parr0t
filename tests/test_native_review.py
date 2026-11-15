@@ -13,6 +13,7 @@ from game_l10n.formats import read_segments, read_translation_results
 from game_l10n.native_pass import import_native_wave, prepare_native_tasks
 from game_l10n.native_review import collect_native_review
 from tests.test_native_pass import review_segment
+from game_l10n.orchestrator import OrchestratorConfig
 
 
 class NativeReviewTests(unittest.TestCase):
@@ -394,9 +395,10 @@ class NativeReviewTests(unittest.TestCase):
                 result.attempts.append(AttemptRecord("review", "deepseek", "approved", candidate_generation=1))
                 return ReviewVerdictEnvelope(ReviewVerdict.OK)
             fake = SimpleNamespace(
-                registry=SimpleNamespace(get=lambda name: SimpleNamespace(fingerprint=lambda: {"name": name})),
+                registry=SimpleNamespace(get=lambda name: SimpleNamespace(name=name, fingerprint=lambda: {"name": name})),
                 context_pack=ContextPack(), glossary=[], project=SimpleNamespace(target_language=""),
-                config=SimpleNamespace(extra_protected_patterns=[], max_length_ratio=4, review_max_rounds=2),
+                config=OrchestratorConfig(["deepseek"], [], require_review=False,
+                                          review_attempt_limits={"deepseek": 1}),
                 _judge_with_refusal_retry=judge,
             )
             first = process_native_review_followup(root, source, root / "out", fake,
@@ -448,11 +450,15 @@ class NativeReviewTests(unittest.TestCase):
             result.attempts.append(AttemptRecord("review", "native-sol", "error", candidate_generation=1))
             source = root / "fallback.jsonl"
             source.write_text(json.dumps(asdict(_pending_segment(base, result))) + "\n")
+            def judge(result, *args):
+                result.attempts.append(AttemptRecord("review", "deepseek", "approved", candidate_generation=result.candidate_generation))
+                return ReviewVerdictEnvelope(ReviewVerdict.OK)
             fake = SimpleNamespace(
-                registry=SimpleNamespace(get=lambda name: SimpleNamespace(fingerprint=lambda: {"name": name})),
+                registry=SimpleNamespace(get=lambda name: SimpleNamespace(name=name, fingerprint=lambda: {"name": name})),
                 context_pack=ContextPack(), glossary=[], project=SimpleNamespace(target_language="ko"),
-                config=SimpleNamespace(extra_protected_patterns=[], max_length_ratio=4, review_max_rounds=2),
-                _judge_with_refusal_retry=lambda *args: ReviewVerdictEnvelope(ReviewVerdict.OK),
+                config=OrchestratorConfig(["deepseek"], [], require_review=False,
+                                          review_attempt_limits={"deepseek": 1}),
+                _judge_with_refusal_retry=judge,
             )
             summary = process_native_review_followup(root, source, root / "out", fake, operation="judge")
             # A cache written before the gate existed: the same row stored as approved.

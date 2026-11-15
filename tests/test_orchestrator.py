@@ -1209,6 +1209,7 @@ class OrchestratorTests(unittest.TestCase):
                 config=OrchestratorConfig(
                     ["luna", "deepseek"],
                     ["sol", "deepseek"],
+                    review_attempt_limits={"deepseek": 1},
                     retry_refusals_once=False,
                     defer_fallbacks_until_primary_complete=True,
                     preserve_source_on_failure=True,
@@ -1272,7 +1273,8 @@ class OrchestratorTests(unittest.TestCase):
             orchestrator = LocalizationOrchestrator(
                 registry=registry,
                 config=OrchestratorConfig(
-                    translator_chain=["t-refuse", "t-ok"], reviewer_chain=["r-refuse", "r-ok"]
+                    translator_chain=["t-refuse", "t-ok"], reviewer_chain=["r-refuse", "r-ok"],
+                    review_attempt_limits={"r-ok": 2},
                 ),
                 project=ProjectContext("TEST", "src", "dst"),
                 context_pack=ContextPack(
