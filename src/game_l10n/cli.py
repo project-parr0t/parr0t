@@ -653,6 +653,8 @@ def _orchestrator(
         rewriter_chain=list(routing.get("rewriters", [])),
         require_review=bool(routing.get("require_review", True)),
         review_max_rounds=int(routing.get("review_max_rounds", 2)),
+        review_attempt_limits=dict(routing.get("review_attempt_limits", {})),
+        **{key: routing.get(key) for key in ("triage_max_calls", "strong_max_calls", "review_max_workers", "triage_max_workers", "strong_max_workers")},
         max_workers=int(routing.get("max_workers", 1)),
         max_length_ratio=float(routing.get("max_length_ratio", 4.0)),
         extra_protected_patterns=list(routing.get("extra_protected_patterns", [])),
@@ -2092,6 +2094,13 @@ def cmd_process_native_review_followup(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     require_sdk_activation(work_dir, config)
+    if args.operation == "judge":
+        from .review_policy import review_policy_status
+        policy = review_policy_status(config)
+        if policy["status"] != "configured":
+            print(json.dumps({**policy, "action": "configure_review_policy",
+                              "issue_code": "E_REVIEW_FALLBACK_POLICY_REQUIRED"}))
+            return 1
     role = "judge_fallback" if args.operation == "judge" else "selective_rewrite"
     if role not in config.get("native_workflow", {}).get("external_provider_roles", []):
         raise ConfigurationError("E_PROVIDER_MODE_DRIFT: review role is not authorized")
@@ -2199,6 +2208,8 @@ def _codex_app_fallback_orchestrator(work_dir: Path) -> LocalizationOrchestrator
             translator_chain=["deepseek"],
             reviewer_chain=[],
             translator_retries={},
+            review_attempt_limits=dict(routing.get("review_attempt_limits", {})),
+            **{key: routing.get(key) for key in ("triage_max_calls", "strong_max_calls", "review_max_workers", "triage_max_workers", "strong_max_workers")},
             require_review=False,
             max_workers=int(routing.get("max_workers", 1)),
             max_length_ratio=float(routing.get("max_length_ratio", 4.0)),
@@ -3014,6 +3025,23 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 1 if issues else 0
 
 
+def cmd_review_policy(args: argparse.Namespace) -> int:
+    from .review_policy import REVIEW_SETTING_FIELDS, configure_review_policy, review_policy_status
+    work_dir = Path(args.workspace).resolve()
+    settings = {key: getattr(args, key) for key in REVIEW_SETTING_FIELDS if getattr(args, key) is not None}
+    if args.fallback_model is None and args.max_calls is None and not settings:
+        result = review_policy_status(load_config(work_dir))
+    else:
+        result = configure_review_policy(
+            work_dir, model=args.fallback_model, max_calls=args.max_calls, settings=settings,
+            provider=args.fallback_provider, user_requested=args.user_requested,
+        )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="game-l10n", description="Parr0t game localization agent framework")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -3057,6 +3085,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     policy.add_argument("--publish-approved", choices=["yes", "no"])
     policy.set_defaults(func=cmd_policy)
+    review_policy = sub.add_parser("review-policy", help="Inspect or record the user's exact fallback-review model and call limit")
+    review_policy.add_argument("--workspace", required=True)
+    review_policy.add_argument("--fallback-model")
+    review_policy.add_argument("--fallback-provider")
+    review_policy.add_argument("--max-calls", type=int)
+    review_policy.add_argument("--user-requested", action="store_true")
+    for key in ("triage_max_calls", "strong_max_calls", "review_max_workers", "triage_max_workers", "strong_max_workers"):
+        review_policy.add_argument("--" + key.replace("_", "-"), type=int)
+    review_policy.set_defaults(func=cmd_review_policy)
+
+
 
     image_policy = sub.add_parser(
         "image-localization-policy",

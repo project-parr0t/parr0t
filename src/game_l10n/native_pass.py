@@ -20,6 +20,7 @@ from .native_followup import CANDIDATE_METADATA_KEY
 from .native_runtime import RUNTIME_ISSUES, launch_contract, native_launch_summary, native_runtime, _unstarted_launch_ledger, _relay_command_argv
 from .omp_isolation import ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
 from .store import stable_hash, stable_hash_sequence
+from .review_policy import judge_calls, review_call_limit, review_worker_limit
 from .validators import validate_integrity
 
 
@@ -903,6 +904,13 @@ def prepare_native_tasks(
     if not 1 <= max_workers <= 64:
         raise ValueError("max_workers must be between 1 and 64")
     from .native_runtime import native_worker_ceiling
+    if pass_kind == "review":
+        config_path = work_dir / "game-l10n.json"
+        config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
+        routing = config.get("routing", {})
+        provider = (route_binding or {}).get("provider") or "native-sol"
+        tier = "triage" if provider in routing.get("review_triagers", ["native-luna"]) else "strong"
+        max_workers = review_worker_limit(routing, max_workers, tier=tier)
     max_workers = native_worker_ceiling(work_dir, (route_binding or {}).get("provider") or (
         "native-luna" if pass_kind == "translation" else "native-sol"), max_workers)
     if _review_split is not None and pass_kind != "review":
@@ -2651,6 +2659,32 @@ def _inherit_native_control_usage(
     _atomic_json(child_path, child_state)
 
 
+def _native_review_call_budget(work_dir: Path, manifest_path: Path, manifest: dict[str, Any]) -> int | None:
+    provider = (manifest.get("route_binding") or {}).get("provider") or "native-sol"
+    config_path = work_dir / "game-l10n.json"
+    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
+    routing = config.get("routing", {})
+    triage = (provider in routing.get("review_triagers", ["native-luna"])
+              and provider not in routing.get("reviewers", []))
+    runtime = native_runtime(work_dir) if provider.startswith("native-") else None
+    model = (runtime or {}).get("models", {}).get(provider, "")
+    limit = (routing.get("triage_max_calls") if triage else review_call_limit(
+        provider, routing.get("reviewers", ["native-sol"]),
+        routing.get("review_attempt_limits", {}), model=model,
+        tier_limit=routing.get("strong_max_calls"),
+    ))
+    if limit is None:
+        return None
+    from .models import AttemptRecord
+    prior = 0
+    for segment in _manifest_task_segments(manifest_path, manifest):
+        saved = segment.metadata.get("_parr0t_review_state", {})
+        attempts = [AttemptRecord(**item) for item in saved.get("attempts", [])]
+        prior = max(prior, judge_calls(attempts, provider, model=model,
+                                      stage_prefix="review-triage" if triage else "review"))
+    return max(0, limit - prior)
+
+
 def _prepare_review_split_child(
     work_dir: Path,
     current_manifest_path: Path,
@@ -2660,6 +2694,7 @@ def _prepare_review_split_child(
     *,
     attempted_records: int,
     root_records: int,
+    review_call_budget: int | None = None,
 ) -> tuple[Path, Path] | None:
     split = current_manifest["review_split"]
     parent_task_records = int(
@@ -2675,6 +2710,7 @@ def _prepare_review_split_child(
         failed,
         attempted_records=attempted_records,
         root_records=root_records,
+        review_call_budget=review_call_budget,
     ):
         return None
     next_depth = split["depth"] + 1
@@ -2750,11 +2786,16 @@ def _review_split_stop_reason(
     *,
     attempted_records: int,
     root_records: int,
+    review_call_budget: int | None = None,
 ) -> str:
     split = current_manifest["review_split"]
     parent_task_records = int(
         current_manifest.get("task_max_records", current_manifest["max_records"])
     )
+    if review_call_budget is None and (current_manifest.get("route_binding") or {}).get("provider", "native-sol") in {"native-sol", "openai-sol"}:
+        review_call_budget = 2
+    if review_call_budget is not None and split["semantic_passes"] >= review_call_budget:
+        return "review_call_limit"
     if len(failed) <= 1:
         return "smallest_safe_record_isolated"
     if parent_task_records <= 1:
@@ -3306,6 +3347,8 @@ def native_control_step(
     """Advance a pass and let the core isolate only failed review rows."""
 
     root_manifest = _load_task_manifest(work_dir, manifest_path)
+    if root_manifest.get("pass_kind") == "review" and root_manifest.get("version") < TASK_MANIFEST_VERSION:
+        raise ValueError("E_NATIVE_REVIEW_CALL_POLICY_REQUIRED")
     if (
         root_manifest.get("version") < TASK_MANIFEST_VERSION
         or root_manifest.get("pass_kind") != "review"
@@ -3322,6 +3365,7 @@ def native_control_step(
             resume_relay=resume_relay,
         )
 
+    review_call_budget = _native_review_call_budget(work_dir, manifest_path, root_manifest)
     root_plan_fingerprint = _native_control_plan_fingerprint(root_manifest)
     chain_path = _review_split_chain_path(work_dir, root_plan_fingerprint)
     chain = _load_review_split_chain(
@@ -3346,6 +3390,8 @@ def native_control_step(
         current_results_dir = (work_dir / chain["current_results"]).resolve()
 
     current_manifest = _load_task_manifest(work_dir, current_manifest_path)
+    if review_call_budget is not None and current_manifest["review_split"]["semantic_passes"] > review_call_budget:
+        raise ValueError("E_REVIEW_CALL_LIMIT_REACHED")
     root_records = int(root_manifest["records"])
     record_attempts = root_records
     for relative in chain["manifests"][1:-1]:
@@ -3379,6 +3425,7 @@ def native_control_step(
         "effective_max_depth": CORE_REVIEW_SPLIT_EFFECTIVE_MAX_DEPTH,
         "terminal_reason": "",
     }
+    split_summary["remaining_call_budget"] = review_call_budget
     if step["action"] != "aggregate_completed_pass":
         _atomic_json(chain_path, chain)
         return {**step, "review_split": split_summary}
@@ -3392,6 +3439,7 @@ def native_control_step(
         failed,
         attempted_records=record_attempts,
         root_records=root_records,
+        review_call_budget=review_call_budget,
     )
     child = _prepare_review_split_child(
         work_dir,
@@ -3401,6 +3449,7 @@ def native_control_step(
         root_plan_fingerprint,
         attempted_records=record_attempts,
         root_records=root_records,
+        review_call_budget=review_call_budget,
     )
     if child is None:
         chain["complete"] = True
@@ -3571,6 +3620,9 @@ def merge_native_pass(
             if row["status"] == "success":
                 row["candidate_generation"] = 1
                 row["candidate_digest"] = stable_hash(row["text"])
+            if bound_manifest is not None and bound_manifest.get("pass_kind") == "review":
+                previous_calls = collected.get(target_id, {}).get("native_review_attempts", 0)
+                row["native_review_attempts"] = previous_calls + int(row.get("semantic_attempts", 1))
             collected[target_id] = row
     merged = [collected[target_id] for target_id in order if target_id in collected]
     _atomic_jsonl(destination, merged)
