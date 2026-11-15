@@ -17,7 +17,7 @@ from .control_plane import (
 from .language_policy import DEFAULT_TARGET_LANGUAGE, language_policy_digest
 from .models import Segment
 from .native_followup import CANDIDATE_METADATA_KEY
-from .native_runtime import RUNTIME_ISSUES, launch_contract, native_launch_summary, native_runtime, _unstarted_launch_ledger
+from .native_runtime import RUNTIME_ISSUES, launch_contract, native_launch_summary, native_runtime, _unstarted_launch_ledger, _relay_command_argv
 from .omp_isolation import ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
 from .store import stable_hash, stable_hash_sequence
 from .validators import validate_integrity
@@ -1610,6 +1610,8 @@ def _write_wave_relay_dispatch(
             if compatible == previous_launch:
                 launch = compatible
         unsigned["launch_contract"] = launch
+        if previous is None or "command_argv" in previous:
+            unsigned["command_argv"] = _relay_command_argv(work_dir, path, unsigned)
     payload = {**unsigned, "dispatch_fingerprint": stable_hash(unsigned)}
     ledger_path = path.with_name(path.stem + "-launch.json")
     if previous_launch is not None and payload != previous and ledger_path.is_file():
@@ -1891,6 +1893,8 @@ def seal_native_wave_relay(
         frozenset(legacy_fields),
         frozenset(fields),
         frozenset(fields | {"launch_contract"}),
+        frozenset(fields | {"command_argv"}),
+        frozenset(fields | {"launch_contract", "command_argv"}),
     }:
         raise ValueError("E_NATIVE_RELAY_INVALID: dispatch shape is invalid")
     active_fields = set(payload)
@@ -1938,6 +1942,9 @@ def seal_native_wave_relay(
         }
     ):
         raise ValueError("E_NATIVE_RELAY_INVALID: dispatch binding is invalid")
+    if "command_argv" in payload and "launch_contract" in payload:
+        if payload["command_argv"] != _relay_command_argv(work_dir, resolved, payload):
+            raise ValueError("E_NATIVE_RELAY_INVALID: lifecycle commands changed")
 
     if relay_ended and ended_tasks:
         raise ValueError(

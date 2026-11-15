@@ -1964,7 +1964,7 @@ def _load_bound_data_plane_relay(
         or (
             relay_schema == DATA_PLANE_RELAY_SCHEMA
             and (
-                set(relay) - {"launch_contract"} != relay_fields
+                set(relay) - {"launch_contract", "command_argv"} != relay_fields
                 or not valid_contract
                 or not _valid_execution_plan(relay)
                 or not isinstance(relay.get("attempt"), int)
@@ -2001,6 +2001,10 @@ def _load_bound_data_plane_relay(
         )
     ):
         raise ConfigurationError("E_DATA_PLANE_RELAY_INVALID: relay contract is invalid")
+    if "command_argv" in relay:
+        from .native_runtime import _relay_command_argv
+        if relay["command_argv"] != _relay_command_argv(work_dir, resolved_relay, relay):
+            raise ConfigurationError("E_DATA_PLANE_RELAY_INVALID: lifecycle commands changed")
 
     task_path = (work_dir / str(relay["task_path"])).resolve()
     if (

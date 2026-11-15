@@ -8,7 +8,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from game_l10n.control_plane import control_plane_state
-from game_l10n.omp_isolation import ISOLATION_ENV, ISOLATION_PATH, ISOLATION_SCHEMA, guard_sha256
+from game_l10n.omp_isolation import ISOLATION_ENV, ISOLATION_SCHEMA, guard_sha256, isolation_path
 
 
 def install_omp_isolation(work_dir: Path, *, session_id: str | None = None) -> dict:
@@ -25,7 +25,7 @@ def install_omp_isolation(work_dir: Path, *, session_id: str | None = None) -> d
         "process_id": os.getpid(),
         "guard_sha256": guard_sha256(),
     }
-    path = work_dir / ISOLATION_PATH
+    path = isolation_path(work_dir, proof["session_id"])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(proof), encoding="utf-8")
     return proof
