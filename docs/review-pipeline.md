@@ -45,7 +45,31 @@ The worker reads only its bound v7 task payload plus the referenced focused cont
 
 This is selective **strong** review, not selective review coverage. Every new or reused candidate receives a fresh triage verdict through the configured route. Prior approval never exempts a candidate. An unselected candidate counts as reviewed only when a current-generation `review-triage` approval and candidate digest both match; selected candidates require a current strong approval. With no `review_triagers` route, Parr0t retains the legacy behavior and sends every candidate through `reviewers`.
 
-`routing.review_max_rounds` bounds judge/rewrite cycles. The recommended value is `2`: one initial judgment and one confirmation after at most one rewrite. Increase it only when representative evaluations show that another correction cycle improves accepted quality enough to justify the extra calls.
+`routing.review_max_rounds` is the legacy judge/rewrite-cycle bound for routes without an explicit call cap. Explicit route/tier caps also bound their correction cycles. Sol strong review has an independent ceiling of **two judge attempts per target, including the first attempt**, error/refusal retries, split attempts, and post-rewrite confirmation. Approved targets remain locked. Attempt history and cumulative ordinal summaries survive split collection and resume; changing a limit does not invalidate successful candidates or reset counters. Operational/native admission errors do not prove a request reached the provider; dispatch counts are not measured provider usage.
+
+Fallback review has no invented call-count default. `routing.review_attempt_limits` maps each configured fallback provider name to the positive total number of judge attempts explicitly requested by the user. Existing template/preset values take precedence: retain them and ask only for missing values. Missing configuration produces `E_REVIEW_FALLBACK_POLICY_REQUIRED` / `user_configuration_required`, preserves the candidate and pending queue, makes no fallback request, and cannot justify `source_preserved` or route exhaustion. Translation retries and complete triage coverage are separate policies.
+
+Pre-v7 worker-owned review contracts cannot enforce the new per-target cap and are held as `E_NATIVE_REVIEW_CALL_POLICY_REQUIRED` before dispatch. Keep their imported successes and original artifacts; aggregate those normally and prepare only still-pending targets under the current v7 contract. Never reset history, overwrite success, or dispatch an old multi-call worker to bypass the cap.
+
+Inspect or record an already specified policy without changing provider models or role topology:
+
+```sh
+game-l10n review-policy --workspace <workspace>
+game-l10n review-policy --workspace <workspace> --fallback-model <exact-configured-model> --max-calls <user-total> --user-requested
+```
+
+The selected model must exactly match one existing fallback-review route. If several routes use that model, specify `--fallback-provider <configured-provider-name>`. Unsupported preset/model bindings are rejected rather than substituted. A Sol route cannot exceed two calls. Model credentials, execution mode, translator retries, and unrelated settings are not changed.
+
+Optional user-selected tier settings are `routing.triage_max_calls`, `routing.strong_max_calls`, `routing.review_max_workers`, `routing.triage_max_workers`, and `routing.strong_max_workers`. Omitted values retain the current policy. Calls must be positive integers; worker caps are integers from 1 through the transport's structural ceiling of 64. Strong review uses the minimum of its explicit route cap, tier cap, and Sol's two-call cap when applicable. A tier cap does not invent missing fallback authorization or its count. Each phase uses the minimum of requested workers, the overall review cap, its tier cap, and the existing host/model ceiling; translation/context concurrency is unchanged.
+
+Record only values explicitly supplied by the user or starting template:
+
+```sh
+game-l10n review-policy --workspace <workspace> --triage-max-calls <user-total> --strong-max-calls <user-total> --review-max-workers <user-limit> --triage-max-workers <user-limit> --strong-max-workers <user-limit> --user-requested
+```
+
+This command can also include the exact fallback model/count flags above; it validates the entire request before one atomic configuration write. It never requests a whole-job usage ceiling or grants extra provider/model permissions.
+
 
 After a complete review pass, freeze the flagged target set. If no more than `execution.residual_direct_records` remain, process them as one cached residual task through its isolated relay and one fresh no-history semantic worker, then aggregate once. The residual size does not waive the relay boundary. Do not create a new controller, ownership/lease layer, proof bundle, or supplemental context workflow for the tail, and never reopen already approved candidates. A capacity failure preserves the exact residual task for resumption instead of restarting the control turn.
 
@@ -76,6 +100,7 @@ Reference cues are advisory evidence, not a license to invent. Context analysis 
       "script_sensitive", "wordplay"
     ],
     "review_max_rounds": 2,
+    "review_attempt_limits": {"judge-fallback": 3},
     "review_refusal_policy": "fallback"
   }
 }
@@ -83,6 +108,7 @@ Reference cues are advisory evidence, not a license to invent. Context analysis 
 
 - `review_triagers` provide complete low-cost verdict coverage. A non-`ok` outcome routes the target to strong review; it never drops the target.
 - `reviewers` are selective strong judges. Refusal or operational failure advances to the next strong judge.
+- `review_attempt_limits` values are user decisions, not recommended defaults; the example's `3` is illustrative. A successful verdict stops early. Counters include prior judge attempts and confirmations, not only the latest invocation. Never copy an example count into a real job without the user's choice.
 - `rewriters` are correction editors. They are called only for `rewrite` verdicts and tried in order.
 - An empty `rewriters` list reuses the active judge as the rewriter for compatibility.
 - Translation and review chains remain independent. Do not use the top-level orchestrator as the semantic judge.

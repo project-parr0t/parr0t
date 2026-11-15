@@ -2,6 +2,8 @@
 
 These prompts are written for Codex or Codex routed through an OpenCodex-compatible proxy. Replace angle-bracket placeholders with local paths or public format identifiers. Do not paste source text into the prompt.
 
+For the Korean starting-prompt composer, including skipping the existing-Korean check, game-specific fonts, mod-based delivery, and explicit fallback-review settings, see the [starting guide](../manual/starting_prompts.md). The examples below cover technical and follow-up requests; they do not replace the entry contracts.
+
 ## Start a new localization and patch job
 
 ```text
