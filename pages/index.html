@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' http://127.0.0.1:10100; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' http://localhost:10100; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>Parr0t · 프롬프트 조합기</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="./style.css">
@@ -41,7 +41,8 @@
           <label>폴백 최대 횟수<input name="fallbackAttempts" type="number" min="1" step="1" placeholder="직접 지정"></label>
           <label class="wide" id="fallback-model-field" hidden>직접 입력한 폴백 모델 ID<input name="fallbackModel" type="text" placeholder="정확한 모델 ID" autocomplete="off" spellcheck="false"></label>
         </div>
-        <div class="catalog-control"><label class="toggle"><input type="checkbox" id="use-proxy" checked>OpenCodex 모델 목록</label><span id="catalog-status" role="status" aria-live="polite"></span></div>
+        <div class="catalog-control"><label class="toggle"><input type="checkbox" id="use-proxy" aria-describedby="local-access-help">localhost 연결 요청</label><span id="catalog-status" role="status" aria-live="polite"></span></div>
+        <p class="optional" id="local-access-help">켜면 OpenCodex 모델 목록을 읽기 위해 http://localhost:10100에 연결합니다. 필요한 경우 브라우저의 로컬 네트워크 접근 권한을 허용하세요. 이미 차단했다면 사이트 설정에서 변경하세요. 이 권한은 CORS를 해제하지 않으며, 서버가 현재 사이트의 origin을 허용하지 않으면 모델 목록을 읽을 수 없습니다.</p>
         <details class="settings" id="review-settings">
           <summary>검수 제한</summary>
           <div class="fields">
