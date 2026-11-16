@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .errors import ConfigurationError
+from .model_policy import codex_app_routes, codex_app_translation_retries, native_role_models
 
 
 CODEX_APP_PRESET = "codex-app-deepseek"
@@ -117,6 +118,9 @@ def validate_provider_policy(
         if mode_lock.get("execution_mode") != mode:
             _mode_drift("execution_mode differs from the workspace provider-mode lock")
 
+    if native_role_models(config) and preset not in {CODEX_APP_PRESET, "custom"}:
+        _mode_drift("native role model overrides require a native workflow")
+
     if preset != CODEX_APP_PRESET:
         return
 
@@ -161,22 +165,13 @@ def validate_provider_policy(
         or len(high_risk_categories) != len(set(high_risk_categories))
     ):
         _mode_drift("strong-review categories must be unique non-empty strings")
-    required_routes = {
-        "context_analyzers": ["native-sol", "native-luna"],
-        "translators": ["native-luna", "native-sol", "deepseek"],
-        "review_triagers": ["native-luna"],
-        "reviewers": ["native-sol", "deepseek"],
-        "rewriters": ["deepseek"],
-    }
+    required_routes = codex_app_routes(config)
     for role, expected in required_routes.items():
         if routing.get(role) != expected:
             _mode_drift(f"Codex App route {role!r} must remain {expected!r}")
-    if routing.get("translator_retries") != {
-        "native-luna": 5,
-        "native-sol": 3,
-    }:
+    if routing.get("translator_retries") != codex_app_translation_retries(config):
         _mode_drift(
-            "Codex App translation retries must remain native-luna=5 and native-sol=3"
+            "Codex App translation retries must retain the configured primary=5 and native-sol=3"
         )
     if routing.get("defer_fallbacks_until_primary_complete") is not True:
         _mode_drift("fallback cannot start before the complete native primary barrier")
