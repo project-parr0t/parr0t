@@ -4,7 +4,7 @@
 
 ## Supported control paths
 
-Supports Codex App/CLI, [guarded OMP](control-plane-contract.md#omp-entry), and OpenCodex-compatible proxies. All preserve isolation and provider roles; proxies change routing only.
+Supports Codex App/CLI, [OMP](control-plane-contract.md#omp-entry), and OpenCodex-compatible proxies. OMP: prompt separation; optional host-enforced guards.
 
 ## Start or resume
 
@@ -21,7 +21,7 @@ For a new job:
 1. Confirm repository/workspace access and only that the source path exists; do not inspect its contents.
 2. Initialize and follow status contracts. Clean entry: `enter-control-plane --workspace <workspace> --contracts-read --source-unopened`. Record exposure before recovery. Rotate by default; explicit user acceptance follows `control-plane-contract.md` when host rules permit. Never auto-launch replacements.
 3. Ask once whether Git may be used for this game task; record only the answer. Disabled forbids Git mutation/publication in that workspace, not authenticated SDK access, download, inventory, or activation. Never infer the answer from transport or missing `.git`.
-4. Bind `native-runtime --host codex|omp --workspace <workspace>` per `control-plane-contract.md`; follow status relays through `local_patch_ready`.
+4. Bind `native-runtime --host codex|omp --workspace <workspace>`; follow status through `local_patch_ready`. Preserve existing OMP modes and started-worker bindings; see `control-plane-contract.md`.
 
 For an existing job, start with status and reuse valid checkpoints. Do not repeat work with unchanged fingerprints.
 
