@@ -53,6 +53,24 @@ def native_role_bindings(config: dict[str, Any]) -> dict[str, str]:
     return {NATIVE_ROLE_ROUTES[role]: model for role, model in native_role_models(config).items()}
 
 
+def model_selection_authorization(config: dict[str, Any], route: str, model: str) -> dict[str, Any]:
+    """Authorize an exact bound selection, independently of engine or provider catalogs."""
+    if not exact_native_model(model):
+        raise ConfigurationError("E_MODEL_POLICY_INVALID: an exact model selection is required")
+    requested = native_role_bindings(config).get(route)
+    if requested is not None and requested != model:
+        raise ConfigurationError("E_MODEL_POLICY_BINDING_REQUIRED: requested role model is not bound")
+    return {
+        "schema": "parr0t.model-selection-authorization.v1",
+        "status": "approved",
+        "source": "user_prompt" if requested is not None else "runtime_binding",
+        "scope": "all_sdks",
+        "model": model,
+        "additional_allowlist_required": False,
+        "execution_availability": "separate_host_result",
+    }
+
+
 def codex_app_routes(config: dict[str, Any]) -> dict[str, list[str]]:
     routes = {
         "context_analyzers": ["native-sol", "native-luna"],
