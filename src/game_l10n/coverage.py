@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from hashlib import sha256
 import json
 import re
 from collections import Counter
@@ -31,6 +32,50 @@ UI_COMPOSITION_FIELDS = (
 UI_SLOT_ROLES = {"standalone", "label", "value", "state_value", "template_fragment"}
 INVENTORY_COMPARISON_KEY = "inventory_comparison_key"
 PRIMARY_IDENTITY_SCHEMA = "parr0t.primary-inventory-identity.v1"
+DISPLAY_SCOPE_SCHEMA = "parr0t.display-scope.v1"
+DISPLAY_SCOPE_EVIDENCE_FIELD = "display_scope_evidence"
+
+
+def validate_inventory_display_scope(
+    payload: dict[str, Any], *, required: bool = False
+) -> None:
+    """Validate evidence-backed translation scope for new inventory tasks."""
+    coverage = payload.get("coverage")
+    tracking = coverage.get("display_scope") if isinstance(coverage, dict) else None
+    if tracking is None and not required:
+        return
+    if not isinstance(tracking, dict) or tracking.get("schema") != DISPLAY_SCOPE_SCHEMA:
+        raise ConfigurationError("Inventory requires a valid coverage.display_scope declaration")
+    for key in ("raw_occurrence_count", "display_candidate_count", "control_only_count", "unclassified_count"):
+        value = tracking.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ConfigurationError(f"Inventory display scope {key} must be a non-negative integer")
+    if tracking["control_only_count"] + tracking["unclassified_count"] > tracking["raw_occurrence_count"]:
+        raise ConfigurationError("Inventory raw occurrence accounting is inconsistent")
+    if payload.get("segments") and tracking["raw_occurrence_count"] == 0:
+        raise ConfigurationError("Inventory display candidates require source occurrences")
+    fingerprint = tracking.get("evidence_fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint.strip():
+        raise ConfigurationError("Inventory display scope requires an evidence_fingerprint")
+    if tracking["display_candidate_count"] != len(payload.get("segments", [])):
+        raise ConfigurationError("Inventory display candidate count must match segments")
+    for row in payload.get("segments", []):
+        metadata = row.get("metadata", {}) if isinstance(row, dict) else {}
+        evidence = metadata.get(DISPLAY_SCOPE_EVIDENCE_FIELD) if isinstance(metadata, dict) else None
+        if (
+            not isinstance(evidence, dict)
+            or evidence.get("kind") not in {"positive_display_binding", "possible_display_dependency"}
+            or not isinstance(evidence.get("evidence_fingerprint"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", evidence["evidence_fingerprint"]) is None
+            or not isinstance(row.get("source"), str)
+            or evidence.get("source_sha256") != sha256(row["source"].encode("utf-8")).hexdigest()
+            or not isinstance(metadata.get("display_binding_id"), str)
+            or not metadata["display_binding_id"].strip()
+        ):
+            raise ConfigurationError("Every inventory target requires display binding or dependency evidence")
+        if metadata.get("storage_role") in {"shared_control_value", "lookup_key", "index", "script_operand"} and metadata.get("display_projection_required") is not True:
+            raise ConfigurationError("Control storage requires a separate display projection")
+
 PRIMARY_IDENTITY_PATH = Path(".game-l10n/inventory-primary-identity.json")
 _SURROGATE = re.compile(r"[\ud800-\udfff]")
 
@@ -192,6 +237,7 @@ def _inventory_document(path: Path) -> dict[str, Any]:
         raise ConfigurationError("Inventory must contain at least one segment")
     if tracking is not None and tracking["included_count"] != len(segments):
         raise ConfigurationError("Inventory static scope included count does not match segments")
+    validate_inventory_display_scope(payload)
     return payload
 
 
@@ -261,8 +307,13 @@ def _ui_contract_map(
                 f"Inventory segment {target_id!r} has an invalid {INVENTORY_COMPARISON_KEY}"
             )
         contract = {key: metadata[key] for key in UI_COMPOSITION_FIELDS if key in metadata}
+        display_binding = {
+            key: metadata[key]
+            for key in ("storage_role", "display_projection_required", "display_binding_id")
+            if key in metadata
+        }
         if not contract:
-            result[comparison_key] = {}
+            result[comparison_key] = display_binding
             continue
         role = contract.get("ui_slot_role")
         if role not in UI_SLOT_ROLES:
@@ -298,6 +349,7 @@ def _ui_contract_map(
             raise ConfigurationError(
                 f"Inventory segment {target_id!r} ui_max_chars must be a non-negative integer"
             )
+        contract.update(display_binding)
         result[comparison_key] = contract
     return result
 
@@ -453,6 +505,14 @@ def _write_primary_identity_binding(
 def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[str, Any]:
     primary = _inventory_document(primary_path)
     independent = _inventory_document(independent_path)
+    return _verify_inventory_payloads(primary_path, independent_path, primary, independent)
+
+def _verify_inventory_payloads(
+    primary_path: Path,
+    independent_path: Path,
+    primary: dict[str, Any],
+    independent: dict[str, Any],
+) -> dict[str, Any]:
     if primary["method"].strip().casefold() == independent["method"].strip().casefold():
         raise ConfigurationError("Inventory methods must be independently named")
     if primary["implementation_fingerprint"] == independent["implementation_fingerprint"]:
@@ -521,11 +581,15 @@ def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[st
     primary_scope = _static_scope_tracking(primary["coverage"])
     independent_scope = _static_scope_tracking(independent["coverage"])
     scope_tracking_mismatch = primary_scope != independent_scope
+    comparison_key_overlap_ratio = len(primary_ids & independent_ids) / max(
+        1, min(len(primary_ids), len(independent_ids))
+    )
     namespace_mismatch = bool(
         primary_ids
         and independent_ids
         and raw_id_overlap_ratio < 0.05
         and source_overlap_ratio >= 0.90
+        and not (comparison_keys_complete and comparison_key_overlap_ratio >= 0.90)
         and (primary_ids != independent_ids)
     )
     declared_complete = all(
@@ -651,8 +715,22 @@ def save_inventory_attestation(
             previous = None
 
     # Validate both inventory documents before advancing canonical ID lineage.
-    attestation = verify_inventory_pair(primary_path, independent_path)
     primary_payload = _inventory_document(primary_path)
+    independent_payload = _inventory_document(independent_path)
+    attestation = _verify_inventory_payloads(
+        primary_path, independent_path, primary_payload, independent_payload
+    )
+    if (
+        previous is not None
+        and (
+            "INVENTORY_IDENTITY_NAMESPACE_MISMATCH" in attestation["issue_codes"]
+            or "INVENTORY_IDENTITY_NAMESPACE_MISMATCH" in previous.get("issue_codes", [])
+        )
+        and len(primary_payload["segments"]) > int(previous.get("primary_segments", 0))
+    ):
+        raise ConfigurationError(
+            "E_INVENTORY_IDENTITY_NAMESPACE_MISMATCH: reconcile identity aliases before primary expansion"
+        )
     identity_binding = _write_primary_identity_binding(
         work_dir, primary_path, primary_payload, previous
     )
@@ -710,7 +788,7 @@ def save_inventory_attestation(
         unchanged_observations = 0
     else:
         progress_state = "changed"
-        unchanged_observations = 0
+        unchanged_observations = int(previous_reconciliation.get("unchanged_observations", 0)) + 1
     attestation["reconciliation"] = {
         "generation": int(previous_reconciliation.get("generation", 0)) + 1,
         "progress_state": progress_state,

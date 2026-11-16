@@ -99,6 +99,21 @@ Do not create a job-local scheduler, controller, lease/owner database, liveness 
 
 Aggregate results once when the relay has actually ended. A capacity failure, missing native slot, or worker startup failure records the exact task in resumable operational state; an unstarted task does not consume a semantic attempt. It must not auto-restart the root turn or generate another controller. Keep ordinary wave transitions silent; report only a completed pass/checkpoint or actionable blocker. Quiet waits and legacy diagnostic action counts cannot end a live relay or the whole job; continue bounded host waits until an actual terminal event, or an explicitly user-bound deadline. An unavailable nested-dispatch tool is an external host blocker, not proof of a failed semantic attempt. Semantic rewrites remain bounded by `routing.review_max_rounds`.
 
+Relay lifecycle observation is finite and interruptible per host call. It is
+not a job deadline and elapsed time is never an operational-failure signal.
+Do not enter an eval wait-until-all that prevents error recording or prompt
+cancellation; after each observation return to core, and on an actually
+observed provider/guard error cancel the owned child and establish terminal
+lifecycle before any replacement task is dispatched.
+
+Inventory reconciliation route succession is opt-in through
+`routing.data_plane_routes.inventory_reconciler`, an ordered list of already
+bound native routes. If omitted, the existing `native-sol` behavior remains.
+Only a sealed `operational_error` advances to the next configured entry;
+semantic failures retain the same route and ordinary attempt behavior. An
+exhausted configured list remains pending and never proves route exhaustion or
+permits source preservation.
+
 After semantic completion, packaging, README assembly, release metadata, and deterministic finalization stay in the current agent. Do not open new translation or review workers for those serial steps. If a framework bug blocks finalization, hold the instance checkpoint, fix the reusable core separately, and rerun only the failed deterministic gate; do not re-review unchanged results.
 
 ## Native model context budget
