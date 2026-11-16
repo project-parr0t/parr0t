@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,7 @@ from .control_plane import (
     require_control_plane_ready,
     validate_control_envelope,
 )
-from .coverage import require_inventory_attestation
+from .coverage import require_inventory_attestation, validate_inventory_display_scope
 from .errors import ConfigurationError, ProviderError
 from .formats import load_dataclass_list, read_segments
 from .image_localization import (
@@ -63,6 +64,10 @@ CONTEXT_WORK_MANIFEST_SCHEMA = "parr0t.context-work-manifest.v1"
 CONTEXT_CHUNK_CLAIM_SCHEMA = "parr0t.context-chunk-claim.v1"
 CONTEXT_CHUNK_RESULT_SCHEMA = "parr0t.context-chunk-result.v1"
 CONTEXT_FRAGMENT_SCHEMA = "parr0t.context-fragment.v1"
+DATA_PLANE_OPERATIONAL_FAILURE_CODES = {
+    "provider_operational_error",
+    "execution_guard_denied",
+}
 CONTEXT_RESULT_ISSUE_CODES = {
     "fallback_required",
     "malformed_response",
@@ -426,6 +431,121 @@ def _relative(work_dir: Path, path: Path) -> str:
 
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def _data_plane_route_chain(config: dict[str, Any], worker_role: str) -> list[str]:
+    """Return only explicitly configured native routes for supported roles."""
+
+    routing = config.get("routing", {})
+    if not isinstance(routing, dict):
+        raise ConfigurationError("E_DATA_PLANE_ROUTE_INVALID: routing must be an object")
+    configured = routing.get("data_plane_routes", {})
+    if not isinstance(configured, dict) or set(configured) - {"inventory_reconciler"}:
+        raise ConfigurationError("E_DATA_PLANE_ROUTE_INVALID: unsupported data-plane route role")
+    if worker_role != "inventory_reconciler":
+        return []
+    routes = configured.get("inventory_reconciler", ["native-sol"])
+    if (
+        not isinstance(routes, list)
+        or not routes
+        or any(
+            not isinstance(route, str)
+            or re.fullmatch(r"native-[a-z0-9][a-z0-9._-]*", route) is None
+            for route in routes
+        )
+        or len(set(routes)) != len(routes)
+    ):
+        raise ConfigurationError("E_DATA_PLANE_ROUTE_INVALID: invalid configured native route chain")
+    return list(routes)
+
+
+def _operational_failure_path(relay_path: Path, task_id: str) -> Path:
+    return relay_path.with_name(f"operational-failure-{task_id}.json")
+
+
+def current_data_plane_operational_failure(
+    work_dir: Path, worker_role: str
+) -> dict[str, Any] | None:
+    relay_path = work_dir / ".game-l10n" / "data-plane" / worker_role / "relay.json"
+    if not relay_path.is_file():
+        return None
+    try:
+        relay = json.loads(relay_path.read_text(encoding="utf-8"))
+        if not isinstance(relay, dict) or not isinstance(
+            relay.get("launch_contract"), dict
+        ):
+            return None
+        task_id = relay.get("task_id")
+        if not isinstance(task_id, str) or not re.fullmatch(r"[a-f0-9]{64}", task_id):
+            return None
+        failure_path = _operational_failure_path(relay_path, task_id)
+        failure = json.loads(failure_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    expected = {
+        "schema": "parr0t.data-plane-operational-failure.v1",
+        "task_id": task_id,
+        "worker_role": worker_role,
+        "stage": relay.get("stage"),
+        "control_generation": int(control_plane_state(work_dir).get("generation", 0)),
+        "owner": {
+            "host": relay.get("launch_contract", {}).get("host"),
+            "relay_role": relay.get("relay_contract", {}).get("role"),
+        },
+    }
+    if (
+        not isinstance(failure, dict)
+        or any(failure.get(key) != value for key, value in expected.items())
+        or failure.get("failure_code") not in DATA_PLANE_OPERATIONAL_FAILURE_CODES
+    ):
+        return None
+    receipt_path = relay_path.with_name("receipt.json")
+    if receipt_path.is_file():
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            receipt = {}
+        if (
+            isinstance(receipt, dict)
+            and receipt.get("task_id") == task_id
+            and receipt.get("status") == "success"
+        ):
+            return None
+    workers = failure.get("workers")
+    if (
+        not isinstance(workers, list)
+        or not workers
+        or any(
+            not isinstance(row, dict) or not isinstance(row.get("worker_id"), str)
+            for row in workers
+        )
+    ):
+        return None
+    from .native_runtime import _load
+
+    try:
+        _, contract, ledger = _load(work_dir, relay_path)
+        expected_workers = [
+            {
+                "task": name,
+                "worker_id": row["worker_id"],
+                "model": row["model"],
+                "observed_model": row["observed_model"],
+            }
+            for name, row in ledger["workers"].items()
+            if name in contract["tasks"]
+        ]
+    except (ConfigurationError, OSError, ValueError, TypeError, KeyError):
+        return None
+    if workers != expected_workers:
+        return None
+    return {
+        "failure_code": failure["failure_code"],
+        "worker_ids": [row["worker_id"] for row in workers],
+        "owner": failure.get("owner"),
+        "cancellation_required": failure.get("terminal") is not True,
+        "terminal": failure.get("terminal") is True,
+    }
+
 
 
 def _load_context_task(work_dir: Path, task_path: Path) -> dict[str, Any]:
@@ -1254,10 +1374,17 @@ def prepare_data_plane_task(
         if profile["counterpart"]
         else None
     )
+    route_chain = _data_plane_route_chain(config, worker_role)
+    route_index = 0
+    worker_route = route_chain[0] if route_chain else ""
+    worker_model_family = "native" if route_chain else ""
+
     attempt = 1
     previous_context_receipt_success = 0
     previous_context_baseline = 0
     previous_context_no_progress = 0
+    previous_issue_codes: list[str] = []
+    previous_receipt_closes = False
     previous_task_path = output_dir / "task.json"
     if previous_task_path.is_file():
         try:
@@ -1274,6 +1401,13 @@ def prepare_data_plane_task(
                 if previous_receipt_path.is_file()
                 else None
             )
+            if isinstance(previous_receipt, dict) and isinstance(
+                previous_receipt.get("issue_codes"), list
+            ):
+                previous_issue_codes = [
+                    code for code in previous_receipt["issue_codes"]
+                    if isinstance(code, str)
+                ]
             if worker_role == "context_analyzer":
                 previous_counts = (
                     previous_receipt.get("counts", {})
@@ -1299,6 +1433,34 @@ def prepare_data_plane_task(
                 and previous_receipt.get("stage") == profile["stage"]
                 and previous_receipt.get("control_generation") == control_generation
             )
+            previous_receipt_closes = receipt_closes_previous
+            if worker_role == "inventory_reconciler" and receipt_closes_previous:
+                previous_codes = previous_receipt.get("issue_codes", [])
+                previous_index = previous_task.get("data_plane_route_index", 0)
+                if "operational_error" in previous_codes:
+                    if (
+                        not isinstance(previous_index, int)
+                        or isinstance(previous_index, bool)
+                        or previous_index < 0
+                    ):
+                        raise ConfigurationError(
+                            "E_DATA_PLANE_ROUTE_INVALID: prior route binding is invalid"
+                        )
+                    route_index = previous_index + 1
+                    if route_index >= len(route_chain):
+                        return {
+                            "status": "pending",
+                            "worker_role": worker_role,
+                            "reason": "no_configured_route_successor",
+                        }
+                else:
+                    route_index = previous_index if (
+                        isinstance(previous_index, int)
+                        and not isinstance(previous_index, bool)
+                        and 0 <= previous_index < len(route_chain)
+                    ) else 0
+                worker_route = route_chain[route_index]
+                worker_model_family = "native"
             runtime_blocked = bool(
                 receipt_closes_previous and set(previous_receipt.get("issue_codes", [])) & RUNTIME_ISSUES
             )
@@ -1342,8 +1504,6 @@ def prepare_data_plane_task(
     envelope = (
         output_dir / f"control-envelope.g{control_generation}.attempt-{attempt}.json"
     ).resolve()
-    worker_route = ""
-    worker_model_family = ""
     relay_max_workers = 1
     worker_delegation_allowed = False
     private_payload: dict[str, Any] = {
@@ -1375,6 +1535,14 @@ def prepare_data_plane_task(
             "relay_returns_only_core_receipt_path_to_parent",
         ],
     }
+    if worker_role == "inventory_reconciler":
+        private_payload.update(
+            data_plane_route_chain=route_chain,
+            data_plane_route_index=route_index,
+            worker_route=worker_route,
+        )
+    if worker_role in {"primary_inventory", "independent_inventory"}:
+        private_payload["inventory_scope_contract"] = "parr0t.display-scope.v1"
     if worker_role == "inventory_reconciler":
         attestation_path = work_dir / ".game-l10n" / "inventory-attestation.json"
         if not attestation_path.is_file():
@@ -1657,6 +1825,26 @@ def prepare_data_plane_task(
                 "report_selected_vs_observed_engine_identity_conflicts_as_sdk_identity_mismatch",
             ]
         )
+        if (
+            previous_receipt_closes
+            and "inventory_display_scope_required" in previous_issue_codes
+            and artifact.is_file()
+        ):
+            private_payload["requirements"].remove(
+                "scan_source_once_using_selected_sdk_role_method"
+            )
+            private_payload["requirements"].extend(
+                [
+                    "reuse_cached_inventory_artifact_without_rescanning_source",
+                    "repair_only_missing_display_binding_and_dependency_evidence",
+                    "preserve_cached_inventory_occurrences_order_and_ids",
+                ]
+            )
+            private_payload["inventory_scope_repair"] = {
+                "failure_code": "inventory_display_scope_required",
+                "cached_artifact": _relative(work_dir, artifact),
+                "cached_artifact_sha256": _digest(artifact),
+            }
     elif worker_role == "inventory_reconciler":
         private_payload["requirements"].extend(
             [
@@ -2045,6 +2233,20 @@ def _load_bound_data_plane_relay(
         != int(control_plane_state(work_dir).get("generation", 0))
     ):
         raise ConfigurationError("E_DATA_PLANE_RELAY_INVALID: task binding is invalid")
+    if "data_plane_route_chain" in task:
+        route_chain = task["data_plane_route_chain"]
+        route_index = task.get("data_plane_route_index")
+        if (
+            task.get("worker_role") != "inventory_reconciler"
+            or not isinstance(route_chain, list)
+            or not route_chain
+            or not isinstance(route_index, int)
+            or isinstance(route_index, bool)
+            or not 0 <= route_index < len(route_chain)
+            or task.get("worker_route") != route_chain[route_index]
+            or relay.get("worker_route") != route_chain[route_index]
+        ):
+            raise ConfigurationError("E_DATA_PLANE_RELAY_INVALID: route binding is invalid")
 
     return relay, task
 
@@ -2165,6 +2367,86 @@ def _relay_execution_summary(
     }
 
 
+
+def record_data_plane_failure(
+    work_dir: Path,
+    relay_path: Path,
+    *,
+    failure_code: str,
+) -> dict[str, Any]:
+    """Record an observed operational failure against started, bound workers."""
+
+    if failure_code not in DATA_PLANE_OPERATIONAL_FAILURE_CODES:
+        raise ConfigurationError("E_DATA_PLANE_FAILURE_INVALID: unsupported failure code")
+    relay, task = _load_bound_data_plane_relay(work_dir, relay_path)
+    if relay.get("schema") != DATA_PLANE_RELAY_SCHEMA or "launch_contract" not in relay:
+        raise ConfigurationError("E_DATA_PLANE_FAILURE_INVALID: current native launch binding required")
+    receipt_path = (
+        work_dir / ".game-l10n" / "data-plane" / str(relay["worker_role"]) / "receipt.json"
+    )
+    if receipt_path.is_file():
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            receipt = {}
+        if (
+            isinstance(receipt, dict)
+            and receipt.get("task_id") == task["task_id"]
+            and receipt.get("status") == "success"
+        ):
+            raise ConfigurationError("E_DATA_PLANE_FAILURE_INVALID: task success is already sealed")
+    from .native_runtime import _load
+
+    _, contract, ledger = _load(work_dir, relay_path)
+    if contract.get("operational_failure_policy") != (
+        "record_only_observed_provider_or_guard_errors; terminal_owner_cancellation_required_before_replacement"
+    ):
+        raise ConfigurationError(
+            "E_DATA_PLANE_FAILURE_INVALID: lifecycle contract does not support failure recording"
+        )
+    workers = []
+    for task_name, worker in ledger["workers"].items():
+        if task_name not in contract["tasks"] or not isinstance(worker, dict):
+            continue
+        workers.append(
+            {
+                "task": task_name,
+                "worker_id": worker["worker_id"],
+                "model": worker["model"],
+                "observed_model": worker["observed_model"],
+            }
+        )
+    if not workers:
+        raise ConfigurationError("E_DATA_PLANE_FAILURE_INVALID: no bound worker start was recorded")
+    failure_path = _operational_failure_path(relay_path, str(task["task_id"]))
+    if failure_path.exists():
+        raise ConfigurationError("E_DATA_PLANE_FAILURE_INVALID: operational failure is already recorded")
+    owner = {
+        "host": contract["host"],
+        "relay_role": relay["relay_contract"]["role"],
+    }
+    failure = {
+        "schema": "parr0t.data-plane-operational-failure.v1",
+        "task_id": task["task_id"],
+        "worker_role": relay["worker_role"],
+        "stage": relay["stage"],
+        "control_generation": task["control_generation"],
+        "failure_code": failure_code,
+        "owner": owner,
+        "workers": workers,
+        "terminal": False,
+    }
+    _atomic_json(failure_path, failure)
+    return {
+        "status": "recorded",
+        "failure_code": failure_code,
+        "task_id": task["task_id"],
+        "worker_role": relay["worker_role"],
+        "workers": workers,
+        "owner": owner,
+        "cancellation_required": True,
+        "cancellation_owner": "actual_host_relay_owner",
+    }
 def record_data_plane_relay_event(
     work_dir: Path,
     relay_path: Path,
@@ -2317,6 +2599,17 @@ def _seal_bound_data_plane_task(
             raise ConfigurationError(
                 "E_DATA_PLANE_RESULT_INVALID: successful inventory is not declared complete"
             )
+        if result["status"] == "success":
+            try:
+                validate_inventory_display_scope(
+                    inventory,
+                    required=task.get("inventory_scope_contract")
+                    == "parr0t.display-scope.v1",
+                )
+            except ConfigurationError as exc:
+                raise ConfigurationError(
+                    "E_INVENTORY_DISPLAY_SCOPE_REQUIRED"
+                ) from exc
     elif result["worker_role"] == "source_probe" and result["status"] == "success":
         config = json.loads(artifact_path.read_text(encoding="utf-8"))
         selection = config.get("sdk_selection", {})
@@ -2624,6 +2917,7 @@ def _seal_ended_data_plane_task(
     *,
     issue_code: str,
     execution: dict[str, Any] | None = None,
+    additional_issue_codes: list[str] | None = None,
 ) -> dict[str, Any]:
     """Close an ended worker categorically without interpreting its response."""
 
@@ -2652,7 +2946,7 @@ def _seal_ended_data_plane_task(
         "stage": relay["stage"],
         "status": "error",
         "counts": counts,
-        "issue_codes": [issue_code],
+        "issue_codes": [issue_code, *(additional_issue_codes or [])],
         "artifact_paths": [],
         "queue_transitions": [],
         "control_generation": int(control_plane_state(work_dir).get("generation", 0)),
@@ -2688,6 +2982,82 @@ def seal_data_plane_task(
 
     relay, task = _load_bound_data_plane_relay(work_dir, relay_path)
     execution = _relay_execution_summary(work_dir, relay)
+    operational_failure_path = _operational_failure_path(
+        relay_path, str(task["task_id"])
+    )
+    if operational_failure_path.is_file():
+        if not worker_ended:
+            raise ConfigurationError(
+                "E_DATA_PLANE_CANCELLATION_REQUIRED: cancel the recorded child through its host owner and seal only after it ends"
+            )
+        if not execution["complete"]:
+            raise ConfigurationError(
+                "E_DATA_PLANE_RELAY_EXECUTION_INCOMPLETE: every bound worker must reach terminal lifecycle"
+            )
+        failure = json.loads(operational_failure_path.read_text(encoding="utf-8"))
+        expected_failure = {
+            "schema": "parr0t.data-plane-operational-failure.v1",
+            "task_id": task["task_id"],
+            "worker_role": relay["worker_role"],
+            "stage": relay["stage"],
+            "control_generation": task["control_generation"],
+            "owner": {
+                "host": relay.get("launch_contract", {}).get("host"),
+                "relay_role": relay.get("relay_contract", {}).get("role"),
+            },
+        }
+        if (
+            not isinstance(failure, dict)
+            or any(failure.get(key) != value for key, value in expected_failure.items())
+            or failure.get("failure_code") not in DATA_PLANE_OPERATIONAL_FAILURE_CODES
+            or type(failure.get("terminal")) is not bool
+        ):
+            raise ConfigurationError("E_DATA_PLANE_FAILURE_INVALID: failure binding changed")
+        from .native_runtime import _load
+
+        _, contract, ledger = _load(work_dir, relay_path)
+        if contract.get("operational_failure_policy") != (
+            "record_only_observed_provider_or_guard_errors; terminal_owner_cancellation_required_before_replacement"
+        ):
+            raise ConfigurationError("E_DATA_PLANE_FAILURE_INVALID: lifecycle contract changed")
+        expected_workers = [
+            {
+                "task": name,
+                "worker_id": row["worker_id"],
+                "model": row["model"],
+                "observed_model": row["observed_model"],
+            }
+            for name, row in ledger["workers"].items()
+            if name in contract["tasks"]
+        ]
+        if failure.get("workers") != expected_workers:
+            raise ConfigurationError("E_DATA_PLANE_FAILURE_INVALID: worker binding changed")
+        failure["terminal"] = True
+        _atomic_json(operational_failure_path, failure)
+        try:
+            success = _seal_bound_data_plane_task(work_dir, relay, task)
+            if success["status"] == "success":
+                return success
+        except (
+            ConfigurationError,
+            ProviderError,
+            OSError,
+            UnicodeError,
+            ValueError,
+            TypeError,
+            AttributeError,
+            KeyError,
+            json.JSONDecodeError,
+        ):
+            pass
+        return _seal_ended_data_plane_task(
+            work_dir,
+            relay,
+            task,
+            issue_code="operational_error",
+            execution=execution,
+            additional_issue_codes=[failure["failure_code"]],
+        )
     if "launch_contract" in relay:
         launch = native_launch_summary(work_dir, relay_path)
         if launch["issue_codes"]:
@@ -2718,9 +3088,17 @@ def seal_data_plane_task(
         AttributeError,
         KeyError,
         json.JSONDecodeError,
-    ):
+    ) as exc:
         if not worker_ended:
             raise
+        if str(exc) == "E_INVENTORY_DISPLAY_SCOPE_REQUIRED":
+            return _seal_ended_data_plane_task(
+                work_dir,
+                relay,
+                task,
+                issue_code="inventory_display_scope_required",
+                execution=execution,
+            )
         envelope_path = (work_dir / str(relay["expected_envelope"])).resolve()
         return _seal_ended_data_plane_task(
             work_dir,

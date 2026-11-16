@@ -51,8 +51,8 @@ Do not reorder barriers. Failures affect only their target and route; they canno
 ## Operating rules
 
 - Select and activate before data-plane work. Bind exact matches to a Git checkout/worktree or authenticated portable snapshot. Portable activation records the full commit ID and verifies normalized content. Other identities are read-only `derive-new` references, never promotion targets. Pass-through tools are placeholders.
-- Inventory completeness requires two independent ordered manifests. Alignment, review, and runtime observation are separate claims.
-- At 10,000+ records, scan once per method. Continue cached gap-only reconciliation while the gap score falls; stop only for a proven blocker, deterministic gate, or unchanged-progress rule. Never infer a root limit from size, elapsed time, context pressure, or model judgment.
+- Independent ordered inventories prove static—not runtime—coverage. Raw presence or `declared_complete` never establishes display scope.
+- At 10,000+ records: scan once/method, cache evidence, reconcile identities before expansion, then repair gaps. Denominator growth is not progress.
 - Keep relevant narrative/voice, functional/UI, knowledge, adjacency, glossary, and immutable evidence target-scoped.
 - The text-free parent handles only IDs, counts, states, queues, paths, and codes. It dispatches only core relays and never inspects game-root contents; a missing SDK changes nothing.
 - Explicit initial models override preset defaults; preserve provider permissions, transport, and unspecified roles. `codex-app-deepseek.md`.
@@ -62,6 +62,7 @@ Do not reorder barriers. Failures affect only their target and route; they canno
 - Build only in the workspace; synthetic checks never install or launch games.
 - Apply proportional verification and stop after the changed layer passes. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.
 - Native uses only the `native-pass-step` relay and `--relay-ended`. Review's 2,048/262,144 ceiling, initial 256/65,536 packing, failed-only splits, depth 3, and 2.0x attempts shape batches; they are not whole-job limits. Never solicit a usage ceiling. None applies unless the user states it first. Only reached DeepSeek fallback requests receive the automatic input preflight.
+- Observe finitely and interruptibly. Operational errors require owner cancellation/sealing before configured fallback. Preserve successes/evidence; missing bindings stay pending.
 
 ## Status-driven routes
 
