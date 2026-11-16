@@ -79,6 +79,14 @@ class PromptTests(unittest.TestCase):
                 scene_summaries={"fixture-scene": {"tone": "FIXTURE_TONE"}},
                 character_guides={"fixture-speaker": {"voice": "FIXTURE_VOICE"}},
                 relationship_timeline=("FIXTURE_RELATIONSHIP",),
+                dialogue_contexts={
+                    "fixture-id": {
+                        "addressee_ids": ["fixture-listener"],
+                        "relationship_state": "guarded",
+                        "register_shift": "supported",
+                        "consistency_group_id": "fixture-group",
+                    }
+                },
             ),
         )
         payload = json.loads(user)
@@ -89,6 +97,12 @@ class PromptTests(unittest.TestCase):
         )
         self.assertEqual(payload["narrative_context"]["story_summary"], "FIXTURE_STORY")
         self.assertEqual(payload["character"]["voice"], "FIXTURE_VOICE")
+        self.assertEqual(
+            payload["narrative_context"]["current_dialogue_context"][
+                "consistency_group_id"
+            ],
+            "fixture-group",
+        )
         self.assertEqual(
             payload["context_only_do_not_translate"]["metadata"]["text_type"],
             "quest_title",
