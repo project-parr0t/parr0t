@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
@@ -31,11 +32,17 @@ UI_SLOT_ROLES = {"standalone", "label", "value", "state_value", "template_fragme
 INVENTORY_COMPARISON_KEY = "inventory_comparison_key"
 PRIMARY_IDENTITY_SCHEMA = "parr0t.primary-inventory-identity.v1"
 PRIMARY_IDENTITY_PATH = Path(".game-l10n/inventory-primary-identity.json")
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
 
 
 def _static_scope_tracking(coverage: dict[str, Any]) -> dict[str, Any] | None:
     tracking = coverage.get("static_scope")
     if tracking is None:
+        if any(
+            item.get("scope") == "static_reachability"
+            for item in coverage.get("exclusions", [])
+        ):
+            raise ConfigurationError("Inventory static scope exclusions require scope tracking")
         return None
     required = {
         "schema",
@@ -129,8 +136,31 @@ def _file_binding(path: Path) -> dict[str, int]:
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
+def _validate_inventory_unicode(value: Any) -> None:
+    """Reject non-scalar JSON strings without exposing or rewriting their contents."""
+
+    if isinstance(value, str):
+        if _SURROGATE.search(value):
+            raise ConfigurationError(
+                "E_INVENTORY_INVALID_UNICODE: inventory strings must contain Unicode scalar values"
+            )
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _validate_inventory_unicode(key)
+            _validate_inventory_unicode(item)
+    elif isinstance(value, list):
+        for item in value:
+            _validate_inventory_unicode(item)
+
+
 def _inventory_document(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except UnicodeDecodeError as exc:
+        raise ConfigurationError(
+            "E_INVENTORY_INVALID_UNICODE: inventory must be valid UTF-8"
+        ) from exc
+    _validate_inventory_unicode(payload)
     if not isinstance(payload, dict) or payload.get("schema") != INVENTORY_SCHEMA:
         raise ConfigurationError(
             f"Inventory must be a {INVENTORY_SCHEMA} JSON document: {path}"
@@ -157,9 +187,11 @@ def _inventory_document(path: Path) -> dict[str, Any]:
             raise ConfigurationError(
                 "Every inventory exclusion must declare affects_user_visible_text"
             )
-    _static_scope_tracking(coverage)
+    tracking = _static_scope_tracking(coverage)
     if not isinstance(segments, list) or not segments:
         raise ConfigurationError("Inventory must contain at least one segment")
+    if tracking is not None and tracking["included_count"] != len(segments):
+        raise ConfigurationError("Inventory static scope included count does not match segments")
     return payload
 
 
@@ -297,15 +329,20 @@ def _localization_authority_map(
 
 
 def inventory_fingerprint(payload: dict[str, Any]) -> str:
-    return stable_hash(
-        {
-            "schema": payload["schema"],
-            "method": payload["method"],
-            "implementation_fingerprint": payload["implementation_fingerprint"],
-            "coverage": payload["coverage"],
-            "segments": payload["segments"],
-        }
-    )
+    try:
+        return stable_hash(
+            {
+                "schema": payload["schema"],
+                "method": payload["method"],
+                "implementation_fingerprint": payload["implementation_fingerprint"],
+                "coverage": payload["coverage"],
+                "segments": payload["segments"],
+            }
+        )
+    except UnicodeEncodeError as exc:
+        raise ConfigurationError(
+            "E_INVENTORY_INVALID_UNICODE: inventory strings must contain Unicode scalar values"
+        ) from exc
 
 
 def _inventory_target_ids(payload: dict[str, Any]) -> list[str]:
