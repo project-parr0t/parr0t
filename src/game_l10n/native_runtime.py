@@ -15,11 +15,12 @@ from typing import Any
 from .control_plane import control_plane_state, require_control_plane_ready
 from .store import stable_hash
 from .omp_isolation import ISOLATION_ENV, ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
-from .model_policy import apply_native_role_models, exact_native_model, native_role_bindings
+from .model_policy import apply_native_role_models, exact_native_model, model_selection_authorization, native_role_bindings
 
 RUNTIME_PATH = ".game-l10n/native/runtime.json"
 RUNTIME_SCHEMA = "parr0t.native-runtime.v1"
 LAUNCH_SCHEMA = "parr0t.native-launch.v1"
+MODEL_FAILURE_CODES = ("host_dispatch_denied", "host_model_not_found", "host_model_unavailable")
 RUNTIME_ISSUES = {
     "E_NATIVE_RELAY_PREFLIGHT_REQUIRED", "E_NATIVE_DISPATCH_UNAVAILABLE",
     "E_NATIVE_WORKER_NOT_STARTED", "E_NATIVE_WORKER_MODEL_MISMATCH",
@@ -159,6 +160,7 @@ def launch_contract(work_dir: Path, route: str, tasks: list[str]) -> dict[str, A
         return None  # Legacy library/checkpoint compatibility; public CLI requires binding.
     if route not in runtime["models"]:
         raise ValueError("E_NATIVE_RUNTIME_INVALID: native route has no exact model")
+    policy_config = {}
     config_path = work_dir / "game-l10n.json"
     if config_path.is_file():
         policy_config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -171,11 +173,13 @@ def launch_contract(work_dir: Path, route: str, tasks: list[str]) -> dict[str, A
         "history_mode": "none", "inherit_model_allowed": False,
         "capability_preflight_required": True,
         "spawn_model_parameter": "tasks[].model" if runtime["host"] == "omp" else "model",
-        "preflight": "inspect_available_dispatch_tool_and_exact_model_before_starting_any_worker",
+        "preflight": "verify_dispatch_tool_then_attempt_bound_model_without_an_additional_model_allowlist",
         "launch_policy": "pass_model_explicitly_then_record_returned_worker_id; skip_already_started_tasks",
         "unavailable_action": "record_capability_unavailable_or_model_unavailable_then_seal_without_results",
         "record_command": "game-l10n record-native-launch --workspace <workspace> --relay <relay-path>",
         "model_evidence": "explicit_spawn_arguments_and_host_model_metadata_when_available",
+        "model_authorization": model_selection_authorization(policy_config, route, runtime["models"][route]),
+        "unavailability_evidence": "observed_host_result_only_not_absence_from_advertised_models",
     }
     isolation = runtime_isolation(work_dir, runtime)
     if isolation is not None:
@@ -285,6 +289,12 @@ def _relay_command_argv(work_dir: Path, relay_path: Path, relay: dict) -> dict[s
         event: [*launch, "--event", event]
         for event in ("capability-available", "capability-unavailable", "model-unavailable")
     }
+    if "model_authorization" in contract:
+        del commands["model-unavailable"]
+        commands.update({
+            f"model-unavailable:{code}": [*launch, "--event", "model-unavailable", "--failure-code", code]
+            for code in MODEL_FAILURE_CODES
+        })
     commands["worker-started"] = {
         task: [*launch, "--event", "worker-started", "--task", task,
                "--model", contract["model"], "--worker-id", "<worker-id>"]
@@ -388,6 +398,13 @@ def _contract_for_relay(work_dir: Path, relay: dict, relay_path: Path) -> dict |
                 raise ValueError("E_NATIVE_LAUNCH_INVALID: preserved legacy result changed")
         tasks = [task for task in tasks if task not in {row["task"] for row in legacy_results}]
     contract = launch_contract(work_dir, route, tasks)
+    previous = relay.get("launch_contract")
+    if contract is not None and isinstance(previous, dict) and "model_authorization" not in previous:
+        # Existing immutable launches retain their original policy and fingerprint.
+        contract.pop("model_authorization", None)
+        contract.pop("unavailability_evidence", None)
+        if contract.get("transport") != "native-host-api":
+            contract["preflight"] = "inspect_available_dispatch_tool_and_exact_model_before_starting_any_worker"
     if contract is not None and "message_isolation" in contract:
         marker = "PARR0T_OMP_RELAY=" + relay_path.resolve().relative_to(work_dir.resolve()).as_posix()
         contract.update(relay_prompt_line=marker, worker_prompt_line=marker)
@@ -441,6 +458,7 @@ def _load(work_dir: Path, relay_path: Path) -> tuple[dict, dict, dict]:
             for row in ledger["workers"].values()
         )
         or ledger.get("issue_code", "") not in RUNTIME_ISSUES | {""}
+        or ledger.get("model_failure_code") not in (None, *MODEL_FAILURE_CODES)
     ):
         raise ValueError("E_NATIVE_LAUNCH_INVALID: launcher evidence changed")
     return relay, contract, ledger
@@ -449,11 +467,20 @@ def _load(work_dir: Path, relay_path: Path) -> tuple[dict, dict, dict]:
 def record_native_launch(
     work_dir: Path, relay_path: Path, *, event: str, task: str | None = None,
     worker_id: str | None = None, model: str | None = None, observed_model: str | None = None,
+    failure_code: str | None = None,
 ) -> dict[str, Any]:
     relay, contract, ledger = _load(work_dir, relay_path)
+    if failure_code is not None and (event != "model-unavailable" or failure_code not in MODEL_FAILURE_CODES):
+        raise ValueError("E_NATIVE_LAUNCH_INVALID: failure evidence is only for an observed model dispatch failure")
     if event in {"capability-available", "capability-unavailable", "model-unavailable"}:
         if any(item is not None for item in (task, worker_id, model, observed_model)):
             raise ValueError("E_NATIVE_LAUNCH_INVALID: preflight takes no worker fields")
+        if event == "model-unavailable" and "model_authorization" in contract and failure_code is None:
+            raise ValueError("E_NATIVE_MODEL_FAILURE_EVIDENCE_REQUIRED: an observed host result is required")
+        if event == "model-unavailable":
+            ledger["model_failure_code"] = failure_code
+        else:
+            ledger.pop("model_failure_code", None)
         ledger["capability"] = "available" if event == "capability-available" else "unavailable"
         ledger["issue_code"] = {
             "capability-available": "", "capability-unavailable": "E_NATIVE_DISPATCH_UNAVAILABLE",
@@ -527,6 +554,8 @@ def native_launch_summary(work_dir: Path, relay_path: Path) -> dict[str, Any]:
         "expected_workers": len(contract["tasks"]), "started_workers": len(valid),
         "unstarted_tasks": [task for task in contract["tasks"] if task not in valid],
         "issue_codes": [issue] if issue else [],
+        "model_authorization": contract.get("model_authorization"),
+        "model_failure_code": ledger.get("model_failure_code"),
         "model": contract["model"], "host": contract["host"],
         "legacy_unverified_results": len(contract.get("legacy_results", [])),
         "observed_model_workers": sum(workers[task].get("observed_model") is not None for task in valid),
