@@ -175,7 +175,45 @@ The top-level agent may observe only core CLI metadata, a validated control-enve
 
 Usage accounting comes only from the core-owned usage ledger or a sealed relay receipt populated at the event boundary. Missing telemetry is unknown, not permission to scrape host/session logs. The relay may observe only bound task lifecycle categories needed to seal an ended task and must never forward child output. Any forbidden detail that reaches root is a control-plane leak: do not interpret it; record the fixed incident. Default recovery is rotation; only the explicit incident-scoped acceptance below provides a same-session alternative.
 
+Every host lifecycle observation must be a finite, interruptible per-call wait.
+This is only a responsiveness bound for one observation, not a relay/job
+timeout or evidence that work failed. Return to core state after each wait and
+continue while the direct relay is active; never use an eval wait-until-all
+operation that cannot be interrupted to record an observed operational error
+or cancel an owned child. If an actual provider/guard operational error is
+observed, cancellation takes priority: the relay owner promptly cancels its
+child, observes terminal lifecycle, seals the current task, and only then
+permits replacement. The core cannot detect upstream frames that the host
+never delivers to the relay.
+
+For a started current data-plane task, a relay that actually observes a provider
+or execution-guard operational error records only the fixed category through
+the exact `operational-failure` argv in its launch contract. Core returns the
+recorded worker IDs and identifies the actual host relay owner as cancellation
+owner; it does not cancel a child. That owner must use the host's own
+interruptible cancellation, then seal only after terminal lifecycle. The core
+holds replacement while the recorded failure is live. On sealing, a validated
+success remains locked; otherwise the receipt records `operational_error`,
+distinct from `task_incomplete` and semantic failure.
+
+Inventory reconciliation may declare `routing.data_plane_routes` as a
+role-to-ordered-native-route-list mapping. Only `inventory_reconciler` is
+currently supported; omission retains `["native-sol"]`. Operational-error
+sealing advances only to the next explicitly configured route, whose exact
+model must already exist in the native runtime binding. A missing successor
+remains pending. Semantic failures do not advance this chain. For example,
+`{"routing":{"data_plane_routes":{"inventory_reconciler":["native-sol","native-luna"]}}}`
+explicitly enables those two existing route bindings without changing other
+provider or role policy.
+
 A non-success receipt cannot be hidden by an empty or partial artifact at the expected path. Status routes that role back to a fresh bound attempt. Inventory workers use the parent-safe `sdk_identity_mismatch` code when selected and observed engine identities conflict; status then routes to the private source probe/SDK selection step instead of inviting the parent to diagnose engine files.
+
+A successful primary or independent inventory bound to the display-scope
+contract that lacks required evidence seals as
+`inventory_display_scope_required`, not as a generic malformed worker response
+or provider failure. Status exposes that fixed code and a cached-inventory
+repair action; the next task binds the cached artifact digest and repairs its
+display-binding evidence without rescanning the source.
 
 Every new workspace starts with `parr0t.control-plane-entry.v1` in `pending`. Existing workspaces without this marker are also treated as pending. `game-l10n status` then returns only `establish_text_free_control_plane` and the contracts that must be read. If the parent has not inspected or received game content, it establishes the gate with:
 
