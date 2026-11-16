@@ -1,8 +1,10 @@
 # Parr0t prompt examples
 
-These prompts are written for Codex or Codex routed through an OpenCodex-compatible proxy. Replace angle-bracket placeholders with local paths or public format identifiers. Do not paste source text into the prompt.
+These prompts are written for Codex, ordinary OMP, or Codex routed through an OpenCodex-compatible proxy. Replace angle-bracket placeholders with local paths or public format identifiers. Do not paste source text into the prompt.
 
 For the Korean starting-prompt composer, including skipping the existing-Korean check, game-specific fonts, mod-based delivery, and explicit fallback-review settings, see the [starting guide](../manual/starting_prompts.md). The examples below cover technical and follow-up requests; they do not replace the entry contracts.
+
+In a clean current OMP session, use the starting prompt directly: no extension, restart, or `parr0t_exec` is required. Bind `native-runtime --host omp --workspace <external-workspace>` and follow the core's exact-model nested relays using normal host tools. No inherited history, no agent messaging, and metadata-only replies are prompt-based contracts, not host-enforced isolation. For optional host tool/message enforcement, use `omp_session --guarded` and `native-runtime --host omp --omp-isolation guarded`; see [the entry contract](control-plane-contract.md#omp-entry). Existing guard bindings remain strict unless explicitly changed; mode changes cannot relabel started workers. Contamination and framework shutdown/analysis retain their canonical recovery requirements.
 
 ## Start a new localization and patch job
 
