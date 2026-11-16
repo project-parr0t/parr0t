@@ -11,7 +11,15 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from scripts.check_branches import audit_branches, default_cache_dir, digest, git, plan_branches, tree
+from scripts.check_branches import (
+    DEFAULT_VALIDATION_JOBS,
+    audit_branches,
+    default_cache_dir,
+    digest,
+    git,
+    plan_branches,
+    tree,
+)
 
 SCHEMA = "parr0t.branch-update.v1"
 
@@ -99,7 +107,7 @@ def merge_tree(repo: Path, plan: dict) -> str:
 
 
 def plan_updates(repo: Path, state: Path, *, main_ref: str = "origin/main", refs: list[str] | None = None,
-                 python: str = sys.executable, environment_key: str = "", jobs: int = 2,
+                 python: str = sys.executable, environment_key: str = "", jobs: int = DEFAULT_VALIDATION_JOBS,
                  require_ancestry: bool = False, provision_dependencies: bool = False,
                  cache_dir: Path | None = None) -> dict:
     repo, state = repo.resolve(), state.resolve()
@@ -245,7 +253,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--branch", action="append", help="Local sdk-* target; repeatable. Omit for origin SDK planning")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--environment-key", default="")
-    parser.add_argument("--jobs", type=int, choices=range(1, 9), default=2)
+    parser.add_argument("--jobs", type=int, choices=range(1, 9), default=DEFAULT_VALIDATION_JOBS)
     parser.add_argument("--require-ancestry", action="store_true", help="Require main ancestry, including for equivalent core content")
     parser.add_argument("--provision-dependencies", action="store_true",
                         help="Install required branch-declared Python test dependencies into the external state directory")
