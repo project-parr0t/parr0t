@@ -19,9 +19,9 @@ export function buildPrompt(options = {}) {
   if (Boolean(model) !== Boolean(attempts)) throw new Error("폴백 모델과 횟수를 함께 지정하세요.");
   if (attempts && (!/^\d+$/.test(attempts) || BigInt(attempts) < 1n)) throw new Error("폴백 횟수는 1 이상의 정수로 지정하세요.");
   if (/[\r\n]/.test(model)) throw new Error("모델 ID는 한 줄로 입력하세요.");
-  const roleModels = [["기초 번역 모델", baseModel], ["약검수 모델", triageModel], ["강검수 모델", strongModel]];
-  if (analyzeContext) roleModels.push(["문맥 파악 모델", contextModel]);
-  if (roleModels.some(([, value]) => /[\r\n]/.test(String(value)))) throw new Error("모델 ID는 한 줄로 입력하세요.");
+  const roleModels = [["translation", "기초 번역 모델", baseModel], ["triage", "약검수 모델", triageModel], ["strong-review", "강검수 모델", strongModel]];
+  if (analyzeContext) roleModels.push(["context", "문맥 파악 모델", contextModel]);
+  if (roleModels.some(([, , value]) => /[\r\n]/.test(String(value)))) throw new Error("모델 ID는 한 줄로 입력하세요.");
   const isSol = value => String(value).split("@", 1)[0].split(":", 1)[0].split("/").at(-1) === "gpt-6.1-sol";
   if (model && isSol(model) && BigInt(attempts) > 2n) throw new Error("Sol 모델의 검수는 최대 2회입니다.");
   const reviewLimits = [
@@ -68,8 +68,19 @@ export function buildPrompt(options = {}) {
     "원어의 의미·어조·말투·용어·패러디를 보존하라. 코드·식별자·리소스 키·플레이스홀더·태그·제어 코드·조건·수치·단위·게임 동작은 변경하지 마라. 정적·합성 검증으로 줄바꿈·UI 잘림을 확인하고 실제 실행에서만 확인할 수 있는 항목은 미확인으로 구분하라.",
   ];
   }
-  const specifiedModels = roleModels.filter(([, value]) => String(value).trim());
-  if (specifiedModels.length) sections.push(specifiedModels.map(([label, value]) => `${label}: ${String(value).trim()}`).join("\n") + "\n정확한 모델 ID와 역할별 바인딩을 보존하라. 지원되는 preset/호스트 역할 안에서만 적용하고, 지원하지 않으면 임의 모델로 바꾸거나 권한을 우회하지 말고 제약을 보고하라. 미지정 역할은 기존 설정을 유지하라.");
+  const specifiedModels = roleModels.filter(([, , value]) => String(value).trim());
+  const nativeRoleModels = specifiedModels.map(([role, , value]) => [role, String(value).trim()]);
+  if (model) nativeRoleModels.push(["review-fallback", model]);
+  if (nativeRoleModels.length) {
+    const bindings = nativeRoleModels.map(([role, value]) => `--role-model ${JSON.stringify(`${role}=${value}`)}`).join(" ");
+    sections.push([
+      ...specifiedModels.map(([, label, value]) => `${label}: ${String(value).trim()}`),
+      "모델 선택 우선순위: 이 초기 사용자 프롬프트·템플릿의 명시적 역할별 모델 선택이 preset 모델 기본값보다 우선한다. preset은 기본값이지 모델 선택을 고정하는 권한이 아니다. 정확한 ID(제공자·경로·접미사 포함)를 보존하고 지정한 역할 슬롯만 교체하라. 미지정 역할과 나머지 경로는 기존 설정을 유지하라.",
+      "현재 네이티브 호스트에서 허용된 역할의 명시 선택은 다음 native-runtime 명령으로 기록하라. <current-native-host>는 이미 선택한 codex 또는 omp로 채우고, API 역할에 이 명령을 적용하거나 API/native를 암묵적으로 교환하지 마라:",
+      `game-l10n native-runtime --workspace <workspace> --host <current-native-host> ${bindings} --user-requested-models`,
+      "선택한 호스트·허용된 전송 경로와 호환되지 않거나 호스트가 아직 바인딩되지 않았으면 정확한 요청을 보존한 pending으로 유지하라. 다른 모델이나 기본 DeepSeek로 대체하거나 실패·거부·경로 소진으로 해석하지 마라. provider mode, 제공자 역할 권한, 엔드포인트·자격 증명, 대상별 호출 상한, 시작된 워커의 바인딩·실행 증거와 완료 결과를 변경하지 마라.",
+    ].join("\n"));
+  }
   sections.push(analyzeContext
     ? "문맥 파악: 수행. 변경된 범위의 흐름·인물 관계·말투 또는 UI·로직 문맥을 지정한 모델로 분석하되 유효한 문맥 체크포인트는 재사용하라. 모델을 지정하지 않았으면 기존 문맥 분석 모델을 유지하라."
     : "문맥 파악: 새 모델 분석 생략. 유효한 기존 문맥 체크포인트와 필수 타입·UI·로직 메타데이터만 재사용하고 새 문맥 모델을 호출하지 마라. 유효한 문맥이 없으면 필수 문맥 게이트를 통과했다고 꾸미지 말고 필요한 입력·승인 경계를 보고하라.");
@@ -85,10 +96,10 @@ export function buildPrompt(options = {}) {
     : "외부 작업 폴더에 적용·복원 정보가 포함된 복원 가능한 패치를 만들어라.");
   sections.push("Sol 모델을 사용하는 강검수는 대상당 최초 호출을 포함해 최대 2회로 제한하라. 오류·거부 재시도, 수정 후 확인, 분할 재시도와 재개에서도 같은 대상의 횟수를 합산하라. 성공한 대상은 잠그고 다시 검수하지 마라. 번역 재시도 횟수와 혼동하지 마라.");
   sections.push(model
-    ? `폴백 검수 모델: ${model}\n폴백 검수 최대 횟수: ${BigInt(attempts)}회 (대상당 최초 호출 포함). 이 사전 지정 값을 보존하고 기본값으로 덮어쓰거나 같은 값을 다시 묻지 마라.`
+    ? `폴백 검수 모델: ${model}\n폴백 검수 최대 횟수: ${BigInt(attempts)}회 (대상당 최초 호출 포함). 이 사전 지정 값을 preset 기본값보다 우선하여 보존하고 같은 값을 다시 묻지 마라.\n폴백 모델과 대상별 총 호출 횟수를 함께 바인딩하라:\ngame-l10n review-policy --workspace <workspace> --fallback-model ${JSON.stringify(model)} --max-calls ${BigInt(attempts)} --user-requested\n기존 기본 DeepSeek 모델과 일치하는지 확인하는 데 그치지 마라. 현재 네이티브 preset/호스트의 허용된 review-fallback 역할이면 native-review-fallback으로 정확히 바인딩하고, 호스트·허용 전송이 호환되지 않거나 아직 바인딩되지 않았으면 요청한 모델과 횟수를 보존한 pending으로 유지하라. 네이티브 요청 모델을 DeepSeek API에 대신 보내지 마라.`
     : "사전 템플릿·사용자 요청에 폴백 검수 모델과 횟수가 이미 지정되어 있으면 그 값을 그대로 따르고 다시 묻지 마라. 누락된 값만 폴백 사용 전에 사용자에게 확인하라. 임의의 모델·횟수를 기본값으로 채우지 마라.");
   if (options.fallbackViaOpenCodex && model) sections.push("폴백 모델은 감지된 OpenCodex 프록시 카탈로그에서 선택했다. 정확한 모델 ID와 허용된 프록시 경로를 보존하고 직접 API나 다른 모델로 몰래 전환하지 마라. 카탈로그 표시는 실제 가용성·모델 호출 권한의 증거가 아니므로 실행 전 바인딩과 지원 여부를 검증하라.");
-  sections.push("폴백은 성공을 보존한 채 실패한 항목에만 적용하라. 설정 누락은 모델 거부·경로 소진·source_preserved가 아니며, pending으로 유지하라. 지정 모델은 기존 preset의 역할·정확한 모델 바인딩·허용 경로 안에서만 사용하고 지원하지 않는 바인딩은 명확히 보고하라. Git·제공자 설정의 기존 승인과 정책을 보존하라. 별도 승인 없이 커밋·푸시·릴리스 게시나 실제 게임 설치·실행을 하지 말고, 로컬 결과물과 검증 범위를 먼저 보고하라.");
+  sections.push("폴백은 성공을 보존한 채 실패한 항목에만 적용하라. 설정 누락·호스트 미바인딩·호환되지 않는 전송은 모델 실패·거부·경로 소진·source_preserved가 아니며, 정확한 요청을 보존한 pending으로 유지하라. preset의 모델 기본값보다 명시 선택을 우선하되 기록된 네이티브 역할 모델 재정의만 좁은 예외로 적용하고, provider mode·제공자 역할 권한·허용 경로는 바꾸지 마라. Git·제공자 설정의 기존 승인과 정책을 보존하라. 별도 승인 없이 커밋·푸시·릴리스 게시나 실제 게임 설치·실행을 하지 말고, 로컬 결과물과 검증 범위를 먼저 보고하라.");
   if (String(gamePath).trim()) sections.push(`게임 폴더:\n${String(gamePath).trim()}`);
   else if (operation === "localize") sections.push("게임 폴더는 이 요청에 첨부한 폴더를 사용하라.");
   return sections.join("\n\n") + "\n";

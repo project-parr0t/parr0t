@@ -4,6 +4,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .model_policy import (
+    NATIVE_ROLE_ROUTES, apply_native_role_models, exact_native_model,
+    native_role_bindings, native_role_models,
+)
+
 SOL_REVIEW_CALLS = 2
 JUDGE_STAGES = frozenset({"review", "review-confirm", "review-grace-retry", "review-refusal-retry"})
 REVIEW_SETTING_FIELDS = ("triage_max_calls", "strong_max_calls", "review_max_workers", "triage_max_workers", "strong_max_workers")
@@ -73,18 +78,31 @@ def review_worker_limit(settings: dict[str, Any], requested: int, *, tier: str) 
     return min(value for value in values if value is not None)
 
 
-def review_policy_status(config: dict[str, Any]) -> dict[str, Any]:
+def review_policy_status(config: dict[str, Any], work_dir: Path | None = None) -> dict[str, Any]:
     routing = config.get("routing", {})
     limits = routing.get("review_attempt_limits", {})
     validate_review_limits(limits)
     validate_review_settings(routing)
     missing = [name for name in routing.get("reviewers", [])[1:] if name not in limits]
+    requested = native_role_bindings(config)
+    pending = []
+    if work_dir is not None and requested:
+        from .native_runtime import native_runtime
+        try:
+            runtime = native_runtime(work_dir)
+        except ValueError:
+            runtime = None
+        bound = runtime["models"] if runtime else {}
+        pending = [route for route, model in requested.items() if bound.get(route) != model]
     return {
-        "status": "user_configuration_required" if missing else "configured",
+        "status": ("native_binding_required" if pending else
+                   "user_configuration_required" if missing else "configured"),
         "sol_max_calls": SOL_REVIEW_CALLS,
         "review_attempt_limits": dict(limits),
         "review_limits": {key: routing[key] for key in REVIEW_SETTING_FIELDS if routing.get(key) is not None},
         "missing_fallback_providers": missing,
+        "requested_native_models": native_role_models(config),
+        "native_binding_pending": pending,
     }
 
 
@@ -93,7 +111,7 @@ def configure_review_policy(
     max_calls: int | None = None, provider: str | None = None,
     settings: dict[str, int] | None = None,
 ) -> dict[str, Any]:
-    from .native_runtime import native_runtime
+    from .native_runtime import configure_native_runtime, native_runtime
     from .workspace import _write_config, load_config
 
     if not user_requested:
@@ -106,6 +124,11 @@ def configure_review_policy(
         raise ReviewPolicyRequired(provider or "")
     config = load_config(work_dir)
     routing = config["routing"]
+    try:
+        runtime = native_runtime(work_dir)
+    except ValueError:
+        runtime = None
+    bind_requested = False
     selected = {}
     if model is not None:
         validate_review_limits({"requested": max_calls})
@@ -113,19 +136,40 @@ def configure_review_policy(
             raise ValueError("E_REVIEW_MODEL_BINDING_INVALID")
         fallback_routes = routing.get("reviewers", [])[1:]
         models = {item["name"]: item.get("model", "") for item in config.get("providers", [])}
-        if any(route.startswith("native-") for route in fallback_routes):
-            runtime = native_runtime(work_dir)
-            if runtime:
-                models.update(runtime["models"])
+        if runtime:
+            models.update(runtime["models"])
         matched = [route for route in fallback_routes
                    if models.get(route) == model and (provider is None or route == provider)]
-        if len(matched) != 1:
+        if len(matched) == 1:
+            route = matched[0]
+        elif (
+            provider in {None, NATIVE_ROLE_ROUTES["review-fallback"]}
+            and exact_native_model(model)
+            and (config.get("provider_preset") == "codex-app-deepseek"
+                 or (config.get("provider_preset") == "custom" and runtime is not None))
+        ):
+            config = apply_native_role_models(config, {"review-fallback": model})
+            routing = config["routing"]
+            route = NATIVE_ROLE_ROUTES["review-fallback"]
+            bind_requested = True
+        else:
             raise ValueError("E_REVIEW_MODEL_BINDING_INVALID")
-        route = matched[0]
         if is_sol_route(route, model) and max_calls > SOL_REVIEW_CALLS:
             raise ValueError("E_SOL_REVIEW_CALL_LIMIT")
         routing.setdefault("review_attempt_limits", {})[route] = max_calls
         selected = {"provider": route, "model": model}
     routing.update(settings)
+    from .provider_policy import validate_provider_policy
+    validate_provider_policy(config)
     _write_config(work_dir, config)
-    return {**review_policy_status(config), **selected}
+    binding_issue = ""
+    if bind_requested and runtime is not None:
+        try:
+            configure_native_runtime(work_dir, runtime["host"], {})
+        except ValueError as error:
+            # Preserve the exact request and limit as pending; no model ran.
+            binding_issue = str(error).split(":", 1)[0]
+    result = {**review_policy_status(config, work_dir), **selected}
+    if binding_issue:
+        result["binding_issue_code"] = binding_issue
+    return result
