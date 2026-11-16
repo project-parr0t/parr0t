@@ -30,8 +30,9 @@ from .native_pass import _load_task_manifest, _require_candidate_bindings, merge
 from .orchestrator import LocalizationOrchestrator
 from .providers import _parse_plain_review_verdict
 from .review_selection import (
-    DEFAULT_STRONG_REVIEW_CATEGORIES, provenance_review_reasons, review_category,
-    rewrite_issue_codes, strong_review_selection_reasons, target_language_review_reasons,
+    DEFAULT_STRONG_REVIEW_CATEGORIES, dialogue_review_reasons,
+    provenance_review_reasons, review_category, rewrite_issue_codes,
+    strong_review_selection_reasons, target_language_review_reasons,
 )
 from .review_policy import judge_calls, review_call_limit, is_sol_route, review_worker_limit
 from .store import stable_hash
@@ -366,6 +367,7 @@ def collect_native_review(
     glossary: list[Any] | None = None, extra_patterns: list[str] | None = None,
     max_length_ratio: float = 4.0,
     reference_cues: tuple[dict[str, Any], ...] = (),
+    dialogue_contexts: dict[str, dict[str, Any]] | None = None,
     primary_translator: str = "",
 ) -> dict[str, Any]:
     """Collect a complete bound pass; preserve accepted rows and route only gaps."""
@@ -448,6 +450,7 @@ def collect_native_review(
                 non_primary_translation=bool(primary_translator)
                 and origin not in {"", "native-worker", primary_translator},
             ))
+            reasons.extend(dialogue_review_reasons(segment.id, dialogue_contexts))
             language_reasons = target_language_review_reasons(
                 result.text, target_language, segment.metadata
             )

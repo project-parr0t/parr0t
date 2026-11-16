@@ -42,6 +42,7 @@ from .providers import ModelProvider, ProviderRegistry
 from .review_selection import (
     DEFAULT_STRONG_REVIEW_CATEGORIES,
     DEFAULT_STRONG_REVIEW_SAMPLE_PERCENT,
+    dialogue_review_reasons,
     provenance_review_reasons,
     review_category,
     rewrite_issue_codes,
@@ -159,7 +160,7 @@ class LocalizationOrchestrator:
         require_localization_mode(self.work_dir)
         self.store = ResultStore(self.work_dir / ".game-l10n" / "cache.sqlite3")
         self.audit = AuditLog(self.work_dir / ".game-l10n" / "audit.jsonl")
-        self._style_memory: dict[str, list[dict[str, str]]] = {}
+        self._style_memory: dict[str, list[dict[str, Any]]] = {}
         self._memory_lock = threading.Lock()
         self._progress_callback = progress_callback
         self._progress_lock = threading.Lock()
@@ -208,18 +209,53 @@ class LocalizationOrchestrator:
                 return character
         return None
 
-    def _anchors(self, speaker: str) -> list[dict[str, str]]:
-        if not self.config.use_style_memory or not speaker:
+    def _anchors(self, segment: Segment) -> list[dict[str, Any]]:
+        if not self.config.use_style_memory or not segment.speaker:
             return []
+        current = (
+            self.context_pack.dialogue_contexts.get(segment.id, {})
+            if self.context_pack
+            else {}
+        )
+        current_group = current.get("consistency_group_id")
+        current_addressees = set(current.get("addressee_ids", []))
+        current_relationship = current.get("relationship_state")
         with self._memory_lock:
-            return list(self._style_memory.get(speaker, []))[-self.config.style_anchor_limit :]
+            entries = list(self._style_memory.get(segment.speaker, []))
+        ranked = sorted(
+            enumerate(entries),
+            key=lambda pair: (
+                pair[1].get("dialogue_context", {}).get("consistency_group_id")
+                == current_group
+                and bool(current_group),
+                bool(
+                    current_addressees
+                    & set(pair[1].get("dialogue_context", {}).get("addressee_ids", []))
+                ),
+                pair[1].get("dialogue_context", {}).get("relationship_state")
+                == current_relationship
+                and bool(current_relationship),
+                pair[0],
+            ),
+            reverse=True,
+        )
+        return [item for _, item in ranked[: self.config.style_anchor_limit]]
 
     def _remember(self, segment: Segment, text: str) -> None:
         if not self.config.use_style_memory or not segment.speaker or not text:
             return
+        item: dict[str, Any] = {
+            "target_id": segment.id,
+            "source": segment.source,
+            "approved_translation": text,
+            "scene": segment.scene,
+        }
+        if self.context_pack:
+            context = self.context_pack.dialogue_contexts.get(segment.id)
+            if context:
+                item["dialogue_context"] = context
         with self._memory_lock:
             entries = self._style_memory.setdefault(segment.speaker, [])
-            item = {"source": segment.source, "approved_translation": text}
             if item not in entries:
                 entries.append(item)
 
@@ -323,7 +359,7 @@ class LocalizationOrchestrator:
             result.text, self.project.target_language, segment.metadata
         )
 
-    def _cache_key(self, segment: Segment, anchors: list[dict[str, str]]) -> str:
+    def _cache_key(self, segment: Segment, anchors: list[dict[str, Any]]) -> str:
         character = self._character(segment.speaker)
         system, user = translation_prompt(
             self.project,
@@ -348,7 +384,7 @@ class LocalizationOrchestrator:
         )
 
     def _legacy_cache_key(
-        self, segment: Segment, anchors: list[dict[str, str]]
+        self, segment: Segment, anchors: list[dict[str, Any]]
     ) -> str:
         return stable_hash(
             {
@@ -544,7 +580,7 @@ class LocalizationOrchestrator:
         self,
         provider: ModelProvider,
         segment: Segment,
-        anchors: list[dict[str, str]],
+        anchors: list[dict[str, Any]],
         *,
         refusal_retry: bool = False,
         retry_feedback: list[dict[str, str]] | None = None,
@@ -574,7 +610,7 @@ class LocalizationOrchestrator:
         provider: ModelProvider,
         segment: Segment,
         candidate: str,
-        anchors: list[dict[str, str]],
+        anchors: list[dict[str, Any]],
         *,
         refusal_retry: bool = False,
     ) -> ReviewVerdictEnvelope:
@@ -606,7 +642,7 @@ class LocalizationOrchestrator:
         segment: Segment,
         candidate: str,
         issue_codes: list[str],
-        anchors: list[dict[str, str]],
+        anchors: list[dict[str, Any]],
         *,
         refusal_retry: bool = False,
         retry_feedback: list[dict[str, str]] | None = None,
@@ -638,7 +674,7 @@ class LocalizationOrchestrator:
         result: TranslationResult,
         provider: ModelProvider,
         segment: Segment,
-        anchors: list[dict[str, str]],
+        anchors: list[dict[str, Any]],
     ) -> AgentEnvelope | None:
         ordinal = 0
         refusal_retried = False
@@ -775,7 +811,7 @@ class LocalizationOrchestrator:
         provider: ModelProvider,
         segment: Segment,
         candidate: str,
-        anchors: list[dict[str, str]],
+        anchors: list[dict[str, Any]],
         *,
         confirmation: bool = False,
         stage_prefix: str = "review",
@@ -888,7 +924,7 @@ class LocalizationOrchestrator:
         segment: Segment,
         candidate: str,
         issue_codes: list[str],
-        anchors: list[dict[str, str]],
+        anchors: list[dict[str, Any]],
     ) -> AgentEnvelope | None:
         ordinal = 0
         refusal_retried = False
@@ -993,7 +1029,7 @@ class LocalizationOrchestrator:
         provider: ModelProvider,
         segment: Segment,
         candidate: str,
-        anchors: list[dict[str, str]],
+        anchors: list[dict[str, Any]],
     ) -> ReviewEnvelope | None:
         working = candidate
         revised = False
@@ -1119,6 +1155,12 @@ class LocalizationOrchestrator:
             )
         )
         reasons.extend(
+            dialogue_review_reasons(
+                segment.id,
+                self.context_pack.dialogue_contexts if self.context_pack else None,
+            )
+        )
+        reasons.extend(
             target_language_review_reasons(
                 candidate, self.project.target_language, segment.metadata
             )
@@ -1145,7 +1187,7 @@ class LocalizationOrchestrator:
         result: TranslationResult,
         segment: Segment,
         candidate: str,
-        anchors: list[dict[str, str]],
+        anchors: list[dict[str, Any]],
     ) -> bool:
         if not self.config.review_triager_chain:
             return True
@@ -1167,7 +1209,7 @@ class LocalizationOrchestrator:
         triager_name: str,
         segment: Segment,
         candidate: str,
-        anchors: list[dict[str, str]],
+        anchors: list[dict[str, Any]],
     ) -> str:
         verdict = self._judge_with_refusal_retry(
             result,
@@ -1200,7 +1242,7 @@ class LocalizationOrchestrator:
         result: TranslationResult,
         segment: Segment,
         candidate: str,
-        anchors: list[dict[str, str]],
+        anchors: list[dict[str, Any]],
     ) -> str:
         for reviewer_name in self.config.reviewer_chain:
             review = self._review_with_refusal_retry(
@@ -1237,7 +1279,7 @@ class LocalizationOrchestrator:
 
     def translate_one(self, segment: Segment, *, force: bool = False) -> TranslationResult:
         require_localization_mode(self.work_dir)
-        anchors = self._anchors(segment.speaker)
+        anchors = self._anchors(segment)
         cache_key = self._cache_key(segment, anchors)
         pending_result = None
         if not force:
@@ -1333,7 +1375,7 @@ class LocalizationOrchestrator:
 
         if not self.config.require_review:
             raise ValueError("Existing candidates require an enabled independent review route")
-        anchors = self._anchors(segment.speaker)
+        anchors = self._anchors(segment)
         pending_key = stable_hash({"review_existing": self._cache_key(segment, anchors),
                                    "candidate": stable_hash(candidate)})
         pending = self.store.get(pending_key)
@@ -1587,8 +1629,8 @@ class LocalizationOrchestrator:
         """
         self._progress_total = len(items)
         self._progress_attempts = 0
-        anchors: dict[int, list[dict[str, str]]] = {
-            index: self._anchors(segment.speaker) for index, segment in enumerate(items)
+        anchors: dict[int, list[dict[str, Any]]] = {
+            index: self._anchors(segment) for index, segment in enumerate(items)
         }
         cache_keys: dict[int, str] = {
             index: self._cache_key(segment, anchors[index])
@@ -1824,7 +1866,7 @@ class LocalizationOrchestrator:
                         assert result is not None
                         segment = items[index]
                         review_anchors = (
-                            self._anchors(segment.speaker)
+                            self._anchors(segment)
                             if self.config.use_style_memory
                             else anchors[index]
                         )
@@ -1888,7 +1930,7 @@ class LocalizationOrchestrator:
                     assert result is not None
                     segment = items[index]
                     review_anchors = (
-                        self._anchors(segment.speaker)
+                        self._anchors(segment)
                         if self.config.use_style_memory
                         else anchors[index]
                     )
