@@ -54,6 +54,9 @@ class PromptModelPolicyTests(unittest.TestCase):
         contract = launch_contract(self.work, "native-review-fallback", ["fixture-task"])
         self.assertEqual(contract["model"], self.model)
         self.assertFalse(contract["inherit_model_allowed"])
+        self.assertEqual(contract["model_authorization"]["status"], "approved")
+        self.assertEqual(contract["model_authorization"]["source"], "user_prompt")
+        self.assertFalse(contract["model_authorization"]["additional_allowlist_required"])
 
     def test_request_and_four_call_limit_survive_until_native_host_is_bound(self):
         result = configure_review_policy(
@@ -63,6 +66,10 @@ class PromptModelPolicyTests(unittest.TestCase):
         self.assertEqual(result["native_binding_pending"], ["native-review-fallback"])
         self.assertEqual(result["model"], self.model)
         self.assertEqual(result["review_attempt_limits"]["native-review-fallback"], 4)
+        authorization = result["model_authorizations"]["native-review-fallback"]
+        self.assertEqual(authorization["status"], "approved")
+        self.assertEqual(authorization["scope"], "all_sdks")
+        self.assertEqual(authorization["model"], self.model)
         self.assertFalse((self.work / RUNTIME_PATH).exists())
         self.bind()
         policy = review_policy_status(load_config(self.work), self.work)

@@ -630,6 +630,19 @@ describe("file-backed OMP host/message isolation", () => {
     expect((await relay.call("parr0t_exec", { argv: allowed }, () => deliveries++))?.block).not.toBe(true);
     expect(deliveries).toBe(1);
   });
+  test("an approved Parr0t selection cannot be rejected without observed execution evidence", async () => {
+    const f = await fixture();
+    f.relayMetadata.launch_contract.model_authorization = { status: "approved", scope: "all_sdks" };
+    writeJson(f.relayPath, f.relayMetadata);
+    const relay = await f.child(1);
+    const base = ["-m", "game_l10n.cli", "record-native-launch", "--workspace", f.workspace, "--relay", f.relayRelative];
+    let deliveries = 0;
+    expect((await relay.call("parr0t_exec", { argv: [...base, "--event", "model-unavailable"] }, () => deliveries++)).block).toBe(true);
+    expect((await relay.call("parr0t_exec", { argv: [...base, "--event", "worker-started", "--task", "worker-0", "--worker-id", "synthetic-worker", "--model", "fixture/exact", "--failure-code", "host_dispatch_denied"] }, () => deliveries++)).block).toBe(true);
+    expect(deliveries).toBe(0);
+    expect((await relay.call("parr0t_exec", { argv: [...base, "--event", "model-unavailable", "--failure-code", "host_dispatch_denied"] }, () => deliveries++))?.block).not.toBe(true);
+    expect(deliveries).toBe(1);
+  });
   test("only root registers actual session/PID/digest and refreshes generation", async () => {
     const f = await fixture();
     expect(Object.keys(f.registration).sort()).toEqual(["schema", "control_generation", "session_id", "process_id", "guard_sha256"].sort());
