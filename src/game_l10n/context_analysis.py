@@ -175,6 +175,63 @@ _COMMON_REQUIRED = [
     "reference_cues",
 ]
 
+def _dialogue_contexts_schema() -> dict[str, Any]:
+    return {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "target_id": {"type": "string"},
+                "speaker": {"type": "string"},
+                "addressee_ids": {"type": "array", "items": {"type": "string"}},
+                "relationship_state": {"type": "string"},
+                "scene_phase": {"type": "string"},
+                "speech_act": {"type": "string"},
+                "delivery": {"type": "string"},
+                "emotion": {"type": "string"},
+                "situational_register": {"type": "string"},
+                "address_form": {"type": "string"},
+                "register_shift": {
+                    "type": "string",
+                    "enum": ["baseline", "supported", "uncertain"],
+                },
+                "register_shift_reason": {"type": "string"},
+                "consistency_group_id": {"type": "string"},
+                "consistency_status": {
+                    "type": "string",
+                    "enum": ["stable", "risk", "uncertain"],
+                },
+                "uncertainties": {"type": "array", "items": {"type": "string"}},
+                "evidence_line_ids": {"type": "array", "items": {"type": "string"}},
+                "confidence": {
+                    "type": "string",
+                    "enum": ["high", "medium", "uncertain"],
+                },
+            },
+            "required": [
+                "target_id",
+                "speaker",
+                "addressee_ids",
+                "relationship_state",
+                "scene_phase",
+                "speech_act",
+                "delivery",
+                "emotion",
+                "situational_register",
+                "address_form",
+                "register_shift",
+                "register_shift_reason",
+                "consistency_group_id",
+                "consistency_status",
+                "uncertainties",
+                "evidence_line_ids",
+                "confidence",
+            ],
+            "additionalProperties": False,
+        },
+    }
+
+
 _NARRATIVE_PROPERTIES: dict[str, Any] = {
     "story_summary": {"type": "string"},
     "scenes": {
@@ -219,8 +276,15 @@ _NARRATIVE_PROPERTIES: dict[str, Any] = {
         },
     },
     "relationship_timeline": {"type": "array", "items": {"type": "string"}},
+    "dialogue_contexts": _dialogue_contexts_schema(),
 }
-_NARRATIVE_REQUIRED = ["story_summary", "scenes", "characters", "relationship_timeline"]
+_NARRATIVE_REQUIRED = [
+    "story_summary",
+    "scenes",
+    "characters",
+    "relationship_timeline",
+    "dialogue_contexts",
+]
 
 _FUNCTIONAL_PROPERTIES: dict[str, Any] = {
     "functional_summary": {"type": "string"},
@@ -340,14 +404,20 @@ speaker_profiles are user-authored and take precedence over inferred traits.
 When source_language_authorities are supplied, analyze each target from that evidenced original implementation,
 complete source catalog, or authoritative source metadata. Presentation, manifest, and display-language metadata
 cannot override it; secondary locales corroborate only. Derive personality and stable voice from that authoritative
-source. Do not normalize all speakers to one register, and record a register shift only when relationship,
-hierarchy, scene-state, or progression evidence supports it.
+source. Do not normalize all speakers to one register. For every dialogue target, emit one dialogue_contexts entry
+bound to that target and its evidence. Record addressees, relationship state, delivery, emotion, speech act,
+situational register, address form, consistency group, and consistency status only when supported. Use empty
+values plus uncertainties, confidence=uncertain, and consistency_status=uncertain instead of guessing. Mark
+register_shift=supported only when relationship, hierarchy, scene-state, emotion with source-visible pragmatic
+force, or progression evidence supports the shift.
 Return only the requested JSON object."""
 
 _MODE_SYSTEM_PROMPTS = {
     ContextMode.NARRATIVE.value: """Analyze story flow, scene state, changing relationships, personality, social
 hierarchy, formality, forms of address, cadence, stable speech habits, atmosphere, and supported references.
-Every named scene and speaker in the supplied data must receive an evidence-grounded entry.""",
+Every named scene and speaker must receive an evidence-grounded entry. Every supplied dialogue target must receive
+one target-bound dialogue context, including an explicit uncertainty record when the addressee, relationship,
+situation, or register cannot be established.""",
     ContextMode.FUNCTIONAL.value: """Analyze user-facing function rather than inventing a story. Reconstruct
 screens, actions, state transitions, conditions, units, controls, text-length or layout constraints, and stable
 feature terminology. Identify render-time composition boundaries such as fixed labels plus value/state slots, and
@@ -359,7 +429,8 @@ supplied line ID must be cited by a knowledge-node entry.""",
     ContextMode.HYBRID.value: """Analyze only the evidence-backed combination of narrative, functional, and
 knowledge domains present in the supplied data. Fill irrelevant domain sections with empty strings or arrays.
 For functional and knowledge domains, cite every applicable line ID. For narrative domains, cover every named
-scene and speaker. Keep shared terminology and style guidance consistent across domains.""",
+scene and speaker and every supplied dialogue target. Keep shared terminology and style guidance consistent across
+domains; record unresolved dialogue context as uncertainty rather than inventing it.""",
 }
 
 # Backward-compatible prompt export for narrative-only integrations.
@@ -756,6 +827,7 @@ def _merge_named_entry(
 def _merge(parts: list[dict[str, Any]], mode: str) -> ContextPack:
     scene_summaries: dict[str, dict[str, Any]] = {}
     character_guides: dict[str, dict[str, Any]] = {}
+    dialogue_contexts: dict[str, dict[str, Any]] = {}
     screen_flows: dict[str, dict[str, Any]] = {}
     feature_guides: dict[str, dict[str, Any]] = {}
     knowledge_nodes: dict[str, dict[str, Any]] = {}
@@ -800,6 +872,8 @@ def _merge(parts: list[dict[str, Any]], mode: str) -> ContextPack:
             _merge_named_entry(scene_summaries, entry, "scene")
         for entry in part.get("characters", []):
             _merge_named_entry(character_guides, entry, "name")
+        for entry in part.get("dialogue_contexts", []):
+            _merge_named_entry(dialogue_contexts, entry, "target_id")
         for entry in part.get("screens", []):
             _merge_named_entry(screen_flows, entry, "screen")
         for entry in part.get("features", []):
@@ -815,6 +889,7 @@ def _merge(parts: list[dict[str, Any]], mode: str) -> ContextPack:
         terminology_rules=tuple(terminology_rules),
         scene_summaries=scene_summaries,
         character_guides=character_guides,
+        dialogue_contexts=dialogue_contexts,
         relationship_timeline=tuple(relationships),
         screen_flows=screen_flows,
         feature_guides=feature_guides,
@@ -973,6 +1048,14 @@ def context_attestation_for_mode(
     )
     required_scenes = sorted({item.scene for item in narrative_segments if item.scene})
     required_characters = sorted({item.speaker for item in narrative_segments if item.speaker})
+    required_dialogue_ids = sorted(
+        item.id
+        for item in narrative_segments
+        if item.speaker
+        or item.metadata.get("dialogue_group_id")
+        or str(item.metadata.get("text_type", "")).strip().casefold().replace("-", "_")
+        in {"dialogue", "npc_dialogue", "spoken_dialogue", "bark", "subtitle"}
+    )
     covered_scenes = sorted(set(required_scenes) & set(context_pack.scene_summaries))
     covered_characters = sorted(set(required_characters) & set(context_pack.character_guides))
     functional_evidence = _evidence_ids(context_pack.screen_flows) | _evidence_ids(
@@ -983,6 +1066,21 @@ def context_attestation_for_mode(
         set(functional_ids) & (functional_evidence | deterministic_ui_ids)
     )
     covered_knowledge = sorted(set(knowledge_ids) & knowledge_evidence)
+    covered_dialogue = sorted(
+        target_id
+        for target_id in required_dialogue_ids
+        if target_id in context_pack.dialogue_contexts
+        and target_id
+        in set(context_pack.dialogue_contexts[target_id].get("evidence_line_ids", []))
+    )
+    uncertain_dialogue = sum(
+        1
+        for target_id in covered_dialogue
+        if context_pack.dialogue_contexts[target_id].get("confidence") == "uncertain"
+        or context_pack.dialogue_contexts[target_id].get("register_shift") == "uncertain"
+        or context_pack.dialogue_contexts[target_id].get("consistency_status") == "uncertain"
+        or bool(context_pack.dialogue_contexts[target_id].get("uncertainties"))
+    )
     return {
         "ordered_script_hash": stable_hash_sequence(asdict(item) for item in segments),
         "context_pack_hash": stable_hash(asdict(context_pack)),
@@ -1005,6 +1103,12 @@ def context_attestation_for_mode(
             "required": len(required_characters),
             "covered": len(covered_characters),
             "complete": covered_characters == required_characters,
+        },
+        "dialogue_coverage": {
+            "required": len(required_dialogue_ids),
+            "covered": len(covered_dialogue),
+            "complete": covered_dialogue == required_dialogue_ids,
+            "uncertain": uncertain_dialogue,
         },
         "functional_coverage": {
             "required": len(functional_ids),
@@ -1039,6 +1143,8 @@ def require_complete_context(attestation: dict[str, Any]) -> None:
             raise ProviderError("Context gate failed: scene coverage is incomplete")
         if not attestation["character_coverage"]["complete"]:
             raise ProviderError("Context gate failed: character coverage is incomplete")
+        if not attestation["dialogue_coverage"]["complete"]:
+            raise ProviderError("Context gate failed: dialogue evidence coverage is incomplete")
     if ContextMode.FUNCTIONAL.value in required_domains:
         semantic_functional_required = (
             attestation["functional_coverage"]["required"]

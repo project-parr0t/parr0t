@@ -161,6 +161,7 @@ class ContextPack:
     screen_flows: dict[str, dict[str, Any]] = field(default_factory=dict)
     feature_guides: dict[str, dict[str, Any]] = field(default_factory=dict)
     knowledge_nodes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    dialogue_contexts: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
