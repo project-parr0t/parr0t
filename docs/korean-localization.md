@@ -11,10 +11,14 @@ This document adds Korean-specific translation and review rules without changing
 
 ## Voice, register, and UI style
 
-1. Korean speech level is speaker- and situation-bound. Preserve each speaker's baseline personality, hierarchy, relationship, address forms, cadence, and degree of politeness. Never normalize all dialogue to honorific speech, polite speech, or casual speech.
-2. A register shift requires relationship, hierarchy, scene-state, or progression evidence. Neighboring lines from the same speaker are style evidence only when independently reviewed and context-compatible.
-3. UI labels, traits, descriptions, tutorials, notifications, and dialogue do not share one universal sentence ending. Follow the authoritative Korean baseline for the same surface and function. Keep parallel items grammatically parallel, but do not impose dialogue endings on UI prose or UI formality on character speech.
-4. Avoid translationese subjects and pronouns when Korean naturally omits them, unless omission changes agency, contrast, quest logic, or speaker stance. Preserve explicit ambiguity when the source does not resolve it.
+Apply `docs/dialogue-localization.md` first. Korean speech level is speaker- and situation-bound; it is not a sentence-ending substitution.
+
+1. Record the speaker's baseline and the current addressee, hierarchy, intimacy, conflict state, public/private setting, speech act, and emotional pressure. Preserve personality, cadence, preferred address forms, and degree of directness. Never normalize all dialogue to honorific speech, polite speech, or casual speech.
+2. Distinguish formal-polite, informal-polite, intimate/plain, familiar-authoritative, semi-formal, and mixed or marked Korean speech levels when the source evidence supports them. Also inspect subject honorification, addressee honorification, titles, vocatives, first- and second-person forms, particles, contractions, profanity, dialect, and omission. Matching only the final ending is insufficient.
+3. A speech-level or address-form shift requires relationship, hierarchy, scene-state, emotional, performative, or progression evidence in the current target's dialogue context. Preserve deliberate code-switching. When evidence is uncertain, retain source ambiguity and route strong review instead of choosing a convenient level.
+4. Approved neighboring lines from the same speaker are style evidence only when their addressee, relationship state, scene role, and consistency group are compatible. A speaker may address a superior, customer, friend, enemy, and self differently without becoming inconsistent.
+5. Natural Korean may omit subjects and pronouns, but omission must not change agency, contrast, quest logic, social stance, or who addresses whom. Do not introduce a generic second-person pronoun, kinship titles, professional titles, or honorific markers merely to make a sentence sound Korean.
+6. UI labels, traits, descriptions, tutorials, notifications, and dialogue do not share one universal sentence ending. Follow the authoritative Korean baseline for the same surface and function. Keep parallel items grammatically parallel, but do not impose dialogue endings on UI prose or UI formality on character speech.
 
 ## Morphology and composition
 

@@ -103,6 +103,7 @@ def _refusal_payload(schema_name: str) -> dict[str, Any]:
             "scenes": [],
             "characters": [],
             "relationship_timeline": [],
+            "dialogue_contexts": [],
             "reference_cues": [],
         }
     return {"status": "refused", "text": "", "reason": "provider_refusal"}

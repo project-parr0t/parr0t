@@ -154,6 +154,29 @@ def provenance_review_reasons(
         reasons.append("fallback_translation")
     return reasons
 
+def dialogue_review_reasons(
+    segment_id: str,
+    dialogue_contexts: dict[str, dict[str, Any]] | None = None,
+) -> list[str]:
+    """Escalate evidence-backed dialogue risk without reading source or target text."""
+
+    context = (dialogue_contexts or {}).get(segment_id)
+    if not isinstance(context, dict):
+        return []
+    reasons: list[str] = []
+    if context.get("register_shift") == "supported":
+        reasons.append("dialogue_register_shift")
+    if context.get("consistency_status") == "risk":
+        reasons.append("dialogue_consistency_risk")
+    if (
+        context.get("confidence") == "uncertain"
+        or context.get("register_shift") == "uncertain"
+        or context.get("consistency_status") == "uncertain"
+        or bool(context.get("uncertainties"))
+    ):
+        reasons.append("dialogue_context_uncertain")
+    return reasons
+
 
 def target_language_review_reasons(
     candidate: str,

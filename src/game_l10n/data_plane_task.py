@@ -1598,11 +1598,13 @@ def prepare_data_plane_task(
                     "object_fields": [
                         "scene_summaries",
                         "character_guides",
+                        "dialogue_contexts",
                         "screen_flows",
                         "feature_guides",
                         "knowledge_nodes",
                     ],
                     "evidence_line_ids_required_for": [
+                        "dialogue_contexts",
                         "screen_flows",
                         "feature_guides",
                         "knowledge_nodes",
