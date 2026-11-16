@@ -1452,7 +1452,7 @@ def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
                   worker_prompt_policy="include_launch_contract_worker_prompt_line_verbatim_in_each_task")
     runtime = native_runtime(work_dir)
     if runtime["host"] == "omp" and runtime.get("transport", "collaboration") == "collaboration":
-        result["tool_transport"] = tool_transport_contract()
+        result["tool_transport"] = tool_transport_contract(prompt=runtime.get("omp_isolation") == "prompt")
     if native_runtime(work_dir).get("transport") == "native-host-api":
         result.update(executor="native-host-api", broker_command=["game-l10n", "run-native-broker",
                       "--workspace", str(work_dir), "--relay", result["relay_path"]])
@@ -1469,9 +1469,12 @@ def cmd_native_runtime(args: argparse.Namespace) -> int:
             if not separator or route in models:
                 raise ValueError("E_NATIVE_RUNTIME_INVALID: repeat --model route=exact-model once per route")
             models[route] = model
-        result = configure_native_runtime(work_dir, args.host, models, transport=getattr(args, "transport", None))
+        result = configure_native_runtime(
+            work_dir, args.host, models, transport=getattr(args, "transport", None),
+            omp_isolation=getattr(args, "omp_isolation", None),
+        )
     else:
-        if args.model or getattr(args, "transport", None):
+        if args.model or getattr(args, "transport", None) or getattr(args, "omp_isolation", None):
             raise ValueError("E_NATIVE_RUNTIME_INVALID: model overrides require --host")
         result = native_runtime(work_dir, required=True)
     print(json.dumps(result, ensure_ascii=False))
@@ -3467,6 +3470,8 @@ def build_parser() -> argparse.ArgumentParser:
     native_host.add_argument("--workspace", required=True)
     native_host.add_argument("--host", help="codex, omp, or an explicitly registered native API host")
     native_host.add_argument("--transport", choices=["collaboration", "native-host-api"])
+    native_host.add_argument("--omp-isolation", choices=["prompt", "guarded"],
+                             help="OMP collaboration separation; preserve existing mode, otherwise prompt unless a guard is active")
     native_host.add_argument("--model", action="append", help="Exact native-route=model-id override; repeatable")
     native_host.set_defaults(func=cmd_native_runtime)
 
