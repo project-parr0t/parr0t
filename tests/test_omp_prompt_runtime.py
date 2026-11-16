@@ -89,6 +89,10 @@ class OmpPromptRuntimeTests(unittest.TestCase):
         tasks, results, step, relay, payload = self.prepare_wave()
         launch = payload["launch_contract"]
         self.assertFalse(launch["message_isolation"]["host_enforced"])
+        self.assertEqual(
+            launch["lifecycle_observation"],
+            "finite_interruptible_per_call_only_not_a_job_timeout",
+        )
         self.assertEqual(step["relay"]["tool_transport"], launch["tool_transport"])
         self.assertFalse(launch["tool_transport"]["required_extension"])
         self.assertEqual(launch["model"], "openai-codex/gpt-6-luna")

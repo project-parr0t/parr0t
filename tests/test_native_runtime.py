@@ -12,7 +12,12 @@ from unittest.mock import patch
 from game_l10n.cli import build_parser, main
 from game_l10n.errors import ConfigurationError
 from game_l10n.control_plane import establish_control_plane_entry
-from game_l10n.data_plane_task import prepare_data_plane_task, seal_data_plane_task
+from game_l10n.data_plane_task import (
+    current_data_plane_operational_failure,
+    prepare_data_plane_task,
+    record_data_plane_failure,
+    seal_data_plane_task,
+)
 from game_l10n.models import Segment
 from game_l10n.native_pass import import_native_wave, native_control_step, prepare_native_tasks, seal_native_wave_relay
 from game_l10n.native_runtime import (
@@ -85,6 +90,14 @@ class NativeRuntimeTests(unittest.TestCase):
     def test_bound_data_plane_argv_records_real_launch_and_seals_missing_output(self) -> None:
         _, output, relay = self.prepare_probe()
         payload = json.loads(relay.read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload["launch_contract"]["lifecycle_observation"],
+            "finite_interruptible_per_call_only_not_a_job_timeout",
+        )
+        self.assertEqual(
+            payload["launch_contract"]["cancellation_priority"],
+            "cancel_owned_child_promptly_on_observed_operational_error_before_replacement",
+        )
         commands = payload["command_argv"]
         self.invoke_argv(commands["capability-available"])
         start = ["synthetic-worker" if value == "<worker-id>" else value
@@ -97,6 +110,87 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(sealed["status"], "error")
         self.assertIn("task_incomplete", sealed["issue_codes"])
         self.assertTrue((output / "receipt.json").is_file())
+
+
+    def test_operational_failure_requires_cancellation_and_preserves_valid_success(self) -> None:
+        config, output, relay = self.prepare_probe()
+        payload = json.loads(relay.read_text(encoding="utf-8"))
+        commands = payload["command_argv"]
+        self.invoke_argv(commands["capability-available"])
+        with self.assertRaisesRegex(ConfigurationError, "no bound worker start"):
+            record_data_plane_failure(
+                self.root, relay, failure_code="provider_operational_error"
+            )
+        start = [
+            "synthetic-worker" if value == "<worker-id>" else value
+            for value in commands["worker-started"]["worker-0"]
+        ]
+        self.invoke_argv(start)
+
+        recorded = self.invoke_argv(
+            commands["operational-failure"]["provider_operational_error"]
+        )
+        self.assertEqual(recorded["workers"][0]["worker_id"], "synthetic-worker")
+        self.assertEqual(
+            recorded["owner"],
+            {"host": "omp", "relay_role": "isolated_data_plane_relay"},
+        )
+        self.assertTrue(recorded["cancellation_required"])
+        retry = prepare_data_plane_task(
+            self.root,
+            output,
+            worker_role="source_probe",
+            config=config,
+        )
+        self.assertEqual(retry["task_id"], payload["task_id"])
+        self.assertTrue(
+            current_data_plane_operational_failure(
+                self.root, "source_probe"
+            )["cancellation_required"]
+        )
+        failure_path = relay.with_name(f"operational-failure-{payload['task_id']}.json")
+        original_failure = failure_path.read_text(encoding="utf-8")
+        changed_failure = json.loads(original_failure)
+        changed_failure["workers"][0]["worker_id"] = "unrelated-worker"
+        failure_path.write_text(json.dumps(changed_failure), encoding="utf-8")
+        self.assertIsNone(current_data_plane_operational_failure(self.root, "source_probe"))
+        failure_path.write_text(original_failure, encoding="utf-8")
+        with self.assertRaisesRegex(ConfigurationError, "CANCELLATION_REQUIRED"):
+            seal_data_plane_task(self.root, relay)
+
+        (self.root / "game-l10n.json").write_text(
+            json.dumps(
+                {
+                    "sdk_selection": {
+                        "status": "selected",
+                        "inventory_fingerprint": "fixture-inventory",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        envelope = self.root / payload["expected_envelope"]
+        envelope.write_text(
+            json.dumps(
+                {
+                    "schema": "parr0t.control-envelope.v2",
+                    "worker_role": "source_probe",
+                    "stage": "discovery",
+                    "status": "success",
+                    "target_ids": [],
+                    "counts": {"total": 1, "success": 1},
+                    "issue_codes": [],
+                    "artifact_paths": ["game-l10n.json"],
+                    "queue_transitions": [],
+                    "route_evidence_path": "",
+                }
+            ),
+            encoding="utf-8",
+        )
+        sealed = seal_data_plane_task(self.root, relay, worker_ended=True)
+        self.assertEqual(sealed["status"], "success")
+        self.assertTrue((self.root / "game-l10n.json").is_file())
+        self.assertIsNone(current_data_plane_operational_failure(self.root, "source_probe"))
 
     def test_bound_native_argv_imports_only_completed_bound_results(self) -> None:
         establish_control_plane_entry(self.root)
