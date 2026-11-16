@@ -6,7 +6,7 @@ from typing import Any
 
 from .model_policy import (
     NATIVE_ROLE_ROUTES, apply_native_role_models, exact_native_model,
-    native_role_bindings, native_role_models,
+    model_selection_authorization, native_role_bindings, native_role_models,
 )
 
 SOL_REVIEW_CALLS = 2
@@ -102,6 +102,10 @@ def review_policy_status(config: dict[str, Any], work_dir: Path | None = None) -
         "review_limits": {key: routing[key] for key in REVIEW_SETTING_FIELDS if routing.get(key) is not None},
         "missing_fallback_providers": missing,
         "requested_native_models": native_role_models(config),
+        "model_authorizations": {
+            route: model_selection_authorization(config, route, model)
+            for route, model in requested.items()
+        },
         "native_binding_pending": pending,
     }
 
