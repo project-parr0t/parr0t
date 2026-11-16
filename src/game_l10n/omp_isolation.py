@@ -1,8 +1,9 @@
-"""Validate text-free OMP host message-isolation registration, not an OS sandbox."""
+"""Describe prompt separation or validate optional host-enforced OMP isolation."""
 from __future__ import annotations
 
 import json
 import os
+import sys
 from hashlib import sha256
 from importlib.resources import files
 from pathlib import Path
@@ -13,6 +14,7 @@ from .control_plane import control_plane_state
 ISOLATION_SCHEMA = "parr0t.omp-isolation.v1"
 ISOLATION_ENV = "PARR0T_OMP_GUARD_SESSION"
 ISOLATION_ISSUE = "E_NATIVE_MESSAGE_ISOLATION_REQUIRED"
+PROMPT_ISOLATION_SCHEMA = "parr0t.omp-prompt-isolation.v1"
 
 
 def guard_sha256() -> str:
@@ -54,11 +56,41 @@ def require_omp_isolation(work_dir: Path) -> dict[str, Any]:
 
 def runtime_isolation(work_dir: Path, runtime: dict[str, Any]) -> dict[str, Any] | None:
     if runtime["host"] == "omp" and runtime.get("transport", "collaboration") == "collaboration":
+        if runtime.get("omp_isolation", "guarded") == "prompt":
+            if os.environ.get(ISOLATION_ENV):
+                # An active extension still controls the host tool surface.
+                raise ValueError(ISOLATION_ISSUE)
+            return {
+                "schema": PROMPT_ISOLATION_SCHEMA,
+                "control_generation": control_plane_state(work_dir).get("generation", 0),
+                "enforcement": "prompt_only",
+                "host_enforced": False,
+            }
         return require_omp_isolation(work_dir)
     return None
 
 
-def tool_transport_contract() -> dict[str, Any]:
+def tool_transport_contract(*, prompt: bool = False) -> dict[str, Any]:
+    if prompt:
+        return {
+            "scope": "relay_and_semantic_subagents",
+            "subagent_python_tool": "available_host_process_tool",
+            "required_extension": False,
+            "outbound_messaging_allowed": False,
+            "enforcement": "prompt_only",
+            "relay_python_argv_prefix": [
+                sys.executable, "-X", "utf8", "-I", "-B",
+                str(Path(__file__).with_name("templates") / "native-python.py"),
+            ],
+            "command_argv_policy": "execute_complete_bound_argv_with_available_host_process_tool",
+            "relay_prompt_marker": "PARR0T_OMP_RELAY=<workspace-relative-relay-path>",
+            "relay_prompt_marker_required_in_task": True,
+            "root_dispatch_instruction": "Put relay_prompt_line as a standalone line in the relay task prompt; never open private artifacts to construct it.",
+            "semantic_worker_delegation_allowed": False,
+            "relay_dispatch": "exact_core_task_bindings_only",
+            "automatic_child_output_forwarding_allowed": False,
+            "boundary": "instruction_level_separation_not_host_enforced_tool_or_message_isolation",
+        }
     return {
         "scope": "relay_and_semantic_subagents",
         "subagent_python_tool": "parr0t_exec",
