@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -160,6 +160,28 @@ describe("live framework instruction lifecycle", () => {
     expect(JSON.parse(readFileSync(completed, "utf8"))).toEqual({ completed: true });
     const evidence = readFileSync(path.join(f.workspace, ".game-l10n/native/omp-isolation-events.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
     expect(evidence.every(record => ["framework_inactive", "diagnostic_admission_invalid"].includes(record.issue_code))).toBe(true);
+  });
+
+  test("a dangling lifecycle link never reactivates root, relay, or worker admission", async () => {
+    const f = await fixture();
+    const relay = await f.child(1);
+    const worker = await f.child(2);
+    const target = path.join(f.workspace, "synthetic-missing-state");
+    mkdirSync(target);
+    symlinkSync(target, path.join(f.workspace, ".game-l10n/framework-session.json"), process.platform === "win32" ? "junction" : "dir");
+    rmdirSync(target);
+    let deliveries = 0;
+    for (const session of [f.root, relay, worker]) {
+      await expect(session.emit("before_agent_start", { prompt: f.marker, systemPrompt: ["Host policy"] })).rejects.toThrow("invalid framework session state");
+      for (const toolName of ["read", "task", "parr0t_exec"]) {
+        const decision = await session.call(toolName, { path: "synthetic.py" }, () => deliveries++);
+        expect(decision.block).toBe(true);
+      }
+      expect((await session.emit("before_subagent_spawn", { invocationKind: "task", spawnKey: "SyntheticChild" })).block).toBe(true);
+      await expect(session.exec({ argv: ["-c", "print('MUST_NOT_EXECUTE')"] })).rejects.toThrow("invalid framework session state");
+    }
+    expect(deliveries).toBe(0);
+    expect((await f.root.emit("tool_result", {})).additionalContext).toContain("lifecycle metadata is invalid");
   });
 
   test("malformed state fails closed categorically before turns, tools, spawns, and direct executor entry", async () => {

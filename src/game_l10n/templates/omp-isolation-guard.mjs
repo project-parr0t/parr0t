@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, appendFileSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -88,12 +88,17 @@ function isolationPath(workspace, sessionId = process.env[SESSION_ENV]) {
   return path.join(workspace, ".game-l10n/native/omp-isolation", `${createHash("sha256").update(sessionId, "utf8").digest("hex")}.json`);
 }
 function frameworkState(workspace) {
-  let serialized;
-  try { serialized = readFileSync(path.join(workspace, ".game-l10n/framework-session.json"), "utf8"); }
+  const statePath = path.join(workspace, ".game-l10n/framework-session.json");
+  // ENOENT while following an existing link/junction is corruption, not a
+  // legacy workspace without lifecycle state. Never reactivate localization.
+  try { lstatSync(statePath); }
   catch (error) {
     if (error.code === "ENOENT") return { mode: "localization", instructions_active: true };
     fail("invalid framework session state", "framework_state_invalid");
   }
+  let serialized;
+  try { serialized = readFileSync(statePath, "utf8"); }
+  catch { fail("invalid framework session state", "framework_state_invalid"); }
   try {
     const state = JSON.parse(serialized);
     const keys = ["schema", "mode", "revision", "instructions_active", "user_requested", "logs"];
