@@ -3,6 +3,14 @@ import assert from "node:assert/strict";
 import { buildPrompt } from "../pages/prompt.mjs";
 import { DEFAULT_MODEL_GROUPS, proxyModelGroups } from "../pages/model-catalog.mjs";
 
+function commandArgs(prompt, command) {
+  const prefix = `game-l10n ${command} `;
+  const lines = prompt.split("\n").filter(line => line.startsWith(prefix));
+  assert.equal(lines.length, 1, `expected one ${command} instruction`);
+  return lines[0].slice(prefix.length).match(/"(?:\\.|[^"\\])*"|\S+/g)
+    .map(token => token.startsWith('"') ? JSON.parse(token) : token);
+}
+
 test("skip, logic, font and mod options compose without the existing-Korean stop policy", () => {
   const prompt = buildPrompt({ gameType: "logic", koreanPolicy: "skip", fonts: true, delivery: "mod",
     fallbackModel: "configured/exact-model:high", fallbackAttempts: "7", gamePath: "C:/Fixture Game" });
@@ -59,6 +67,59 @@ test("role models, tier limits and requested images combine while disabled conte
   assert.ok(!buildPrompt().includes("이미지 번역: 요청함"));
   assert.throws(() => buildPrompt({ reviewMaxWorkers: "0" }));
   assert.throws(() => buildPrompt({ strongMaxWorkers: "65" }));
+});
+
+test("explicit models produce exact role override and fallback policy commands in either operation", () => {
+  const options = {
+    baseModel: "fixture/translator@fixture-route:low",
+    triageModel: "fixture/triager:medium",
+    strongModel: "fixture/strong@fixture-route:high",
+    contextModel: "fixture/context:low",
+    fallbackModel: "fixture/fallback@fixture-route:high", fallbackAttempts: "007",
+  };
+  for (const operation of ["localize", "migrate"]) {
+    const prompt = buildPrompt({ ...options, operation, repositoryUrl: "https://example.test/fixture.git" });
+    assert.deepEqual(commandArgs(prompt, "native-runtime"), [
+      "--workspace", "<workspace>", "--host", "<current-native-host>",
+      "--role-model", `translation=${options.baseModel}`,
+      "--role-model", `triage=${options.triageModel}`,
+      "--role-model", `strong-review=${options.strongModel}`,
+      "--role-model", `context=${options.contextModel}`,
+      "--role-model", `review-fallback=${options.fallbackModel}`,
+      "--user-requested-models",
+    ]);
+    assert.deepEqual(commandArgs(prompt, "review-policy"), [
+      "--workspace", "<workspace>", "--fallback-model", options.fallbackModel,
+      "--max-calls", "7", "--user-requested",
+    ]);
+  }
+});
+
+test("sparse role selections never fill unspecified roles with preset defaults", () => {
+  for (const [option, role] of [["baseModel", "translation"], ["triageModel", "triage"], ["strongModel", "strong-review"], ["contextModel", "context"]]) {
+    const prompt = buildPrompt({ [option]: "  fixture/selected@fixture-route:high  " });
+    assert.deepEqual(commandArgs(prompt, "native-runtime"), [
+      "--workspace", "<workspace>", "--host", "<current-native-host>", "--role-model", `${role}=fixture/selected@fixture-route:high`, "--user-requested-models",
+    ]);
+    assert.ok(!prompt.split("\n").some(line => line.startsWith("game-l10n review-policy ")));
+  }
+  for (const options of [{}, { analyzeContext: false, contextModel: "fixture/stale:high" }]) {
+    const prompt = buildPrompt(options);
+    assert.ok(!prompt.split("\n").some(line => /^game-l10n (?:native-runtime|review-policy) /.test(line)));
+  }
+});
+
+test("fallback-only selection binds the requested model and count without changing other roles or transport", () => {
+  const model = "fixture/fallback@fixture-proxy:high";
+  const prompt = buildPrompt({ fallbackModel: model, fallbackAttempts: "4", fallbackViaOpenCodex: true,
+    analyzeContext: false, contextModel: "fixture/stale-context" });
+  assert.deepEqual(commandArgs(prompt, "native-runtime"), [
+    "--workspace", "<workspace>", "--host", "<current-native-host>", "--role-model", `review-fallback=${model}`, "--user-requested-models",
+  ]);
+  assert.deepEqual(commandArgs(prompt, "review-policy"), [
+    "--workspace", "<workspace>", "--fallback-model", model, "--max-calls", "4", "--user-requested",
+  ]);
+  assert.ok(!prompt.includes("fixture/stale-context"));
 });
 
 test("proxy catalogs require the bound schema and only replace defaults with valid model IDs", () => {
