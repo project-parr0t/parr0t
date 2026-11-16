@@ -19,7 +19,7 @@ const OUTPUT_BYTES = 1024 * 1024;
 const FRAMEWORK_SCHEMA = "parr0t.framework-session.v1";
 const LOCAL_TOOLS = new Set(["read", "write", "edit", "grep", "glob"]);
 const EXEC_VERBS = {
-  "record-native-launch": { values: ["--workspace", "--relay", "--event", "--task", "--worker-id", "--model", "--observed-model"], flags: [] },
+  "record-native-launch": { values: ["--workspace", "--relay", "--event", "--task", "--worker-id", "--model", "--observed-model", "--failure-code"], flags: [] },
   "record-data-plane-relay-event": { values: ["--workspace", "--relay", "--event", "--slot"], flags: [] },
   "seal-data-plane-task": { values: ["--workspace", "--relay"], flags: ["--worker-ended"] },
   "seal-native-wave-relay": { values: ["--workspace", "--dispatch", "--ended-task"], flags: ["--relay-ended"] },
@@ -214,6 +214,8 @@ function relayArguments(argv, cwd, workspace, relay) {
     if (event === "worker-started") {
       if (fields.some(key => !options.has(key)) || options.get("--worker-id") === "<worker-id>") fail("worker start requires the actual task, worker ID and requested model", "relay_arguments_invalid");
     } else if ([...fields, "--observed-model"].some(key => options.has(key))) fail("preflight must not contain worker fields", "relay_arguments_invalid");
+    if (options.has("--failure-code") && event !== "model-unavailable") fail("model failure evidence requires a model-unavailable event", "relay_arguments_invalid");
+    if (event === "model-unavailable" && relay.metadata.launch_contract?.model_authorization && !options.has("--failure-code")) fail("an observed execution-layer failure is required", "relay_arguments_invalid");
   } else if (verb === "record-data-plane-relay-event") {
     if (!["worker-started", "worker-ended", "finalizer-started", "finalizer-ended"].includes(event)) fail("use a core command_argv relay event", "relay_arguments_invalid");
     if (event.startsWith("worker-")) {
