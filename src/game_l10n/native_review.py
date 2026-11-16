@@ -325,7 +325,10 @@ def _pending_segment(segment: Segment, result: TranslationResult) -> Segment:
     return replace(segment, metadata={**segment.metadata, REVIEW_STATE_KEY: state})
 
 
-def select_native_review_route(segments: list[Segment], routes: list[str], *, stage: str) -> str:
+def select_native_review_route(
+    segments: list[Segment], routes: list[str], *, stage: str,
+    route_models: dict[str, str] | None = None,
+) -> str:
     """Select the next ordered role route from current-candidate attempt evidence.
 
     Callers pass only a collector's pending artifact, never its accepted rows.
@@ -338,7 +341,9 @@ def select_native_review_route(segments: list[Segment], routes: list[str], *, st
                      if item.stage == stage and item.candidate_generation == result.candidate_generation}
         if stage == "review":
             attempted.update(route for route in routes
-                             if is_sol_route(route) and judge_calls(result.attempts, route) >= 2)
+                             if is_sol_route(route, (route_models or {}).get(route, ""))
+                             and judge_calls(result.attempts, route,
+                                             model=(route_models or {}).get(route, "")) >= 2)
         active_routes = routes
         if stage == "review-rewrite" and not active_routes:
             active_routes = [next((item.provider for item in reversed(result.attempts)
@@ -394,6 +399,7 @@ def collect_native_review(
     issue_counts: Counter[str] = Counter()
     from .native_runtime import native_runtime
     runtime = native_runtime(work_dir)
+    route_models = (runtime or {}).get("models", {})
     for segment, row in zip(segments, rows, strict=True):
         result = _bound_result(segment)
         if result.candidate_digest != stable_hash(result.text):
@@ -420,7 +426,7 @@ def collect_native_review(
             ordinal=judge_calls(result.attempts, provider, stage_prefix=stage)
                     + int(row.get("native_review_attempts", row.get("semantic_attempts", 1))),
             candidate_generation=result.candidate_generation,
-            model=(runtime or {}).get("models", {}).get(provider, ""),
+            model=route_models.get(provider, ""),
         ))
         integrity = validate_integrity(segment, result.text, glossary or [],
             extra_patterns=extra_patterns, max_length_ratio=max_length_ratio)
@@ -473,13 +479,15 @@ def collect_native_review(
             result.metadata["rewrite_issues"] = rewrite_issue_codes(
                 issues, integrity, language_risk=True
             )
-            (fallback if is_sol_route(provider) and judge_calls(result.attempts, provider) >= 2
+            (fallback if is_sol_route(provider, route_models.get(provider, ""))
+             and judge_calls(result.attempts, provider, model=route_models.get(provider, "")) >= 2
              else rewrite).append(_pending_segment(segment, result))
             continue
         if verdict.verdict is ReviewVerdict.REWRITE or integrity:
             result.metadata["review_tier"] = "strong_pending"
             result.metadata["rewrite_issues"] = rewrite_issue_codes(issues, integrity)
-            (fallback if is_sol_route(provider) and judge_calls(result.attempts, provider) >= 2
+            (fallback if is_sol_route(provider, route_models.get(provider, ""))
+             and judge_calls(result.attempts, provider, model=route_models.get(provider, "")) >= 2
              else rewrite).append(_pending_segment(segment, result))
             continue
         # Only a parsed current-candidate OK and clean integrity can approve.
@@ -594,6 +602,7 @@ def process_native_review_followup(
     work_dir: Path, source: Path, output: Path, orchestrator: Any, *, operation: str,
     deadline_epoch: float | None = None, wave_size: int = 8,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    primary_review_provider: str = "native-sol", primary_review_limit: int | None = 2,
 ) -> dict[str, Any]:
     """Run only the locked external review role, with durable per-wave results.
 
@@ -604,6 +613,8 @@ def process_native_review_followup(
     require_control_plane_ready(work_dir)
     if operation not in {"judge", "rewrite"} or not 1 <= wave_size <= 8:
         raise ValueError("E_NATIVE_REVIEW_FOLLOWUP_INVALID")
+    if operation == "judge" and "deepseek" not in orchestrator.config.reviewer_chain:
+        raise ValueError("E_NATIVE_REVIEW_NATIVE_FALLBACK_REQUIRED: use prepare-native-pass for the configured reviewer chain")
     work_dir = work_dir.resolve()
     source.resolve().relative_to(work_dir)
     output.resolve().relative_to(work_dir)
@@ -618,13 +629,15 @@ def process_native_review_followup(
     for segment in segments:
         result = _bound_result(segment)
         native = [a for a in result.attempts
-                  if a.provider == "native-sol" and a.stage == "review"]
+                  if a.provider == primary_review_provider and a.stage == "review"
+                  and a.candidate_generation == result.candidate_generation]
         if not native or result.status == "reviewed":
             raise ValueError("E_NATIVE_REVIEW_PRIMARY_BARRIER_REQUIRED")
         if operation == "rewrite" and not result.metadata.get("rewrite_issues"):
             raise ValueError("E_NATIVE_REVIEW_REWRITE_NOT_FLAGGED")
         if (operation == "judge" and native[-1].status not in {"error", "refused"}
-                and judge_calls(result.attempts, "native-sol") < 2):
+                and (primary_review_limit is None
+                     or judge_calls(result.attempts, primary_review_provider) < primary_review_limit)):
             raise ValueError("E_NATIVE_REVIEW_FALLBACK_NOT_FAILED")
         fingerprint = stable_hash({
             "segment": asdict(segment), "operation": operation,
