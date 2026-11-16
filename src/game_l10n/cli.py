@@ -93,6 +93,7 @@ from .native_translation_retry import (
     start_native_translation_retries,
 )
 from .native_runtime import (
+    MODEL_FAILURE_CODES,
     bind_data_plane_launch, configure_native_runtime, native_runtime, record_native_launch,
 )
 from .omp_isolation import runtime_isolation, tool_transport_contract
@@ -1523,7 +1524,7 @@ def cmd_record_native_launch(args: argparse.Namespace) -> int:
     result = record_native_launch(
         work_dir, _path_in_workspace(work_dir, args.relay, must_exist=True),
         event=args.event, task=args.task, worker_id=args.worker_id,
-        model=args.model, observed_model=args.observed_model,
+        model=args.model, observed_model=args.observed_model, failure_code=args.failure_code,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -3552,6 +3553,8 @@ def build_parser() -> argparse.ArgumentParser:
     native_launch.add_argument("--worker-id")
     native_launch.add_argument("--model")
     native_launch.add_argument("--observed-model")
+    native_launch.add_argument("--failure-code", choices=MODEL_FAILURE_CODES,
+                               help="Observed execution-layer failure; not absence from a model advertisement")
     native_launch.set_defaults(func=cmd_record_native_launch)
 
     native_relay = sub.add_parser(

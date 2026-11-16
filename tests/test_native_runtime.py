@@ -292,7 +292,7 @@ class NativeRuntimeTests(unittest.TestCase):
 
     def test_model_rebind_of_unstarted_wave_quarantines_unverified_output(self) -> None:
         _, relay, payload = self.prepare()
-        record_native_launch(self.root, relay, event="model-unavailable")
+        record_native_launch(self.root, relay, event="model-unavailable", failure_code="host_model_unavailable")
         seal_native_wave_relay(self.root, relay, relay_ended=True)
         binding = payload["task_bindings"][0]
         self.write_rows(self.root / binding["result"], [self.row("a")])
@@ -318,7 +318,7 @@ class NativeRuntimeTests(unittest.TestCase):
 
     def test_interrupted_unstarted_rebind_is_resumable_from_archived_evidence(self) -> None:
         _, relay, _ = self.prepare()
-        record_native_launch(self.root, relay, event="model-unavailable")
+        record_native_launch(self.root, relay, event="model-unavailable", failure_code="host_model_unavailable")
         seal_native_wave_relay(self.root, relay, relay_ended=True)
         configure_native_runtime(self.root, "omp", {"native-luna": "fixture/approved-new-model"})
         with patch("game_l10n.native_pass._write_wave_relay_dispatch", side_effect=OSError("fixture interrupted write")):
@@ -567,7 +567,7 @@ class NativeRuntimeTests(unittest.TestCase):
         payload = json.loads(relay.read_text())
         envelope = self.root / payload["expected_envelope"]
         envelope.write_text('{"stale":true}', encoding="utf-8")
-        record_native_launch(self.root, relay, event="model-unavailable")
+        record_native_launch(self.root, relay, event="model-unavailable", failure_code="host_model_unavailable")
         seal_data_plane_task(self.root, relay, worker_ended=True)
         configure_native_runtime(self.root, "omp", {"native-sol": "fixture/approved-new-model"})
         prepared = prepare_data_plane_task(self.root, output, worker_role="source_probe", config=config)
@@ -588,7 +588,7 @@ class NativeRuntimeTests(unittest.TestCase):
 
     def test_data_plane_rebind_requires_terminal_evidence(self) -> None:
         _, _, relay = self.prepare_probe()
-        record_native_launch(self.root, relay, event="model-unavailable")
+        record_native_launch(self.root, relay, event="model-unavailable", failure_code="host_model_unavailable")
         configure_native_runtime(self.root, "omp", {"native-sol": "fixture/approved-new-model"})
         original = relay.read_bytes()
         with self.assertRaisesRegex(ValueError, "ended data-plane receipt required"):
@@ -601,7 +601,7 @@ class NativeRuntimeTests(unittest.TestCase):
         record_native_launch(self.root, relay, event="capability-available")
         record_native_launch(self.root, relay, event="worker-started", task="worker-0",
                              worker_id="existing-probe", model=model)
-        record_native_launch(self.root, relay, event="model-unavailable")
+        record_native_launch(self.root, relay, event="model-unavailable", failure_code="host_model_unavailable")
         seal_data_plane_task(self.root, relay, worker_ended=True)
         configure_native_runtime(self.root, "omp", {"native-sol": "fixture/approved-new-model"})
         original = relay.read_bytes()
@@ -611,7 +611,7 @@ class NativeRuntimeTests(unittest.TestCase):
 
     def test_interrupted_data_plane_rebind_recovers_archived_evidence(self) -> None:
         _, output, relay = self.prepare_probe()
-        record_native_launch(self.root, relay, event="model-unavailable")
+        record_native_launch(self.root, relay, event="model-unavailable", failure_code="host_model_unavailable")
         seal_data_plane_task(self.root, relay, worker_ended=True)
         configure_native_runtime(self.root, "omp", {"native-sol": "fixture/approved-new-model"})
         original = (output / "task.json").read_bytes()
@@ -621,3 +621,60 @@ class NativeRuntimeTests(unittest.TestCase):
         bind_data_plane_launch(self.root, relay)
         self.assertEqual(native_launch_summary(self.root, relay)["model"], "fixture/approved-new-model")
         self.assertEqual((output / "task.json").read_bytes(), original)
+
+    def test_prompt_selected_model_can_launch_without_a_secondary_approval_list(self) -> None:
+        selected = "fixture-provider/unlisted-review-model@fixture-route:high"
+        (self.root / "game-l10n.json").write_text(json.dumps({
+            "model_policy": {"source": "user_prompt", "native_roles": {"translation": selected}},
+        }), encoding="utf-8")
+        configure_native_runtime(self.root, "omp", {})
+        prepare_native_tasks(self.root, self.source, self.segments, self.tasks,
+                             max_records=1, max_workers=2,
+                             route_binding={"provider": "native-translation", "attempt": 1})
+        relay = self.root / self.step()["relay"]["dispatch"]
+        payload = json.loads(relay.read_text())
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_MODEL_FAILURE_EVIDENCE_REQUIRED"):
+            record_native_launch(self.root, relay, event="model-unavailable")
+        self.assertEqual(native_launch_summary(self.root, relay)["issue_codes"], ["E_NATIVE_RELAY_PREFLIGHT_REQUIRED"])
+        record_native_launch(self.root, relay, event="capability-available")
+        record_native_launch(self.root, relay, event="worker-started",
+                             task=payload["task_bindings"][0]["task"], worker_id="fixture-exact-worker", model=selected)
+        summary = native_launch_summary(self.root, relay)
+        self.assertEqual(summary["started_workers"], 1)
+        self.assertEqual(summary["model"], selected)
+        self.assertEqual(summary["model_authorization"]["source"], "user_prompt")
+        self.assertEqual(summary["model_authorization"]["status"], "approved")
+
+    def test_observed_dispatch_denial_is_operational_not_revoked_model_approval(self) -> None:
+        _, _, relay = self.prepare_probe()
+        before = native_runtime(self.root)
+        payload = json.loads(relay.read_text())
+        summary = self.invoke_argv(payload["command_argv"]["model-unavailable:host_dispatch_denied"])
+        self.assertEqual(summary["model_authorization"]["status"], "approved")
+        self.assertEqual(summary["model_failure_code"], "host_dispatch_denied")
+        self.assertEqual(summary["started_workers"], 0)
+        self.assertEqual(native_runtime(self.root), before)
+        sealed = self.invoke_argv(payload["command_argv"]["seal"])
+        self.assertEqual(sealed["status"], "error")
+        self.assertEqual(sealed["issue_codes"], ["E_NATIVE_WORKER_MODEL_UNAVAILABLE"])
+
+    def test_existing_started_contract_keeps_original_authorization_boundary(self) -> None:
+        from game_l10n.native_runtime import launch_contract
+
+        def legacy_contract(*args, **kwargs):
+            contract = launch_contract(*args, **kwargs)
+            contract.pop("model_authorization", None)
+            contract.pop("unavailability_evidence", None)
+            contract["preflight"] = "inspect_available_dispatch_tool_and_exact_model_before_starting_any_worker"
+            return contract
+
+        with patch("game_l10n.native_runtime.launch_contract", side_effect=legacy_contract), \
+             patch("game_l10n.native_pass.launch_contract", side_effect=legacy_contract):
+            _, relay, payload = self.prepare()
+            record_native_launch(self.root, relay, event="capability-available")
+            record_native_launch(self.root, relay, event="worker-started",
+                                 task=payload["task_bindings"][0]["task"], worker_id="fixture-existing-worker",
+                                 model=payload["launch_contract"]["model"])
+        original = relay.read_bytes()
+        self.assertEqual(native_launch_summary(self.root, relay)["started_workers"], 1)
+        self.assertEqual(relay.read_bytes(), original)
