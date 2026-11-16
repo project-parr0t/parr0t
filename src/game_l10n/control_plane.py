@@ -330,9 +330,16 @@ def initial_control_plane_entry_state() -> dict[str, Any]:
 
 def control_plane_entry_state(work_dir: Path) -> dict[str, Any]:
     path = work_dir / CONTROL_ENTRY_PATH
-    if not path.is_file():
+    try:
+        path.lstat()
+    except FileNotFoundError:
         return initial_control_plane_entry_state()
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ConfigurationError("E_CONTROL_PLANE_ENTRY_STATE: unreadable state") from exc
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ConfigurationError("E_CONTROL_PLANE_ENTRY_STATE: unreadable state") from exc
     if not isinstance(payload, dict) or set(payload) != {
         "schema",
         "status",
@@ -404,9 +411,16 @@ def initial_control_plane_state() -> dict[str, Any]:
 
 def control_plane_state(work_dir: Path) -> dict[str, Any]:
     path = work_dir / CONTROL_STATE_PATH
-    if not path.is_file():
+    try:
+        path.lstat()
+    except FileNotFoundError:
         return initial_control_plane_state()
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ConfigurationError("E_CONTROL_PLANE_STATE: unreadable state") from exc
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ConfigurationError("E_CONTROL_PLANE_STATE: unreadable state") from exc
     if not isinstance(payload, dict):
         raise ConfigurationError("E_CONTROL_PLANE_STATE: state must be an object")
     status = payload.get("status")
