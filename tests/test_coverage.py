@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from game_l10n.coverage import (
     completion_attestation,
+    inventory_fingerprint,
     record_runtime_coverage,
     require_inventory_attestation,
     runtime_coverage_state,
@@ -128,6 +129,138 @@ class CoverageTests(unittest.TestCase):
         self.assertFalse(state["static_complete"])
         self.assertTrue(state["static_scope_tracking_mismatch"])
         self.assertIn("STATIC_SCOPE_TRACKING_MISMATCH", state["issue_codes"])
+
+    def test_static_scope_included_count_must_match_physical_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            rows = [{"id": "synthetic-active", "source": "SOURCE"}]
+            scope = self._static_scope(unused=0)
+            scope["conservative_retained_count"] = 1
+            write_inventory(primary, "primary", rows, static_scope=scope)
+            write_inventory(independent, "independent", rows, static_scope=scope)
+
+            with self.assertRaisesRegex(ConfigurationError, "included count"):
+                verify_inventory_pair(primary, independent)
+
+    def test_static_reachability_exclusion_requires_scope_accounting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            rows = [{"id": "synthetic-active", "source": "SOURCE"}]
+            exclusions = [{
+                "reason_code": "SYNTHETIC_STATIC_UNREACHABLE",
+                "affects_user_visible_text": False,
+                "scope": "static_reachability",
+                "target_count": 1,
+                "evidence_fingerprint": "fixture-exclusion-evidence",
+            }]
+            write_inventory(primary, "primary", rows, exclusions=exclusions)
+            write_inventory(independent, "independent", rows, exclusions=exclusions)
+
+            with self.assertRaisesRegex(ConfigurationError, "require scope tracking"):
+                verify_inventory_pair(primary, independent)
+
+    def test_unresolved_reference_can_retain_multiple_equal_valued_occurrences(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            rows = [
+                {"id": "synthetic-first", "source": "SOURCE"},
+                {"id": "synthetic-second", "source": "SOURCE"},
+            ]
+            scope = self._static_scope(unused=0)
+            scope.update(conservative_retained_count=2, unresolved_dynamic_reference_count=1)
+            exclusions = [{
+                "reason_code": "SYNTHETIC_PROVEN_NON_DISPLAY",
+                "affects_user_visible_text": False,
+                "target_count": 5,
+                "evidence_fingerprint": "fixture-format-role-evidence",
+            }]
+            write_inventory(primary, "primary", rows, exclusions=exclusions, static_scope=scope)
+            write_inventory(independent, "independent", rows, exclusions=exclusions, static_scope=scope)
+
+            state = verify_inventory_pair(primary, independent)
+
+        self.assertTrue(state["static_complete"])
+        self.assertEqual(state["primary_segments"], 2)
+        self.assertEqual(state["static_scope"]["conservative_retained_count"], 2)
+
+    def test_malformed_inventory_unicode_preserves_existing_attestations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            rows = [{"id": "synthetic-active", "source": "SOURCE"}]
+            write_inventory(primary, "primary", rows)
+            write_inventory(independent, "independent", rows)
+            save_inventory_attestation(root, primary, independent)
+            state_path = root / ".game-l10n" / "inventory-attestation.json"
+            identity_path = root / ".game-l10n" / "inventory-primary-identity.json"
+            saved_state = state_path.read_bytes()
+            saved_identity = identity_path.read_bytes()
+            malformed_rows = [
+                [{"id": "synthetic-active", "source": "\ud800"}],
+                [{"id": "synthetic-active", "source": "\udfff"}],
+                [{"id": "\ud800", "source": "SOURCE"}],
+                [{"id": "synthetic-active", "source": "SOURCE", "metadata": {"value": "\udfff"}}],
+                [{"id": "synthetic-active", "source": "SOURCE", "metadata": {"\ud800": "value"}}],
+            ]
+            for malformed in malformed_rows:
+                with self.subTest(case=malformed_rows.index(malformed)):
+                    write_inventory(primary, "primary", malformed)
+                    with self.assertRaisesRegex(ConfigurationError, "E_INVENTORY_INVALID_UNICODE"):
+                        save_inventory_attestation(root, primary, independent)
+                    self.assertEqual(state_path.read_bytes(), saved_state)
+                    self.assertEqual(identity_path.read_bytes(), saved_identity)
+
+    def test_inventory_fingerprint_rejects_malformed_unicode_categorically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.json"
+            write_inventory(path, "primary", [{"id": "synthetic-active", "source": "\ud800"}])
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        with self.assertRaisesRegex(ConfigurationError, "E_INVENTORY_INVALID_UNICODE"):
+            inventory_fingerprint(payload)
+
+    def test_inventory_rejects_invalid_utf8_categorically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            primary.write_bytes(b'"\xed\xa0\x80"')
+
+            with self.assertRaisesRegex(ConfigurationError, "E_INVENTORY_INVALID_UNICODE"):
+                verify_inventory_pair(primary, independent)
+
+    def test_supplementary_unicode_preserves_inventory_fingerprints_and_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.json"
+            independent = root / "independent.json"
+            rows = [{
+                "id": "synthetic-\U0001f642",
+                "source": "SOURCE_\U0001f680",
+                "metadata": {"\U0001f642": "\U0001f680"},
+            }]
+            write_inventory(primary, "primary", rows)
+            write_inventory(independent, "independent", rows)
+            independent_payload = json.loads(independent.read_text(encoding="utf-8"))
+            independent.write_text(json.dumps(independent_payload, ensure_ascii=False), encoding="utf-8")
+            primary_payload = json.loads(primary.read_text(encoding="utf-8"))
+
+            state = save_inventory_attestation(root, primary, independent)
+            identity = json.loads(
+                (root / ".game-l10n" / "inventory-primary-identity.json").read_text(encoding="utf-8")
+            )
+
+        self.assertTrue(state["static_complete"])
+        self.assertEqual(state["primary_fingerprint"], stable_hash(primary_payload))
+        self.assertEqual(state["independent_fingerprint"], stable_hash(independent_payload))
+        self.assertEqual(identity["ids"], [rows[0]["id"]])
 
     def test_verified_inventory_uses_unchanged_file_binding_fast_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
