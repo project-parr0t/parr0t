@@ -3283,7 +3283,7 @@ def _native_control_step_single(
                 "dispatch": relay_dispatch,
                 "prompt": "PARR0T_OMP_RELAY=" + relay_dispatch,
                 "worker_prompt_policy": "include_launch_contract_worker_prompt_line_verbatim_in_each_task",
-                "tool_transport": tool_transport_contract() if (native_runtime(work_dir) or {}).get("host") == "omp"
+                "tool_transport": tool_transport_contract(prompt=(native_runtime(work_dir) or {}).get("omp_isolation") == "prompt") if (native_runtime(work_dir) or {}).get("host") == "omp"
                     and (native_runtime(work_dir) or {}).get("transport", "collaboration") == "collaboration" else None,
                 "role": "isolated_wave_relay",
                 "history_mode": "none",

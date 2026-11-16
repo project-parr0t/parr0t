@@ -1,4 +1,4 @@
-"""Start a fresh, guarded OMP control plane without replaying an old session."""
+"""Start a fresh, no-history OMP control plane with an optional execution guard."""
 from __future__ import annotations
 
 import argparse
@@ -16,7 +16,7 @@ from uuid import uuid4
 from .control_plane import CONTROL_HANDOFF_PATH, control_plane_entry_state, control_plane_state
 
 
-def _startup_prompt(workspace: Path, core: Path, mode: str = "rotation") -> str:
+def _startup_prompt(workspace: Path, core: Path, mode: str = "rotation", *, guarded: bool = False) -> str:
     return (
         "Parr0t의 기존 게임 현지화 작업을 새 text-free 최상위 제어 세션으로 이어가라. "
         "이 세션은 이전 세션의 대화·요약·하위 에이전트 기록을 상속하거나 열람하지 않는다. "
@@ -36,15 +36,25 @@ def _startup_prompt(workspace: Path, core: Path, mode: str = "rotation") -> str:
         )
         +
         "게임 폴더는 읽기 전용이며 최상위는 게임 내용·번역 가능성을 직접 조사하지 않는다. "
-        "기존 한국어·엔진·전체 번역 범위는 코어가 준비한 격리 릴레이/데이터 워커만 조사한다. "
+        "기존 한국어·엔진·전체 번역 범위는 코어가 준비한 릴레이/데이터 워커만 조사한다. "
         "기존 한국어 개선을 포함하여 기록된 사용자 요청 범위만 수행하고 범위를 새로 추가하거나 줄이지 마라. "
         "기존 SDK와 캐시·완료된 증거·대상 ID를 재사용하고 보고된 미완료 범위만 이어가라. "
         "코드·식별자·플레이스홀더·제어 코드·게임 동작을 보존하라. "
         "폰트·이미지 작업은 사용자 범위와 계약이 허용할 때만 수행하라. "
         "설정된 기본 번역 재시도와 사전 폴백을 완료한 뒤 남은 항목에만 설정된 후순위 폴백 경로를 사용하라. "
         "실패 항목 때문에 다른 항목을 중단하거나 범위를 줄이지 마라. "
-        "현재 세션의 OMP 실행 가드가 등록된 후 native-runtime을 다시 바인딩하고 기존 정확한 모델 매핑을 보존하라. "
-        "릴레이/워커는 launch_contract의 메시지 격리·parr0t_exec 실행 규약을 따르며 agent:// 메시지를 보내지 않는다. "
+        +
+        (
+            "현재 세션의 OMP 실행 가드가 등록된 후 native-runtime --omp-isolation guarded로 다시 바인딩하고 "
+            "기존 정확한 모델 매핑을 보존하라. "
+            "릴레이/워커는 launch_contract의 메시지 격리·parr0t_exec 실행 규약을 따르며 agent:// 메시지를 보내지 않는다. "
+            if guarded else
+            "native-runtime --omp-isolation prompt로 다시 바인딩하고 기존 정확한 모델 매핑을 보존하라. "
+            "릴레이/워커는 launch_contract에 따라 메시지 전송·대화 및 세션 기록 열람을 하지 않는다. "
+            "agent:// 메시지와 history:// 열람을 사용하지 마라. 일반 호스트 Python과 도구로 실행하라. "
+            "이 경계는 프롬프트 지시이며 도구나 호스트가 강제하는 격리가 아니다. 실행 가드 등록을 기다리지 마라. "
+        )
+        +
         "최상위가 새 릴레이를 시작할 때 코어가 반환한 상대 릴레이 경로를 PARR0T_OMP_RELAY=경로 형식의 단독 줄로 전달하라. "
         "게임에 설치·실행하지 말고 외부 작업 폴더에 복원 가능한 패치를 완성·검증한 뒤 보고하라. "
         "기존 게임 작업의 Git 선택 및 잠긴 대상 언어·제공자 정책을 보존하라. 사용량 상한을 새로 만들거나 요청하지 마라. "
@@ -52,7 +62,9 @@ def _startup_prompt(workspace: Path, core: Path, mode: str = "rotation") -> str:
     )
 
 
-def _plan_command(workspace: Path, model: str, mode: str = "rotation") -> tuple[list[str], Path, Path]:
+def _plan_command(
+    workspace: Path, model: str, mode: str = "rotation", *, guarded: bool = False,
+) -> tuple[list[str], Path, Path | None]:
     """Validate prerequisites and plan a fresh session without writing anything."""
     workspace = workspace.resolve()
     if mode not in {"rotation", "workspace"}:
@@ -77,35 +89,36 @@ def _plan_command(workspace: Path, model: str, mode: str = "rotation") -> tuple[
     if executable is None:
         raise ValueError("E_OMP_CONTROL_EXECUTABLE_REQUIRED")
     core = Path(__file__).resolve().parents[2]
-    guard = Path(__file__).with_name("templates") / "omp-isolation-guard.mjs"
-    if not guard.is_file():
+    guard = Path(__file__).with_name("templates") / "omp-isolation-guard.mjs" if guarded else None
+    if guard is not None and not guard.is_file():
         raise ValueError("E_OMP_CONTROL_GUARD_REQUIRED")
     launch_dir = workspace / ".game-l10n" / "omp-control" / uuid4().hex
     session_dir = launch_dir / "sessions"
     command = [
         executable, "--cwd", str(workspace), "--model", model,
         "--session-dir", str(session_dir), "--no-prewalk", "--no-title",
-        "--trusted-extension", str(guard.resolve()),
-        "--parr0t-workspace", str(workspace), _startup_prompt(workspace, core, mode),
     ]
+    if guard is not None:
+        command.extend(["--trusted-extension", str(guard.resolve()), "--parr0t-workspace", str(workspace)])
+    command.append(_startup_prompt(workspace, core, mode, guarded=guarded))
     return command, launch_dir, guard
 
 
 def _launch(
     workspace: Path, model: str, startup_seconds: float = 45.0,
-    *, mode: str = "rotation", foreground: bool = False,
+    *, mode: str = "rotation", foreground: bool = False, guarded: bool = False,
 ) -> dict:
     workspace = workspace.resolve()
     if os.name != "nt" and not foreground:
         raise ValueError("E_OMP_CONTROL_TERMINAL_REQUIRED: use --foreground")
-    command, launch_dir, guard = _plan_command(workspace, model, mode)
+    command, launch_dir, guard = _plan_command(workspace, model, mode, guarded=guarded)
     session_dir = launch_dir / "sessions"
     session_dir.mkdir(parents=True)
     record = {
         "schema": "parr0t.omp-control-launch.v1", "status": "starting",
         "model": model, "session_directory": str(session_dir),
         "handoff_receipt": CONTROL_HANDOFF_PATH if mode == "rotation" else None,
-        "mode": mode, "process_id": None,
+        "mode": mode, "omp_isolation": "guarded" if guarded else "prompt", "process_id": None,
     }
     record_path = launch_dir / "launch.json"
     record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
@@ -113,7 +126,9 @@ def _launch(
     # Registration belongs to the new process, never the caller's host session.
     environment.pop("PARR0T_OMP_GUARD_SESSION", None)
     environment.pop("PARR0T_OMP_GUARD_WORKSPACE", None)
-    environment["PARR0T_OMP_CONTROL_DIRECTORY"] = str(launch_dir)
+    environment.pop("PARR0T_OMP_CONTROL_DIRECTORY", None)
+    if guarded:
+        environment["PARR0T_OMP_CONTROL_DIRECTORY"] = str(launch_dir)
     process = subprocess.Popen(
         command, cwd=workspace, env=environment,
         creationflags=0 if foreground else subprocess.CREATE_NEW_CONSOLE, close_fds=True,
@@ -123,6 +138,11 @@ def _launch(
     if foreground:
         record["exit_code"] = process.wait()
         record["status"] = "exited"
+        record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        return {**record, "launch_record": str(record_path)}
+    if guard is None:
+        # Process creation is observed; readiness and enforced isolation are not.
+        record["status"] = "started"
         record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
         return {**record, "launch_record": str(record_path)}
     registration = launch_dir / "ready.json"
@@ -165,14 +185,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", required=True, help="Exact approved provider/model identifier")
     parser.add_argument("--mode", choices=("rotation", "workspace"), default="rotation")
     parser.add_argument("--foreground", action="store_true", help="Use the current terminal")
+    parser.add_argument("--guarded", action="store_true", help="Require the OMP execution guard and registration proof")
     parser.add_argument("--print-command", action="store_true", help="Print JSON argv without launching")
     args = parser.parse_args(argv)
     try:
         if args.print_command:
-            command, _, _ = _plan_command(args.workspace, args.model, args.mode)
+            command, _, _ = _plan_command(args.workspace, args.model, args.mode, guarded=args.guarded)
             print(json.dumps(command, ensure_ascii=False))
             return 0
-        result = _launch(args.workspace, args.model, mode=args.mode, foreground=args.foreground)
+        result = _launch(
+            args.workspace, args.model, mode=args.mode, foreground=args.foreground, guarded=args.guarded,
+        )
     except (OSError, ValueError) as error:
         issue = str(error).split(":", 1)[0]
         if not re.fullmatch(r"E_[A-Z_]+", issue):
@@ -182,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps(result, ensure_ascii=False))
     if args.foreground:
         return result["exit_code"]
-    return 0 if result["status"] == "guard_registered" else 1
+    return 0 if result["status"] in {"started", "guard_registered"} else 1
 
 
 if __name__ == "__main__":
