@@ -26,11 +26,15 @@ def _framework_session_lock(work_dir: Path):
 
 def framework_session_state(work_dir: Path) -> dict[str, Any]:
     path = work_dir / FRAMEWORK_SESSION_PATH
-    if not path.exists() and not path.is_symlink():
+    try:
+        path.lstat()
+    except FileNotFoundError:
         return {
             "schema": FRAMEWORK_SESSION_SCHEMA, "mode": "localization", "revision": 0,
             "instructions_active": True, "user_requested": False, "logs": [],
         }
+    except OSError as exc:
+        raise ConfigurationError("E_FRAMEWORK_SESSION_INVALID: unreadable session state") from exc
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
