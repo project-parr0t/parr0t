@@ -1629,12 +1629,28 @@ def prepare_data_plane_task(
                 "output_image_root": "localized/image-ui",
             }
         )
+    if worker_role in {"primary_inventory", "independent_inventory", "inventory_reconciler"}:
+        private_payload["requirements"].extend(
+            [
+                "raw_literal_presence_alone_is_not_display_or_completeness_evidence",
+                "derive_display_targets_from_format_roles_bindings_and_runtime_reference_evidence",
+                "include_player_visible_system_messages_and_dynamic_display_dependencies",
+                "retain_unresolved_player_visible_candidates",
+                "account_raw_occurrences_by_provenance_and_category_separately_from_display_target_counts",
+                "keep_private_occurrence_evidence_for_display_bound_uncertain_and_proven_non_display_classifications",
+                "exclude_only_evidenced_non_display_occurrences_never_blanket_engine_or_module_categories",
+                "record_exclusion_reason_codes_counts_and_evidence_fingerprints_in_coverage_exclusions",
+                "use_existing_coverage_static_scope_contract_for_reachability_exclusions",
+                "preserve_physical_occurrences_and_source_order_never_deduplicate_by_text_value",
+            ]
+        )
     if worker_role in {"primary_inventory", "independent_inventory"}:
         private_payload["requirements"].extend(
             [
                 "scan_source_once_using_selected_sdk_role_method",
+                "cache_role_local_structural_parse_provenance_and_display_dependency_evidence",
+                "construct_inventory_from_cached_single_pass_evidence_without_repeated_source_reads",
                 "do_not_read_or_derive_from_counterpart_inventory",
-                "retain_unresolved_player_visible_candidates",
                 "emit_inventory_comparison_key_for_method_specific_ids",
                 "report_selected_vs_observed_engine_identity_conflicts_as_sdk_identity_mismatch",
             ]
@@ -1651,7 +1667,6 @@ def prepare_data_plane_task(
                 "preserve_primary_ids_as_downstream_canonical_identity",
                 "repair_method_specific_aliases_on_the_independent_inventory_with_deterministic_evidence",
                 "do_not_match_duplicate_source_text_without_occurrence_or_location_evidence",
-                "retain_unresolved_player_visible_candidates",
                 "run_core_verify_inventory_and_bind_current_attestation",
                 "incomplete_with_measured_progress_requires_another_bounded_step",
             ]
