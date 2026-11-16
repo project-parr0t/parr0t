@@ -6,6 +6,7 @@ No session log or semantic result is read to determine the executing model.
 from __future__ import annotations
 
 import json
+import os
 import re
 from hashlib import sha256
 from pathlib import Path
@@ -13,7 +14,7 @@ from typing import Any
 
 from .control_plane import control_plane_state, require_control_plane_ready
 from .store import stable_hash
-from .omp_isolation import ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
+from .omp_isolation import ISOLATION_ENV, ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
 
 RUNTIME_PATH = ".game-l10n/native/runtime.json"
 RUNTIME_SCHEMA = "parr0t.native-runtime.v1"
@@ -42,7 +43,8 @@ def _exact_model(value: str) -> bool:
 
 
 def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str],
-                             *, transport: str | None = None) -> dict[str, Any]:
+                             *, transport: str | None = None,
+                             omp_isolation: str | None = None) -> dict[str, Any]:
     require_control_plane_ready(work_dir)
     prefix = "openai-codex/" if host == "omp" else ""
     bindings = ({"native-luna": prefix + "gpt-6-luna", "native-sol": prefix + "gpt-6.1-sol"}
@@ -70,6 +72,19 @@ def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str],
         "schema": RUNTIME_SCHEMA, "host": host, "models": bindings,
         "control_generation": int(control_plane_state(work_dir).get("generation", 0)),
     }
+    if host == "omp" and transport == "collaboration":
+        if omp_isolation is None:
+            omp_isolation = (
+                previous.get("omp_isolation", "guarded")
+                if previous is not None and previous["host"] == host
+                and previous.get("transport", "collaboration") == "collaboration"
+                else "guarded" if os.environ.get(ISOLATION_ENV) else "prompt"
+            )
+        if omp_isolation not in {"prompt", "guarded"}:
+            raise ValueError("E_NATIVE_RUNTIME_INVALID: unsupported OMP isolation mode")
+        payload["omp_isolation"] = omp_isolation
+    elif omp_isolation is not None:
+        raise ValueError("E_NATIVE_RUNTIME_INVALID: OMP isolation requires OMP collaboration")
     if transport == "native-host-api":
         from .native_host import native_host_profile
         payload.update(transport=transport, host_profile_fingerprint=native_host_profile(work_dir, host)["fingerprint"])
@@ -94,10 +109,16 @@ def native_runtime(work_dir: Path, *, required: bool = False,
             from .native_host import native_host_profile
             required_keys |= {"transport", "host_profile_fingerprint"}
             profile = native_host_profile(work_dir, value["host"])
+        if "omp_isolation" in value:
+            required_keys.add("omp_isolation")
         valid = (
             set(value) == required_keys
             and value["schema"] == RUNTIME_SCHEMA
             and (value["host_profile_fingerprint"] == profile["fingerprint"] if broker else value["host"] in {"codex", "omp"})
+            and ("omp_isolation" not in value or (
+                value["host"] == "omp" and not broker
+                and value["omp_isolation"] in {"prompt", "guarded"}
+            ))
             and value["fingerprint"] == stable_hash(unsigned)
             and (allow_stale_generation or value["control_generation"] == int(control_plane_state(work_dir).get("generation", 0)))
             and {"native-luna", "native-sol"} <= set(value["models"])
@@ -132,7 +153,8 @@ def launch_contract(work_dir: Path, route: str, tasks: list[str]) -> dict[str, A
     }
     isolation = runtime_isolation(work_dir, runtime)
     if isolation is not None:
-        contract.update(message_isolation=isolation, tool_transport=tool_transport_contract())
+        contract.update(message_isolation=isolation,
+                        tool_transport=tool_transport_contract(prompt=runtime.get("omp_isolation") == "prompt"))
     if runtime.get("transport") == "native-host-api":
         from .native_host import verified_host_probe
         verified_host_probe(work_dir, runtime, route)
@@ -229,7 +251,7 @@ def _relay_command_argv(work_dir: Path, relay_path: Path, relay: dict) -> dict[s
             or not all(isinstance(task, str) for task in contract["tasks"])
             or len(set(contract["tasks"])) != len(contract["tasks"])):
         raise ValueError("E_NATIVE_LAUNCH_INVALID: lifecycle commands need a bound model and tasks")
-    prefix = ["-m", "game_l10n.cli"]
+    prefix = contract.get("tool_transport", {}).get("relay_python_argv_prefix", ["-m", "game_l10n.cli"])
     workspace = ["--workspace", str(work_dir.resolve())]
     relative = relay_path.resolve().relative_to(work_dir.resolve()).as_posix()
     launch = [*prefix, "record-native-launch", *workspace, "--relay", relative]
