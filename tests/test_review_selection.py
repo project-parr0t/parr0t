@@ -4,6 +4,7 @@ import unittest
 
 from game_l10n.models import Segment, ValidationIssue
 from game_l10n.review_selection import (
+    dialogue_review_reasons,
     review_category,
     rewrite_issue_codes,
     strong_review_selection_reasons,
@@ -108,6 +109,26 @@ class ReviewSelectionTests(unittest.TestCase):
             ["target_script_contamination"],
         )
 
+
+    def test_dialogue_risk_and_uncertainty_route_strong_review(self) -> None:
+        contexts = {
+            "fixture": {
+                "register_shift": "supported",
+                "consistency_status": "risk",
+                "confidence": "uncertain",
+                "uncertainties": ["addressee"],
+            }
+        }
+
+        self.assertEqual(
+            dialogue_review_reasons("fixture", contexts),
+            [
+                "dialogue_register_shift",
+                "dialogue_consistency_risk",
+                "dialogue_context_uncertain",
+            ],
+        )
+        self.assertEqual(dialogue_review_reasons("other", contexts), [])
 
     def test_provenance_reasons_need_exact_cue_ids_or_fallback_origin(self) -> None:
         from game_l10n.review_selection import provenance_review_reasons
