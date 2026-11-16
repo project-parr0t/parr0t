@@ -180,6 +180,9 @@ def launch_contract(work_dir: Path, route: str, tasks: list[str]) -> dict[str, A
         "model_evidence": "explicit_spawn_arguments_and_host_model_metadata_when_available",
         "model_authorization": model_selection_authorization(policy_config, route, runtime["models"][route]),
         "unavailability_evidence": "observed_host_result_only_not_absence_from_advertised_models",
+        "lifecycle_observation": "finite_interruptible_per_call_only_not_a_job_timeout",
+        "cancellation_priority": "cancel_owned_child_promptly_on_observed_operational_error_before_replacement",
+        "operational_failure_policy": "record_only_observed_provider_or_guard_errors; terminal_owner_cancellation_required_before_replacement",
     }
     isolation = runtime_isolation(work_dir, runtime)
     if isolation is not None:
@@ -317,6 +320,14 @@ def _relay_command_argv(work_dir: Path, relay_path: Path, relay: dict) -> dict[s
                 event: [*base, "--event", event]
                 for event in ("finalizer-started", "finalizer-ended")
             })
+    if not native and "operational_failure_policy" in contract:
+        failure_base = [
+            *prefix, "record-data-plane-failure", *workspace, "--relay", relative
+        ]
+        commands["operational-failure"] = {
+            code: [*failure_base, "--failure-code", code]
+            for code in ("provider_operational_error", "execution_guard_denied")
+        }
     return commands
 
 
@@ -405,6 +416,14 @@ def _contract_for_relay(work_dir: Path, relay: dict, relay_path: Path) -> dict |
         contract.pop("unavailability_evidence", None)
         if contract.get("transport") != "native-host-api":
             contract["preflight"] = "inspect_available_dispatch_tool_and_exact_model_before_starting_any_worker"
+    if contract is not None and isinstance(previous, dict):
+        for field in (
+            "lifecycle_observation",
+            "cancellation_priority",
+            "operational_failure_policy",
+        ):
+            if field not in previous:
+                contract.pop(field, None)
     if contract is not None and "message_isolation" in contract:
         marker = "PARR0T_OMP_RELAY=" + relay_path.resolve().relative_to(work_dir.resolve()).as_posix()
         contract.update(relay_prompt_line=marker, worker_prompt_line=marker)

@@ -51,9 +51,11 @@ from .data_plane_task import (
     MAX_CONTEXT_WORKERS,
     claim_context_chunk,
     commit_context_fragment,
+    current_data_plane_operational_failure,
     current_data_plane_receipt,
     finalize_context_fragments,
     prepare_data_plane_task,
+    record_data_plane_failure,
     record_data_plane_relay_event,
     seal_data_plane_task,
 )
@@ -350,6 +352,20 @@ def _status_data_plane_task(work_dir: Path, action: str) -> dict[str, Any] | Non
         task["continuation_required"] = True
         if any(code.startswith("E_NATIVE_") for code in receipt.get("issue_codes", []) if isinstance(code, str)):
             task["failure_action"] = "repair_native_runtime_then_resume_same_task"
+        if "inventory_display_scope_required" in receipt.get("issue_codes", []):
+            task["failure_action"] = "repair_cached_inventory_display_bindings_then_retry"
+    operational_failure = current_data_plane_operational_failure(work_dir, role)
+    if operational_failure is not None:
+        task["operational_failure"] = operational_failure
+        if operational_failure["cancellation_required"]:
+            task["failure_action"] = "cancel_owned_child_then_seal_before_replacement"
+    if (
+        receipt is not None
+        and role == "inventory_reconciler"
+        and "operational_error" in receipt.get("issue_codes", [])
+        and (operational_failure is None or not operational_failure["cancellation_required"])
+    ):
+        task["failure_action"] = "prepare_next_configured_native_route_or_remain_pending"
     return task
 
 
@@ -1449,15 +1465,25 @@ def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
         config=config,
         sdk_activation=activation,
     )
-    bind_data_plane_launch(work_dir, work_dir / result["relay_path"])
-    result.update(relay_prompt_line="PARR0T_OMP_RELAY=" + result["relay_path"],
-                  worker_prompt_policy="include_launch_contract_worker_prompt_line_verbatim_in_each_task")
-    runtime = native_runtime(work_dir)
-    if runtime["host"] == "omp" and runtime.get("transport", "collaboration") == "collaboration":
-        result["tool_transport"] = tool_transport_contract(prompt=runtime.get("omp_isolation") == "prompt")
-    if native_runtime(work_dir).get("transport") == "native-host-api":
-        result.update(executor="native-host-api", broker_command=["game-l10n", "run-native-broker",
-                      "--workspace", str(work_dir), "--relay", result["relay_path"]])
+    if result.get("status") == "ready":
+        bind_data_plane_launch(work_dir, work_dir / result["relay_path"])
+        result.update(
+            relay_prompt_line="PARR0T_OMP_RELAY=" + result["relay_path"],
+            worker_prompt_policy="include_launch_contract_worker_prompt_line_verbatim_in_each_task",
+        )
+        runtime = native_runtime(work_dir)
+        if runtime["host"] == "omp" and runtime.get("transport", "collaboration") == "collaboration":
+            result["tool_transport"] = tool_transport_contract(
+                prompt=runtime.get("omp_isolation") == "prompt"
+            )
+        if runtime.get("transport") == "native-host-api":
+            result.update(
+                executor="native-host-api",
+                broker_command=[
+                    "game-l10n", "run-native-broker", "--workspace",
+                    str(work_dir), "--relay", result["relay_path"],
+                ],
+            )
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -1530,6 +1556,16 @@ def cmd_record_native_launch(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def cmd_record_data_plane_failure(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    result = record_data_plane_failure(
+        work_dir,
+        _path_in_workspace(work_dir, args.relay, must_exist=True),
+        failure_code=args.failure_code,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
 def cmd_record_data_plane_relay_event(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     result = record_data_plane_relay_event(
@@ -3847,6 +3883,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Private task directory; defaults under .game-l10n/data-plane",
     )
     data_plane_prepare.set_defaults(func=cmd_prepare_data_plane_task)
+
+    data_plane_failure = sub.add_parser(
+        "record-data-plane-failure",
+        help="Record an observed operational failure for the current started relay task",
+    )
+    data_plane_failure.add_argument("--workspace", required=True)
+    data_plane_failure.add_argument("--relay", required=True)
+    data_plane_failure.add_argument(
+        "--failure-code",
+        choices=["provider_operational_error", "execution_guard_denied"],
+        required=True,
+    )
+    data_plane_failure.set_defaults(func=cmd_record_data_plane_failure)
 
     data_plane_event = sub.add_parser(
         "record-data-plane-relay-event",

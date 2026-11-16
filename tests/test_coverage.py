@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from hashlib import sha256
 import json
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from game_l10n.coverage import (
+    validate_inventory_display_scope,
     completion_attestation,
     inventory_fingerprint,
     record_runtime_coverage,
@@ -15,6 +17,7 @@ from game_l10n.coverage import (
     save_inventory_attestation,
     verify_inventory_pair,
 )
+
 from game_l10n.cli import _finalize_translation_results
 from game_l10n.errors import ConfigurationError
 from game_l10n.failure_queue import load_failure_queue, update_failure_queue
@@ -61,6 +64,60 @@ def write_inventory(
         ),
         encoding="utf-8",
     )
+
+
+class DisplayScopeContractTests(unittest.TestCase):
+    def test_new_contract_rejects_raw_only_but_accepts_uncertain_display_dependency(self) -> None:
+        payload = {
+            "coverage": {"declared_complete": True},
+            "segments": [{"id": "raw", "source": "SYNTHETIC"}],
+        }
+        validate_inventory_display_scope(payload)
+        with self.assertRaises(ConfigurationError):
+            validate_inventory_display_scope(payload, required=True)
+        payload["coverage"]["display_scope"] = {
+            "schema": "parr0t.display-scope.v1",
+            "raw_occurrence_count": 4,
+            "display_candidate_count": 1,
+            "control_only_count": 2,
+            "unclassified_count": 1,
+            "evidence_fingerprint": "synthetic-source-map",
+        }
+        payload["segments"][0]["metadata"] = {
+            "display_binding_id": "synthetic-render-sink",
+            "display_scope_evidence": {
+                "kind": "possible_display_dependency",
+                "evidence_fingerprint": "a" * 64,
+                "source_sha256": sha256(b"SYNTHETIC").hexdigest(),
+            }
+        }
+        validate_inventory_display_scope(payload, required=True)
+        payload["segments"][0]["source"] = "CHANGED SYNTHETIC SOURCE"
+        with self.assertRaises(ConfigurationError):
+            validate_inventory_display_scope(payload, required=True)
+
+    def test_control_storage_needs_a_distinct_display_projection(self) -> None:
+        payload = {
+            "coverage": {"display_scope": {
+                "schema": "parr0t.display-scope.v1", "raw_occurrence_count": 1,
+                "display_candidate_count": 1, "control_only_count": 0,
+                "unclassified_count": 0, "evidence_fingerprint": "synthetic-map",
+            }},
+            "segments": [{"id": "synthetic-control", "source": "SYNTHETIC_KEY", "metadata": {
+                "storage_role": "lookup_key", "display_binding_id": "synthetic-render",
+                "display_scope_evidence": {
+                    "kind": "positive_display_binding", "evidence_fingerprint": "b" * 64,
+                    "source_sha256": sha256(b"SYNTHETIC_KEY").hexdigest(),
+                },
+            }}],
+        }
+        with self.assertRaises(ConfigurationError):
+            validate_inventory_display_scope(payload, required=True)
+        payload["segments"][0]["metadata"]["display_projection_required"] = True
+        validate_inventory_display_scope(payload, required=True)
+        payload["coverage"]["display_scope"]["unclassified_count"] = 2
+        with self.assertRaises(ConfigurationError):
+            validate_inventory_display_scope(payload, required=True)
 
 
 class CoverageTests(unittest.TestCase):
@@ -579,6 +636,54 @@ class CoverageTests(unittest.TestCase):
         )
         self.assertEqual(state["gap_score"], 2)
 
+    def test_physical_comparison_keys_distinguish_extra_targets_from_namespace_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary, independent = root / "primary.json", root / "independent.json"
+            rows = [{"id": f"primary-{i}", "source": f"SOURCE_{i}",
+                     "metadata": {"inventory_comparison_key": f"physical-slot-{i}"}} for i in range(10)]
+            other = [{**row, "id": f"independent-{i}"} for i, row in enumerate(rows)]
+            other.append({"id": "new-target", "source": "NEW SOURCE",
+                          "metadata": {"inventory_comparison_key": "physical-slot-new"}})
+            write_inventory(primary, "synthetic-primary", rows)
+            write_inventory(independent, "synthetic-independent", other)
+            state = verify_inventory_pair(primary, independent)
+        self.assertNotIn("INVENTORY_IDENTITY_NAMESPACE_MISMATCH", state["issue_codes"])
+        self.assertEqual(state["missing_from_primary_count"], 1)
+        self.assertFalse(state["static_complete"])
+
+    def test_equal_text_never_aliases_different_physical_occurrences(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary, independent = root / "primary.json", root / "independent.json"
+            def row(identifier, slot):
+                return {"id": identifier, "source": "REPEATED SYNTHETIC TEXT",
+                        "metadata": {"inventory_comparison_key": slot}}
+            write_inventory(primary, "synthetic-primary", [row("p-a", "slot-a"), row("p-b", "slot-b")])
+            write_inventory(independent, "synthetic-independent", [row("s-a", "slot-a"), row("s-c", "slot-c")])
+            state = verify_inventory_pair(primary, independent)
+        self.assertEqual(state["missing_from_primary_count"], 1)
+        self.assertEqual(state["missing_from_independent_count"], 1)
+        self.assertFalse(state["static_complete"])
+
+    def test_namespace_repair_cannot_hide_a_primary_union_expansion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary, independent = root / "primary.json", root / "independent.json"
+            rows = [{"id": f"p-{i}", "source": f"SOURCE_{i}"} for i in range(3)]
+            write_inventory(primary, "synthetic-primary", rows)
+            write_inventory(independent, "synthetic-independent", [{**row, "id": f"s-{i}"} for i, row in enumerate(rows)])
+            first = save_inventory_attestation(root, primary, independent)
+            self.assertIn("INVENTORY_IDENTITY_NAMESPACE_MISMATCH", first["issue_codes"])
+            attestation = root / ".game-l10n/inventory-attestation.json"
+            original = attestation.read_bytes()
+            expanded = rows + [{"id": "added", "source": "ADDED SOURCE"}]
+            write_inventory(primary, "synthetic-primary", expanded)
+            write_inventory(independent, "synthetic-independent", expanded)
+            with self.assertRaisesRegex(ConfigurationError, "before primary expansion"):
+                save_inventory_attestation(root, primary, independent)
+            self.assertEqual(attestation.read_bytes(), original)
+
     def test_saved_primary_identity_is_append_only_across_handoffs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -637,6 +742,34 @@ class CoverageTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ConfigurationError, "duplicate comparison key"):
                 verify_inventory_pair(primary, independent)
+
+    def test_independent_inventory_must_confirm_control_storage_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary, independent = root / "primary.json", root / "independent.json"
+            metadata = {"storage_role": "lookup_key", "display_projection_required": True,
+                        "display_binding_id": "synthetic-render-sink"}
+            write_inventory(primary, "synthetic-primary", [{"id": "same-target", "source": "SYNTHETIC",
+                            "metadata": metadata}])
+            write_inventory(independent, "synthetic-independent", [{"id": "same-target", "source": "SYNTHETIC",
+                            "metadata": {**metadata, "display_projection_required": False}}])
+            state = verify_inventory_pair(primary, independent)
+        self.assertEqual(state["ui_composition_mismatch_count"], 1)
+        self.assertFalse(state["static_complete"])
+
+    def test_denominator_growth_does_not_reset_no_progress_observations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary, independent = root / "primary.json", root / "independent.json"
+            rows = [{"id": f"stable-{i}", "source": f"SOURCE_{i}"} for i in range(3)]
+            write_inventory(primary, "synthetic-primary", rows[:2])
+            write_inventory(independent, "synthetic-independent", rows[:1])
+            first = save_inventory_attestation(root, primary, independent)
+            write_inventory(primary, "synthetic-primary", rows)
+            changed = save_inventory_attestation(root, primary, independent)
+        self.assertGreater(changed["gap_score"], first["gap_score"])
+        self.assertEqual(changed["reconciliation"]["progress_state"], "changed")
+        self.assertEqual(changed["reconciliation"]["unchanged_observations"], 1)
 
     def test_saved_inventory_attestation_records_measured_gap_progress(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
