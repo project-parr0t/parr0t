@@ -203,6 +203,55 @@ class OrchestratorTests(unittest.TestCase):
                     {attempt.issue_code for attempt in result.attempts},
                 )
 
+    def test_style_memory_prioritizes_context_compatible_dialogue(self) -> None:
+        provider = ScriptedProvider(
+            "translator",
+            lambda **_: {"status": "success", "text": "TARGET", "reason": ""},
+        )
+        contexts = {
+            "compatible": {
+                "consistency_group_id": "speaker:addressee",
+                "addressee_ids": ["addressee"],
+                "relationship_state": "trusted",
+            },
+            "unrelated": {
+                "consistency_group_id": "speaker:other",
+                "addressee_ids": ["other"],
+                "relationship_state": "hostile",
+            },
+            "current": {
+                "consistency_group_id": "speaker:addressee",
+                "addressee_ids": ["addressee"],
+                "relationship_state": "trusted",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            orchestrator = LocalizationOrchestrator(
+                registry=ProviderRegistry({provider.name: provider}),
+                config=OrchestratorConfig(
+                    [provider.name],
+                    [],
+                    require_review=False,
+                    use_style_memory=True,
+                    style_anchor_limit=1,
+                ),
+                project=ProjectContext("TEST", "src", "dst"),
+                context_pack=ContextPack(dialogue_contexts=contexts),
+                work_dir=Path(directory),
+            )
+            orchestrator._remember(
+                Segment("compatible", "SOURCE_1", speaker="speaker"), "TARGET_1"
+            )
+            orchestrator._remember(
+                Segment("unrelated", "SOURCE_2", speaker="speaker"), "TARGET_2"
+            )
+
+            anchors = orchestrator._anchors(
+                Segment("current", "SOURCE_3", speaker="speaker")
+            )
+
+        self.assertEqual([anchor["target_id"] for anchor in anchors], ["compatible"])
+
     def test_unreviewed_results_do_not_become_approved_style_anchors(self) -> None:
         observed_anchors: list[list[dict[str, str]]] = []
 
