@@ -2081,6 +2081,7 @@ def cmd_collect_native_review(args: argparse.Namespace) -> int:
         high_risk_categories=routing.get("strong_review_high_risk_categories", []),
         target_language=str(config.get("project", {}).get("target_language", "")),
         reference_cues=_context_reference_cues(work_dir, config),
+        dialogue_contexts=_context_dialogue_contexts(work_dir, config),
         primary_translator=str((routing.get("translators") or [""])[0]),
         **_native_review_integrity_options(work_dir, config),
     )
@@ -2098,6 +2099,26 @@ def _context_reference_cues(work_dir: Path, config: dict[str, Any]) -> tuple[dic
     payload = json.loads(path.read_text(encoding="utf-8-sig"))
     cues = payload.get("reference_cues", []) if isinstance(payload, dict) else []
     return tuple(cue for cue in cues if isinstance(cue, dict))
+
+def _context_dialogue_contexts(
+    work_dir: Path, config: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """Target-bound dialogue evidence for deterministic strong-review routing."""
+
+    path = _path_in_workspace(
+        work_dir, config.get("files", {}).get("context_pack", "context/context-pack.json")
+    )
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    contexts = payload.get("dialogue_contexts", {}) if isinstance(payload, dict) else {}
+    if not isinstance(contexts, dict):
+        return {}
+    return {
+        str(target_id): context
+        for target_id, context in contexts.items()
+        if isinstance(target_id, str) and isinstance(context, dict)
+    }
 
 
 def cmd_collect_native_rewrite(args: argparse.Namespace) -> int:

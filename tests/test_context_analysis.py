@@ -48,6 +48,28 @@ def successful_context(**kwargs):
             }
         ],
         "relationship_timeline": ["EVENT"],
+        "dialogue_contexts": [
+            {
+                "target_id": item["id"],
+                "speaker": item.get("speaker", ""),
+                "addressee_ids": [],
+                "relationship_state": "established",
+                "scene_phase": "ongoing",
+                "speech_act": "statement",
+                "delivery": "direct",
+                "emotion": "neutral",
+                "situational_register": "baseline",
+                "address_form": "established form",
+                "register_shift": "baseline",
+                "register_shift_reason": "",
+                "consistency_group_id": f'{item.get("speaker", "")}:baseline',
+                "consistency_status": "stable",
+                "uncertainties": [],
+                "evidence_line_ids": [item["id"]],
+                "confidence": "high",
+            }
+            for item in payload["lines"]
+        ],
         "reference_cues": [],
     }
 
@@ -524,6 +546,24 @@ class ContextAnalysisTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with self.assertRaisesRegex(ProviderError, "character coverage"):
+                analyze_with_cache(
+                    analyzer=analyzer,
+                    segments=[Segment("fixture-1", "SOURCE", speaker="A", scene="S")],
+                    output_path=root / "context.json",
+                    state_path=root / "state.json",
+                )
+
+    def test_context_gate_rejects_missing_dialogue_evidence(self) -> None:
+        def incomplete(**kwargs):
+            payload = successful_context(**kwargs)
+            payload["dialogue_contexts"] = []
+            return payload
+
+        provider = ScriptedProvider("context", incomplete)
+        analyzer = ContextAnalyzer(ProviderRegistry({"context": provider}), ["context"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(ProviderError, "dialogue evidence coverage"):
                 analyze_with_cache(
                     analyzer=analyzer,
                     segments=[Segment("fixture-1", "SOURCE", speaker="A", scene="S")],
