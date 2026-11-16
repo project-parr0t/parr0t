@@ -19,12 +19,20 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = "parr0t.branch-audit.v1"
 IMPACT_SCHEMA = "parr0t.branch-adapter-impact.v2"
+MAX_VALIDATION_WORKERS = 8
+DEFAULT_VALIDATION_JOBS = max(1, min(MAX_VALIDATION_WORKERS, os.cpu_count() or 1))
 VALIDATION_RUNNER_FUNCTIONS = {
-    "_blob", "complete_cached_result", "dependency_tree_digest",
+    "_blob", "complete_cached_result", "core_test_workers", "dependency_tree_digest",
     "external_environment_digest", "extract_snapshot", "git", "hash_file",
     "initialize_snapshot", "run_checks", "unittest_summary", "validation_environment_files",
 }
 
+
+
+def core_test_workers() -> int:
+    """Bound process-level full-suite parallelism independently of SDK jobs."""
+
+    return max(1, min(MAX_VALIDATION_WORKERS, os.cpu_count() or 1))
 
 def digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -447,7 +455,11 @@ def validator_digest() -> str:
         raise ValueError("E_BRANCH_VALIDATION_RUNNER_INCOMPLETE")
     supporting = {
         path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
-        for path in ("scripts/check_repo_privacy.py", "scripts/check_engine_faq.py")
+        for path in (
+            "scripts/check_repo_privacy.py",
+            "scripts/check_engine_faq.py",
+            "scripts/run_unittest_shards.py",
+        )
     }
     return digest(["parr0t.branch-validator.v2", functions, supporting])
 
@@ -627,9 +639,19 @@ def run_checks(snapshot: Path, python: str, sdk: bool, log: Path,
     ]
     if sdk:
         commands.append(("engine_faq", [python, str(ROOT / "scripts/check_engine_faq.py"), str(snapshot / "docs/engine-faq.md")]))
-    test_command = [python, "-m", "unittest", "-v", *test_paths] if test_paths is not None else [
-        python, "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v",
-    ]
+    full_test_workers = core_test_workers()
+    test_command = (
+        [python, "-m", "unittest", "-v", *test_paths]
+        if test_paths is not None
+        else [
+            python,
+            str(ROOT / "scripts/run_unittest_shards.py"),
+            "--root",
+            str(snapshot),
+            "--workers",
+            str(full_test_workers),
+        ]
+    )
     commands.append(("tests", test_command if test_paths != [] else None))
     checks = {}
     progress = log.with_suffix(log.suffix + ".json")
@@ -677,6 +699,8 @@ def run_checks(snapshot: Path, python: str, sdk: bool, log: Path,
                         "complete": bool(count > 0 and summary and skipped_count == 0),
                         "scope": "adapter" if test_paths is not None else "full",
                     })
+                    if test_paths is None:
+                        checks[name]["workers"] = full_test_workers
                     if not checks[name]["complete"]:
                         checks[name]["passed"] = False
                         checks[name]["issue_code"] = (
@@ -706,7 +730,7 @@ def run_checks(snapshot: Path, python: str, sdk: bool, log: Path,
 
 
 def audit_branches(repo: Path, state: Path, *, main_ref: str = "origin/main", refs: list[str] | None = None,
-                   python: str = sys.executable, environment_key: str = "", jobs: int = 2, force: bool = False,
+                   python: str = sys.executable, environment_key: str = "", jobs: int = DEFAULT_VALIDATION_JOBS, force: bool = False,
                    pinned_plans: list[dict] | None = None,
                    provision_dependencies: bool = False, cache_dir: Path | None = None) -> dict:
     repo, state = repo.resolve(), state.resolve()
@@ -945,7 +969,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ref", action="append", help="Repeat for a subset; default: all origin tracking branches")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--environment-key", default="", help="Invalidate when external tools or editable dependencies change")
-    parser.add_argument("--jobs", type=int, choices=range(1, 9), default=2)
+    parser.add_argument("--jobs", type=int, choices=range(1, 9), default=DEFAULT_VALIDATION_JOBS)
     parser.add_argument("--force", action="store_true", help="Ignore previous passing validation")
     parser.add_argument("--provision-dependencies", action="store_true",
                         help="Install required branch-declared Python test dependencies into the external state directory")
