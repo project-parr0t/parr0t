@@ -397,7 +397,7 @@ class NativeReviewTests(unittest.TestCase):
             fake = SimpleNamespace(
                 registry=SimpleNamespace(get=lambda name: SimpleNamespace(name=name, fingerprint=lambda: {"name": name})),
                 context_pack=ContextPack(), glossary=[], project=SimpleNamespace(target_language=""),
-                config=OrchestratorConfig(["deepseek"], [], require_review=False,
+                config=OrchestratorConfig(["deepseek"], ["deepseek"], require_review=False,
                                           review_attempt_limits={"deepseek": 1}),
                 _judge_with_refusal_retry=judge,
             )
@@ -456,7 +456,7 @@ class NativeReviewTests(unittest.TestCase):
             fake = SimpleNamespace(
                 registry=SimpleNamespace(get=lambda name: SimpleNamespace(name=name, fingerprint=lambda: {"name": name})),
                 context_pack=ContextPack(), glossary=[], project=SimpleNamespace(target_language="ko"),
-                config=OrchestratorConfig(["deepseek"], [], require_review=False,
+                config=OrchestratorConfig(["deepseek"], ["deepseek"], require_review=False,
                                           review_attempt_limits={"deepseek": 1}),
                 _judge_with_refusal_retry=judge,
             )

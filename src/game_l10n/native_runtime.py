@@ -15,6 +15,7 @@ from typing import Any
 from .control_plane import control_plane_state, require_control_plane_ready
 from .store import stable_hash
 from .omp_isolation import ISOLATION_ENV, ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
+from .model_policy import apply_native_role_models, exact_native_model, native_role_bindings
 
 RUNTIME_PATH = ".game-l10n/native/runtime.json"
 RUNTIME_SCHEMA = "parr0t.native-runtime.v1"
@@ -34,18 +35,30 @@ def _write(path: Path, value: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def _exact_model(value: str) -> bool:
-    return (
-        isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@+\-]*", value) is not None
-        and value not in {"default", "inherit", "task", "smol", "slow", "luna", "sol"}
-        and not value.startswith("@")
-    )
-
-
 def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str],
                              *, transport: str | None = None,
-                             omp_isolation: str | None = None) -> dict[str, Any]:
+                             omp_isolation: str | None = None,
+                             role_models: dict[str, str] | None = None,
+                             user_requested_models: bool = False) -> dict[str, Any]:
     require_control_plane_ready(work_dir)
+    policy_config = {}
+    config_path = work_dir / "game-l10n.json"
+    if role_models:
+        if not user_requested_models:
+            raise ValueError("E_MODEL_POLICY_USER_REQUEST_REQUIRED")
+        from .workspace import load_config
+        from .provider_policy import validate_provider_policy
+        policy_config = apply_native_role_models(load_config(work_dir), role_models)
+        validate_provider_policy(policy_config)
+    elif config_path.is_file():
+        # Runtime repair also works with a malformed legacy configuration.
+        # A present model policy, however, must validate rather than disappear.
+        try:
+            stored = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            stored = {}
+        if isinstance(stored, dict) and "model_policy" in stored:
+            policy_config = stored
     prefix = "openai-codex/" if host == "omp" else ""
     bindings = ({"native-luna": prefix + "gpt-6-luna", "native-sol": prefix + "gpt-6.1-sol"}
                 if host in {"codex", "omp"} else {})
@@ -62,10 +75,14 @@ def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str],
         raise ValueError("E_NATIVE_RUNTIME_INVALID: unsupported host or transport")
     if (
         not all(re.fullmatch(r"native-[a-z0-9][a-z0-9._-]*", route) for route in models)
-        or not all(_exact_model(value) for value in models.values())
+        or not all(exact_native_model(value) for value in models.values())
     ):
         raise ValueError("E_NATIVE_RUNTIME_INVALID: use exact route=model bindings")
     bindings.update(models)
+    requested_bindings = native_role_bindings(policy_config)
+    if any(route in models and models[route] != model for route, model in requested_bindings.items()):
+        raise ValueError("E_MODEL_POLICY_BINDING_CONFLICT: explicit role models take precedence")
+    bindings.update(requested_bindings)
     if not {"native-luna", "native-sol"} <= bindings.keys():
         raise ValueError("E_NATIVE_RUNTIME_INVALID: registered hosts require both exact model bindings")
     payload = {
@@ -90,6 +107,9 @@ def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str],
         payload.update(transport=transport, host_profile_fingerprint=native_host_profile(work_dir, host)["fingerprint"])
     runtime_isolation(work_dir, payload)
     _write(work_dir / RUNTIME_PATH, {**payload, "fingerprint": stable_hash(payload)})
+    if role_models:
+        from .workspace import _write_config
+        _write_config(work_dir, policy_config)
     return {**payload, "runtime_path": RUNTIME_PATH}
 
 
@@ -123,7 +143,7 @@ def native_runtime(work_dir: Path, *, required: bool = False,
             and (allow_stale_generation or value["control_generation"] == int(control_plane_state(work_dir).get("generation", 0)))
             and {"native-luna", "native-sol"} <= set(value["models"])
             and all(re.fullmatch(r"native-[a-z0-9][a-z0-9._-]*", route) for route in value["models"])
-            and all(_exact_model(model) for model in value["models"].values())
+            and all(exact_native_model(model) for model in value["models"].values())
         )
     except (OSError, ValueError, TypeError, AttributeError, KeyError):
         valid = False
@@ -139,6 +159,12 @@ def launch_contract(work_dir: Path, route: str, tasks: list[str]) -> dict[str, A
         return None  # Legacy library/checkpoint compatibility; public CLI requires binding.
     if route not in runtime["models"]:
         raise ValueError("E_NATIVE_RUNTIME_INVALID: native route has no exact model")
+    config_path = work_dir / "game-l10n.json"
+    if config_path.is_file():
+        policy_config = json.loads(config_path.read_text(encoding="utf-8"))
+        requested = native_role_bindings(policy_config).get(route)
+        if requested is not None and runtime["models"][route] != requested:
+            raise ValueError("E_MODEL_POLICY_BINDING_REQUIRED: requested role model is not bound")
     contract = {
         "host": runtime["host"], "runtime_fingerprint": runtime["fingerprint"],
         "route": route, "model": runtime["models"][route], "tasks": tasks,

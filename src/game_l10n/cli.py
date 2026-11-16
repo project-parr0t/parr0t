@@ -83,6 +83,7 @@ from .language_policy import (
     record_target_language_policy,
 )
 from .filesystem_package import build_filesystem_package, validate_filesystem_package
+from .model_policy import NATIVE_ROLE_ROUTES, native_role_models
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext
 from .native_followup import collect_native_followup, prepare_native_followup
 from .native_translation_retry import (
@@ -1469,12 +1470,22 @@ def cmd_native_runtime(args: argparse.Namespace) -> int:
             if not separator or route in models:
                 raise ValueError("E_NATIVE_RUNTIME_INVALID: repeat --model route=exact-model once per route")
             models[route] = model
+        role_models = {}
+        for binding in getattr(args, "role_model", None) or []:
+            role, separator, model = binding.partition("=")
+            if not separator or role in role_models:
+                raise ValueError("E_NATIVE_RUNTIME_INVALID: repeat --role-model role=exact-model once per role")
+            role_models[role] = model
         result = configure_native_runtime(
             work_dir, args.host, models, transport=getattr(args, "transport", None),
             omp_isolation=getattr(args, "omp_isolation", None),
+            role_models=role_models,
+            user_requested_models=getattr(args, "user_requested_models", False),
         )
     else:
-        if args.model or getattr(args, "transport", None) or getattr(args, "omp_isolation", None):
+        if (args.model or getattr(args, "role_model", None)
+                or getattr(args, "user_requested_models", False)
+                or getattr(args, "transport", None) or getattr(args, "omp_isolation", None)):
             raise ValueError("E_NATIVE_RUNTIME_INVALID: model overrides require --host")
         result = native_runtime(work_dir, required=True)
     print(json.dumps(result, ensure_ascii=False))
@@ -1694,8 +1705,10 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
     route_binding = None
     codex_app_mode = effective_execution_mode(config) == CODEX_APP_EXECUTION_MODE
     custom_native_mode = config.get("provider_preset") == "custom"
+    declared_native_roles = native_role_models(config)
+    ordered_native_review = bool(declared_native_roles) and pass_kind in {"review", "rewrite"}
     segments = read_segments(source)
-    if custom_native_mode:
+    if custom_native_mode or ordered_native_review:
         if pass_kind == "translation":
             plan = _native_translation_route_plan(config)
             provider = args.native_provider or (plan[0]["provider"] if plan else "")
@@ -1716,12 +1729,14 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
                     raise ConfigurationError("E_NATIVE_REVIEW_TIER_INVALID")
                 role, stage = "rewriters", "review-rewrite"
             routes = routing.get(role, [])
-            provider = select_native_review_route(segments, routes, stage=stage)
+            provider = select_native_review_route(
+                segments, routes, stage=stage,
+                route_models=native_runtime(work_dir, required=True)["models"],
+            )
             attempt = 1
             if (args.native_provider is not None and args.native_provider != provider
                     or args.route_attempt not in {None, 1}):
                 raise ConfigurationError("E_NATIVE_ROUTE_INVALID: review route must follow configured order")
-        from .native_runtime import native_runtime
         if provider not in native_runtime(work_dir, required=True)["models"]:
             raise ConfigurationError("E_NATIVE_RUNTIME_INVALID: native route has no exact model")
         route_binding = {"provider": provider, "attempt": attempt}
@@ -2113,10 +2128,29 @@ def cmd_process_native_review_followup(args: argparse.Namespace) -> int:
     require_sdk_activation(work_dir, config)
     if args.operation == "judge":
         from .review_policy import review_policy_status
-        policy = review_policy_status(config)
+        policy = review_policy_status(config, work_dir)
         if policy["status"] != "configured":
-            print(json.dumps({**policy, "action": "configure_review_policy",
-                              "issue_code": "E_REVIEW_FALLBACK_POLICY_REQUIRED"}))
+            print(json.dumps({**policy,
+                              "action": ("configure_native_runtime"
+                                         if policy["status"] == "native_binding_required"
+                                         else "configure_review_policy"),
+                              "issue_code": ("E_NATIVE_RUNTIME_INVALID"
+                                             if policy["status"] == "native_binding_required"
+                                             else "E_REVIEW_FALLBACK_POLICY_REQUIRED")}))
+            return 1
+        if "review-fallback" in native_role_models(config):
+            provider = NATIVE_ROLE_ROUTES["review-fallback"]
+            print(json.dumps({
+                "status": "native_pass_required", "action": "prepare_native_pass",
+                "issue_code": "E_NATIVE_REVIEW_NATIVE_FALLBACK_REQUIRED",
+                "provider": provider,
+                "command_argv": [
+                    "game-l10n", "prepare-native-pass", "--workspace", str(work_dir),
+                    "--input", args.input, "--output", args.output,
+                    "--pass-kind", "review", "--review-tier", "strong",
+                    "--native-provider", provider,
+                ],
+            }))
             return 1
     role = "judge_fallback" if args.operation == "judge" else "selective_rewrite"
     if role not in config.get("native_workflow", {}).get("external_provider_roles", []):
@@ -2135,6 +2169,16 @@ def cmd_process_native_review_followup(args: argparse.Namespace) -> int:
     orchestrator = _codex_app_fallback_orchestrator(work_dir)
     orchestrator.config.retry_refusals_once = False
     orchestrator.config.grace_retries = 0
+    from .review_policy import review_call_limit
+    routing = config.get("routing", {})
+    orchestrator.config.reviewer_chain = list(routing.get("reviewers", []))
+    primary_review_provider = (routing.get("reviewers") or ["native-sol"])[0]
+    primary_review_limit = review_call_limit(
+        primary_review_provider, routing.get("reviewers", ["native-sol"]),
+        routing.get("review_attempt_limits", {}),
+        model=(native_runtime(work_dir) or {}).get("models", {}).get(primary_review_provider, ""),
+        tier_limit=routing.get("strong_max_calls"),
+    )
     with live_processing_ui(
         operation="review_fallback", total_records=total_records
     ) as progress:
@@ -2148,6 +2192,8 @@ def cmd_process_native_review_followup(args: argparse.Namespace) -> int:
             deadline_epoch=deadline_epoch,
             wave_size=args.wave_size,
             progress_callback=progress.apply_event,
+            primary_review_provider=primary_review_provider,
+            primary_review_limit=primary_review_limit,
         )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -3050,7 +3096,7 @@ def cmd_review_policy(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     settings = {key: getattr(args, key) for key in REVIEW_SETTING_FIELDS if getattr(args, key) is not None}
     if args.fallback_model is None and args.max_calls is None and not settings:
-        result = review_policy_status(load_config(work_dir))
+        result = review_policy_status(load_config(work_dir), work_dir)
     else:
         result = configure_review_policy(
             work_dir, model=args.fallback_model, max_calls=args.max_calls, settings=settings,
@@ -3473,6 +3519,9 @@ def build_parser() -> argparse.ArgumentParser:
     native_host.add_argument("--omp-isolation", choices=["prompt", "guarded"],
                              help="OMP collaboration separation; preserve existing mode, otherwise prompt unless a guard is active")
     native_host.add_argument("--model", action="append", help="Exact native-route=model-id override; repeatable")
+    native_host.add_argument("--role-model", action="append", help="Exact role=model-id override; repeatable")
+    native_host.add_argument("--user-requested-models", action="store_true",
+                             help="Record role overrides explicitly selected in the initial user prompt")
     native_host.set_defaults(func=cmd_native_runtime)
 
     register_host = sub.add_parser("configure-native-host", help="Register an existing native worker API service")

@@ -21,7 +21,7 @@ For a new job:
 1. Confirm repository/workspace access and only that the source path exists; do not inspect its contents.
 2. Initialize and follow status contracts. Clean entry: `enter-control-plane --workspace <workspace> --contracts-read --source-unopened`. Record exposure before recovery. Rotate by default; explicit user acceptance follows `control-plane-contract.md` when host rules permit. Never auto-launch replacements.
 3. Ask once whether Git may be used for this game task; record only the answer. Disabled forbids Git mutation/publication in that workspace, not authenticated SDK access, download, inventory, or activation. Never infer the answer from transport or missing `.git`.
-4. Bind `native-runtime --host codex|omp --workspace <workspace>`; follow status through `local_patch_ready`. Preserve existing OMP modes and started-worker bindings; see `control-plane-contract.md`.
+4. Bind `native-runtime --host codex|omp` before dispatch. Model overrides use `--role-model role=exact-id --user-requested-models`. Preserve host/isolation and started bindings; see `codex-app-deepseek.md`.
 
 For an existing job, start with status and reuse valid checkpoints. Do not repeat work with unchanged fingerprints.
 
@@ -55,9 +55,9 @@ Do not reorder barriers. Failures affect only their target and route; they canno
 - At 10,000+ records, scan once per method. Continue cached gap-only reconciliation while the gap score falls; stop only for a proven blocker, deterministic gate, or unchanged-progress rule. Never infer a root limit from size, elapsed time, context pressure, or model judgment.
 - Keep relevant narrative/voice, functional/UI, knowledge, adjacency, glossary, and immutable evidence target-scoped.
 - The text-free parent handles only IDs, counts, states, queues, paths, and codes. It dispatches only core relays and never inspects game-root contents; a missing SDK changes nothing.
-- Presets fix provider roles. Keys do not change mode, role, or service. Parent sees only `fallback_required`, never rationale.
-- Recommended presets retry failed Luna targets 5 times, then Sol targets 3 times, before DeepSeek. Counts exclude each route's first attempt; authentication/quota exhaustion advances immediately.
-- Sol: ≤2 strong-judge attempts/target (retries/confirmation/resume). Preserve user/template fallback model/count; missing→pending. `review-pipeline.md`.
+- Explicit initial models override preset defaults; preserve provider permissions, transport, and unspecified roles. `codex-app-deepseek.md`.
+- Translation retries default to Luna 5, Sol 3, then DeepSeek; first calls excluded. Unbound routes remain pending.
+- Sol strong review: ≤2 calls/target across retries/confirmation/resume. Bind initial fallback model/count with `review-policy`; missing/incompatible bindings stay pending, never substitute DeepSeek. `review-pipeline.md`.
 - Translation is faithful transformation, not content generation. Independent review checks meaning, omission, voice, tone, function, conditions, units, terminology, allusions, placeholders, markup, control codes, ordering, and material layout risk.
 - Build only in the workspace; synthetic checks never install or launch games.
 - Apply proportional verification and stop after the changed layer passes. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.
