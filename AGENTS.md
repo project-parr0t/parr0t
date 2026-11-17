@@ -13,7 +13,7 @@ Parr0t is engine-neutral. Keep game, credential, title, and job data in external
 
 ## Non-negotiable rules
 
-1. **Stay authorized.** Apply `skills/request-scope-guard/SKILL.md` after scope changes/external effects and `skills/third-party-consent/SKILL.md` before third-party use. Access is not authorization; require risk disclosure, explicit user approval, and a consumed core record.
+1. **Stay authorized.** Apply `skills/request-scope-guard/SKILL.md` after scope changes/external effects and `skills/third-party-consent/SKILL.md` before third-party use. Access is not authorization; require risk disclosure, explicit user approval, and a consumed core record. Validated locked dependencies without known supply-chain attack history are preapproved.
 2. **Separate locations.** This repository holds reusable code; the game root is read-only; generated work belongs in a `game-l10n init-workspace` workspace.
 3. **Text is the default scope.** Do not inspect images for text or run OCR unless the user requests image translation. Then record `image-localization-policy`, follow `docs/image-localization.md`, and process only definitively bound player-visible UI text regions; never scan all images.
 4. **During localization, keep root metadata-only.** Never inspect private data, semantic text, transcripts, logs, trees, or nested-worker output/status. Observe only core status, validated envelopes/receipts, relay lifecycle, and core-owned usage. Record leaks; rotate by default. Explicit user acceptance follows `docs/control-plane-contract.md` when host rules permit. Accepted exposure grants no semantic/worker permissions.
