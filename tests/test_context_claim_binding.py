@@ -14,6 +14,7 @@ from game_l10n.data_plane_task import (
 )
 from game_l10n.errors import ConfigurationError
 from game_l10n.store import stable_hash
+from tests import context_result_provenance
 
 
 class ContextClaimBindingTests(unittest.TestCase):
@@ -91,6 +92,7 @@ class ContextClaimBindingTests(unittest.TestCase):
             "status": "success" if success else "error",
             "context_part": part if success else {},
             "issue_code": "" if success else "worker_error",
+            "content_provenance": context_result_provenance(claim),
         }), encoding="utf-8")
         return path
 

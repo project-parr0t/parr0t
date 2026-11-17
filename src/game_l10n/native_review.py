@@ -290,19 +290,44 @@ def _compact_verdict(text: str) -> Any:
 
 def _bound_result(segment: Segment) -> TranslationResult:
     candidate = segment.metadata[CANDIDATE_METADATA_KEY]
+    metadata = {
+        key: value
+        for key, value in segment.metadata.items()
+        if key not in {CANDIDATE_METADATA_KEY, REVIEW_STATE_KEY}
+    }
+    if "content_provenance" in candidate:
+        provenance = candidate["content_provenance"]
+        if not isinstance(provenance, dict):
+            raise ValueError("E_OUTPUT_PROVENANCE_INVALID")
+        metadata["content_provenance"] = dict(provenance)
+    lineage = candidate.get("content_provenance_lineage")
+    if lineage is not None:
+        if (
+            not isinstance(lineage, list)
+            or not lineage
+            or not all(isinstance(item, dict) for item in lineage)
+        ):
+            raise ValueError("E_OUTPUT_PROVENANCE_INVALID")
+        metadata["content_provenance_lineage"] = [
+            dict(item) for item in lineage
+        ]
     result = TranslationResult(
-        segment_id=segment.id, source=segment.source, text=candidate["text"],
-        translator=candidate["provider"], candidate_generation=candidate["generation"],
+        segment_id=segment.id,
+        source=segment.source,
+        text=candidate["text"],
+        translator=candidate["provider"],
+        candidate_generation=candidate["generation"],
         candidate_digest=candidate["digest"],
-        metadata={key: value for key, value in segment.metadata.items()
-                  if key not in {CANDIDATE_METADATA_KEY, REVIEW_STATE_KEY}},
+        metadata=metadata,
     )
     saved = segment.metadata.get(REVIEW_STATE_KEY)
     if saved is not None:
         if not isinstance(saved, dict):
             raise ValueError("E_NATIVE_REVIEW_STATE_INVALID")
-        if (saved.get("candidate_digest") != candidate["digest"]
-                or saved.get("candidate_generation") != candidate["generation"]):
+        if (
+            saved.get("candidate_digest") != candidate["digest"]
+            or saved.get("candidate_generation") != candidate["generation"]
+        ):
             raise ValueError("E_NATIVE_REVIEW_STATE_STALE")
         result.attempts = [AttemptRecord(**item) for item in saved.get("attempts", [])]
         result.metadata.update(saved.get("metadata", {}))
@@ -382,6 +407,16 @@ def collect_native_review(
     manifest = _load_task_manifest(work_dir, manifest_path)
     if manifest.get("pass_kind") != "review":
         raise ValueError("E_NATIVE_REVIEW_PASS_REQUIRED")
+    review_policy = manifest.get("content_source_policy")
+    expected_task_kind = "triage" if tier == "triage" else "strong_review"
+    if isinstance(review_policy, dict) and (
+        review_policy.get("task_kind") != expected_task_kind
+        and not (
+            review_policy.get("task_kind") == "review"
+            and review_policy.get("authorization") == "default_deny"
+        )
+    ):
+        raise ValueError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
     # No overwrite of any prepared input or prior result. Repeated collection
     # is deterministic and never starts a worker or consumes another attempt.
     if output.resolve() in {source.resolve().parent, manifest_path.resolve().parent}:
@@ -584,10 +619,33 @@ def collect_native_rewrite(
             result.text = row["text"]
             result.metadata["review_tier"] = "strong_pending"
             result.metadata["native_confirmation_pending"] = True
-            bound = replace(segment, metadata={**segment.metadata, CANDIDATE_METADATA_KEY: {
-                "text": result.text, "generation": result.candidate_generation,
-                "digest": result.candidate_digest, "provider": provider,
-            }})
+            rewritten_candidate = {
+                "text": result.text,
+                "generation": result.candidate_generation,
+                "digest": result.candidate_digest,
+                "provider": provider,
+            }
+            if "content_provenance" in row:
+                current_provenance = dict(row["content_provenance"])
+                prior_lineage = segment.metadata.get(
+                    CANDIDATE_METADATA_KEY, {}
+                ).get("content_provenance_lineage", [])
+                rewritten_candidate["content_provenance"] = current_provenance
+                rewritten_candidate["content_provenance_lineage"] = [
+                    *[dict(item) for item in prior_lineage],
+                    current_provenance,
+                ]
+                result.metadata["content_provenance"] = current_provenance
+                result.metadata["content_provenance_lineage"] = list(
+                    rewritten_candidate["content_provenance_lineage"]
+                )
+            bound = replace(
+                segment,
+                metadata={
+                    **segment.metadata,
+                    CANDIDATE_METADATA_KEY: rewritten_candidate,
+                },
+            )
             confirmation.append(_pending_segment(bound, result))
         else:
             unresolved.append(_pending_segment(segment, result))
@@ -709,6 +767,26 @@ def process_native_review_followup(
             if response and response.status is AgentStatus.SUCCESS:
                 orchestrator._set_candidate(result, response.text)
                 result.text = response.text
+                prior_provenance = result.metadata.pop(
+                    "content_provenance", None
+                )
+                if isinstance(prior_provenance, dict):
+                    lineage = result.metadata.get(
+                        "content_provenance_lineage", []
+                    )
+                    normalized_lineage = (
+                        [dict(item) for item in lineage]
+                        if isinstance(lineage, list)
+                        else []
+                    )
+                    if (
+                        not normalized_lineage
+                        or normalized_lineage[-1] != prior_provenance
+                    ):
+                        normalized_lineage.append(dict(prior_provenance))
+                    result.metadata["content_provenance_lineage"] = (
+                        normalized_lineage
+                    )
                 result.metadata["review_tier"] = "strong_pending"
                 result.metadata["native_confirmation_pending"] = True
         return result
@@ -782,11 +860,39 @@ def process_native_review_followup(
             continue
         if result.metadata.get("native_confirmation_pending") is True:
             metadata = dict(segment.metadata)
-            metadata[CANDIDATE_METADATA_KEY] = {
-                "text": result.text, "generation": result.candidate_generation,
-                "digest": result.candidate_digest, "provider": "deepseek",
+            fallback_candidate = {
+                "text": result.text,
+                "generation": result.candidate_generation,
+                "digest": result.candidate_digest,
+                "provider": "deepseek",
             }
-            confirmation.append(_pending_segment(replace(segment, metadata=metadata), result))
+            current = result.metadata.get("content_provenance")
+            prior = segment.metadata.get(CANDIDATE_METADATA_KEY, {}).get(
+                "content_provenance"
+            )
+            prior_lineage = segment.metadata.get(
+                CANDIDATE_METADATA_KEY, {}
+            ).get("content_provenance_lineage", [])
+            lineage = (
+                [dict(item) for item in prior_lineage]
+                if isinstance(prior_lineage, list)
+                else []
+            )
+            if not lineage and isinstance(prior, dict):
+                lineage = [dict(prior)]
+            if isinstance(current, dict):
+                fallback_candidate["content_provenance"] = dict(current)
+                if not lineage or lineage[-1] != current:
+                    lineage.append(dict(current))
+            if lineage:
+                fallback_candidate["content_provenance_lineage"] = lineage
+                result.metadata["content_provenance_lineage"] = [
+                    dict(item) for item in lineage
+                ]
+            metadata[CANDIDATE_METADATA_KEY] = fallback_candidate
+            confirmation.append(
+                _pending_segment(replace(segment, metadata=metadata), result)
+            )
         elif operation == "judge" and result.metadata.get("rewrite_issues"):
             rewrite.append(_pending_segment(segment, result))
         else:

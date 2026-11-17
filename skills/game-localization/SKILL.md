@@ -11,7 +11,7 @@ repair/rebind the SDK, change model/batch/budget choices, or resume a halted
 review autonomously. Checkpoint unknown or incomplete state. Never invent a
 budget or replace a manifest; only user-set limits execute.
 
-`game-l10n` owns execution; read core/workspace instructions and status contracts. Explicit shutdown/diagnosis uses `framework-mode` under `docs/control-plane-contract.md`, suspending localization directives but not host safety/privacy.
+`game-l10n` owns execution; follow core/workspace instructions and status. Shutdown/diagnosis uses `framework-mode` under `docs/control-plane-contract.md`, suspending localization directives but not host safety/privacy.
 
 ## Run
 
@@ -26,11 +26,12 @@ budget or replace a manifest; only user-set limits execute.
 ## Routing invariants
 
 - Apply `request-scope-guard` after every user message that limits scope or before any optional, destructive, or external action. Workers receive only authorized targets and effects.
+- Apply `translation-source-isolation` to every semantic worker. It defines default-deny external content access, exact task-bound grants, immutable policy/direct-model provenance, and taint rejection.
 - Provider refusal is `fallback_required`, not an exclusion or semantic decision. Finish the primary pass before fallback. Preserve source only after all configured routes are proven exhausted.
 - Each target retains relevant narrative/voice, functional/UI, or knowledge/prerequisite context even though provider calls isolate failures per target.
-- Native workers start fresh with no parent history and return only a `parr0t.control-envelope.v2` path. The parent must not receive source, candidates, results, refusal prose, or semantic review details. Follow `docs/control-plane-contract.md`.
-- Native v7 is executable; v6 is completion-only. Use one batch per task. Review splitting is core-only (depth 3, 2.0x attempts). Use `native-pass-step` and terminal `--relay-ended`; core queues missing tasks. Never run per-record loops, infer limits, enumerate workers, or poll. Follow `docs/detail-contract.md`.
-- Manual/fallback handoff uses only `parr0t.translation-exchange/v1`; the parent neither opens the text-bearing bundle nor invents another format.
+- Native workers start without parent history and return only a `parr0t.control-envelope.v2` path; semantic content never reaches the parent. Follow `docs/control-plane-contract.md`.
+- Native v7 executes; v6 is completion-only. Use one batch, `native-pass-step`, and terminal `--relay-ended`; core locks successes and splits failed review subsets. Never loop per record, infer limits, enumerate workers, poll, or open the full source. Follow `docs/detail-contract.md`.
+- Manual/fallback handoff uses only `parr0t.translation-exchange/v1`; the parent never opens its text-bearing bundle.
 - Operational failures remain in the resumable metadata queue. Retry after a later explicit user request; if `metadata.blocking_on_failure=true`, hold the complete patch.
 - A configured preset fixes provider roles. API-key presence cannot select or alter it. For `codex-app-deepseek`, follow `docs/codex-app-deepseek.md`.
 - The source root is read-only. Real install, update, remove/restore, and launch are separate actions requiring explicit one-shot approval.

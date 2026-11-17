@@ -10,6 +10,7 @@ from game_l10n.formats import read_segments
 from game_l10n.models import Segment
 from game_l10n.native_pass import native_control_step, prepare_native_tasks, seal_native_wave_relay
 from game_l10n.store import stable_hash
+from tests import write_semantic_result_rows
 
 
 class NativePreparationResumeTests(unittest.TestCase):
@@ -47,8 +48,11 @@ class NativePreparationResumeTests(unittest.TestCase):
                 first = native_control_step(root, path, results,
                                             usage_event_id="fixture-usage", input_tokens=234)
                 first_result = results / manifest["tasks"][0]["file"]
-                first_result.write_text(json.dumps({"target_id": "a", "status": "success", "text": "TARGET"}) + "\n",
-                                        encoding="utf-8")
+                write_semantic_result_rows(
+                    first_result,
+                    [{"target_id": "a", "status": "success", "text": "TARGET"}],
+                    manifest=manifest,
+                )
                 seal_native_wave_relay(root, root / first["relay"]["dispatch"], relay_ended=True)
                 partial = native_control_step(root, path, results, require_relay_receipt=True)
                 self.assertEqual(partial["counts"]["imported_tasks"], 1)
