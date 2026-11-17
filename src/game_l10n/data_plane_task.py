@@ -59,7 +59,7 @@ from .inventory_constraints import (
 from .language_policy import language_binding
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext, Segment
 from .native_runtime import RUNTIME_ISSUES, native_launch_summary, native_runtime
-from .omp_isolation import ISOLATION_ISSUE, runtime_isolation
+from .omp_isolation import ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
 from .privacy import is_within
 from .store import stable_hash
 
@@ -80,6 +80,7 @@ CONTEXT_WORK_MANIFEST_SCHEMA = "parr0t.context-work-manifest.v1"
 CONTEXT_CHUNK_CLAIM_SCHEMA = "parr0t.context-chunk-claim.v1"
 CONTEXT_CHUNK_RESULT_SCHEMA = "parr0t.context-chunk-result.v1"
 CONTEXT_FRAGMENT_SCHEMA = "parr0t.context-fragment.v1"
+CONTEXT_WORKER_EXECUTION_SCHEMA = "parr0t.context-worker-execution.v1"
 DATA_PLANE_OPERATIONAL_FAILURE_CODES = {
     "provider_operational_error",
     "execution_guard_denied",
@@ -1514,6 +1515,53 @@ def _seal_inventory_constraint(
         return
 
 
+def _context_worker_execution(
+    work_dir: Path, task_path: Path, runtime: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Bind worker commands before task hashing, independently of relay lifecycle."""
+    guarded = bool(
+        runtime
+        and runtime["host"] == "omp"
+        and runtime.get("transport", "collaboration") == "collaboration"
+        and runtime.get("omp_isolation", "guarded") == "guarded"
+    )
+    transport = tool_transport_contract(prompt=not guarded)
+    prefix = transport["relay_python_argv_prefix"]
+    workspace = str(work_dir.resolve())
+    task = str(task_path.resolve())
+    binding = ["--workspace", workspace, "--task", task]
+    contract = {
+        "schema": CONTEXT_WORKER_EXECUTION_SCHEMA,
+        "tool": transport["subagent_python_tool"],
+        "argv_convention": (
+            "python_arguments_without_executable" if guarded else "complete_executable_argv"
+        ),
+        "workspace_root": workspace,
+        "task_path": task,
+        "substitution_policy": "replace_only_whole_declared_placeholder_arguments_never_shell_interpolate",
+        "placeholders": {
+            "<slot>": "relay_assigned_worker_slot_from_one_to_context_parallelism_max_workers",
+            "<claim-path>": "exact_claim_path_returned_for_this_workers_assigned_slot",
+            "<result-path>": "workspace_file_containing_the_result_for_that_exact_claim_id",
+        },
+        "command_argv": {
+            "claim-context-chunk": [*prefix, "claim-context-chunk", *binding, "--slot", "<slot>"],
+            "commit-context-fragment": [
+                *prefix, "commit-context-fragment", *binding,
+                "--claim", "<claim-path>", "--result", "<result-path>",
+            ],
+            "finalize-context-fragments": [*prefix, "finalize-context-fragments", *binding],
+        },
+        "roles": {
+            "slot_worker": ["claim-context-chunk", "commit-context-fragment"],
+            "finalizer_only": ["finalize-context-fragments"],
+        },
+    }
+    if guarded:
+        contract["tool_device"] = transport["subagent_python_tool_device"]
+    return contract
+
+
 def prepare_data_plane_task(
     work_dir: Path,
     output_dir: Path,
@@ -1957,18 +2005,7 @@ def prepare_data_plane_task(
                     "claim_schema": CONTEXT_CHUNK_CLAIM_SCHEMA,
                     "result_schema": CONTEXT_CHUNK_RESULT_SCHEMA,
                     "fragment_schema": CONTEXT_FRAGMENT_SCHEMA,
-                    "claim_command": (
-                        "game-l10n claim-context-chunk --workspace <workspace> "
-                        "--task <task-path> --slot <slot>"
-                    ),
-                    "commit_command": (
-                        "game-l10n commit-context-fragment --workspace <workspace> "
-                        "--task <task-path> --claim <claim-path> --result <result-path>"
-                    ),
-                    "finalize_command": (
-                        "game-l10n finalize-context-fragments --workspace <workspace> "
-                        "--task <task-path>"
-                    ),
+                    "execution_contract": "worker_execution",
                     "direct_context_pack_write_forbidden": True,
                     "success_requires_every_manifest_chunk": True,
                 },
@@ -2143,11 +2180,17 @@ def prepare_data_plane_task(
                 "never_send_the_whole_inventory_in_one_semantic_request",
                 "measure_chunk_limits_over_the_complete_serialized_request_rows_including_metadata",
                 "process_deterministic_bounded_context_chunks_without_returning_text_to_parent",
-                "write_one_merged_context_pack_using_exact_context_pack_fields",
+                "only_the_fresh_finalizer_writes_the_merged_context_pack_using_exact_context_pack_fields",
                 "preserve_evidence_line_ids_for_every_required_domain",
                 "on_partial_or_operational_failure_record_resumable_private_progress",
                 "continue_unaffected_chunks_when_one_chunk_requires_fallback",
                 "relay_assigns_unique_context_worker_slots_from_one_to_max_workers",
+                "execute_complete_argv_from_worker_execution_using_its_bound_tool_and_argv_convention",
+                "substitute_only_whole_declared_worker_execution_placeholders",
+                "do_not_read_relay_command_argv_launch_ledgers_or_lifecycle_state_to_run_worker_commands",
+                "slot_workers_use_only_claim_and_commit_commands_for_their_assigned_slot",
+                "only_the_fresh_finalizer_uses_the_finalize_command_after_the_worker_wave",
+                "on_command_or_semantic_failure_do_not_send_agent_parent_sibling_or_irc_messages",
                 "workers_must_use_core_claim_context_chunk_command",
                 "each_worker_keeps_at_most_one_core_atomic_claim_active_at_a_time",
                 "workers_must_write_exact_context_chunk_result_schema",
@@ -2208,6 +2251,11 @@ def prepare_data_plane_task(
                 "inspect_only_metadata_needed_for_locale_engine_and_version",
                 "record_sdk_evaluation_and_selection_inside_workspace",
             ]
+        )
+
+    if worker_role == "context_analyzer":
+        private_payload["worker_execution"] = _context_worker_execution(
+            work_dir, output_dir / "task.json", runtime
         )
 
     task_id = stable_hash(private_payload)
