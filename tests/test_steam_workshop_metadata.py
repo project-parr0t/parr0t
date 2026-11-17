@@ -27,6 +27,7 @@ class SteamWorkshopMetadataTests(unittest.TestCase):
             "title": "Probably Translated",
             "description_file": "description.txt",
             "locales": ["english", "koreana"],
+            "required_tags": ["synthetic-tag-a", "synthetic-tag-b"],
         }
         payload.update(updates)
         path = root / "metadata.json"
@@ -42,6 +43,7 @@ class SteamWorkshopMetadataTests(unittest.TestCase):
             self.assertEqual(plan.title, "Probably Translated")
             self.assertEqual(plan.description, "Canonical description")
             self.assertEqual(plan.locales, ("english", "koreana"))
+            self.assertEqual(plan.required_tags, ("synthetic-tag-a", "synthetic-tag-b"))
 
     def test_manifest_rejects_duplicate_or_unknown_locales(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -50,6 +52,41 @@ class SteamWorkshopMetadataTests(unittest.TestCase):
                 MODULE.load_plan(self._manifest(root, locales=["english", "english"]))
             with self.assertRaisesRegex(MODULE.MetadataError, "unsupported"):
                 MODULE.load_plan(self._manifest(root, locales=["english", "not-a-steam-language"]))
+
+
+    def test_manifest_rejects_invalid_or_duplicate_tags(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(MODULE.MetadataError, "duplicates"):
+                MODULE.load_plan(
+                    self._manifest(root, required_tags=["Synthetic-Tag", "synthetic-tag"])
+                )
+            with self.assertRaisesRegex(MODULE.MetadataError, "invalid"):
+                MODULE.load_plan(self._manifest(root, required_tags=[" prefixed-tag"]))
+            with self.assertRaisesRegex(MODULE.MetadataError, "255"):
+                MODULE.load_plan(self._manifest(root, required_tags=["x" * 256]))
+
+    def test_required_tags_are_added_without_removing_existing_tags(self) -> None:
+        self.assertEqual(
+            MODULE.merge_required_tags(
+                ("existing-tag", "synthetic-tag"),
+                ("Synthetic-Tag", "required-tag"),
+            ),
+            ("existing-tag", "synthetic-tag", "required-tag"),
+        )
+
+    def test_detail_tag_decoder_uses_documented_structure_fields(self) -> None:
+        raw = bytearray(MODULE.UGC_DETAILS_BUFFER_BYTES)
+        tags_offset = MODULE.SteamUGCDetailsPrefix.tags.offset
+        encoded = b"existing-tag,required-tag\0"
+        raw[tags_offset : tags_offset + len(encoded)] = encoded
+        self.assertEqual(
+            MODULE.decode_details_tags(bytes(raw)),
+            ("existing-tag", "required-tag"),
+        )
+        raw[MODULE.SteamUGCDetailsPrefix.tags_truncated.offset] = 1
+        with self.assertRaisesRegex(MODULE.MetadataError, "truncated"):
+            MODULE.decode_details_tags(bytes(raw))
 
     def test_description_cannot_escape_manifest_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
