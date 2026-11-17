@@ -293,7 +293,7 @@ class WorkspaceTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigurationError, "recorded by sdk-activate"):
                 require_sdk_activation(work)
 
-    def test_git_sdk_candidate_accepts_its_exact_portable_archive(self) -> None:
+    def test_git_sdk_candidate_activates_separately_and_accepts_exact_portable_archive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sdk = root / "sdk"
@@ -301,6 +301,8 @@ class WorkspaceTests(unittest.TestCase):
             work = root / "work"
             archive = root / "sdk.zip"
             sdk.mkdir()
+            game = root / "game"
+            game.mkdir()
 
             def git(*args: str) -> subprocess.CompletedProcess[str]:
                 completed = subprocess.run(
@@ -327,7 +329,7 @@ class WorkspaceTests(unittest.TestCase):
             candidate_commit = git("rev-parse", "HEAD").stdout.strip()
             git("switch", "main")
 
-            initialize_workspace(work, sdk, git_choice="disabled")
+            initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
             candidate = load_config(work)["sdk_selection"]["candidates"][0]
             self.assertEqual(candidate["commit"], candidate_commit)
             record_sdk_evaluation(
@@ -346,6 +348,27 @@ class WorkspaceTests(unittest.TestCase):
                 target_engine="fixture",
                 target_version="1.0",
             )
+
+            git("switch", "sdk-fixture-1.0")
+            activation = record_sdk_activation(work)
+            self.assertEqual(activation["runtime"]["kind"], "git")
+            self.assertEqual(activation["runtime"]["path"], str(sdk.resolve()))
+            self.assertEqual(require_sdk_activation(work), activation)
+            with self.assertRaisesRegex(ConfigurationError, "recorded by sdk-activate"):
+                require_sdk_activation(work, runtime_root=work)
+
+            establish_control_plane_entry(work)
+            with redirect_stdout(output := StringIO()):
+                cmd_status(SimpleNamespace(workspace=str(work)))
+            status = json.loads(output.getvalue())
+            self.assertEqual(status["sdk_activation"]["status"], "active")
+            self.assertNotEqual(status["next_actions"], ["activate_selected_sdk_implementation"])
+
+            contract = sdk / "docs" / "fixture-sdk.md"
+            contract.write_text("changed fixture contract\n", encoding="utf-8")
+            with self.assertRaisesRegex(ConfigurationError, "recorded by sdk-activate"):
+                require_sdk_activation(work)
+            contract.write_text("fixture contract\n", encoding="utf-8")
 
             git("archive", "--format=zip", f"--output={archive}", "sdk-fixture-1.0")
             with zipfile.ZipFile(archive) as source:
