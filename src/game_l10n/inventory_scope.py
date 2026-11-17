@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -41,9 +42,40 @@ def _rows_by_key(rows: Any) -> dict[str, dict[str, Any]]:
     return result
 
 
+@dataclass(frozen=True, slots=True)
+class _BasisSnapshot:
+    sha256: str
+    payload: dict[str, Any]
+    rows: dict[str, dict[str, Any]]
+    fingerprint: str
+
+
+def _read_basis(path: Path, expected_sha256: str) -> _BasisSnapshot:
+    try:
+        raw = path.read_bytes()
+        digest = sha256(raw).hexdigest()
+        if digest != expected_sha256:
+            raise _invalid()
+        original = json.loads(raw.decode("utf-8-sig"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise _invalid() from exc
+    if (not isinstance(original, dict) or original.get("schema") != _SOURCE_INVENTORY_SCHEMA
+            or not isinstance(original.get("method"), str) or not original["method"].strip()
+            or not isinstance(original.get("implementation_fingerprint"), str)
+            or not original["implementation_fingerprint"].strip()
+            or not isinstance(original.get("coverage"), dict)):
+        raise _invalid()
+    rows = _rows_by_key(original.get("segments"))
+    fingerprint = stable_hash({key: original[key] for key in (
+        "schema", "method", "implementation_fingerprint", "coverage", "segments"
+    )})
+    return _BasisSnapshot(digest, original, rows, fingerprint)
+
+
 def inventory_scope(
     payload: dict[str, Any], path: Path | None = None,
     *, defer_projection_constraints: bool = False,
+    _basis_cache: dict[Path, _BasisSnapshot] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     """Separate active display targets from retained canonical occurrence history.
 
@@ -131,30 +163,22 @@ def inventory_scope(
 
     basis_fingerprint = None
     if path is not None:
-        basis_path = path.parent / basis["file"]
         try:
-            resolved_parent = path.parent.resolve()
-            if (basis_path.resolve().parent != resolved_parent
-                    or basis_path.resolve() == path.resolve()):
-                raise _invalid()
-            raw = basis_path.read_bytes()
-            if sha256(raw).hexdigest() != basis["sha256"]:
-                raise _invalid()
-            original = json.loads(raw.decode("utf-8-sig"))
-        except (OSError, UnicodeError, ValueError) as exc:
+            basis_path = (path.parent / basis["file"]).resolve()
+        except (OSError, ValueError) as exc:
             raise _invalid() from exc
-        if (not isinstance(original, dict) or original.get("schema") != _SOURCE_INVENTORY_SCHEMA
-                or not isinstance(original.get("method"), str) or not original["method"].strip()
-                or not isinstance(original.get("implementation_fingerprint"), str)
-                or not original["implementation_fingerprint"].strip()
-                or not isinstance(original.get("coverage"), dict)):
+        if basis_path.parent != path.parent.resolve() or basis_path == path.resolve():
             raise _invalid()
-        original_rows = _rows_by_key(original.get("segments"))
-        basis_fingerprint = stable_hash({key: original[key] for key in (
-            "schema", "method", "implementation_fingerprint", "coverage", "segments"
-        )})
-        if records and (original.get("method"), original.get("implementation_fingerprint")) not in method_bindings:
+        snapshot = _basis_cache.get(basis_path) if _basis_cache is not None else None
+        if snapshot is None:
+            snapshot = _read_basis(basis_path, basis["sha256"])
+            if _basis_cache is not None:
+                _basis_cache[basis_path] = snapshot
+        if snapshot.sha256 != basis["sha256"]:
             raise _invalid()
+        original = snapshot.payload
+        original_rows = snapshot.rows
+        basis_fingerprint = snapshot.fingerprint
         canonical_document = (
             payload.get("method") == original.get("method")
             and payload.get("implementation_fingerprint") == original.get("implementation_fingerprint")
