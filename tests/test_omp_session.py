@@ -64,9 +64,11 @@ class OmpSessionTests(unittest.TestCase):
         self.assertEqual(command[:5], ["C:/synthetic tools/omp.exe", "--cwd", str(self.workspace.resolve()),
                                        "--model", self.model])
         self.assertEqual(command[7:9], ["--no-prewalk", "--no-title"])
-        self.assertEqual(len(command), 10)
-        self.assertNotIn("--trusted-extension", command)
-        self.assertNotIn("--parr0t-workspace", command)
+        self.assertEqual(len(command), 14)
+        self.assertEqual(command[9], "--trusted-extension")
+        self.assertEqual(Path(command[10]).name, "omp-prompt-isolation.mjs")
+        self.assertTrue(Path(command[10]).is_file())
+        self.assertEqual(command[11:13], ["--parr0t-workspace", str(self.workspace.resolve())])
         self.assertNotIn("--continue", command)
         self.assertNotIn("--resume", command)
         self.assertNotIn("parr0t_exec", command[-1])
@@ -82,6 +84,8 @@ class OmpSessionTests(unittest.TestCase):
         command = json.loads(output.getvalue())
         self.assertEqual(command[9], "--trusted-extension")
         self.assertTrue(Path(command[10]).is_file())
+        self.assertEqual(Path(command[10]).name, "omp-isolation-guard.mjs")
+        self.assertEqual(command.count("--trusted-extension"), 1)
         self.assertEqual(command[11:13], ["--parr0t-workspace", str(self.workspace.resolve())])
 
     def test_model_and_guard_prerequisites(self):
@@ -94,6 +98,8 @@ class OmpSessionTests(unittest.TestCase):
         with patch.object(omp_session, "__file__", str(self.workspace / "missing.py")):
             with self.assertRaisesRegex(ValueError, "GUARD_REQUIRED"):
                 self.plan(guarded=True)
+            with self.assertRaisesRegex(ValueError, "PROMPT_HELPER_REQUIRED"):
+                self.plan()
 
     def test_guarded_cli_rejects_missing_guard_before_spawning(self):
         errors = io.StringIO()
@@ -105,6 +111,16 @@ class OmpSessionTests(unittest.TestCase):
         self.assertEqual(json.loads(errors.getvalue())["issue_code"], "E_OMP_CONTROL_GUARD_REQUIRED")
         spawn.assert_not_called()
 
+    def test_prompt_cli_rejects_missing_helper_before_spawning(self):
+        errors = io.StringIO()
+        with patch.object(omp_session, "__file__", str(self.workspace / "missing.py")), \
+                patch.object(omp_session.subprocess, "Popen") as spawn, redirect_stderr(errors):
+            code = omp_session.main(["--workspace", str(self.workspace), "--model", self.model,
+                                     "--mode", "workspace", "--foreground"])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(errors.getvalue())["issue_code"], "E_OMP_CONTROL_PROMPT_HELPER_REQUIRED")
+        spawn.assert_not_called()
+
     def test_foreground_exit_and_environment(self):
         child = Mock(pid=123)
         child.wait.return_value = 23
@@ -112,7 +128,8 @@ class OmpSessionTests(unittest.TestCase):
             with self.subTest(guarded=guarded), \
                     patch.dict(os.environ, {"PARR0T_OMP_GUARD_SESSION": "old",
                                             "PARR0T_OMP_GUARD_WORKSPACE": "old",
-                                            "PARR0T_OMP_CONTROL_DIRECTORY": "old"}), \
+                                            "PARR0T_OMP_CONTROL_DIRECTORY": "old",
+                                            "PARR0T_OMP_PROMPT_WORKSPACE": "old"}), \
                     patch.object(omp_session.subprocess, "Popen", return_value=child) as spawn, \
                     redirect_stdout(io.StringIO()):
                 child.wait.reset_mock()
@@ -124,6 +141,7 @@ class OmpSessionTests(unittest.TestCase):
                 self.assertEqual(kwargs["creationflags"], 0)
                 self.assertNotIn("PARR0T_OMP_GUARD_SESSION", kwargs["env"])
                 self.assertNotIn("PARR0T_OMP_GUARD_WORKSPACE", kwargs["env"])
+                self.assertNotIn("PARR0T_OMP_PROMPT_WORKSPACE", kwargs["env"])
                 self.assertEqual("PARR0T_OMP_CONTROL_DIRECTORY" in kwargs["env"], guarded)
                 child.wait.assert_called_once_with()
                 child.poll.assert_not_called()
@@ -135,11 +153,10 @@ class OmpSessionTests(unittest.TestCase):
         self.assertIn(omp_session.CONTROL_HANDOFF_PATH, command[-1])
         self.assertIn("fresh-session-confirmed", command[-1])
 
-    def test_prompt_launch_without_guard_returns_started_immediately(self):
+    def test_prompt_launch_with_helper_returns_started_without_guard_registration(self):
         child = Mock(pid=123)
         output = io.StringIO()
-        with patch.object(omp_session, "__file__", str(self.workspace / "missing.py")), \
-                patch.object(omp_session, "os", self.windows_os), \
+        with patch.object(omp_session, "os", self.windows_os), \
                 patch.object(omp_session.subprocess, "CREATE_NEW_CONSOLE", 16, create=True), \
                 patch.object(omp_session.subprocess, "Popen", return_value=child) as spawn, \
                 patch.object(omp_session.time, "monotonic") as clock, \
@@ -158,8 +175,9 @@ class OmpSessionTests(unittest.TestCase):
         self.assertEqual(json.loads(Path(result["launch_record"]).read_text(encoding="utf-8"))["status"], "started")
         spawn.assert_called_once()
         command = spawn.call_args.args[0]
-        self.assertNotIn("--trusted-extension", command)
-        self.assertNotIn("--parr0t-workspace", command)
+        self.assertEqual(command[9], "--trusted-extension")
+        self.assertEqual(Path(command[10]).name, "omp-prompt-isolation.mjs")
+        self.assertEqual(command[11:13], ["--parr0t-workspace", str(self.workspace.resolve())])
         self.assertEqual(command[4], self.model)
         self.assertEqual(spawn.call_args.kwargs["creationflags"], 16)
         self.assertNotIn("PARR0T_OMP_CONTROL_DIRECTORY", spawn.call_args.kwargs["env"])
