@@ -46,7 +46,7 @@ Use the user's language for the question. A suitable pattern is: "요청하신 �
 ## Keep implementation minimal
 
 - Implement only behavior required by the acceptance criteria or directly necessary for it to function.
-- Prefer existing project patterns and dependencies. Ask before adding a dependency, migration, service, or configuration change that materially expands the project or has a viable lower-impact alternative.
+- Prefer existing project patterns and dependencies. Any new or newly executed third-party dependency, migration tool, service, framework, package, plugin, repository, binary, or configuration provider requires `skills/third-party-consent/SKILL.md`, exact risk disclosure, explicit user approval, and a consumed core approval record. No materiality or convenience exception applies.
 - Fix an adjacent issue only when it directly blocks the requested outcome. Otherwise report it separately without changing it.
 - Run proportionate checks needed to verify requested work, but do not add unrelated tests, refactors, formatting sweeps, or generated artifacts.
 - Do not commit, push, publish, deploy, send, or merge unless explicitly requested.
