@@ -53,6 +53,7 @@ from .data_plane_task import (
     commit_context_fragment,
     current_data_plane_operational_failure,
     current_data_plane_receipt,
+    current_inventory_constraint,
     finalize_context_fragments,
     prepare_data_plane_task,
     record_data_plane_failure,
@@ -200,6 +201,10 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
     "verify_independent_source_inventory": ("docs/coverage-gates.md",),
     "reconcile_inventory_identity_namespace": ("docs/coverage-gates.md",),
     "resolve_source_inventory_gaps": ("docs/coverage-gates.md",),
+    "await_inventory_constraint_repair": (
+        "docs/control-plane-contract.md",
+        "docs/coverage-gates.md",
+    ),
     "analyze_complete_script_context": (
         "docs/coverage-gates.md",
         "docs/provider-protocol.md",
@@ -2614,6 +2619,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                 action = "verify_independent_source_inventory"
             else:
                 inventory_gate = _public_inventory_gate(inventory_state)
+                constraint = current_inventory_constraint(
+                    work_dir, config=config, sdk_activation=active
+                )
                 inventory_verified = bool(
                     inventory_state.get("status") == "static_verified"
                     and inventory_state.get("static_complete") is True
@@ -2621,8 +2629,14 @@ def cmd_status(args: argparse.Namespace) -> int:
                     and inventory_state.get("primary_fingerprint")
                     and isinstance(inventory_state.get("primary_path"), str)
                     and inventory_state.get("primary_path")
+                    and constraint is None
                 )
-                if not inventory_verified:
+                if constraint is not None:
+                    action = "await_inventory_constraint_repair"
+                    inventory_gate["constraint_repair"] = constraint
+                    inventory_gate["static_complete"] = False
+                    inventory_gate["continuation_required"] = True
+                elif not inventory_verified:
                     action = (
                         "reconcile_inventory_identity_namespace"
                         if "INVENTORY_IDENTITY_NAMESPACE_MISMATCH"
