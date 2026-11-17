@@ -13,7 +13,11 @@ Before any of the following actions, obtain explicit user approval for the exact
 
 Reading public documentation, package metadata, licenses, checksums, and source in a read-only browser is discovery, not approval. Do not download or execute the component during discovery.
 
-Dependencies already declared and immutably locked by the target repository, host-provided tools already selected by the user, and services explicitly selected in the current request remain authorized only within their existing scope. Adding, replacing, updating, newly executing, or broadening them requires a new decision.
+An exact dependency version already declared and immutably locked by Parr0t becomes preapproved after complete validation passes without skips against those exact bytes, provided an evidence-backed review finds no known supply-chain attack history affecting that version, artifact, publisher, or source. The review must check authoritative project/package security notices and recognized advisory sources current at validation time. This exception covers the validated dependency closure and ordinary reuse only within the validated scope; it does not require a one-shot approval record.
+
+The preapproval is content-bound, not name-bound. A version, source, publisher, digest, dependency closure, permissions, execution purpose, or data-scope change requires a new validation or explicit user consent. Incomplete, stale, skipped, or failed validation grants nothing. A later compromise report, yanked artifact for a security cause, provenance anomaly, or other credible supply-chain evidence immediately revokes inherited approval until the exact dependency is replaced and validated again or the user explicitly decides otherwise.
+
+Host-provided tools already selected by the user and services explicitly selected in the current request remain authorized only within their existing scope. Adding, replacing, updating, newly executing, or broadening them requires a new decision.
 
 ## Required disclosure
 
