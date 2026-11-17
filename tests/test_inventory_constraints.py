@@ -175,6 +175,29 @@ class InventoryConstraintTests(unittest.TestCase):
         self._seal()
         self.assertIsNotNone(self._pending())
 
+    def test_matching_additions_at_constant_gap_remain_executable_and_visible(self) -> None:
+        self.assertEqual(self._prepare()["status"], "ready")
+        extra = {"id": "synthetic-added-occurrence", "source": "SYNTHETIC ADDED DISPLAY"}
+        self._inventory(self.primary, "synthetic-structural", [self.row, extra])
+        self._inventory(self.independent, "synthetic-independent", [self.row, extra])
+        self.assertEqual(self._seal()["status"], "partial")
+        self.assertIsNone(self._pending())
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(main(["status", "--workspace", str(self.work)]), 0)
+        public = json.loads(output.getvalue())
+        gate = public["inventory_gate"]
+        self.assertEqual(gate["gap_score"], 1)
+        self.assertEqual(gate["agreed_target_count"], 2)
+        self.assertEqual(gate["reconciliation"]["progress_state"], "improved")
+        self.assertEqual(gate["reconciliation"]["unchanged_observations"], 0)
+        self.assertTrue(gate["continuation_required"])
+        self.assertFalse(gate["static_complete"])
+        self.assertNotEqual(public["next_actions"], ["await_inventory_constraint_repair"])
+        self.assertNotIn(extra["source"], json.dumps(gate))
+        self.assertNotIn(extra["id"], json.dumps(gate))
+        self.assertEqual(self._prepare()["status"], "ready")
+
     def test_input_evidence_and_capability_changes_resume_without_erasing_history(self) -> None:
         self._block()
         historical = next(self.output.glob("inventory-constraint.*.json"))

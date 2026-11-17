@@ -289,6 +289,55 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(resumed["wave"], 1)
         self.assertEqual(resumed["route_binding"]["attempt"], 1)
 
+    def _resume_legacy_unavailable_wave(self, event: str, missing_fields: tuple[str, ...]) -> None:
+        from game_l10n.native_runtime import launch_contract
+
+        def legacy_contract(*args, **kwargs):
+            contract = launch_contract(*args, **kwargs)
+            for field in missing_fields:
+                contract.pop(field, None)
+            if 'model_authorization' in missing_fields:
+                contract['preflight'] = 'inspect_available_dispatch_tool_and_exact_model_before_starting_any_worker'
+            return contract
+
+        with patch('game_l10n.native_runtime.launch_contract', side_effect=legacy_contract), \
+             patch('game_l10n.native_pass.launch_contract', side_effect=legacy_contract):
+            _, relay, payload = self.prepare()
+            record_native_launch(self.root, relay, event=event)
+            seal_native_wave_relay(self.root, relay, relay_ended=True)
+        ledger = relay.with_name(relay.stem + '-launch.json')
+        paths = [relay, ledger, self.tasks / 'manifest.json',
+                 *(self.root / binding['task'] for binding in payload['task_bindings'])]
+        originals = {path: path.read_bytes() for path in paths}
+        runtime = native_runtime(self.root)
+        self.assertEqual(self.step()['action'], 'repair_native_runtime')
+        resumed = self.step(resume_relay=True)
+        self.assertEqual(resumed['action'], 'dispatch_isolated_wave_relay')
+        self.assertEqual(resumed['wave'], 1)
+        self.assertEqual(resumed['route_binding']['attempt'], 1)
+        self.assertEqual(native_runtime(self.root), runtime)
+        for path, original in originals.items():
+            self.assertEqual(path.read_bytes(), original)
+        for field in missing_fields:
+            self.assertNotIn(field, json.loads(relay.read_text())['launch_contract'])
+        record_native_launch(self.root, relay, event='capability-available')
+        for binding, target in zip(payload['task_bindings'], ('a', 'b')):
+            record_native_launch(self.root, relay, event='worker-started', task=binding['task'],
+                                 worker_id='synthetic-legacy-' + target, model=payload['launch_contract']['model'])
+            self.write_rows(self.root / binding['result'], [self.row(target)])
+        seal_native_wave_relay(self.root, relay, relay_ended=True)
+        self.assertEqual(self.step()['action'], 'aggregate_completed_pass')
+        self.assertEqual(relay.read_bytes(), originals[relay])
+
+    def test_old_promptless_capability_unavailable_wave_resumes_same_runtime(self) -> None:
+        self._resume_legacy_unavailable_wave('capability-unavailable', ('worker_prompt',))
+
+    def test_old_policyless_model_unavailable_wave_resumes_same_runtime(self) -> None:
+        self._resume_legacy_unavailable_wave('model-unavailable', (
+            'model_authorization', 'unavailability_evidence', 'worker_prompt',
+            'lifecycle_observation', 'cancellation_priority', 'operational_failure_policy',
+        ))
+
     def test_live_relay_wait_has_no_implicit_deadline(self) -> None:
         _, relay, _ = self.prepare()
         for _ in range(5):
@@ -782,6 +831,7 @@ class NativeRuntimeTests(unittest.TestCase):
             contract = launch_contract(*args, **kwargs)
             contract.pop("model_authorization", None)
             contract.pop("unavailability_evidence", None)
+            contract.pop("worker_prompt", None)
             contract["preflight"] = "inspect_available_dispatch_tool_and_exact_model_before_starting_any_worker"
             return contract
 

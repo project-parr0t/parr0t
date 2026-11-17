@@ -194,7 +194,6 @@ class ControlPlaneContractTests(unittest.TestCase):
         sdk.mkdir()
         initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
         establish_control_plane_entry(work)
-        record_sdk_selection(work, "private-new", target_engine="fixture-engine", target_version="1")
         config = load_config(work)
         relays = {}
         for role, method in (("primary_inventory", "primary"), ("independent_inventory", "independent")):
@@ -249,6 +248,10 @@ class ControlPlaneContractTests(unittest.TestCase):
                 "success" if complete else "partial",
             )
             relays[role] = relay_path
+        # Historical inventories predate the extractor-preparation barrier.
+        # Selecting a deficient SDK must preserve their evidence, not authorize a new scan.
+        record_sdk_selection(work, "private-new", target_engine="fixture-engine", target_version="1")
+        config = load_config(work)
         return work, config, relays
 
     def _inventory_status(self, work: Path):
@@ -290,7 +293,7 @@ class ControlPlaneContractTests(unittest.TestCase):
             "malformed", "wrong_schema", "empty", "missing_artifact", "missing_receipt",
             "old_generation", "wrong_task", "changed_task", "unbound_artifact",
             "incomplete_execution", "operational_error", "mixed_provider_error",
-            "missing_scope", "invalid_evidence", "same_method", "active_attempt", "scope_repair",
+            "missing_scope", "invalid_evidence", "same_method", "scope_repair",
         )
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
@@ -323,10 +326,6 @@ class ControlPlaneContractTests(unittest.TestCase):
                     task = json.loads(task_path.read_text(encoding="utf-8"))
                     task["attempt"] += 1
                     task_path.write_text(json.dumps(task), encoding="utf-8")
-                elif case == "active_attempt":
-                    prepare_data_plane_task(
-                        work, relay.parent, worker_role="primary_inventory", config=config, sdk_activation={}
-                    )
                 else:
                     if case == "old_generation":
                         receipt["control_generation"] -= 1
@@ -346,11 +345,27 @@ class ControlPlaneContractTests(unittest.TestCase):
                         receipt["issue_codes"].append("provider_error")
                     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
                 _, status = self._inventory_status(work)
-                self.assertIn(status["next_actions"][0], {
-                    "unpack_and_extract_ordered_script", "extract_independent_source_inventory"
-                })
+                self.assertEqual(status["next_actions"], ["prepare_and_validate_extractors"])
                 self.assertIsNotNone(status["data_plane_task"])
                 self.assertFalse((work / ".game-l10n/inventory-attestation.json").exists())
+
+    def test_legacy_inventory_evidence_does_not_authorize_a_new_deficient_sdk_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work, config, relays = self._sealed_inventory_pair(Path(directory))
+            before = {
+                path: path.read_bytes()
+                for relay in relays.values()
+                for path in (relay, relay.with_name("task.json"), relay.with_name("receipt.json"))
+            }
+            with patch("game_l10n.workspace.require_sdk_activation", return_value={}):
+                with self.assertRaisesRegex(ConfigurationError, "E_EXTRACTOR_PREPARATION_PENDING"):
+                    prepare_data_plane_task(
+                        work, relays["primary_inventory"].parent,
+                        worker_role="primary_inventory", config=config, sdk_activation={},
+                    )
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+            _, status = self._inventory_status(work)
+            self.assertEqual(status["next_actions"], ["verify_independent_source_inventory"])
 
     def test_status_keeps_invalid_attestation_recovery_ahead_of_partial_pair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

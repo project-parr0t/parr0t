@@ -58,6 +58,7 @@ from .data_plane_task import (
     current_data_plane_operational_failure,
     current_data_plane_receipt,
     current_inventory_constraint,
+    data_plane_receipt_path,
     finalize_context_fragments,
     prepare_data_plane_task,
     record_data_plane_failure,
@@ -147,6 +148,13 @@ from .translation_exchange import (
     seal_translation_exchange,
 )
 from .tooling import cached_tool_state, run_cached_tool
+from .extractor_preparation import (
+    ACTION as EXTRACTOR_PREPARATION_ACTION,
+    PURPOSE as EXTRACTOR_PREPARATION_PURPOSE,
+    check_extractor_preparation,
+    preparation_state,
+    require_extractor_preparation,
+)
 from .workspace import (
     initialize_workspace,
     refresh_sdk_inventory,
@@ -201,6 +209,7 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
         "docs/sdk-selection.md",
         "docs/sdk-branch-contract.md",
     ),
+    "prepare_and_validate_extractors": ("docs/sdk-selection.md",),
     "unpack_and_extract_ordered_script": ("docs/coverage-gates.md",),
     "extract_independent_source_inventory": ("docs/coverage-gates.md",),
     "verify_independent_source_inventory": ("docs/coverage-gates.md",),
@@ -307,6 +316,7 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
 
 STATUS_DATA_PLANE_ROLES = {
     "record_target_identity_evaluate_and_select_sdk": "source_probe",
+    "prepare_and_validate_extractors": "source_probe",
     "unpack_and_extract_ordered_script": "primary_inventory",
     "extract_independent_source_inventory": "independent_inventory",
     "reconcile_inventory_identity_namespace": "inventory_reconciler",
@@ -321,7 +331,9 @@ def _status_data_plane_task(work_dir: Path, action: str) -> dict[str, Any] | Non
     role = STATUS_DATA_PLANE_ROLES.get(action)
     if role is None:
         return None
-    receipt = current_data_plane_receipt(work_dir, role)
+    preparation = action == EXTRACTOR_PREPARATION_ACTION
+    purpose = EXTRACTOR_PREPARATION_PURPOSE if preparation else ""
+    receipt = current_data_plane_receipt(work_dir, role, purpose=purpose)
     task: dict[str, Any] = {
         "worker_role": role,
         "stage": DATA_PLANE_PROFILES[role]["stage"],
@@ -330,6 +342,7 @@ def _status_data_plane_task(work_dir: Path, action: str) -> dict[str, Any] | Non
         "prepare_command": (
             "game-l10n prepare-data-plane-task --workspace <workspace> "
             f"--worker-role {role}"
+            + (f" --purpose {EXTRACTOR_PREPARATION_PURPOSE}" if preparation else "")
         ),
         "seal_command": (
             "game-l10n seal-data-plane-task --workspace <workspace> "
@@ -348,6 +361,9 @@ def _status_data_plane_task(work_dir: Path, action: str) -> dict[str, Any] | Non
         "runtime_setup_command": "game-l10n native-runtime --workspace <workspace> --host <codex|omp>",
         "launch_record_command": "game-l10n record-native-launch --workspace <workspace> --relay <relay-path>",
     }
+    if preparation:
+        task["purpose"] = EXTRACTOR_PREPARATION_PURPOSE
+        task["stage"] = "discovery"
     if role == "context_analyzer":
         task["parallelism"] = "core_bound_disjoint_chunks_up_to_configured_ceiling"
         task["merge_policy"] = "single_fresh_finalizer_source_order"
@@ -364,7 +380,7 @@ def _status_data_plane_task(work_dir: Path, action: str) -> dict[str, Any] | Non
             task["failure_action"] = "repair_native_runtime_then_resume_same_task"
         if "inventory_display_scope_required" in receipt.get("issue_codes", []):
             task["failure_action"] = "repair_cached_inventory_display_bindings_then_retry"
-    operational_failure = current_data_plane_operational_failure(work_dir, role)
+    operational_failure = current_data_plane_operational_failure(work_dir, role, purpose=purpose)
     if operational_failure is not None:
         task["operational_failure"] = operational_failure
         if operational_failure["cancellation_required"]:
@@ -448,6 +464,7 @@ def _public_inventory_gate(state: dict[str, Any] | None) -> dict[str, Any]:
         "static_complete": state.get("static_complete") is True,
         "primary_segments": state.get("primary_segments", 0),
         "independent_segments": state.get("independent_segments", 0),
+        "agreed_target_count": state.get("agreed_target_count", 0),
         "gap_score": state.get("gap_score", 0),
         "issue_codes": list(state.get("issue_codes", [])),
         "identity_gate": dict(state.get("identity_gate", {})),
@@ -1400,6 +1417,8 @@ def cmd_run_tool(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     activation = require_sdk_activation(work_dir, config)
+    if args.stage == "unpack":
+        require_extractor_preparation(work_dir, config, activation)
     if activation.get("workspace_tools") is None:
         raise ValueError(
             "The selected SDK owns its engine tools; run the adapter command from its activated checkout"
@@ -1504,26 +1523,38 @@ def cmd_validate_control_envelope(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_check_extractor_preparation(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    result = check_extractor_preparation(
+        work_dir, _path_in_workspace(work_dir, args.relay, must_exist=True)
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     runtime_isolation(work_dir, native_runtime(work_dir, required=True))
+    purpose = getattr(args, "purpose", "")
     activation = None
-    if args.worker_role != "source_probe":
+    if args.worker_role != "source_probe" or purpose:
         activation = require_sdk_activation(work_dir, config)
-    output_value = args.output or f".game-l10n/data-plane/{args.worker_role}"
+    default_output = data_plane_receipt_path(work_dir, args.worker_role, purpose=purpose).parent
+    output_value = args.output or str(default_output)
     result = prepare_data_plane_task(
         work_dir,
         _path_in_workspace(work_dir, output_value),
         worker_role=args.worker_role,
         config=config,
         sdk_activation=activation,
+        purpose=purpose,
     )
     if result.get("status") == "ready":
         bind_data_plane_launch(work_dir, work_dir / result["relay_path"])
         result.update(
             relay_prompt_line="PARR0T_OMP_RELAY=" + result["relay_path"],
-            worker_prompt_policy="include_launch_contract_worker_prompt_line_verbatim_in_each_task",
+            worker_prompt_policy="include_launch_contract_worker_prompt_and_any_worker_prompt_line_verbatim_in_each_task",
         )
         runtime = native_runtime(work_dir)
         if runtime["host"] == "omp" and runtime.get("transport", "collaboration") == "collaboration":
@@ -2593,6 +2624,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     state_issue_codes: list[str] = []
     local_artifact: dict[str, Any] = {"status": "not_checked"}
     inventory_gate: dict[str, Any] = {"status": "not_checked"}
+    extractor_preparation: dict[str, Any] = {"status": "not_checked"}
     if policy.get("initial_choice") == "pending":
         action = "ask_user_for_initial_git_choice"
     game_roots = [Path(item) for item in config.get("game_roots", [])]
@@ -2629,6 +2661,20 @@ def cmd_status(args: argparse.Namespace) -> int:
         except (GameL10nError, OSError, ValueError, json.JSONDecodeError):
             sdk_activation = {"status": "required"}
             action = "activate_selected_sdk_implementation"
+    if action is None:
+        # Existing inventory pairs and downstream checkpoints remain untouched.
+        # Every new inventory dispatch independently enforces current readiness.
+        pair_present = all(
+            (work_dir / "inputs" / name).is_file()
+            for name in ("primary-inventory.json", "independent-inventory.json")
+        )
+        historical_attestation = (work_dir / ".game-l10n" / "inventory-attestation.json").is_file()
+        if not pair_present and not historical_attestation:
+            extractor_preparation = preparation_state(work_dir, config, active)
+            if extractor_preparation["status"] == "pending":
+                action = EXTRACTOR_PREPARATION_ACTION
+        else:
+            extractor_preparation = {"status": "existing_inventory_evidence_preserved"}
     if action is None:
         primary_inventory_path = work_dir / "inputs" / "primary-inventory.json"
         independent_inventory_path = (
@@ -2850,6 +2896,10 @@ def cmd_status(args: argparse.Namespace) -> int:
                                 issue_code = local_artifact.get("issue_code")
                                 if isinstance(issue_code, str):
                                     state_issue_codes.append(issue_code)
+    if action in {"unpack_and_extract_ordered_script", "extract_independent_source_inventory"}:
+        extractor_preparation = preparation_state(work_dir, config, active)
+        if extractor_preparation["status"] == "pending":
+            action = EXTRACTOR_PREPARATION_ACTION
     action = action or "run_primary_translation_review_pipeline"
     if config.get("provider_preset") == "custom" and _native_translation_route_plan(config):
         action = {
@@ -2901,6 +2951,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                   else None),
                 "sdk_selection": sdk_selection,
                 "sdk_activation": sdk_activation,
+                "extractor_preparation": extractor_preparation,
                 "execution": config.get("execution", {}),
                 "runtime": config.get("runtime", {"default_policy": "deny"}),
                 "target_language_policy": target_language_policy,
@@ -4012,10 +4063,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--worker-role", choices=sorted(DATA_PLANE_PROFILES), required=True
     )
     data_plane_prepare.add_argument(
+        "--purpose", choices=[EXTRACTOR_PREPARATION_PURPOSE], default="",
+        help="Bind source_probe to isolated pre-inventory extractor implementation and checks",
+    )
+    data_plane_prepare.add_argument(
         "--output",
         help="Private task directory; defaults under .game-l10n/data-plane",
     )
     data_plane_prepare.set_defaults(func=cmd_prepare_data_plane_task)
+
+    extractor_check = sub.add_parser(
+        "check-extractor-preparation", help="Run bound local format checks inside the isolated preparation worker",
+    )
+    extractor_check.add_argument("--workspace", required=True)
+    extractor_check.add_argument("--relay", required=True)
+    extractor_check.set_defaults(func=cmd_check_extractor_preparation)
 
     data_plane_failure = sub.add_parser(
         "record-data-plane-failure",

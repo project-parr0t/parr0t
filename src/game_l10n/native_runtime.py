@@ -174,6 +174,18 @@ def launch_contract(work_dir: Path, route: str, tasks: list[str]) -> dict[str, A
         "host": runtime["host"], "runtime_fingerprint": runtime["fingerprint"],
         "route": route, "model": runtime["models"][route], "tasks": tasks,
         "history_mode": "none", "inherit_model_allowed": False,
+        "worker_prompt": (
+            "You are the native worker selected for this binding, not the relay. "
+            "For semantic work, this session is already the exact requested model: "
+            "perform the bound task using your own current model inference. "
+            "No separate model-dispatch tool or API is required or permitted; "
+            "its absence alone is not model unavailability. "
+            "Read and verify only the exact task locator, digest and slot supplied with this prompt, "
+            "then follow that immutable task and write its bound outputs. "
+            "For a finalizer binding, run only the bound deterministic finalization command. "
+            "Do not delegate or send agent/IRC messages to any parent or sibling. "
+            "Return only the bound result or envelope path."
+        ),
         "capability_preflight_required": True,
         "spawn_model_parameter": "tasks[].model" if runtime["host"] == "omp" else "model",
         "preflight": "verify_dispatch_tool_then_attempt_bound_model_without_an_additional_model_allowlist",
@@ -210,7 +222,7 @@ def native_worker_ceiling(work_dir: Path, route: str, requested: int) -> int:
     return requested
 
 
-def _ledger_path(relay_path: Path) -> Path:
+def _ledger_path(work_dir: Path, relay_path: Path) -> Path:
     legacy = relay_path.with_name(relay_path.stem + "-launch.json")
     relay = json.loads(relay_path.read_text(encoding="utf-8"))
     if not str(relay.get("schema", "")).startswith("parr0t.data-plane-relay."):
@@ -227,7 +239,11 @@ def _ledger_path(relay_path: Path) -> Path:
     if old_ledgers:
         # A pre-namespace completed attempt may have left its canonical ledger.
         # Preserve it; only an independently sealed earlier task permits a new key.
-        receipt_path = relay_path.with_name("receipt.json")
+        from .data_plane_task import _load_bound_data_plane_relay, data_plane_receipt_path
+        _, task = _load_bound_data_plane_relay(work_dir, relay_path)
+        receipt_path = data_plane_receipt_path(
+            work_dir, str(relay["worker_role"]), purpose=task.get("purpose", "")
+        )
         receipt = json.loads(receipt_path.read_text(encoding="utf-8")) if receipt_path.is_file() else {}
         if not (
             receipt.get("schema") in {"parr0t.data-plane-receipt.v1", "parr0t.data-plane-receipt.v2"}
@@ -255,9 +271,9 @@ def _metadata_versions(path: Path) -> list[dict[str, Any]]:
     return values
 
 
-def _unstarted_launch_ledger(relay_path: Path, relay: dict) -> dict:
+def _unstarted_launch_ledger(work_dir: Path, relay_path: Path, relay: dict) -> dict:
     matched = []
-    for ledger in _metadata_versions(_ledger_path(relay_path)):
+    for ledger in _metadata_versions(_ledger_path(work_dir, relay_path)):
         if ledger.get("relay_fingerprint") != stable_hash(relay):
             continue
         if (ledger.get("schema") != LAUNCH_SCHEMA or ledger.get("workers") != {}
@@ -350,13 +366,13 @@ def bind_data_plane_launch(work_dir: Path, relay_path: Path) -> None:
                 raise
         # Only an ended, operationally blocked task with evidence of zero
         # starts can follow a newly approved host/model binding.
-        from .data_plane_task import _load_bound_data_plane_relay
-        _load_bound_data_plane_relay(work_dir, relay_path)
-        _unstarted_launch_ledger(relay_path, relay)
+        from .data_plane_task import _load_bound_data_plane_relay, data_plane_receipt_path
+        _, task = _load_bound_data_plane_relay(work_dir, relay_path)
+        _unstarted_launch_ledger(work_dir, relay_path, relay)
         role = relay.get("worker_role")
         if not isinstance(role, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", role):
             raise ValueError("E_NATIVE_LAUNCH_INVALID: data-plane role changed")
-        receipt_path = work_dir / ".game-l10n/data-plane" / role / "receipt.json"
+        receipt_path = data_plane_receipt_path(work_dir, role, purpose=task.get("purpose", ""))
         ended = any(
             receipt.get("task_id") == relay["task_id"] and receipt.get("status") == "error"
             and receipt.get("worker_role") == role and receipt.get("stage") == relay["stage"]
@@ -370,7 +386,7 @@ def bind_data_plane_launch(work_dir: Path, relay_path: Path) -> None:
         envelope_path = (work_dir / relay["expected_envelope"]).resolve()
         if not envelope_path.is_relative_to(work_dir.resolve()):
             raise ValueError("E_NATIVE_LAUNCH_INVALID: data-plane envelope escaped workspace")
-        paths = (relay_path, receipt_path, _ledger_path(relay_path), envelope_path)
+        paths = (relay_path, receipt_path, _ledger_path(work_dir, relay_path), envelope_path)
         for path in paths:
             _archive_metadata(path)
         for path in paths[1:]:
@@ -379,6 +395,25 @@ def bind_data_plane_launch(work_dir: Path, relay_path: Path) -> None:
     if relay.get("schema") == "parr0t.data-plane-relay.v4":
         relay["command_argv"] = _relay_command_argv(work_dir, relay_path, relay)
     _write(relay_path, relay)
+
+
+def _preserve_legacy_launch_fields(contract: dict | None, previous: dict | None) -> None:
+    """Regenerate old launches without introducing new immutable policy fields."""
+    if contract is None or not isinstance(previous, dict):
+        return
+    if "model_authorization" not in previous:
+        contract.pop("model_authorization", None)
+        contract.pop("unavailability_evidence", None)
+        if contract.get("transport") != "native-host-api":
+            contract["preflight"] = "inspect_available_dispatch_tool_and_exact_model_before_starting_any_worker"
+    for field in (
+        "lifecycle_observation",
+        "cancellation_priority",
+        "operational_failure_policy",
+        "worker_prompt",
+    ):
+        if field not in previous:
+            contract.pop(field, None)
 
 
 def _contract_for_relay(work_dir: Path, relay: dict, relay_path: Path) -> dict | None:
@@ -412,21 +447,7 @@ def _contract_for_relay(work_dir: Path, relay: dict, relay_path: Path) -> dict |
                 raise ValueError("E_NATIVE_LAUNCH_INVALID: preserved legacy result changed")
         tasks = [task for task in tasks if task not in {row["task"] for row in legacy_results}]
     contract = launch_contract(work_dir, route, tasks)
-    previous = relay.get("launch_contract")
-    if contract is not None and isinstance(previous, dict) and "model_authorization" not in previous:
-        # Existing immutable launches retain their original policy and fingerprint.
-        contract.pop("model_authorization", None)
-        contract.pop("unavailability_evidence", None)
-        if contract.get("transport") != "native-host-api":
-            contract["preflight"] = "inspect_available_dispatch_tool_and_exact_model_before_starting_any_worker"
-    if contract is not None and isinstance(previous, dict):
-        for field in (
-            "lifecycle_observation",
-            "cancellation_priority",
-            "operational_failure_policy",
-        ):
-            if field not in previous:
-                contract.pop(field, None)
+    _preserve_legacy_launch_fields(contract, relay.get("launch_contract"))
     if contract is not None and "message_isolation" in contract:
         marker = "PARR0T_OMP_RELAY=" + relay_path.resolve().relative_to(work_dir.resolve()).as_posix()
         contract.update(relay_prompt_line=marker, worker_prompt_line=marker)
@@ -461,7 +482,7 @@ def _load(work_dir: Path, relay_path: Path) -> tuple[dict, dict, dict]:
         raise ValueError("E_NATIVE_LAUNCH_INVALID: runtime binding changed")
     if "command_argv" in relay and relay["command_argv"] != _relay_command_argv(work_dir, relay_path, relay):
         raise ValueError("E_NATIVE_LAUNCH_INVALID: lifecycle commands changed")
-    path = _ledger_path(relay_path)
+    path = _ledger_path(work_dir, relay_path)
     ledger = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {
         "schema": LAUNCH_SCHEMA, "relay_fingerprint": stable_hash(relay),
         "capability": "unknown", "workers": {}, "issue_code": "",
@@ -540,7 +561,7 @@ def record_native_launch(
             ledger["workers"][task] = worker
     else:
         raise ValueError("E_NATIVE_LAUNCH_INVALID: unsupported event")
-    _write(_ledger_path(relay_path), ledger)
+    _write(_ledger_path(work_dir, relay_path), ledger)
     return native_launch_summary(work_dir, relay_path)
 
 
