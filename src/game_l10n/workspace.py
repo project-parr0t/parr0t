@@ -263,7 +263,7 @@ This private workspace contains game data. Resolve Parr0t from `game-l10n.json`;
 ## Core contract
 
 - Apply the repository `skills/request-scope-guard/SKILL.md` after every scope-changing user message and before optional or external effects. Git, provider, installation, launch, and publication permissions are separate; never infer one from access or another approval.
-- Do not inspect images for text or run OCR unless the user requests image translation. Then record `image-localization-policy`, read `docs/image-localization.md`, and process only definitively bound player-visible UI text; never scan all images.
+- Deny new third-party acquisition, execution, adoption, service use, and data transmission. Apply `skills/third-party-consent/SKILL.md`; require risk disclosure, explicit user approval, and a consumed core record.
 - Select and activate the exact engine/version SDK before data-plane work. A different SDK may be a bound `reference` for `derive-new`; generated pass-through tools are not an adapter.
 - Require two independent complete ordered inventories, typed context analysis, primary translation, translation fallback for failures only, complete low-cost triage, selective strong review for flags/risk/sample, flagged-only rewrite, review fallback for failures only, deterministic validation, then packing. Do not shrink scope or reorder barriers.
 - During localization, root observes only core metadata, validated envelopes/receipts, direct-relay lifecycle, and core-owned usage. Never inspect private data, transcripts, logs, trees, or nested-worker output/status. Validate envelopes; record forbidden exposure.
@@ -290,6 +290,7 @@ This private workspace contains game data. Resolve Parr0t from `game-l10n.json`;
 - Manual/API handoff: `docs/translation-exchange.md`.
 - Existing release or game update: `docs/release-checkpoint.md`; exact approved wording fix: `docs/minimal-corrections.md`; composed UI: `docs/segment-metadata.md`; requested UI images: `docs/image-localization.md`.
 - Runtime mutation: `docs/runtime-approval.md` only after the exact user request.
+- Third parties: `skills/third-party-consent/SKILL.md` and `docs/third-party-consent.md` before use.
 - Windows package: `docs/installer-contract.md` plus `docs/filesystem-packaging.md` or `docs/steam-packaging.md`.
 - Steam integration: `docs/steam-faq.md` and `docs/wrapper-executable.md` only when requested.
 - Per-game publication: `docs/instance-release.md` only after the user commands publication.
