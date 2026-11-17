@@ -257,6 +257,24 @@ class InventoryScopeCorrectionTests(unittest.TestCase):
                     save_inventory_attestation(self.root, self.primary_path, self.independent_path)
                 self.assertEqual(identity_path.read_bytes(), identity_before)
 
+    def test_pair_verification_does_not_reuse_a_basis_from_an_earlier_call(self) -> None:
+        self._correct()
+        self.assertTrue(verify_inventory_pair(self.primary_path, self.independent_path)["static_complete"])
+        raw = self.basis_path.read_bytes()
+        self.basis_path.write_bytes(raw + b" ")
+        with self.assertRaisesRegex(ConfigurationError, "CORRECTION_INVALID"):
+            verify_inventory_pair(self.primary_path, self.independent_path)
+        self.basis_path.write_bytes(raw)
+        self.assertTrue(verify_inventory_pair(self.primary_path, self.independent_path)["static_complete"])
+
+    def test_shared_basis_still_checks_each_methods_expected_digest(self) -> None:
+        self._correct()
+        self.independent["coverage"]["scope_correction"]["basis"]["sha256"] = "0" * 64
+        self._write()
+        with self.assertRaisesRegex(ConfigurationError, "CORRECTION_INVALID"):
+            verify_inventory_pair(self.primary_path, self.independent_path)
+
+
 
 if __name__ == "__main__":
     unittest.main()
