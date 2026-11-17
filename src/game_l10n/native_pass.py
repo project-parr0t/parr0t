@@ -17,7 +17,7 @@ from .control_plane import (
 from .language_policy import DEFAULT_TARGET_LANGUAGE, language_policy_digest
 from .models import Segment
 from .native_followup import CANDIDATE_METADATA_KEY
-from .native_runtime import RUNTIME_ISSUES, launch_contract, native_launch_summary, native_runtime, _unstarted_launch_ledger, _relay_command_argv
+from .native_runtime import RUNTIME_ISSUES, launch_contract, native_launch_summary, native_runtime, _unstarted_launch_ledger, _relay_command_argv, _preserve_legacy_launch_fields
 from .omp_isolation import ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
 from .store import stable_hash, stable_hash_sequence
 from .review_policy import judge_calls, review_call_limit, review_worker_limit
@@ -1599,6 +1599,7 @@ def _write_wave_relay_dispatch(
         or ("native-luna" if manifest["pass_kind"] == "translation" else "native-sol"),
         [binding["task"] for binding in bindings],
     )
+    _preserve_legacy_launch_fields(launch, previous_launch)
     if launch is not None:
         if "message_isolation" in launch:
             marker = "PARR0T_OMP_RELAY=" + path.resolve().relative_to(work_dir.resolve()).as_posix()
@@ -1663,7 +1664,7 @@ def _repair_ended_wave_relay(
                 and old_launch.get("host_profile_fingerprint") == runtime.get("host_profile_fingerprint")):
             if old_launch.get("message_isolation") == runtime_isolation(work_dir, runtime):
                 return False
-        _unstarted_launch_ledger(path, payload)
+        _unstarted_launch_ledger(work_dir, path, payload)
     unsigned = {key: value for key, value in payload.items() if key != "dispatch_fingerprint"}
     relative_manifest = manifest_path.resolve().relative_to(work_dir.resolve()).as_posix()
     bindings = payload.get("task_bindings")
