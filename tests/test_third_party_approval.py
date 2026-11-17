@@ -90,6 +90,8 @@ class ThirdPartyApprovalTests(unittest.TestCase):
             contract = (work / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn("skills/third-party-consent/SKILL.md", contract)
             self.assertIn("explicit user approval", contract)
+            self.assertIn("complete validation", contract)
+            self.assertIn("no known supply-chain attack history", contract)
 
 
 if __name__ == "__main__":
