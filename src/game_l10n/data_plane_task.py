@@ -40,6 +40,16 @@ from .image_localization import (
     verify_image_localization_results,
     verify_image_ui_inventory,
 )
+from .inventory_constraints import (
+    CONSTRAINT_ACTION,
+    CONSTRAINT_CODE,
+    CONSTRAINT_SCHEMA,
+    artifact_digest,
+    has_inventory_constraint,
+    inventory_constraint_binding,
+    observe_inventory_constraints,
+    persistent_inventory_constraint,
+)
 from .language_policy import language_binding
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext, Segment
 from .native_runtime import RUNTIME_ISSUES, native_launch_summary, native_runtime
@@ -1302,6 +1312,165 @@ def current_data_plane_receipt(
     }
 
 
+def _inventory_constraint_state(
+    work_dir: Path,
+    task_dir: Path,
+    task: dict[str, Any],
+    receipt: dict[str, Any],
+    attestation: dict[str, Any],
+    config: dict[str, Any],
+    sdk_activation: dict[str, Any],
+) -> dict[str, Any]:
+    envelope = (work_dir / str(task["output_envelope"])).resolve()
+    if not is_within(envelope, work_dir):
+        raise ValueError("inventory envelope binding")
+    unsigned = {
+        "schema": CONSTRAINT_SCHEMA,
+        "task_id": task["task_id"],
+        "control_generation": task["control_generation"],
+        "task_sha256": artifact_digest(task_dir / "task.json"),
+        "relay_sha256": artifact_digest(task_dir / "relay.json"),
+        "receipt_binding": stable_hash(receipt),
+        "envelope_sha256": artifact_digest(envelope),
+        "attestation_binding": stable_hash(attestation),
+        "input_binding": inventory_constraint_binding(
+            work_dir, attestation, config, sdk_activation, native_runtime(work_dir),
+            task["inventory_constraint_baseline"]["evidence_paths"],
+        ),
+        "constraint_count": task["inventory_constraint_baseline"]["constraint_count"],
+    }
+    return {**unsigned, "state_fingerprint": stable_hash(unsigned)}
+
+
+def _inventory_constraint_locator(
+    work_dir: Path, task_dir: Path, task_id: str
+) -> None:
+    _atomic_json(
+        work_dir / ".game-l10n/data-plane/inventory_reconciler/inventory-constraint-current.json",
+        {
+            "schema": "parr0t.inventory-constraint-locator.v1",
+            "task_dir": _relative(work_dir, task_dir),
+            "task_id": task_id,
+        },
+    )
+
+
+def current_inventory_constraint(
+    work_dir: Path,
+    *,
+    config: dict[str, Any],
+    sdk_activation: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Validate an exact core seal without reparsing inventory documents."""
+    task_dir = work_dir / ".game-l10n/data-plane/inventory_reconciler"
+    try:
+        locator_path = task_dir / "inventory-constraint-current.json"
+        locator = None
+        if locator_path.is_file():
+            locator = json.loads(locator_path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(locator, dict)
+                or set(locator) != {"schema", "task_dir", "task_id"}
+                or locator["schema"] != "parr0t.inventory-constraint-locator.v1"
+            ):
+                return None
+            task_dir = (work_dir / locator["task_dir"]).resolve()
+            if not is_within(task_dir, work_dir):
+                return None
+        if not (task_dir / "task.json").is_file():
+            return None
+        task_stub = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
+        if not isinstance(task_stub, dict) or re.fullmatch(
+            r"[0-9a-f]{64}", str(task_stub.get("task_id", ""))
+        ) is None:
+            return None
+        if locator is not None and locator["task_id"] != task_stub["task_id"]:
+            return None
+        state_path = task_dir / f"inventory-constraint.{task_stub['task_id']}.json"
+        if not state_path.is_file():
+            return None
+        relay, task = _load_bound_data_plane_relay(work_dir, task_dir / "relay.json")
+        if task.get("worker_role") != "inventory_reconciler":
+            return None
+        safe_receipt = current_data_plane_receipt(work_dir, "inventory_reconciler")
+        receipt = json.loads(
+            (work_dir / ".game-l10n/data-plane/inventory_reconciler/receipt.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        if (
+            safe_receipt is None
+            or receipt.get("task_id") != task["task_id"]
+            or receipt.get("status") == "success"
+            or not has_inventory_constraint(receipt.get("issue_codes"))
+            or receipt.get("execution", {}).get("complete", True) is not True
+        ):
+            return None
+        attestation = json.loads(
+            (work_dir / ".game-l10n/inventory-attestation.json").read_text(encoding="utf-8")
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        expected = _inventory_constraint_state(
+            work_dir, task_dir, task, receipt, attestation, config, sdk_activation
+        )
+        if (
+            state != expected
+            or attestation.get("static_complete") is not False
+            or attestation.get("status") != "incomplete"
+            or type(state.get("constraint_count")) is not int
+            or state["constraint_count"] <= 0
+        ):
+            return None
+        return {
+            "status": "pending",
+            "next_action": CONSTRAINT_ACTION,
+            "issue_codes": [CONSTRAINT_CODE],
+            "counts": {"blocking_constraints": state["constraint_count"]},
+            "binding": state["state_fingerprint"],
+            "job_terminal": False,
+            "dispatch_allowed": False,
+        }
+    except (ConfigurationError, OSError, ValueError, TypeError, AttributeError, KeyError):
+        return None
+
+
+def _seal_inventory_constraint(
+    work_dir: Path, relay: dict[str, Any], task: dict[str, Any], receipt: dict[str, Any]
+) -> None:
+    if (
+        task.get("worker_role") != "inventory_reconciler"
+        or receipt.get("status") == "success"
+        or not has_inventory_constraint(receipt.get("issue_codes"))
+        or receipt.get("execution", {}).get("complete", True) is not True
+        or not isinstance(task.get("inventory_constraint_baseline"), dict)
+    ):
+        return
+    from .workspace import load_config, require_sdk_activation
+
+    try:
+        config = load_config(work_dir)
+        activation = require_sdk_activation(work_dir, config)
+        attestation = json.loads(
+            (work_dir / ".game-l10n/inventory-attestation.json").read_text(encoding="utf-8")
+        )
+        current = observe_inventory_constraints(
+            work_dir, attestation, config, activation, native_runtime(work_dir)
+        )
+        if not persistent_inventory_constraint(
+            task["inventory_constraint_baseline"], current, attestation
+        ):
+            return
+        task_dir = (work_dir / str(relay["task_path"])).resolve().parent
+        state = _inventory_constraint_state(
+            work_dir, task_dir, task, receipt, attestation, config, activation
+        )
+        _atomic_json(task_dir / f"inventory-constraint.{task['task_id']}.json", state)
+        _inventory_constraint_locator(work_dir, task_dir, task["task_id"])
+    except (ConfigurationError, OSError, ValueError, TypeError, AttributeError, KeyError):
+        # An unverified claim is an ordinary resumable receipt, never a hold.
+        return
+
+
 def prepare_data_plane_task(
     work_dir: Path,
     output_dir: Path,
@@ -1329,6 +1498,12 @@ def prepare_data_plane_task(
     output_dir = output_dir.resolve()
     if not is_within(output_dir, work_dir):
         raise ConfigurationError("E_DATA_PLANE_TASK_PATH: output must stay inside the workspace")
+    if worker_role == "inventory_reconciler":
+        blocked = current_inventory_constraint(
+            work_dir, config=config, sdk_activation=sdk_activation or {}
+        )
+        if blocked is not None:
+            return {**blocked, "worker_role": worker_role}
 
     roots = [str(Path(item).resolve()) for item in config.get("game_roots", [])]
     if not roots:
@@ -1568,6 +1743,13 @@ def prepare_data_plane_task(
             "issue_codes": attestation.get("issue_codes", []),
             "reconciliation_generation": reconciliation.get("generation", 0),
         }
+        try:
+            private_payload["inventory_constraint_baseline"] = observe_inventory_constraints(
+                work_dir, attestation, config, sdk_activation or {}, runtime
+            )
+        except (ConfigurationError, OSError, ValueError, TypeError, AttributeError, KeyError):
+            # Legacy or stale attestations remain executable, not blocked.
+            pass
     if worker_role == "context_analyzer":
         attestation_path = work_dir / ".game-l10n" / "inventory-attestation.json"
         if not attestation_path.is_file():
@@ -1859,6 +2041,10 @@ def prepare_data_plane_task(
                 "do_not_match_duplicate_source_text_without_occurrence_or_location_evidence",
                 "run_core_verify_inventory_and_bind_current_attestation",
                 "incomplete_with_measured_progress_requires_another_bounded_step",
+                "constraint_unsatisfiable_alone_requests_core_validation_not_terminal_authority",
+                "never_relabel_provider_transport_or_malformed_output_as_inventory_constraint",
+                "require_fresh_complete_pair_verification_and_bound_history_for_projection_constraints",
+                "repair_scope_eligibility_without_removing_or_reordering_canonical_primary_history",
             ]
         )
     elif worker_role == "context_analyzer":
@@ -1931,6 +2117,8 @@ def prepare_data_plane_task(
     task = {**private_payload, "task_id": task_id}
     task_path = output_dir / "task.json"
     _atomic_json(task_path, task)
+    if worker_role == "inventory_reconciler":
+        _inventory_constraint_locator(work_dir, output_dir, task_id)
     lifecycle_path = output_dir / "relay-lifecycle.json"
     lifecycle_relative = (
         _relative(work_dir, lifecycle_path)
@@ -2898,6 +3086,7 @@ def _seal_bound_data_plane_task(
         / "receipt.json"
     )
     _atomic_json(receipt_path, receipt)
+    _seal_inventory_constraint(work_dir, relay, task, receipt)
     return {
         "schema": receipt["schema"],
         "status": receipt["status"],

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from hashlib import sha256
+from hashlib import file_digest, sha256
 import json
 import re
 from collections import Counter
@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .errors import ConfigurationError
+from .inventory_scope import inventory_scope
 from .localization_authority import localization_authority_contract
 from .models import FailureCode, Segment, TranslationResult
 from .review_selection import target_language_review_reasons
@@ -40,7 +41,15 @@ def validate_inventory_display_scope(
     payload: dict[str, Any], *, required: bool = False
 ) -> None:
     """Validate evidence-backed translation scope for new inventory tasks."""
+    active_rows, _ = inventory_scope(payload)
+    _validate_active_display_scope(payload, active_rows, required=required)
+
+
+def _validate_active_display_scope(
+    payload: dict[str, Any], active_rows: list[dict[str, Any]], *, required: bool = False,
+) -> None:
     coverage = payload.get("coverage")
+    required = required or (isinstance(coverage, dict) and coverage.get("scope_correction") is not None)
     tracking = coverage.get("display_scope") if isinstance(coverage, dict) else None
     if tracking is None and not required:
         return
@@ -52,14 +61,14 @@ def validate_inventory_display_scope(
             raise ConfigurationError(f"Inventory display scope {key} must be a non-negative integer")
     if tracking["control_only_count"] + tracking["unclassified_count"] > tracking["raw_occurrence_count"]:
         raise ConfigurationError("Inventory raw occurrence accounting is inconsistent")
-    if payload.get("segments") and tracking["raw_occurrence_count"] == 0:
+    if active_rows and tracking["raw_occurrence_count"] == 0:
         raise ConfigurationError("Inventory display candidates require source occurrences")
     fingerprint = tracking.get("evidence_fingerprint")
     if not isinstance(fingerprint, str) or not fingerprint.strip():
         raise ConfigurationError("Inventory display scope requires an evidence_fingerprint")
-    if tracking["display_candidate_count"] != len(payload.get("segments", [])):
+    if tracking["display_candidate_count"] != len(active_rows):
         raise ConfigurationError("Inventory display candidate count must match segments")
-    for row in payload.get("segments", []):
+    for row in active_rows:
         metadata = row.get("metadata", {}) if isinstance(row, dict) else {}
         evidence = metadata.get(DISPLAY_SCOPE_EVIDENCE_FIELD) if isinstance(metadata, dict) else None
         if (
@@ -198,7 +207,7 @@ def _validate_inventory_unicode(value: Any) -> None:
             _validate_inventory_unicode(item)
 
 
-def _inventory_document(path: Path) -> dict[str, Any]:
+def _inventory_document(path: Path, *, defer_projection_constraints: bool = False) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except UnicodeDecodeError as exc:
@@ -235,9 +244,10 @@ def _inventory_document(path: Path) -> dict[str, Any]:
     tracking = _static_scope_tracking(coverage)
     if not isinstance(segments, list) or not segments:
         raise ConfigurationError("Inventory must contain at least one segment")
-    if tracking is not None and tracking["included_count"] != len(segments):
-        raise ConfigurationError("Inventory static scope included count does not match segments")
-    validate_inventory_display_scope(payload)
+    active_rows, _ = inventory_scope(payload, path, defer_projection_constraints=defer_projection_constraints)
+    if tracking is not None and tracking["included_count"] != len(active_rows):
+        raise ConfigurationError("Inventory static scope included count does not match eligible segments")
+    _validate_active_display_scope(payload, active_rows)
     return payload
 
 
@@ -309,7 +319,7 @@ def _ui_contract_map(
         contract = {key: metadata[key] for key in UI_COMPOSITION_FIELDS if key in metadata}
         display_binding = {
             key: metadata[key]
-            for key in ("storage_role", "display_projection_required", "display_binding_id")
+            for key in ("storage_role", "display_projection_required", "display_binding_id", "display_projection_of")
             if key in metadata
         }
         if not contract:
@@ -427,11 +437,30 @@ def _source_multiset_overlap(
     return overlap, (overlap / denominator if denominator else 0.0)
 
 
+def _validate_scope_correction_history(
+    work_dir: Path, attestation: dict[str, Any], previous: dict[str, Any] | None,
+) -> None:
+    correction = attestation.get("scope_correction")
+    previous_correction = previous.get("scope_correction") if previous else None
+    if previous_correction is not None and correction is None:
+        raise ConfigurationError("E_INVENTORY_SCOPE_CORRECTION_HISTORY_REQUIRED")
+    for proposal in attestation.get("scope_correction_proposals", []):
+        if previous is not None:
+            accepted_bases = {previous.get("primary_fingerprint")}
+            if isinstance(previous_correction, dict):
+                accepted_bases.add(previous_correction.get("basis_fingerprint"))
+            if proposal["basis_fingerprint"] not in accepted_bases:
+                raise ConfigurationError("E_INVENTORY_SCOPE_CORRECTION_BASIS_STALE")
+        elif (work_dir / PRIMARY_IDENTITY_PATH).exists():
+            raise ConfigurationError("E_INVENTORY_SCOPE_CORRECTION_BASIS_UNBOUND")
+
+
 def _write_primary_identity_binding(
     work_dir: Path,
     primary_path: Path,
     primary_payload: dict[str, Any],
     previous_attestation: dict[str, Any] | None,
+    *, scope_correction: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Preserve canonical IDs across handoffs while allowing additive extraction.
 
@@ -491,6 +520,37 @@ def _write_primary_identity_binding(
         "id_fingerprint": stable_hash(current_ids),
         "ids": current_ids,
     }
+    previous_occurrences = existing_binding.get("occurrences") if existing_binding else None
+    if scope_correction is not None or (existing_binding and "occurrences" in existing_binding):
+        current_occurrences = {
+            row["id"]: {
+                "source_sha256": sha256(row["source"].encode("utf-8")).hexdigest(),
+                "comparison_key": row.get("metadata", {}).get(INVENTORY_COMPARISON_KEY, row["id"]),
+            }
+            for row in primary_payload["segments"]
+        }
+        if existing_binding and "occurrences" in existing_binding:
+            if (not isinstance(previous_occurrences, dict)
+                    or set(previous_occurrences) != set(existing_binding["ids"])
+                    or any(not isinstance(value, dict)
+                           or set(value) != {"source_sha256", "comparison_key"}
+                           or not isinstance(value["source_sha256"], str)
+                           or re.fullmatch(r"[0-9a-f]{64}", value["source_sha256"]) is None
+                           or not isinstance(value["comparison_key"], str)
+                           or not value["comparison_key"]
+                           for value in previous_occurrences.values())):
+                raise ConfigurationError("E_INVENTORY_PRIMARY_IDENTITY_INVALID")
+            if any(current_occurrences[target_id] != value
+                   for target_id, value in previous_occurrences.items()):
+                raise ConfigurationError("E_INVENTORY_PRIMARY_OCCURRENCE_DRIFT")
+        elif existing_binding:
+            previous_fingerprint = previous_attestation.get("primary_fingerprint") if previous_attestation else None
+            if (previous_fingerprint is None
+                    or (inventory_fingerprint(primary_payload) != previous_fingerprint
+                        and (scope_correction is None
+                             or scope_correction["basis_fingerprint"] != previous_fingerprint))):
+                raise ConfigurationError("E_INVENTORY_IDENTITY_LINEAGE_UNAVAILABLE")
+        binding["occurrences"] = current_occurrences
     if existing_binding != binding:
         _atomic_json(binding_path, binding)
     return {
@@ -499,12 +559,14 @@ def _write_primary_identity_binding(
         "records": binding["records"],
         "id_fingerprint": binding["id_fingerprint"],
         "policy": "append_only_preserve_existing_id_order",
+        **({"occurrence_fingerprint": stable_hash(binding["occurrences"])}
+           if "occurrences" in binding else {}),
     }
 
 
 def verify_inventory_pair(primary_path: Path, independent_path: Path) -> dict[str, Any]:
-    primary = _inventory_document(primary_path)
-    independent = _inventory_document(independent_path)
+    primary = _inventory_document(primary_path, defer_projection_constraints=True)
+    independent = _inventory_document(independent_path, defer_projection_constraints=True)
     return _verify_inventory_payloads(primary_path, independent_path, primary, independent)
 
 def _verify_inventory_payloads(
@@ -517,20 +579,51 @@ def _verify_inventory_payloads(
         raise ConfigurationError("Inventory methods must be independently named")
     if primary["implementation_fingerprint"] == independent["implementation_fingerprint"]:
         raise ConfigurationError("Inventory methods must use different implementation fingerprints")
+    primary_active, primary_correction = inventory_scope(primary, primary_path, defer_projection_constraints=True)
+    independent_active, independent_correction = inventory_scope(independent, independent_path, defer_projection_constraints=True)
+    primary_targets = {**primary, "segments": primary_active}
+    independent_targets = {**independent, "segments": independent_active}
+    actual_methods = sorted([
+        [primary["method"], primary["implementation_fingerprint"]],
+        [independent["method"], independent["implementation_fingerprint"]],
+    ])
+    correction_mismatch = bool(primary_correction) != bool(independent_correction)
+    if primary_correction is not None and independent_correction is not None:
+        correction_mismatch = (
+            primary_correction["fingerprint"] != independent_correction["fingerprint"]
+            or primary_correction["basis_fingerprint"] != independent_correction["basis_fingerprint"]
+            or any(item["methods"] and item["methods"] != actual_methods
+                   for item in (primary_correction, independent_correction))
+            or primary_correction["canonical_method"] != primary["method"]
+            or primary_correction["canonical_implementation"] != primary["implementation_fingerprint"]
+        )
+    projection_constraints = sum(
+        correction["projection_constraint_count"]
+        for correction in (primary_correction, independent_correction) if correction is not None
+    )
+    scope_correction = None
+    if primary_correction is not None:
+        scope_correction = {**primary_correction, "basis_files": [
+            {"path": str((path.parent / correction["basis_file"]).resolve()),
+             "sha256": correction["basis_sha256"]}
+            for path, correction in ((primary_path, primary_correction),
+                                     (independent_path, independent_correction))
+            if correction is not None
+        ]}
 
-    primary_rows = _segment_map(primary, use_comparison_key=True)
-    independent_rows = _segment_map(independent, use_comparison_key=True)
-    primary_raw_rows = _segment_map(primary)
-    independent_raw_rows = _segment_map(independent)
-    primary_ui_contracts = _ui_contract_map(primary, use_comparison_key=True)
+    primary_rows = _segment_map(primary_targets, use_comparison_key=True)
+    independent_rows = _segment_map(independent_targets, use_comparison_key=True)
+    primary_raw_rows = _segment_map(primary_targets)
+    independent_raw_rows = _segment_map(independent_targets)
+    primary_ui_contracts = _ui_contract_map(primary_targets, use_comparison_key=True)
     independent_ui_contracts = _ui_contract_map(
-        independent, use_comparison_key=True
+        independent_targets, use_comparison_key=True
     )
     primary_authority_contracts = _localization_authority_map(
-        primary, use_comparison_key=True
+        primary_targets, use_comparison_key=True
     )
     independent_authority_contracts = _localization_authority_map(
-        independent, use_comparison_key=True
+        independent_targets, use_comparison_key=True
     )
     primary_order = list(primary_rows)
     independent_order = list(independent_rows)
@@ -547,8 +640,8 @@ def _verify_inventory_payloads(
         )
     else:
         source_overlap_count, source_overlap_ratio = 0, 0.0
-    primary_comparison_key_count = _comparison_key_coverage(primary)
-    independent_comparison_key_count = _comparison_key_coverage(independent)
+    primary_comparison_key_count = _comparison_key_coverage(primary_targets)
+    independent_comparison_key_count = _comparison_key_coverage(independent_targets)
     comparison_keys_complete = (
         primary_comparison_key_count == len(primary_raw_rows)
         and independent_comparison_key_count == len(independent_raw_rows)
@@ -605,8 +698,14 @@ def _verify_inventory_payloads(
         or visible_exclusions
         or scope_tracking_mismatch
         or not declared_complete
+        or correction_mismatch
+        or projection_constraints
     )
     issue_codes: list[str] = []
+    if correction_mismatch:
+        issue_codes.append("INVENTORY_SCOPE_CORRECTION_MISMATCH")
+    if projection_constraints:
+        issue_codes.append("INVENTORY_SCOPE_PROJECTION_REQUIRED")
     if namespace_mismatch:
         issue_codes.append("INVENTORY_IDENTITY_NAMESPACE_MISMATCH")
     if missing_from_primary:
@@ -641,6 +740,8 @@ def _verify_inventory_payloads(
         + int(order_mismatch)
         + int(scope_tracking_mismatch)
         + int(not declared_complete)
+        + int(correction_mismatch)
+        + projection_constraints
     )
     return {
         "schema": "parr0t.inventory-attestation.v1",
@@ -659,6 +760,12 @@ def _verify_inventory_payloads(
         "independent_id_fingerprint": _inventory_id_fingerprint(independent),
         "primary_segments": len(primary_rows),
         "independent_segments": len(independent_rows),
+        "primary_occurrences": len(primary["segments"]),
+        "independent_occurrences": len(independent["segments"]),
+        "scope_correction": scope_correction,
+        "scope_correction_proposals": [correction for correction in
+                                       (primary_correction, independent_correction) if correction is not None],
+        "projection_constraint_count": projection_constraints,
         "missing_from_primary_count": len(missing_from_primary),
         "missing_from_independent_count": len(missing_from_independent),
         "source_mismatch_count": len(source_mismatches),
@@ -715,24 +822,26 @@ def save_inventory_attestation(
             previous = None
 
     # Validate both inventory documents before advancing canonical ID lineage.
-    primary_payload = _inventory_document(primary_path)
-    independent_payload = _inventory_document(independent_path)
+    primary_payload = _inventory_document(primary_path, defer_projection_constraints=True)
+    independent_payload = _inventory_document(independent_path, defer_projection_constraints=True)
     attestation = _verify_inventory_payloads(
         primary_path, independent_path, primary_payload, independent_payload
     )
+    _validate_scope_correction_history(work_dir, attestation, previous)
     if (
         previous is not None
         and (
             "INVENTORY_IDENTITY_NAMESPACE_MISMATCH" in attestation["issue_codes"]
             or "INVENTORY_IDENTITY_NAMESPACE_MISMATCH" in previous.get("issue_codes", [])
         )
-        and len(primary_payload["segments"]) > int(previous.get("primary_segments", 0))
+        and len(primary_payload["segments"]) > int(previous.get("primary_occurrences", previous.get("primary_segments", 0)))
     ):
         raise ConfigurationError(
             "E_INVENTORY_IDENTITY_NAMESPACE_MISMATCH: reconcile identity aliases before primary expansion"
         )
     identity_binding = _write_primary_identity_binding(
-        work_dir, primary_path, primary_payload, previous
+        work_dir, primary_path, primary_payload, previous,
+        scope_correction=attestation["scope_correction"],
     )
     attestation["primary_identity_binding"] = identity_binding
 
@@ -814,6 +923,28 @@ def require_inventory_attestation(work_dir: Path, primary_path: Path) -> dict[st
         raise ConfigurationError("Independent source inventory is incomplete")
     if state.get("primary_path") != str(primary_path.resolve()):
         raise ConfigurationError("Verified primary inventory does not match this context input")
+    correction = state.get("scope_correction")
+    if correction is not None:
+        basis_file = correction.get("basis_file") if isinstance(correction, dict) else None
+        if (not isinstance(basis_file, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.json", basis_file) is None):
+            raise ConfigurationError("E_INVENTORY_SCOPE_CORRECTION_BASIS_STALE")
+        independent_path = Path(str(state.get("independent_path", "")))
+        try:
+            for directory in {primary_path.parent.resolve(), independent_path.parent.resolve()}:
+                basis_path = directory / basis_file
+                if basis_path.resolve().parent != directory:
+                    raise ConfigurationError("E_INVENTORY_SCOPE_CORRECTION_BASIS_STALE")
+                with basis_path.open("rb") as handle:
+                    if file_digest(handle, "sha256").hexdigest() != correction.get("basis_sha256"):
+                        raise ConfigurationError("E_INVENTORY_SCOPE_CORRECTION_BASIS_STALE")
+            independent_binding = _file_binding(independent_path)
+        except OSError as exc:
+            raise ConfigurationError("E_INVENTORY_SCOPE_CORRECTION_BASIS_STALE") from exc
+        if state.get("file_bindings", {}).get("independent") != independent_binding:
+            independent_payload = _inventory_document(independent_path)
+            if inventory_fingerprint(independent_payload) != state.get("independent_fingerprint"):
+                raise ConfigurationError("Independent inventory changed after scope correction verification")
     bindings = state.get("file_bindings")
     if (
         isinstance(bindings, dict)
@@ -883,8 +1014,10 @@ def record_runtime_coverage(work_dir: Path, report_path: Path) -> dict[str, Any]
     )
     if payload.get("inventory_fingerprint") != inventory_state["primary_fingerprint"]:
         raise ConfigurationError("Runtime report targets a different source inventory")
-    primary = _inventory_document(Path(inventory_state["primary_path"]))
-    expected_ids = set(_segment_map(primary))
+    primary_path = Path(inventory_state["primary_path"])
+    primary = _inventory_document(primary_path)
+    active_rows, _ = inventory_scope(primary, primary_path)
+    expected_ids = {row["id"] for row in active_rows}
     observed_ids = set(target_ids)
     unknown_target_count = len(observed_ids - expected_ids)
     unobserved_target_count = len(expected_ids - observed_ids)
