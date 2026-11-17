@@ -6,6 +6,7 @@ from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any, Iterable
 
+from .inventory_scope import inventory_scope
 from .models import AttemptRecord, Segment, TranslationResult
 
 
@@ -20,6 +21,7 @@ def load_dataclass_list(path: Path, cls: type) -> list[Any]:
 
 def read_segments(path: Path) -> list[Segment]:
     suffix = path.suffix.lower()
+    corrected_scope = False
     if suffix == ".jsonl":
         def rows() -> Iterable[dict[str, object]]:
             with path.open("r", encoding="utf-8-sig") as handle:
@@ -33,6 +35,9 @@ def read_segments(path: Path) -> list[Segment]:
     elif suffix == ".json":
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
         raw_rows = payload["segments"] if isinstance(payload, dict) else payload
+        if isinstance(payload, dict) and payload.get("schema") == "parr0t.source-inventory.v1":
+            raw_rows, correction = inventory_scope(payload, path)
+            corrected_scope = correction is not None
         if not isinstance(raw_rows, list):
             raise ValueError("JSON segment input must contain a list")
 
@@ -66,8 +71,8 @@ def read_segments(path: Path) -> list[Segment]:
                 source=source,
                 speaker=str(row.get("speaker", "") or ""),
                 scene=str(row.get("scene", "") or ""),
-                previous=str(row.get("previous", "") or ""),
-                next=str(row.get("next", "") or ""),
+                previous="" if corrected_scope else str(row.get("previous", "") or ""),
+                next="" if corrected_scope else str(row.get("next", "") or ""),
                 metadata=metadata,
             )
         )
