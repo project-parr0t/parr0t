@@ -11,7 +11,7 @@ Apply `docs/third-party-consent.md`. New third-party use is deny-by-default.
 
 Do not download, clone, install, execute, vendor, copy, add as a dependency or submodule, call as a service, or send data to a third party until the user explicitly approves the exact component and action. Installed or reachable does not mean approved. Open source, popularity, convenience, credentials, urgency, and broad instructions such as “fix”, “test”, “build”, “deploy”, or “publish” do not imply consent.
 
-Ordinary use of dependencies already declared and immutably locked by the target repository is within the repository contract. A new dependency, newly executed helper, replacement, update, source change, permission increase, or new data recipient is not.
+Parr0t dependencies are preapproved only when complete validation passed without skips for the exact locked version, source, digest, closure, and use scope, and authoritative package/project notices plus recognized advisories show no known supply-chain attack history affecting them at validation time. Bind the approval to those exact bytes. Any changed input, stale/incomplete validation, credible later compromise report, security-related yank, or provenance anomaly revokes it. Ordinary reuse within the validated scope needs no one-shot approval record; everything else does.
 
 ## Investigate without importing
 
