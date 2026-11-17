@@ -60,9 +60,12 @@ def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str],
             stored = {}
         if isinstance(stored, dict) and "model_policy" in stored:
             policy_config = stored
-    prefix = "openai-codex/" if host == "omp" else ""
-    bindings = ({"native-luna": prefix + "gpt-6-luna", "native-sol": prefix + "gpt-6.1-sol"}
-                if host in {"codex", "omp"} else {})
+    if host == "omp":
+        bindings = {"native-luna": "openai-codex/gpt-6-luna", "native-sol": "opencodex/gpt-6.1-sol:high"}
+    elif host == "codex":
+        bindings = {"native-luna": "gpt-6-luna", "native-sol": "gpt-6.1-sol"}
+    else:
+        bindings = {}
     try:
         previous = native_runtime(work_dir, allow_stale_generation=True)
     except ValueError:
