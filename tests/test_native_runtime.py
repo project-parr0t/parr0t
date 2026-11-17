@@ -220,14 +220,34 @@ class NativeRuntimeTests(unittest.TestCase):
 
     def test_host_specific_exact_models_and_explicit_override(self) -> None:
         configure_native_runtime(self.root, "codex", {})
-        self.assertEqual(native_runtime(self.root)["models"]["native-luna"], "gpt-6-luna")
+        self.assertEqual(native_runtime(self.root)["models"], {
+            "native-luna": "gpt-6-luna", "native-sol": "gpt-6.1-sol",
+        })
         configure_native_runtime(self.root, "omp", {"native-sol": "fixture/selected-sol"})
         self.assertEqual(native_runtime(self.root)["models"], {
             "native-luna": "openai-codex/gpt-6-luna", "native-sol": "fixture/selected-sol",
         })
+        configure_native_runtime(self.root, "omp", {})
+        self.assertEqual(native_runtime(self.root)["models"]["native-sol"], "fixture/selected-sol")
         for value in ("default", "inherit", "@task", "fixture/*", ""):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "E_NATIVE_RUNTIME_INVALID"):
                 configure_native_runtime(self.root, "omp", {"native-luna": value})
+
+    def test_fresh_omp_sol_wave_binds_exact_provider_path_and_effort(self) -> None:
+        configure_native_runtime(self.root, "omp", {})
+        self.assertEqual(native_runtime(self.root)["models"], {
+            "native-luna": "openai-codex/gpt-6-luna", "native-sol": "opencodex/gpt-6.1-sol:high",
+        })
+        prepare_native_tasks(
+            self.root, self.source, self.segments, self.tasks,
+            max_records=1, max_workers=2,
+            route_binding={"provider": "native-sol", "attempt": 1},
+        )
+        step = self.step()
+        relay = self.root / step["relay"]["dispatch"]
+        contract = json.loads(relay.read_text(encoding="utf-8"))["launch_contract"]
+        self.assertEqual(contract["model"], "opencodex/gpt-6.1-sol:high")
+        self.assertEqual(contract["spawn_model_parameter"], "tasks[].model")
 
     def test_missing_runtime_does_not_create_a_controller_checkpoint(self) -> None:
         prepare_native_tasks(self.root, self.source, self.segments, self.tasks)
@@ -365,6 +385,7 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(self.step(resume_relay=True)["action"], "aggregate_completed_pass")
 
     def test_runtime_refresh_keeps_custom_models_and_active_route_evidence(self) -> None:
+        configure_native_runtime(self.root, "omp", {"native-sol": "openai-codex/gpt-6.1-sol"})
         _, relay, payload = self.prepare()
         record_native_launch(self.root, relay, event="capability-available")
         first = payload["task_bindings"][0]
@@ -374,6 +395,7 @@ class NativeRuntimeTests(unittest.TestCase):
         configure_native_runtime(self.root, "omp", {"native-qwen": "fixture/approved-qwen"})
         configure_native_runtime(self.root, "omp", {})
         self.assertEqual(native_runtime(self.root)["models"]["native-qwen"], "fixture/approved-qwen")
+        self.assertEqual(native_runtime(self.root)["models"]["native-sol"], "openai-codex/gpt-6.1-sol")
         self.assertEqual(native_launch_summary(self.root, relay)["started_workers"], 1)
         self.assertEqual(relay.read_bytes(), original)
         next_generation = native_runtime(self.root)["control_generation"] + 1
@@ -382,6 +404,7 @@ class NativeRuntimeTests(unittest.TestCase):
                 native_runtime(self.root)
             configure_native_runtime(self.root, "omp", {})
             self.assertEqual(native_runtime(self.root)["models"]["native-qwen"], "fixture/approved-qwen")
+            self.assertEqual(native_runtime(self.root)["models"]["native-sol"], "openai-codex/gpt-6.1-sol")
             self.assertEqual(native_launch_summary(self.root, relay)["started_workers"], 1)
 
     def test_model_rebind_of_unstarted_wave_quarantines_unverified_output(self) -> None:
