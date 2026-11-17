@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from game_l10n.cli import _public_inventory_gate
 from game_l10n.coverage import (
     record_runtime_coverage, require_inventory_attestation, save_inventory_attestation,
     verify_inventory_pair,
@@ -228,8 +229,12 @@ class InventoryScopeCorrectionTests(unittest.TestCase):
             save_inventory_attestation(self.root, self.primary_path, self.independent_path)
 
     def test_post_basis_additions_keep_their_attested_source_and_physical_occurrence(self) -> None:
+        for payload in (self.primary, self.independent):
+            payload["coverage"]["declared_complete"] = False
         self._correct()
-        save_inventory_attestation(self.root, self.primary_path, self.independent_path)
+        baseline = save_inventory_attestation(self.root, self.primary_path, self.independent_path)
+        observed = save_inventory_attestation(self.root, self.primary_path, self.independent_path)
+        self.assertEqual(observed["reconciliation"]["progress_state"], "unchanged")
         added = _row("canonical-added", "added", "SYNTHETIC ADDED DISPLAY")
         self.primary["segments"].append(added)
         independent_added = deepcopy(added)
@@ -238,7 +243,21 @@ class InventoryScopeCorrectionTests(unittest.TestCase):
         for payload in (self.primary, self.independent):
             payload["coverage"]["display_scope"].update(raw_occurrence_count=4, display_candidate_count=3)
         self._write()
-        save_inventory_attestation(self.root, self.primary_path, self.independent_path)
+        expanded = save_inventory_attestation(self.root, self.primary_path, self.independent_path)
+        public = _public_inventory_gate(expanded)
+        self.assertEqual(baseline["gap_score"], 1)
+        self.assertEqual(public["gap_score"], 1)
+        self.assertEqual(public["agreed_target_count"], baseline["agreed_target_count"] + 1)
+        self.assertEqual(public["primary_segments"], 3)
+        self.assertEqual(expanded["primary_occurrences"], 4)
+        self.assertEqual(public["reconciliation"]["progress_state"], "improved")
+        self.assertEqual(public["reconciliation"]["unchanged_observations"], 0)
+        self.assertEqual(public["issue_codes"], ["INVENTORY_NOT_DECLARED_COMPLETE"])
+        self.assertTrue(public["continuation_required"])
+        self.assertFalse(public["static_complete"])
+        self.assertFalse(public["reconciliation"]["terminal"])
+        self.assertNotIn(added["source"], json.dumps(public))
+        self.assertNotIn(added["id"], json.dumps(public))
         primary_before, independent_before = deepcopy(self.primary), deepcopy(self.independent)
         identity_path = self.root / ".game-l10n/inventory-primary-identity.json"
         identity_before = identity_path.read_bytes()
@@ -256,6 +275,21 @@ class InventoryScopeCorrectionTests(unittest.TestCase):
                 with self.assertRaisesRegex(ConfigurationError, "PRIMARY_OCCURRENCE_DRIFT"):
                     save_inventory_attestation(self.root, self.primary_path, self.independent_path)
                 self.assertEqual(identity_path.read_bytes(), identity_before)
+
+    def test_raw_scope_growth_without_active_agreement_is_not_progress(self) -> None:
+        for payload in (self.primary, self.independent):
+            payload["coverage"]["declared_complete"] = False
+        self._correct()
+        baseline = save_inventory_attestation(self.root, self.primary_path, self.independent_path)
+        for payload in (self.primary, self.independent):
+            payload["coverage"]["display_scope"].update(raw_occurrence_count=4, unclassified_count=1)
+        self._write()
+        observed = save_inventory_attestation(self.root, self.primary_path, self.independent_path)
+        self.assertEqual(observed["gap_score"], baseline["gap_score"])
+        self.assertEqual(observed["agreed_target_count"], baseline["agreed_target_count"])
+        self.assertEqual(observed["reconciliation"]["progress_state"], "changed")
+        self.assertEqual(observed["reconciliation"]["unchanged_observations"], 1)
+        self.assertTrue(observed["continuation_required"])
 
     def test_pair_verification_does_not_reuse_a_basis_from_an_earlier_call(self) -> None:
         self._correct()
