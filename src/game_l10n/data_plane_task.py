@@ -32,6 +32,12 @@ from .control_plane import (
 )
 from .coverage import require_inventory_attestation, validate_inventory_display_scope
 from .errors import ConfigurationError, ProviderError
+from .extractor_preparation import (
+    ATTESTATION_PATH as EXTRACTOR_ATTESTATION_PATH,
+    PURPOSE as EXTRACTOR_PREPARATION_PURPOSE,
+    require_extractor_preparation,
+    preparation_required,
+)
 from .formats import load_dataclass_list, read_segments
 from .image_localization import (
     SCOPE_PATH as IMAGE_SCOPE_PATH,
@@ -472,10 +478,19 @@ def _operational_failure_path(relay_path: Path, task_id: str) -> Path:
     return relay_path.with_name(f"operational-failure-{task_id}.json")
 
 
+def data_plane_receipt_path(work_dir: Path, worker_role: str, *, purpose: str = "") -> Path:
+    """Keep each bound purpose's lifecycle separate from its worker role."""
+    if worker_role not in DATA_PLANE_PROFILES:
+        raise ConfigurationError("E_DATA_PLANE_TASK_ROLE: unsupported data-plane role")
+    if purpose and (worker_role != "source_probe" or purpose != EXTRACTOR_PREPARATION_PURPOSE):
+        raise ConfigurationError("E_DATA_PLANE_TASK_PURPOSE: unsupported bound worker purpose")
+    return work_dir / ".game-l10n" / "data-plane" / (purpose or worker_role) / "receipt.json"
+
+
 def current_data_plane_operational_failure(
-    work_dir: Path, worker_role: str
+    work_dir: Path, worker_role: str, *, purpose: str = ""
 ) -> dict[str, Any] | None:
-    relay_path = work_dir / ".game-l10n" / "data-plane" / worker_role / "relay.json"
+    relay_path = data_plane_receipt_path(work_dir, worker_role, purpose=purpose).with_name("relay.json")
     if not relay_path.is_file():
         return None
     try:
@@ -508,7 +523,7 @@ def current_data_plane_operational_failure(
         or failure.get("failure_code") not in DATA_PLANE_OPERATIONAL_FAILURE_CODES
     ):
         return None
-    receipt_path = relay_path.with_name("receipt.json")
+    receipt_path = data_plane_receipt_path(work_dir, worker_role, purpose=purpose)
     if receipt_path.is_file():
         try:
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -562,21 +577,13 @@ def _load_context_task(work_dir: Path, task_path: Path) -> dict[str, Any]:
     resolved = task_path.resolve()
     if not is_within(resolved, work_dir) or not resolved.is_file():
         raise ConfigurationError("E_CONTEXT_TASK_INVALID: task must be a workspace file")
-    try:
-        task = json.loads(resolved.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ConfigurationError("E_CONTEXT_TASK_INVALID: task is unreadable") from exc
-    identity = dict(task) if isinstance(task, dict) else {}
-    identity.pop("task_id", None)
+    relay, task = _load_bound_data_plane_relay(work_dir, resolved.with_name("relay.json"))
     if (
-        not isinstance(task, dict)
-        or task.get("schema") != DATA_PLANE_TASK_SCHEMA
+        (work_dir / str(relay["task_path"])).resolve() != resolved
         or task.get("worker_role") != "context_analyzer"
-        or task.get("task_id") != stable_hash(identity)
-        or task.get("control_generation")
-        != int(control_plane_state(work_dir).get("generation", 0))
+        or task.get("stage") != "context"
     ):
-        raise ConfigurationError("E_CONTEXT_TASK_INVALID: task binding is invalid")
+        raise ConfigurationError("E_CONTEXT_TASK_INVALID: task is not bound to this relay")
     manifest_path = (work_dir / str(task.get("input_context_manifest", ""))).resolve()
     if (
         not is_within(manifest_path, work_dir)
@@ -648,6 +655,60 @@ def _context_safe_counts(
     }
 
 
+def _require_context_claim_binding(
+    work_dir: Path,
+    task: dict[str, Any],
+    manifest: dict[str, Any],
+    claim_path: Path,
+    claim: dict[str, Any],
+    *,
+    slot: int | None = None,
+) -> None:
+    if not isinstance(claim, dict):
+        raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: claim binding is invalid")
+    claim_slot = claim.get("slot")
+    chunk = next((
+        item for item in manifest["chunks"]
+        if isinstance(item, dict) and item.get("binding_id") == claim.get("binding_id")
+    ), None)
+    if (
+        type(claim_slot) is not int
+        or not 1 <= claim_slot <= int(task["context_parallelism"]["max_workers"])
+        or (slot is not None and claim_slot != slot)
+        or chunk is None
+    ):
+        raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: claim ownership is invalid")
+    claim_root = work_dir / ".game-l10n/context-progress/claims" / task["task_id"]
+    expected_path = claim_root / chunk["binding_id"] / "claim.json"
+    unsigned = {
+        "schema": CONTEXT_CHUNK_CLAIM_SCHEMA,
+        "task_id": task["task_id"],
+        "manifest_id": manifest["manifest_id"],
+        "binding_id": chunk["binding_id"],
+        "binding": chunk["binding"],
+        "source_index": chunk["source_index"],
+        "slot": claim_slot,
+        "provider": task["context_route"],
+        "rows": chunk["rows"],
+    }
+    if chunk.get("localization_inputs"):
+        unsigned["localization_inputs"] = chunk["localization_inputs"]
+    try:
+        owner = json.loads((claim_root / "slots" / f"slot-{claim_slot}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: claim owner is unavailable") from exc
+    if (
+        claim_path.resolve() != expected_path.resolve()
+        or set(claim) != set(unsigned) | {"claim_id", "status", "issue_code", "fragment_path"}
+        or any(claim.get(key) != value for key, value in unsigned.items())
+        or claim.get("claim_id") != stable_hash(unsigned)
+        or not isinstance(owner, dict)
+        or not isinstance(owner.get("active_claim_path"), str)
+        or (work_dir / owner["active_claim_path"]).resolve() != expected_path.resolve()
+    ):
+        raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: claim is not bound to this task and slot")
+
+
 def claim_context_chunk(
     work_dir: Path, task_path: Path, *, slot: int
 ) -> dict[str, Any]:
@@ -684,18 +745,20 @@ def claim_context_chunk(
     active_relative = str(slot_state["active_claim_path"])
     if active_relative:
         active_path = (work_dir / active_relative).resolve()
-        if is_within(active_path, work_dir) and active_path.is_file():
-            try:
-                existing = json.loads(active_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                existing = {}
-            if existing.get("slot") == slot and existing.get("status") == "claimed":
-                return {
-                    "status": "claimed",
-                    "slot": slot,
-                    "claim_path": active_relative,
-                    "record_count": len(existing.get("rows", [])),
-                }
+        if not is_within(active_path, work_dir) or not active_path.is_file():
+            raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: active claim is unavailable")
+        try:
+            existing = json.loads(active_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: active claim is unreadable") from exc
+        _require_context_claim_binding(work_dir, task, manifest, active_path, existing, slot=slot)
+        if existing.get("status") == "claimed":
+            return {
+                "status": "claimed",
+                "slot": slot,
+                "claim_path": active_relative,
+                "record_count": len(existing["rows"]),
+            }
     chunks = list(manifest["chunks"])
     start = max(0, int(slot_state["cursor"]) + 1)
     for ordinal in range(start, len(chunks)):
@@ -764,6 +827,7 @@ def commit_context_fragment(
     require_control_plane_ready(work_dir)
     require_control_plane_entry(work_dir)
     task = _load_context_task(work_dir, task_path)
+    _, manifest = _load_context_manifest(work_dir, task)
     resolved_claim = claim_path.resolve()
     resolved_result = result_path.resolve()
     if (
@@ -778,29 +842,8 @@ def commit_context_fragment(
         result = json.loads(resolved_result.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: result is unreadable") from exc
-    claim_unsigned = {
-        key: claim.get(key)
-        for key in (
-            "schema",
-            "task_id",
-            "manifest_id",
-            "binding_id",
-            "binding",
-            "source_index",
-            "slot",
-            "provider",
-            "rows",
-        )
-    }
-    if isinstance(claim, dict) and "localization_inputs" in claim:
-        claim_unsigned["localization_inputs"] = claim["localization_inputs"]
-    if (
-        not isinstance(claim, dict)
-        or claim.get("schema") != CONTEXT_CHUNK_CLAIM_SCHEMA
-        or claim.get("task_id") != task["task_id"]
-        or claim.get("claim_id") != stable_hash(claim_unsigned)
-        or claim.get("status") != "claimed"
-    ):
+    _require_context_claim_binding(work_dir, task, manifest, resolved_claim, claim)
+    if claim.get("status") != "claimed":
         raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: claim is not active")
     if not isinstance(result, dict) or set(result) != {
         "schema",
@@ -1243,14 +1286,14 @@ def _safe_execution_summary(value: Any) -> dict[str, Any] | None:
 
 
 def current_data_plane_receipt(
-    work_dir: Path, worker_role: str
+    work_dir: Path, worker_role: str, *, purpose: str = ""
 ) -> dict[str, Any] | None:
     """Return only a current, parent-safe receipt for status recovery."""
 
     profile = DATA_PLANE_PROFILES.get(worker_role)
     if profile is None:
         return None
-    path = work_dir / ".game-l10n" / "data-plane" / worker_role / "receipt.json"
+    path = data_plane_receipt_path(work_dir, worker_role, purpose=purpose)
     if not path.is_file():
         return None
     try:
@@ -1478,6 +1521,7 @@ def prepare_data_plane_task(
     worker_role: str,
     config: dict[str, Any],
     sdk_activation: dict[str, Any] | None = None,
+    purpose: str = "",
 ) -> dict[str, Any]:
     """Prepare one exact, private discovery, inventory, or context worker task.
 
@@ -1495,6 +1539,20 @@ def prepare_data_plane_task(
     profile = DATA_PLANE_PROFILES.get(worker_role)
     if profile is None:
         raise ConfigurationError("E_DATA_PLANE_TASK_ROLE: unsupported data-plane role")
+    if purpose and (worker_role != "source_probe" or purpose != EXTRACTOR_PREPARATION_PURPOSE):
+        raise ConfigurationError("E_DATA_PLANE_TASK_PURPOSE: unsupported bound worker purpose")
+    if purpose:
+        profile = {**profile, "artifact": EXTRACTOR_ATTESTATION_PATH}
+    if purpose or (
+        worker_role in {"primary_inventory", "independent_inventory"}
+        and preparation_required(work_dir, config)
+    ):
+        from .workspace import require_sdk_activation
+        current_activation = require_sdk_activation(work_dir, config)
+        if sdk_activation != current_activation:
+            raise ConfigurationError("E_DATA_PLANE_TASK_SDK_ACTIVATION: current activation is required")
+        if not purpose:
+            require_extractor_preparation(work_dir, config, current_activation)
     output_dir = output_dir.resolve()
     if not is_within(output_dir, work_dir):
         raise ConfigurationError("E_DATA_PLANE_TASK_PATH: output must stay inside the workspace")
@@ -1564,13 +1622,15 @@ def prepare_data_plane_task(
     if previous_task_path.is_file():
         try:
             previous_task = json.loads(previous_task_path.read_text(encoding="utf-8"))
+            if previous_task.get("purpose", "") != purpose:
+                raise ConfigurationError("E_DATA_PLANE_TASK_PURPOSE: output belongs to another purpose")
             previous_attempt = previous_task.get("attempt", 0)
             valid_previous_attempt = (
                 isinstance(previous_attempt, int)
                 and not isinstance(previous_attempt, bool)
                 and previous_attempt >= 1
             )
-            previous_receipt_path = output_dir / "receipt.json"
+            previous_receipt_path = data_plane_receipt_path(work_dir, worker_role, purpose=purpose)
             previous_receipt = (
                 json.loads(previous_receipt_path.read_text(encoding="utf-8"))
                 if previous_receipt_path.is_file()
@@ -1700,6 +1760,11 @@ def prepare_data_plane_task(
         ),
         "requirements": [
             "source_roots_are_read_only",
+            "you_are_the_core_bound_native_worker_not_a_relay_or_model_api_controller",
+            "perform_bound_semantic_work_with_your_own_current_native_model_inference",
+            "no_separate_model_invocation_tool_or_api_is_required_or_allowed",
+            "absence_of_an_additional_model_tool_is_not_model_unavailability",
+            "never_delegate_or_send_agent_irc_parent_or_sibling_messages",
             (
                 "no_install_launch_or_publication"
                 if worker_role in {"image_ui_inventory", "image_localizer"}
@@ -1710,6 +1775,15 @@ def prepare_data_plane_task(
             "relay_returns_only_core_receipt_path_to_parent",
         ],
     }
+    if purpose:
+        private_payload["purpose"] = purpose
+        private_payload["extractor_requirements"] = config.get("extractor_requirements")
+        private_payload["preparation_contract"] = {
+            "profile_path": "tools/extractor-preparation.json",
+            "profile_schema": "parr0t.extractor-preparation-profile.v1",
+            "check_command": "game-l10n check-extractor-preparation --workspace <workspace> --relay <relay-path>",
+            "relay_path": _relative(work_dir, output_dir / "relay.json"),
+        }
     if worker_role == "inventory_reconciler":
         private_payload.update(
             data_plane_route_chain=route_chain,
@@ -1876,6 +1950,10 @@ def prepare_data_plane_task(
                 },
                 "context_protocol": {
                     "manifest_schema": CONTEXT_WORK_MANIFEST_SCHEMA,
+                    "semantic_executor": "current_native_worker_inference",
+                    "additional_model_invocation_required": False,
+                    "semantic_worker_delegation_allowed": False,
+                    "outbound_agent_messaging_allowed": False,
                     "claim_schema": CONTEXT_CHUNK_CLAIM_SCHEMA,
                     "result_schema": CONTEXT_CHUNK_RESULT_SCHEMA,
                     "fragment_schema": CONTEXT_FRAGMENT_SCHEMA,
@@ -1990,6 +2068,9 @@ def prepare_data_plane_task(
                 "retain_unresolved_player_visible_candidates",
                 "account_raw_occurrences_by_provenance_and_category_separately_from_display_target_counts",
                 "keep_private_occurrence_evidence_for_display_bound_uncertain_and_proven_non_display_classifications",
+                "store_reusable_method_file_and_type_proofs_once_and_reference_them_by_fingerprint",
+                "preserve_every_occurrence_location_and_scope_binding_without_repeating_large_shared_proof_payloads",
+                "serialize_large_deterministic_parse_caches_natively_from_files_not_as_model_or_tool_rpc_text_payloads",
                 "exclude_only_evidenced_non_display_occurrences_never_blanket_engine_or_module_categories",
                 "record_exclusion_reason_codes_counts_and_evidence_fingerprints_in_coverage_exclusions",
                 "use_existing_coverage_static_scope_contract_for_reachability_exclusions",
@@ -2103,6 +2184,22 @@ def prepare_data_plane_task(
                 "record_independent_visual_review_or_explicit_user_acceptance_for_each_asset",
                 "write_localized_assets_only_under_output_image_root",
                 "do_not_apply_pack_install_launch_publish_or_delegate",
+            ]
+        )
+    elif purpose:
+        private_payload["requirements"].extend(
+            [
+                "implement_missing_extractors_only_inside_external_workspace",
+                "inspect_only_bounded_source_format_metadata_never_full_inventory",
+                "record_source_metadata_driven_extractor_requirements_without_narrowing_existing_requirements",
+                "cover_every_required_source_format_and_extractor_capability",
+                "stage_fixed_synthetic_or_bounded_format_fixtures_and_actual_extraction_round_trip_expectations",
+                "never_use_self_echo_or_no_throw_checks_as_extractor_proof",
+                "reactivate_same_selection_if_bound_workspace_tools_change",
+                "run_core_check_extractor_preparation_with_this_exact_relay",
+                "on_failure_leave_preparation_pending_never_start_either_inventory",
+                "do_not_translate_repair_inventory_pack_install_launch_or_publish",
+                "readiness_never_establishes_inventory_static_or_runtime_completion",
             ]
         )
     else:
@@ -2569,8 +2666,8 @@ def record_data_plane_failure(
     relay, task = _load_bound_data_plane_relay(work_dir, relay_path)
     if relay.get("schema") != DATA_PLANE_RELAY_SCHEMA or "launch_contract" not in relay:
         raise ConfigurationError("E_DATA_PLANE_FAILURE_INVALID: current native launch binding required")
-    receipt_path = (
-        work_dir / ".game-l10n" / "data-plane" / str(relay["worker_role"]) / "receipt.json"
+    receipt_path = data_plane_receipt_path(
+        work_dir, str(relay["worker_role"]), purpose=task.get("purpose", "")
     )
     if receipt_path.is_file():
         try:
@@ -2798,6 +2895,11 @@ def _seal_bound_data_plane_task(
                 raise ConfigurationError(
                     "E_INVENTORY_DISPLAY_SCOPE_REQUIRED"
                 ) from exc
+    elif task.get("purpose") == EXTRACTOR_PREPARATION_PURPOSE:
+        if result["status"] == "success":
+            from .workspace import load_config, require_sdk_activation
+            config = load_config(work_dir)
+            require_extractor_preparation(work_dir, config, require_sdk_activation(work_dir, config))
     elif result["worker_role"] == "source_probe" and result["status"] == "success":
         config = json.loads(artifact_path.read_text(encoding="utf-8"))
         selection = config.get("sdk_selection", {})
@@ -3078,12 +3180,8 @@ def _seal_bound_data_plane_task(
         "control_generation": int(control_plane_state(work_dir).get("generation", 0)),
         **({"execution": execution} if current_relay else {}),
     }
-    receipt_path = (
-        work_dir
-        / ".game-l10n"
-        / "data-plane"
-        / str(result["worker_role"])
-        / "receipt.json"
+    receipt_path = data_plane_receipt_path(
+        work_dir, str(result["worker_role"]), purpose=task.get("purpose", "")
     )
     _atomic_json(receipt_path, receipt)
     _seal_inventory_constraint(work_dir, relay, task, receipt)
@@ -3141,12 +3239,8 @@ def _seal_ended_data_plane_task(
         "control_generation": int(control_plane_state(work_dir).get("generation", 0)),
         **({"execution": execution} if current_relay else {}),
     }
-    receipt_path = (
-        work_dir
-        / ".game-l10n"
-        / "data-plane"
-        / str(relay["worker_role"])
-        / "receipt.json"
+    receipt_path = data_plane_receipt_path(
+        work_dir, str(relay["worker_role"]), purpose=(task or {}).get("purpose", "")
     )
     _atomic_json(receipt_path, receipt)
     return {
