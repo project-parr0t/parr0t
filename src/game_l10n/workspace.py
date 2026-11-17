@@ -975,11 +975,7 @@ def record_sdk_activation(
     module_root = Path(__file__).resolve().parents[2]
     configured_root = Path(config.get("sdk_root") or module_root)
     if runtime_root is None:
-        runtime_root = (
-            configured_root
-            if mode in {"reuse", "extend"} and not (module_root / ".git").exists()
-            else module_root
-        )
+        runtime_root = configured_root if mode in {"reuse", "extend"} else module_root
     runtime_root = runtime_root.resolve()
     runtime = _sdk_runtime_binding(runtime_root)
     tools: dict[str, Any] | None = None
@@ -1116,11 +1112,7 @@ def require_sdk_activation(
     if not isinstance(expected_runtime, dict) or not expected_runtime.get("path"):
         raise ConfigurationError("SDK activation record has no runtime binding")
     if runtime_root is None:
-        runtime_root = (
-            Path(expected_runtime["path"])
-            if expected_runtime.get("kind") == "content"
-            else Path(__file__).resolve().parents[2]
-        )
+        runtime_root = Path(expected_runtime["path"])
     current_runtime = _sdk_runtime_binding(runtime_root.resolve())
     if expected_runtime != current_runtime:
         raise ConfigurationError(
