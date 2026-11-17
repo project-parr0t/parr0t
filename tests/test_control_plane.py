@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import tempfile
@@ -46,7 +47,7 @@ from game_l10n.native_runtime import (
     configure_native_runtime,
     record_native_launch,
 )
-from game_l10n.workspace import initialize_workspace, record_sdk_selection
+from game_l10n.workspace import initialize_workspace, load_config, record_sdk_selection
 
 
 class ControlPlaneContractTests(unittest.TestCase):
@@ -183,6 +184,192 @@ class ControlPlaneContractTests(unittest.TestCase):
             with self.subTest(command=argv[0]):
                 self.assertEqual(build_parser().parse_args(argv).func.__name__, name)
 
+
+
+    def _sealed_inventory_pair(
+        self, root: Path, *, namespace_mismatch: bool = True, primary_success: bool = False
+    ):
+        game, sdk, work = root / "game", root / "sdk", root / "work"
+        game.mkdir()
+        sdk.mkdir()
+        initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+        establish_control_plane_entry(work)
+        record_sdk_selection(work, "private-new", target_engine="fixture-engine", target_version="1")
+        config = load_config(work)
+        relays = {}
+        for role, method in (("primary_inventory", "primary"), ("independent_inventory", "independent")):
+            complete = primary_success and role == "primary_inventory"
+            output = work / ".game-l10n/data-plane" / role
+            prepared = prepare_data_plane_task(
+                work, output, worker_role=role, config=config, sdk_activation={}
+            )
+            relay_path = work / prepared["relay_path"]
+            relay = json.loads(relay_path.read_text(encoding="utf-8"))
+            task = json.loads((output / "task.json").read_text(encoding="utf-8"))
+            rows = []
+            for index in range(2):
+                source = f"SYNTHETIC_SOURCE_{index}"
+                prefix = method if namespace_mismatch else "canonical"
+                rows.append({
+                    "id": f"{prefix}-{index}", "source": source,
+                    "metadata": {
+                        "display_binding_id": f"display-{index}",
+                        "display_scope_evidence": {
+                            "kind": "positive_display_binding",
+                            "evidence_fingerprint": "a" * 64,
+                            "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+                        },
+                    },
+                })
+            artifact = work / task["output_artifact"]
+            artifact.write_text(json.dumps({
+                "schema": "parr0t.source-inventory.v1", "method": method,
+                "implementation_fingerprint": f"{method}-implementation",
+                "coverage": {
+                    "declared_complete": complete, "exclusions": [],
+                    "display_scope": {
+                        "schema": "parr0t.display-scope.v1",
+                        "raw_occurrence_count": 2, "display_candidate_count": 2,
+                        "control_only_count": 0, "unclassified_count": 0,
+                        "evidence_fingerprint": "synthetic-evidence",
+                    },
+                },
+                "segments": rows,
+            }), encoding="utf-8")
+            (work / relay["expected_envelope"]).write_text(json.dumps({
+                "schema": "parr0t.control-envelope.v2", "worker_role": role,
+                "stage": "inventory", "status": "success" if complete else "partial", "target_ids": [],
+                "counts": {"total": 2, "success": 2 if complete else 1, "pending": 0 if complete else 1},
+                "issue_codes": [] if complete else ["inventory_not_declared_complete"],
+                "artifact_paths": [task["output_artifact"]],
+                "queue_transitions": [], "route_evidence_path": "",
+            }), encoding="utf-8")
+            self.assertEqual(
+                seal_data_plane_task(work, relay_path, worker_ended=True)["status"],
+                "success" if complete else "partial",
+            )
+            relays[role] = relay_path
+        return work, config, relays
+
+    def _inventory_status(self, work: Path):
+        output = io.StringIO()
+        with patch("game_l10n.cli.require_sdk_activation", return_value={}), redirect_stdout(output):
+            code = main(["status", "--workspace", str(work)])
+        return code, json.loads(output.getvalue())
+
+    def test_status_compares_sealed_partial_pair_before_inventory_expansion(self) -> None:
+        for namespace_mismatch, primary_success in ((True, False), (False, False), (True, True)):
+            with self.subTest(namespace_mismatch=namespace_mismatch, primary_success=primary_success), tempfile.TemporaryDirectory() as directory:
+                work, _, _ = self._sealed_inventory_pair(
+                    Path(directory), namespace_mismatch=namespace_mismatch, primary_success=primary_success
+                )
+                code, status = self._inventory_status(work)
+                self.assertEqual(code, 0)
+                self.assertEqual(status["next_actions"], ["verify_independent_source_inventory"])
+                self.assertIsNone(status["data_plane_task"])
+                attestation = work / ".game-l10n/inventory-attestation.json"
+                self.assertFalse(attestation.exists())
+                output = io.StringIO()
+                with patch("game_l10n.cli.require_sdk_activation", return_value={}), redirect_stdout(output):
+                    self.assertEqual(main([
+                        "verify-inventory", "--workspace", str(work),
+                        "--primary", "inputs/primary-inventory.json",
+                        "--independent", "inputs/independent-inventory.json",
+                    ]), 1)
+                self.assertFalse(json.loads(attestation.read_text(encoding="utf-8"))["static_complete"])
+                _, status = self._inventory_status(work)
+                self.assertEqual(status["next_actions"], [
+                    "reconcile_inventory_identity_namespace" if namespace_mismatch
+                    else "resolve_source_inventory_gaps"
+                ])
+                self.assertEqual(status["data_plane_task"]["worker_role"], "inventory_reconciler")
+                self.assertFalse(status["inventory_gate"]["static_complete"])
+
+    def test_status_keeps_unsafe_partial_pairs_on_inventory_recovery(self) -> None:
+        cases = (
+            "malformed", "wrong_schema", "empty", "missing_artifact", "missing_receipt",
+            "old_generation", "wrong_task", "changed_task", "unbound_artifact",
+            "incomplete_execution", "operational_error", "mixed_provider_error",
+            "missing_scope", "invalid_evidence", "same_method", "active_attempt", "scope_repair",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                work, config, relays = self._sealed_inventory_pair(Path(directory))
+                relay = relays["primary_inventory"]
+                receipt_path = relay.with_name("receipt.json")
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                artifact = work / "inputs/primary-inventory.json"
+                payload = json.loads(artifact.read_text(encoding="utf-8"))
+                if case == "malformed":
+                    artifact.write_text("{", encoding="utf-8")
+                elif case == "empty":
+                    artifact.write_text("", encoding="utf-8")
+                elif case == "missing_artifact":
+                    artifact.unlink()
+                elif case == "missing_receipt":
+                    receipt_path.unlink()
+                elif case in {"wrong_schema", "missing_scope", "invalid_evidence", "same_method"}:
+                    if case == "wrong_schema":
+                        payload["schema"] = "invalid"
+                    elif case == "missing_scope":
+                        del payload["coverage"]["display_scope"]
+                    elif case == "invalid_evidence":
+                        payload["segments"][0]["metadata"]["display_scope_evidence"]["source_sha256"] = "0" * 64
+                    else:
+                        payload["method"] = "independent"
+                    artifact.write_text(json.dumps(payload), encoding="utf-8")
+                elif case == "changed_task":
+                    task_path = relay.with_name("task.json")
+                    task = json.loads(task_path.read_text(encoding="utf-8"))
+                    task["attempt"] += 1
+                    task_path.write_text(json.dumps(task), encoding="utf-8")
+                elif case == "active_attempt":
+                    prepare_data_plane_task(
+                        work, relay.parent, worker_role="primary_inventory", config=config, sdk_activation={}
+                    )
+                else:
+                    if case == "old_generation":
+                        receipt["control_generation"] -= 1
+                    elif case == "wrong_task":
+                        receipt["task_id"] = "f" * 64
+                    elif case == "unbound_artifact":
+                        receipt["artifact_paths"] = []
+                    elif case == "incomplete_execution":
+                        receipt["execution"]["complete"] = False
+                    elif case == "scope_repair":
+                        receipt["status"] = "error"
+                        receipt["issue_codes"] = ["inventory_display_scope_required"]
+                    elif case == "operational_error":
+                        receipt["status"] = "error"
+                        receipt["issue_codes"] = ["operational_error", "provider_operational_error"]
+                    elif case == "mixed_provider_error":
+                        receipt["issue_codes"].append("provider_error")
+                    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                _, status = self._inventory_status(work)
+                self.assertIn(status["next_actions"][0], {
+                    "unpack_and_extract_ordered_script", "extract_independent_source_inventory"
+                })
+                self.assertIsNotNone(status["data_plane_task"])
+                self.assertFalse((work / ".game-l10n/inventory-attestation.json").exists())
+
+    def test_status_keeps_invalid_attestation_recovery_ahead_of_partial_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work, _, _ = self._sealed_inventory_pair(Path(directory))
+            (work / ".game-l10n/inventory-attestation.json").write_text("{", encoding="utf-8")
+            code, status = self._inventory_status(work)
+            self.assertEqual(code, 1)
+            self.assertEqual(status["next_actions"], ["repair_invalid_workspace_state"])
+            self.assertIsNone(status["data_plane_task"])
+
+    def test_status_prioritizes_independent_sdk_mismatch_over_primary_partial_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work, _, relays = self._sealed_inventory_pair(Path(directory))
+            path = relays["independent_inventory"].with_name("receipt.json")
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+            receipt["issue_codes"] = ["sdk_identity_mismatch"]
+            path.write_text(json.dumps(receipt), encoding="utf-8")
+            _, status = self._inventory_status(work)
+            self.assertEqual(status["next_actions"], ["record_target_identity_evaluate_and_select_sdk"])
 
 
     def test_inventory_scope_failure_seals_as_repairable_cached_evidence(self) -> None:

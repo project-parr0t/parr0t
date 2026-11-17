@@ -14,6 +14,7 @@ from .control_plane import (
     LEAK_INCIDENT_CODES,
     CONTROL_HANDOFF_PATH,
     ROLE_STAGES,
+    INVENTORY_ISSUE_CODES,
     WORKER_ROLES,
     acknowledge_control_plane_rotation,
     accept_control_plane_exposure,
@@ -41,6 +42,7 @@ from .coverage import (
     runtime_coverage_state,
     save_completion_attestation,
     save_inventory_attestation,
+    verify_inventory_pair,
 )
 from .context_analysis import CONTEXT_STATE_SCHEMA, ContextAnalyzer, analyze_with_cache
 from .corrections import apply_user_corrections
@@ -48,7 +50,9 @@ from .correction_ui import CorrectionWorkspace, serve_correction_ui
 from .data_plane_task import (
     DATA_PLANE_PROFILES,
     DATA_PLANE_RELAY_SCHEMA,
+    DATA_PLANE_RECEIPT_SCHEMA,
     MAX_CONTEXT_WORKERS,
+    _load_bound_data_plane_relay,
     claim_context_chunk,
     commit_context_fragment,
     current_data_plane_operational_failure,
@@ -375,19 +379,63 @@ def _status_data_plane_task(work_dir: Path, action: str) -> dict[str, Any] | Non
     return task
 
 
-def _failed_inventory_data_plane_action(work_dir: Path) -> str | None:
-    """Turn a sealed inventory failure back into an executable next step."""
+def _inventory_pair_ready_for_comparison(
+    work_dir: Path, receipts: dict[str, dict[str, Any] | None]
+) -> bool:
+    """Permit comparison of sealed partial work, never certify inventory readiness."""
 
-    for role, action in (
-        ("primary_inventory", "unpack_and_extract_ordered_script"),
-        ("independent_inventory", "extract_independent_source_inventory"),
-    ):
-        receipt = current_data_plane_receipt(work_dir, role)
-        if receipt is None or receipt.get("status") == "success":
-            continue
-        if "sdk_identity_mismatch" in receipt.get("issue_codes", []):
-            return "record_target_identity_evaluate_and_select_sdk"
-        return action
+    paths: list[Path] = []
+    try:
+        for role, receipt in receipts.items():
+            if (
+                receipt is None
+                or receipt.get("status") not in {"success", "partial"}
+                or not set(receipt.get("issue_codes", []))
+                <= INVENTORY_ISSUE_CODES - {"sdk_identity_mismatch"}
+                or receipt.get("execution", {}).get("complete") is not True
+                or current_data_plane_operational_failure(work_dir, role) is not None
+            ):
+                return False
+            task_dir = work_dir / ".game-l10n" / "data-plane" / role
+            _, task = _load_bound_data_plane_relay(work_dir, task_dir / "relay.json")
+            sealed = json.loads((task_dir / "receipt.json").read_text(encoding="utf-8"))
+            artifact = DATA_PLANE_PROFILES[role]["artifact"]
+            if (
+                sealed.get("schema") != DATA_PLANE_RECEIPT_SCHEMA
+                or sealed.get("task_id") != task["task_id"]
+                or task.get("worker_role") != role
+                or task.get("output_artifact") != artifact
+                or artifact not in sealed.get("artifact_paths", [])
+            ):
+                return False
+            path = (work_dir / artifact).resolve()
+            if not is_within(path, work_dir):
+                return False
+            paths.append(path)
+        verify_inventory_pair(*paths, required_display_scope=True)
+    except (GameL10nError, OSError, UnicodeError, ValueError, TypeError, AttributeError, KeyError):
+        return False
+    return True
+
+
+def _failed_inventory_data_plane_action(work_dir: Path) -> str | None:
+    """Recover inventory failures, comparing safely sealed partial pairs first."""
+
+    actions = {
+        "primary_inventory": "unpack_and_extract_ordered_script",
+        "independent_inventory": "extract_independent_source_inventory",
+    }
+    receipts = {role: current_data_plane_receipt(work_dir, role) for role in actions}
+    failures = {
+        role: receipt for role, receipt in receipts.items()
+        if receipt is not None and receipt.get("status") != "success"
+    }
+    if any("sdk_identity_mismatch" in receipt.get("issue_codes", []) for receipt in failures.values()):
+        return "record_target_identity_evaluate_and_select_sdk"
+    if failures and _inventory_pair_ready_for_comparison(work_dir, receipts):
+        return "verify_independent_source_inventory"
+    for role in failures:
+        return actions[role]
     return None
 
 
