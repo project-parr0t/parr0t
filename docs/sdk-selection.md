@@ -56,6 +56,131 @@ The repository choice in the private game workspace is unrelated. `disabled` pro
 
 Extraction, context analysis, translation, packing, and SDK promotion remain blocked until both selection and activation are valid. For `reuse`/`extend`, use the selected branch's engine commands; the generic workspace `run-tool` command is reserved for a bound `derive-new` or `private-new` adapter.
 
+## Extractor preparation before either inventory
+
+Exact selection and activation precede preparation. An `extend`, `derive-new`,
+`private-new`, `partial` evaluation, declared `extractor_requirements`, or an
+existing preparation profile/evidence requires fresh extractor proof before
+**either** primary or independent full inventory can be dispatched. Activation
+identifies code; it does not prove missing extractors have been implemented.
+Status reports `prepare_and_validate_extractors`, not inventory Repair.
+
+Prepare the isolated implementation worker using the existing `source_probe`
+role, exact configured model, permissions, transport and retry policy:
+
+```text
+game-l10n prepare-data-plane-task --workspace <workspace> --worker-role source_probe --purpose extractor_preparation
+```
+
+Its immutable task has `purpose: extractor_preparation`, stage `discovery`, a
+separate default relay directory `.game-l10n/data-plane/extractor_preparation`,
+and output `.game-l10n/extractor-preparation.json`. Dispatch only the core-bound
+relay and include its generated worker prompt verbatim. The worker implements
+the missing extraction delta in the external workspace, stages deterministic
+synthetic/bounded **format** fixtures, and checks actual extraction/round-trip
+outcomes. It must not perform a third full source scan, either inventory, or a
+whole-game dry run. No-op/no-throw or self-echo checks are not format proof.
+The parent never reads private source, fixtures, tasks, or evidence; it receives
+validated categorical status, counts, and paths only.
+
+Preparation receipts live at
+`.game-l10n/data-plane/extractor_preparation/receipt.json`, independently of the
+source-discovery receipt under `source_probe`. Status and native launch repair
+use that same purpose-specific lifecycle. An ended failed or stale successful
+preparation can be prepared again as a fresh attempt with the current requirements;
+an operationally blocked native launch instead resumes its bound task after host
+repair. Neither path overwrites discovery evidence or changes SDK selection.
+
+Source-format discovery records `extractor_requirements` in `game-l10n.json`:
+`required_capabilities` and `required_formats` are nonempty unique categorical
+code lists, and `source_metadata` is a nonempty metadata object. Required
+categories come from observed source/format metadata, not from whichever
+extractors happen to exist. Existing requirements are bound into the prepared
+task and cannot be narrowed by that worker. If previously absent, the worker
+establishes them from bounded metadata before checking. A new requirement or
+metadata change invalidates readiness, not the completed inventory history.
+
+The SDK preparation helper stages `tools/extractor-preparation.json` with this
+typed profile (all paths are workspace-relative):
+
+```json
+{
+  "schema": "parr0t.extractor-preparation-profile.v1",
+  "required_capabilities": ["ordered-strings", "unicode"],
+  "required_formats": ["synthetic-format"],
+  "source_metadata": {"engine": "synthetic", "version": "1"},
+  "extractor_paths": ["tools/check.py", "tools/extractor.py"],
+  "checks": [{
+    "id": "synthetic-round-trip",
+    "format": "synthetic-format",
+    "capabilities": ["ordered-strings", "unicode"],
+    "runner": "tools/check.py",
+    "arguments": [],
+    "cases": [{
+      "id": "unicode-case",
+      "input_path": "fixtures/input.bin",
+      "expected_path": "fixtures/expected.json",
+      "actual_path": ".game-l10n/preparation-output/actual.json"
+    }]
+  }]
+}
+```
+
+Profile requirements/metadata must exactly match configuration; checks must
+cover every required format and capability. Each runner is an implemented
+`.py` file listed in `extractor_paths`. Inputs and fixed expected outputs exist
+before execution and are content-bound. Actual outputs are distinct, unique
+paths, removed by Core before each run. Keep generated outputs outside `tools/`
+because the entire workspace tool manifest is also bound. Category/case/check
+codes use `[a-z0-9][a-z0-9._-]*`. Every declared extractor, runner, fixture,
+expected result, profile, selected SDK decision, activated runtime, tool
+manifest and source/format requirement is bound into readiness.
+
+After implementation, reactivate the **same** SDK selection if its bound tools
+changed, then run inside that isolated worker:
+
+```text
+game-l10n check-extractor-preparation --workspace <workspace> --relay <bound-relay-path>
+```
+
+Core marks preparation pending before attempting checks and invokes each local
+runner as the current Python `-I -B <runner> <arguments>` followed by
+`--preparation-request <absolute-json-path> --preparation-result <absolute-json-path>`.
+No dependencies are acquired and no ambient packages are added. A runner may
+explicitly bind already-authorized dependency paths as part of its implemented
+bytes and activated runtime. There are no new model calls or usage/time caps.
+
+The request schema is `parr0t.extractor-preparation-request.v1`, with `task_id`,
+`binding_fingerprint`, the complete declared `check`, and a content-derived
+`request_id`. The runner writes a result with schema
+`parr0t.extractor-preparation-check.v1`, that exact `request_id`, and `cases`
+equal to the declared case descriptors. Core, not the runner's prose/status,
+checks zero process exit, actual output bytes equal to every fixed expected
+output, request/task binding, and unchanged implementation/fixture/activation
+bytes. The resulting `parr0t.extractor-preparation.v1` attestation is admitted
+only with its immutable prepared relay/task, current complete binding, and
+unchanged request/result/output digests. Worker success is sealed through the
+normal `seal-data-plane-task --worker-ended` control-envelope flow; the envelope
+must bind the preparation attestation. Missing, failing, malformed, forged,
+unbound, or stale proof remains pending and does not authorize either inventory.
+
+`require_extractor_preparation(work_dir, config, activation)` is the deterministic
+SDK/Core admission API. It raises `E_EXTRACTOR_PREPARATION_PENDING` on missing or
+invalid required proof, otherwise returns only safe status/counts/path metadata.
+Both SDK inventory commands and Core inventory task admission use it after
+activation. `run-tool --stage unpack` likewise cannot bypass required proof.
+
+Preparation proves extraction readiness only. It never writes inventory
+attestations or sets static/runtime coverage complete. Two independent full
+inventories and later reconciliation remain separate mandatory coverage gates.
+Conservative compatibility preserves jobs that already have both inventories:
+status continues their existing reconciliation/downstream path without
+rewriting inventories, successful receipts, or checkpoints solely because an
+older job lacks preparation evidence. Every **new** inventory dispatch still
+requires current readiness for a deficient SDK, including after changed tools,
+selection, requirements, metadata, fixtures, or output bytes.
+
+
 ## Two independent decisions
 
 SDK selection has two axes that must never be collapsed:
