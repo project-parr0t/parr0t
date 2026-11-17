@@ -49,3 +49,7 @@ class ToolExecutionError(GameL10nError):
 
 class RuntimeApprovalError(GameL10nError):
     """A real installation, removal, update, or launch lacks exact user approval."""
+
+
+class ThirdPartyApprovalError(GameL10nError):
+    """A third-party action lacks exact, risk-disclosed user approval."""
