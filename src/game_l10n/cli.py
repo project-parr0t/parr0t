@@ -137,6 +137,7 @@ from .provider_policy import (
     validate_provider_policy,
 )
 from .runtime_approval import create_runtime_approval
+from .third_party_approval import create_third_party_approval, require_third_party_approval
 from .store import stable_hash, stable_hash_sequence
 from .steam import build_steam_package, inspect_installed_state, validate_steam_package
 from .translation_exchange import (
@@ -3167,6 +3168,76 @@ def cmd_approve_runtime(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_approve_third_party(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
+    require_external_workdir(work_dir, sdk_root)
+    ttl_minutes = args.ttl_minutes
+    if ttl_minutes is None:
+        ttl_minutes = int(config.get("third_party", {}).get("approval_ttl_minutes", 30))
+    approval_path, approval = create_third_party_approval(
+        work_dir,
+        action=args.action,
+        name=args.name,
+        publisher=args.publisher,
+        source=args.source,
+        version=args.version,
+        digest=args.digest,
+        license_name=args.license,
+        purpose=args.purpose,
+        data_scope=args.data_scope,
+        ttl_minutes=ttl_minutes,
+        risk_disclosed=args.risk_disclosed,
+        user_confirmed=args.user_confirmed,
+    )
+    print(
+        json.dumps(
+            {
+                "approval": str(approval_path),
+                "action": approval["action"],
+                "name": approval["name"],
+                "version": approval["version"],
+                "digest": approval["digest"],
+                "expires_at_utc": approval["expires_at_utc"],
+                "status": "recorded_not_used",
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def cmd_consume_third_party_approval(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    sdk_root = Path(config.get("sdk_root") or _sdk_root()).resolve()
+    require_external_workdir(work_dir, sdk_root)
+    approval = require_third_party_approval(
+        work_dir,
+        _path_in_workspace(work_dir, args.approval, must_exist=True),
+        action=args.action,
+        name=args.name,
+        publisher=args.publisher,
+        source=args.source,
+        version=args.version,
+        digest=args.digest,
+        consume=True,
+    )
+    print(
+        json.dumps(
+            {
+                "approval": args.approval,
+                "action": approval["action"],
+                "name": approval["name"],
+                "status": "consumed_for_immediate_action",
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
@@ -4336,6 +4407,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="Assert that the user explicitly requested this exact external action",
     )
     approve_runtime.set_defaults(func=cmd_approve_runtime)
+
+    third_party_actions = [
+        "download",
+        "clone",
+        "install",
+        "execute",
+        "vendor",
+        "add-dependency",
+        "add-submodule",
+        "use-service",
+        "send-data",
+    ]
+    approve_third_party = sub.add_parser(
+        "approve-third-party",
+        help="Record exact, risk-disclosed user consent for one third-party action",
+    )
+    approve_third_party.add_argument("--workspace", required=True)
+    approve_third_party.add_argument("--action", choices=third_party_actions, required=True)
+    approve_third_party.add_argument("--name", required=True)
+    approve_third_party.add_argument("--publisher", required=True)
+    approve_third_party.add_argument("--source", required=True)
+    approve_third_party.add_argument("--version", required=True)
+    approve_third_party.add_argument("--digest", required=True)
+    approve_third_party.add_argument("--license", required=True)
+    approve_third_party.add_argument("--purpose", required=True)
+    approve_third_party.add_argument("--data-scope", required=True)
+    approve_third_party.add_argument("--ttl-minutes", type=int)
+    approve_third_party.add_argument("--risk-disclosed", action="store_true", required=True)
+    approve_third_party.add_argument("--user-confirmed", action="store_true", required=True)
+    approve_third_party.set_defaults(func=cmd_approve_third_party)
+
+    consume_third_party = sub.add_parser(
+        "consume-third-party-approval",
+        help="Consume one exact approval immediately before its third-party action",
+    )
+    consume_third_party.add_argument("--workspace", required=True)
+    consume_third_party.add_argument("--approval", required=True)
+    consume_third_party.add_argument("--action", choices=third_party_actions, required=True)
+    consume_third_party.add_argument("--name", required=True)
+    consume_third_party.add_argument("--publisher", required=True)
+    consume_third_party.add_argument("--source", required=True)
+    consume_third_party.add_argument("--version", required=True)
+    consume_third_party.add_argument("--digest", required=True)
+    consume_third_party.set_defaults(func=cmd_consume_third_party_approval)
 
     doctor = sub.add_parser("doctor", help="Check workspace configuration without sending game data")
     doctor.add_argument("--workspace", required=True)
