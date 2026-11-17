@@ -1,24 +1,28 @@
-# Unity 2022.3 Mono TextAsset prototype
+# Unity 2022.3 Mono text SDK tools
 
-This sanitized profile contains only the direct UnityFS workflow validated for a Unity 2022.3 Mono player:
+This profile contains reusable public-format code and unmistakably synthetic preparation fixtures only. Game content, inventories, selectors, cached bytes, translations and execution evidence belong in an external workspace.
 
-- discover one `*_Data` player layout and require the `2022.3` series;
-- identify a single language bundle containing ordered INI `TextAsset` locale tables;
-- emit a source/target inventory while treating the player root as read-only;
-- rebuild a copy with exactly one target locale `TextAsset` changed;
-- verify IDs, order, placeholders, object structure, other object bytes, other locale bytes, and source immutability.
+## Preparation and admission
 
-The implementation was validated with `UnityPy==1.25.4`; install that exact dependency in the private workspace. The profile does not bundle third-party binaries.
+Use Core with the extractor-preparation protocol, propagated through the official branch updater. Activate the selected exact SDK before implementation. A deficient SDK must complete a bound `source_probe --purpose extractor_preparation` task before either full inventory.
 
-`unpack.py` accepts `INPUT_GAME_ROOT OUTPUT_DIRECTORY`. The target locale defaults to `ko` and may be set with `GAME_L10N_TARGET_LOCALE`. When automatic source-locale selection is ambiguous, set `GAME_L10N_SOURCE_LOCALE` explicitly.
+The worker runs `prepare.py --workspace <workspace> [--dependency-path <authorized-exact-cache>]`. It stages implemented tools, synthetic binaries, fixed extraction/round-trip expectations and `tools/extractor-preparation.json`. Then Core's `check-extractor-preparation --workspace <workspace> --relay <bound-relay>` executes/admit checks. Changed tools, fixtures or requirements invalidate readiness. This is not another full-game scan, a model call or an inventory/static/runtime coverage claim.
 
-`pack.py` accepts `REQUEST_JSON OUTPUT_DIRECTORY`. The request uses schema version 1 and supplies `game_root`, `segments_path`, `reviewed_path`, `source_bundle_relative`, `source_bundle_sha256`, and optionally `report_path`. `GAME_L10N_WORKDIR` must identify the private workspace and `GAME_L10N_STAGE` must be `pack`.
+Dependencies are fixed in `profiles/unity-2022.3-requirements.txt`; use only separately authorized bytes. No dependency, font, image or audio asset is bundled/acquired by these commands. The primary serialized loader rejects UnityPy versions other than 1.25.4. Do not override a selected SDK's Core runtime with a different import path to evade activation checks.
 
-This is deliberately not a complete Unity text-coverage adapter. Managed literals, non-INI assets, runtime-generated text, UI discovery, and an independent second inventory remain outside the prototype. Callers must keep static coverage incomplete until those paths are independently accounted for.
+## Extraction
 
-Two separate libraries extend the same Unity 2022.3 identity:
+With `GAME_L10N_WORKDIR` set, run `unpack.py INPUT_GAME_ROOT OUTPUT_DIRECTORY`. Set `GAME_L10N_INVENTORY_METHOD=primary` or `independent`. Each method independently parses immutable source bytes; outputs are `inventory.json`, source snapshot/manifest and normalized `evidence.sqlite3`. Warm scans reuse matching method/source/implementation bindings, not counterpart decisions.
 
-- `unity_serialized.py`: `pack_string`, `string_at` and `unique_boundary` provide explicitly bound string helpers. `rebuild_serialized(raw_bytes, changed_objects)` supports opaque replacement in standalone v22 little-endian serialized files only, preserving unowned bytes and protected metadata. `replace_font_payload(raw_bytes, object_id, font_bytes, family_names)` replaces an embedded Font payload and family names with typetree verification. These functions do not discover targets or handle UnityFS containers.
-- `unity_layout.py`: `Rect` and `resolve_rect_size(rectangles, node_id, canvas_size)` resolve anchor-based child dimensions, with roots representing the caller's canvas reference. `FontMetrics` takes codepoint advances and line-height units; `TextLayout` supplies wrapping and best-fit bounds. `screen_text(text, rect_size, metrics, layout, strip_rich_text=False)` returns conservative measurements, overflow and missing codepoints. No bundled fonts or mandatory font parser are required. Its `runtime_verified` is always false.
+`unity_managed` handles CLR metadata, literal/field/call relationships and embedded resources. `unity_objects` handles serialized v22 LE objects, typed/physical script bindings, PPtrs, JSON/INI payload entries and UnityFS v6–8. `unity_native` handles Windows UI resources and `app.info`; `unity_native_calls` handles bounded PE64 native UI references. Equal text at different physical positions is never collapsed. Shared method/type proofs use references instead of repeated large payloads.
 
-See the SDK's `docs/unity-2022.3.md` for usable interfaces, a synthetic example and exact limits. Private inventories, target selection, patch orchestration, font sourcing and runtime observations remain caller responsibilities. Run `python selftest.py` in this tools directory for dependency-free smoke checks. Metric screening cannot prove Unity rendering, runtime font ingestion or screen coverage.
+Raw strings alone are neither display targets nor omissions. Structurally bound UI text is retained; unresolved actual display dependencies remain pending. Independent methods share public-format/low-level helpers, not source-derived inventory outputs. No image pixels, OCR, audio decoding or runtime observation occurs.
+
+## Packing and existing libraries
+
+With `GAME_L10N_WORKDIR` and `GAME_L10N_STAGE=pack`, run `pack.py REQUEST_JSON OUTPUT_DIRECTORY`. Inputs include `game_root`, `segments_path`, `reviewed_path`, `source_manifest_path`, and optional natively assembled `managed_types` for stripped objects. Core's eligible scope, exact source/result mapping, protected tokens and source hashes are enforced. Only new copied payload files and `pack-report.json` are written. Signatures are never stripped; unsafe layouts/projections reject rather than fake success.
+
+`unity_textasset` retains bounded INI parsing/rewriting helpers and the older explicit locale-table library; it is not the default completeness route. `unity_serialized` retains opaque standalone object/font rebuilding. `unity_layout` supplies conservative geometry/glyph screening with `runtime_verified=False`; no font or license is bundled.
+
+The seven preparation format checks and focused `tests.test_unity_managed`, `tests.test_unity_objects`, and `tests.test_unity_inventory` exercise actual synthetic bytes, selected replacements and duplicate preservation. Existing serialized/layout/INI library tests remain applicable. See `docs/unity-2022.3.md` for contracts and exact limits. Passing static/synthetic checks never means the supplied game was installed, launched or visually verified.
+

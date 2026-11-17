@@ -1,38 +1,48 @@
-# Unity 2022.3 Mono TextAsset prototype
+# Unity 2022.3 Mono text SDK
 
-This branch records the bounded direct-bundle workflow validated for Unity 2022.3 Mono players. It is a reusable prototype, not a claim that every Unity 2022.3 title uses the same localization layout.
+The profile under `profiles/sdk-unity-2022.3` implements source-bound extraction and copied-payload rewriting for Unity `2022.3.x` Mono players. It rejects IL2CPP and other Unity series. Format support is not a claim that every runtime-generated string or every title-specific reference is statically understood.
 
-## Supported contract
+## String extraction capabilities
 
-The profile under `profiles/sdk-unity-2022.3` supports a player only when all of these conditions hold:
+- PE32/PE32+ CLR metadata, CIL literals, typed fields, call/field display dependencies and embedded `.resources` v1/v2 strings. Resource names and lookup keys remain identifiers; a physical literal also proven to reach display stays a display candidate, but changing its shared identifier use is rejected rather than rewriting game logic.
+- Standalone little-endian serialized files v22 and UnityFS v6–8 containers, with none/LZMA/LZ4 block codecs. Native UI fields, physically bound MonoScript/custom fields, nested arrays and PPtrs retain exact object/field identities. JSON/INI TextAsset values retain syntax-bound entry locations; raw presence alone does not prove display use.
+- Windows string, dialog, menu and message resources; Unity `app.info` product/window title. PE64 native import-IAT/unwind/operand-bound UI references retain possible dependencies. Only exactly bound UTF-16 native arguments support selected-use relocation; unproven projections remain pending.
+- Existing opaque font replacement and pure glyph/layout screening remain available below. The text scanners never decode image pixels or audio and never perform OCR.
 
-- exactly one `*_Data` directory identifies a Unity `2022.3.x` Mono player;
-- one UnityFS bundle contains at least two locale-named `TextAsset` objects;
-- the source and target assets are UTF-8 INI tables with identical section/key order;
-- a non-locale reference table uniquely identifies the source locale, or `GAME_L10N_SOURCE_LOCALE` is supplied;
-- `UnityPy==1.25.4` is installed in the private workspace.
+Managed method-driven and heap/use-driven enumeration use fresh readers. Serialized primary extraction uses exactly UnityPy 1.25.4; the independent path uses first-party byte/typetree decoding. Public format constants and low-level CLR/native semantic machinery are shared: do not describe these as independently implemented decoders. Neither method derives targets or parse evidence from the counterpart inventory.
 
-The extractor writes an ordered source/target inventory outside the player root. The packer accepts reviewed or exact source-preserved results, rewrites only the configured target locale asset in a copied bundle, and verifies:
+## Prepare before either inventory
 
-- exact ID coverage and contiguous order;
-- source/result alignment and placeholder/control-token preservation;
-- unchanged Unity object structure;
-- byte-identical non-target objects and locale assets;
-- unchanged source-tree hashes before and after processing.
+Use Core containing the extractor-preparation protocol. Propagate Core through the official branch updater before activating a combined SDK; importing a different Core over an already activated runtime is not deployment and is correctly rejected. No merge, publication or game action is implicit.
 
-Neither command installs the payload or launches the player.
+For a deficient/extended SDK, activate the exact selected SDK first, then prepare its isolated implementation task:
 
-## Deliberate exclusions
+```text
+game-l10n prepare-data-plane-task --workspace <workspace> --worker-role source_probe --purpose extractor_preparation
+```
 
-This profile does not inventory managed literals, non-INI `TextAsset` data, other serialized string fields, runtime-generated text, or UI layout behavior. Its extraction summary therefore declares `static_complete=false`. The separate library helpers below do not expand the extractor's discovery coverage. A localization task still needs a separately implemented complete ordered inventory and must reconcile both inventories before context analysis or translation.
+Inside that worker, run the activated profile's `prepare.py --workspace <workspace>`, repeating `--dependency-path <authorized-exact-cache>` when needed. It stages implemented tools, real synthetic format binaries, fixed expectations and `tools/extractor-preparation.json`. Source-probe requirements, when present, must match supported format/capability codes; unsupported requirements are not silently dropped. Use only separately authorized exact dependencies from `profiles/unity-2022.3-requirements.txt`; no tool downloads or installs them.
 
-The profile rejects IL2CPP players and Unity versions outside the 2022.3 series. Use another compatible SDK branch or create a separately validated profile rather than weakening those checks.
+Reactivate the same selection if its activation-bound implementation changed, then run `game-l10n check-extractor-preparation --workspace <workspace> --relay <bound-relay>`. Core executes checks and binds their input/output bytes, implemented files, requirements and current activation. Missing, stale or failing readiness blocks both new inventory roles. Preparation checks cover extraction, duplicate physical bindings, independent agreement and selected rewrite/restore; they do not establish full-game coverage or semantic quality.
 
 ## Private workspace interface
 
-Run `tools/unpack.py INPUT_GAME_ROOT OUTPUT_DIRECTORY`. The target locale defaults to `ko`; set `GAME_L10N_TARGET_LOCALE` when another target is required. Set `GAME_L10N_SOURCE_LOCALE` only when automatic source selection is ambiguous.
+Bind `GAME_L10N_WORKDIR` and use `unpack.py INPUT_GAME_ROOT OUTPUT_DIRECTORY`. `GAME_L10N_INVENTORY_METHOD` selects `primary` or `independent`; a call runs only that method. Outputs remain outside the read-only player tree: immutable source snapshot/manifest, `evidence.sqlite3`, and `inventory.json`. Each scan is bound to method, source and implementation bytes; unchanged scans are reused. Shared proofs are stored once while equal-valued physical occurrences remain distinct. Inventories are streamed directly to files, not serialized through model/tool arguments.
 
-Run `tools/pack.py REQUEST_JSON OUTPUT_DIRECTORY` with `GAME_L10N_WORKDIR` bound to the private workspace and `GAME_L10N_STAGE=pack`. The schema-version-1 request supplies `game_root`, `segments_path`, `reviewed_path`, `source_bundle_relative`, `source_bundle_sha256`, and optionally `report_path`. All outputs must remain in the private workspace.
+CLR method/field resolution uses image-local declaration indexes and token caches instead of rescanning all definitions at every call. Exact assembly/type/signature checks and ambiguous-resolution behavior are preserved; caches never cross source images or independent methods.
+
+Private raw caches preserve non-display UTF-16 code units losslessly using escaped JSON. Actual display candidates still require valid Unicode scalar values; invalid source is held, never replaced or normalized away. Known image-content dependencies remain recorded as unverified non-text work, so they cannot deadlock text inventory before the separately requested image phase.
+
+Canonical IDs use physical method/IL, resource-entry or object/field/table-entry bindings, never source value, method label or incidental heap/payload relocation. Native operand-use identity survives relocation. Unknown raw strings are accounting data, not automatic translation targets or completeness gaps. Actual unresolved display dependencies retain candidates and hold coverage. Two independent inventories and Core reconciliation still precede context/translation/review; extraction readiness never replaces those barriers.
+
+Sink-reached string parameters without an image-local input binding remain unresolved display dependencies, including helpers called from another assembly. Cross-assembly callers are not guessed from names. Decoded RIP-relative loads of known native display IAT entries retain possible scope even when invocation is register-indirect; unrelated native functions are not promoted. Scanner-declared static incompleteness remains a coverage hold when its file has relevant display evidence, including after cache reuse.
+
+A display-bound TextAsset with JSON/INI entries keeps both payload and entry occurrences in raw accounting. The asset reference alone does not select whole-payload rendering versus parsed-value rendering: only one possible payload candidate is exported, marked `display_projection_required`, and coverage/packing remain held. Parsed entries are not independently promoted without a proven consumer, so overlapping payload/entry rewrites are never invented.
+
+For `pack.py REQUEST_JSON OUTPUT_DIRECTORY`, bind `GAME_L10N_STAGE=pack`. The request supplies `game_root`, workspace-contained `segments_path`, `reviewed_path`, `source_manifest_path`, and optional explicit `managed_types`/physical script bindings for stripped custom objects. Assemble large typed maps natively from the method's cache, never paste them through a model RPC. The packer uses Core's eligible segment scope, exact reviewed/source-preserved alignment, protected tokens and bound source hashes. It emits only copied replacement files and `pack-report.json`; it does not install, launch, alter source files, strip signatures or create behavior-changing hooks.
+
+Signed/unsafe write layouts, ambiguous bindings, unknown serialization, unresolved reflection/dispatch/resource culture and unproven native projections remain explicit pending/rejection cases. UnityFS decoding bounds and supported layout limits are categorical, not permissions to omit affected display scope. Real runtime behavior, font ingestion, glyph rendering and UI clipping require separate authorized observation and remain unverified here.
+
 
 ## Bounded standalone library
 
