@@ -690,6 +690,10 @@ def _verify_inventory_payloads(
         if primary_authority_contracts[target_id]
         != independent_authority_contracts[target_id]
     }
+    agreed_target_count = len(
+        (primary_ids & independent_ids)
+        - source_mismatches - ui_contract_mismatches - authority_contract_mismatches
+    )
     order_mismatch = primary_order != independent_order
     visible_exclusions = [
         item
@@ -786,6 +790,7 @@ def _verify_inventory_payloads(
         "independent_id_fingerprint": _inventory_id_fingerprint(independent),
         "primary_segments": len(primary_rows),
         "independent_segments": len(independent_rows),
+        "agreed_target_count": agreed_target_count,
         "primary_occurrences": len(primary["segments"]),
         "independent_occurrences": len(independent["segments"]),
         "scope_correction": scope_correction,
@@ -889,6 +894,14 @@ def save_inventory_attestation(
         "ui_composition_mismatch_count": attestation[
             "ui_composition_mismatch_count"
         ],
+        "localization_authority_mismatch_count": attestation[
+            "localization_authority_mismatch_count"
+        ],
+        "scope_correction_mismatch": "INVENTORY_SCOPE_CORRECTION_MISMATCH"
+        in attestation["issue_codes"],
+        "projection_constraint_count": attestation["projection_constraint_count"],
+        "identity_namespace_mismatch": "INVENTORY_IDENTITY_NAMESPACE_MISMATCH"
+        in attestation["issue_codes"],
         "user_visible_exclusion_count": attestation[
             "user_visible_exclusion_count"
         ],
@@ -916,12 +929,24 @@ def save_inventory_attestation(
     elif previous is None:
         progress_state = "initial"
         unchanged_observations = 0
-    elif same_inputs or previous_vector == current_vector:
+    elif same_inputs:
         progress_state = "unchanged"
         unchanged_observations = int(
             previous_reconciliation.get("unchanged_observations", 0)
         ) + 1
     elif isinstance(previous_score, int) and attestation["gap_score"] < previous_score:
+        progress_state = "improved"
+        unchanged_observations = 0
+    elif (
+        previous_vector == current_vector
+        and type(previous.get("agreed_target_count")) is int
+        and attestation["agreed_target_count"] > previous["agreed_target_count"]
+        and attestation["primary_segments"] >= previous.get("primary_segments", 0)
+        and attestation["independent_segments"] >= previous.get("independent_segments", 0)
+    ):
+        # More independently agreeing active targets is net progress even while
+        # an unchanged completeness declaration keeps the weighted gap at one.
+        # Raw occurrence growth and input-fingerprint churn alone do not qualify.
         progress_state = "improved"
         unchanged_observations = 0
     else:

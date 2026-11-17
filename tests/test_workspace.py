@@ -2031,7 +2031,7 @@ class WorkspaceTests(unittest.TestCase):
             ["docs/sdk-selection.md", "docs/sdk-branch-contract.md"],
         )
 
-    def test_status_emits_core_data_plane_tasks_for_each_inventory_method(self) -> None:
+    def test_status_holds_deficient_sdk_before_either_inventory_but_preserves_existing_pair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sdk = root / "sdk"
@@ -2117,9 +2117,11 @@ class WorkspaceTests(unittest.TestCase):
                 cmd_status(SimpleNamespace(workspace=str(work)))
             namespace_status = json.loads(namespace_output.getvalue())
 
-        self.assertEqual(
-            primary_status["data_plane_task"]["worker_role"], "primary_inventory"
-        )
+        self.assertEqual(primary_status["sdk_activation"]["status"], "active")
+        self.assertEqual(primary_status["next_actions"], ["prepare_and_validate_extractors"])
+        self.assertEqual(primary_status["data_plane_task"]["worker_role"], "source_probe")
+        self.assertEqual(primary_status["data_plane_task"]["purpose"], "extractor_preparation")
+        self.assertFalse(primary_status["extractor_preparation"]["dispatch_allowed"])
         self.assertEqual(
             primary_status["data_plane_task"]["relay_schema"],
             "parr0t.data-plane-relay.v4",
@@ -2133,14 +2135,10 @@ class WorkspaceTests(unittest.TestCase):
                 "--worker-ended"
             )
         )
-        self.assertEqual(
-            independent_status["next_actions"],
-            ["extract_independent_source_inventory"],
-        )
-        self.assertEqual(
-            independent_status["data_plane_task"]["worker_role"],
-            "independent_inventory",
-        )
+        self.assertEqual(independent_status["next_actions"], ["prepare_and_validate_extractors"])
+        self.assertEqual(independent_status["data_plane_task"]["worker_role"], "source_probe")
+        self.assertEqual(independent_status["data_plane_task"]["purpose"], "extractor_preparation")
+        self.assertFalse(independent_status["extractor_preparation"]["dispatch_allowed"])
         self.assertEqual(
             verify_status["next_actions"], ["verify_independent_source_inventory"]
         )
@@ -2160,7 +2158,7 @@ class WorkspaceTests(unittest.TestCase):
             "namespace_mismatch",
         )
 
-    def test_status_retries_a_sealed_inventory_failure_instead_of_verifying_it(self) -> None:
+    def test_status_requires_preparation_before_retrying_a_deficient_sdk_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sdk = root / "sdk"
@@ -2212,12 +2210,10 @@ class WorkspaceTests(unittest.TestCase):
                 cmd_status(SimpleNamespace(workspace=str(work)))
             mismatch_status = json.loads(mismatch_output.getvalue())
 
-        self.assertEqual(
-            status["next_actions"], ["extract_independent_source_inventory"]
-        )
-        self.assertEqual(
-            status["data_plane_task"]["worker_role"], "independent_inventory"
-        )
+        self.assertEqual(status["next_actions"], ["prepare_and_validate_extractors"])
+        self.assertEqual(status["data_plane_task"]["worker_role"], "source_probe")
+        self.assertEqual(status["data_plane_task"]["purpose"], "extractor_preparation")
+        self.assertFalse(status["extractor_preparation"]["dispatch_allowed"])
         self.assertEqual(
             mismatch_status["next_actions"],
             ["record_target_identity_evaluate_and_select_sdk"],

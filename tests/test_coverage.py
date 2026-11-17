@@ -771,6 +771,51 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(changed["reconciliation"]["progress_state"], "changed")
         self.assertEqual(changed["reconciliation"]["unchanged_observations"], 1)
 
+    def test_partial_authority_repair_is_progress_before_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary, independent = root / "primary.json", root / "independent.json"
+            rows = [{"id": "stable", "source": "SYNTHETIC",
+                     "metadata": {"terminology_concept_ids": ["synthetic-concept"]}}]
+            write_inventory(primary, "synthetic-primary", rows, declared_complete=False)
+            write_inventory(independent, "synthetic-independent", [
+                {"id": "stable", "source": "SYNTHETIC"}
+            ], declared_complete=False)
+            first = save_inventory_attestation(root, primary, independent)
+            write_inventory(independent, "synthetic-independent", rows, declared_complete=False)
+            repaired = save_inventory_attestation(root, primary, independent)
+
+        self.assertEqual(first["gap_score"], 2)
+        self.assertEqual(first["agreed_target_count"], 0)
+        self.assertEqual(repaired["gap_score"], 1)
+        self.assertEqual(repaired["agreed_target_count"], 1)
+        self.assertEqual(repaired["reconciliation"]["progress_state"], "improved")
+        self.assertEqual(repaired["reconciliation"]["unchanged_observations"], 0)
+        self.assertEqual(repaired["reconciliation"]["gap_vector"]["localization_authority_mismatch_count"], 0)
+        self.assertEqual(repaired["issue_codes"], ["INVENTORY_NOT_DECLARED_COMPLETE"])
+        self.assertTrue(repaired["continuation_required"])
+
+    def test_input_churn_is_changed_not_identical_evidence_or_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary, independent = root / "primary.json", root / "independent.json"
+            rows = [{"id": "stable", "source": "SYNTHETIC"}]
+            for path, method in ((primary, "synthetic-primary"), (independent, "synthetic-independent")):
+                write_inventory(path, method, rows, declared_complete=False)
+            save_inventory_attestation(root, primary, independent)
+            write_inventory(independent, "synthetic-independent", [
+                {**rows[0], "metadata": {"synthetic_evidence_revision": 2}}
+            ], declared_complete=False)
+            changed = save_inventory_attestation(root, primary, independent)
+            unchanged = save_inventory_attestation(root, primary, independent)
+
+        self.assertEqual(changed["gap_score"], 1)
+        self.assertEqual(changed["agreed_target_count"], 1)
+        self.assertEqual(changed["reconciliation"]["progress_state"], "changed")
+        self.assertEqual(changed["reconciliation"]["unchanged_observations"], 1)
+        self.assertEqual(unchanged["reconciliation"]["progress_state"], "unchanged")
+        self.assertEqual(unchanged["reconciliation"]["unchanged_observations"], 2)
+
     def test_saved_inventory_attestation_records_measured_gap_progress(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
