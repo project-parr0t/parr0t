@@ -19,6 +19,9 @@ SUBMIT_ITEM_UPDATE_CALLBACK = 3404
 RESULT_OK = 1
 INVALID_UPDATE_HANDLE = (1 << 64) - 1
 INVALID_QUERY_HANDLE = (1 << 64) - 1
+UGC_DETAILS_TAG_BYTES = 1025
+MAX_TAGS = 100
+MAX_TAG_BYTES = 255
 UGC_DETAILS_TITLE_OFFSET = 24
 UGC_DETAILS_TITLE_BYTES = 129
 UGC_DETAILS_DESCRIPTION_OFFSET = UGC_DETAILS_TITLE_OFFSET + UGC_DETAILS_TITLE_BYTES
@@ -73,6 +76,7 @@ class MetadataPlan:
     title: str
     description: str
     locales: tuple[str, ...]
+    required_tags: tuple[str, ...] = ()
 
 
 class SubmitItemUpdateResult(ctypes.Structure):
@@ -80,6 +84,34 @@ class SubmitItemUpdateResult(ctypes.Structure):
         ("result", ctypes.c_int32),
         ("needs_legal_agreement", ctypes.c_bool),
         ("item_id", ctypes.c_uint64),
+    ]
+
+
+class SteamParamStringArray(ctypes.Structure):
+    _fields_ = [
+        ("strings", ctypes.POINTER(ctypes.c_char_p)),
+        ("count", ctypes.c_int32),
+    ]
+
+
+class SteamUGCDetailsPrefix(ctypes.Structure):
+    _fields_ = [
+        ("item_id", ctypes.c_uint64),
+        ("result", ctypes.c_int32),
+        ("file_type", ctypes.c_int32),
+        ("creator_app_id", ctypes.c_uint32),
+        ("consumer_app_id", ctypes.c_uint32),
+        ("title", ctypes.c_char * UGC_DETAILS_TITLE_BYTES),
+        ("description", ctypes.c_char * UGC_DETAILS_DESCRIPTION_BYTES),
+        ("owner_id", ctypes.c_uint64),
+        ("created", ctypes.c_uint32),
+        ("updated", ctypes.c_uint32),
+        ("added_to_user_list", ctypes.c_uint32),
+        ("visibility", ctypes.c_int32),
+        ("banned", ctypes.c_bool),
+        ("accepted_for_use", ctypes.c_bool),
+        ("tags_truncated", ctypes.c_bool),
+        ("tags", ctypes.c_char * UGC_DETAILS_TAG_BYTES),
     ]
 
 
@@ -106,6 +138,50 @@ def _read_relative_text(manifest_path: Path, value: Any) -> str:
         raise MetadataError("description_file is empty")
     return description
 
+
+def _required_tags(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise MetadataError("required_tags must be a list")
+    if len(value) > MAX_TAGS:
+        raise MetadataError(f"required_tags exceeds Steam's {MAX_TAGS}-tag limit")
+    tags: list[str] = []
+    keys: set[str] = set()
+    for tag in value:
+        if not isinstance(tag, str) or not tag or tag != tag.strip() or "\0" in tag:
+            raise MetadataError("required_tags contains an invalid tag")
+        if len(tag.encode("utf-8")) > MAX_TAG_BYTES:
+            raise MetadataError(f"required_tags contains a tag over {MAX_TAG_BYTES} UTF-8 bytes")
+        key = tag.casefold()
+        if key in keys:
+            raise MetadataError("required_tags contains duplicates")
+        keys.add(key)
+        tags.append(tag)
+    return tuple(tags)
+
+
+def merge_required_tags(current: Iterable[str], required: Iterable[str]) -> tuple[str, ...]:
+    merged = list(current)
+    keys = {tag.casefold() for tag in merged}
+    for tag in required:
+        key = tag.casefold()
+        if key not in keys:
+            merged.append(tag)
+            keys.add(key)
+    return tuple(merged)
+
+
+
+def decode_details_tags(raw: bytes) -> tuple[str, ...]:
+    tags_offset = SteamUGCDetailsPrefix.tags.offset
+    tags_end = tags_offset + UGC_DETAILS_TAG_BYTES
+    if len(raw) < tags_end:
+        raise MetadataError("Steam returned an undersized Workshop detail record")
+    if raw[SteamUGCDetailsPrefix.tags_truncated.offset]:
+        raise MetadataError("Steam truncated the current Workshop tag list")
+    value = raw[tags_offset:tags_end].split(b"\0", 1)[0].decode("utf-8", errors="strict")
+    return tuple(tag.strip() for tag in value.split(",") if tag.strip())
 
 def load_plan(manifest_path: Path) -> MetadataPlan:
     source = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -134,6 +210,7 @@ def load_plan(manifest_path: Path) -> MetadataPlan:
         title=title,
         description=description,
         locales=locales,
+        required_tags=_required_tags(source.get("required_tags")),
     )
 
 
@@ -211,6 +288,12 @@ class SteamMetadataClient:
             function = getattr(dll, name)
             function.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_char_p]
             function.restype = ctypes.c_bool
+        dll.SteamAPI_ISteamUGC_SetItemTags.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.POINTER(SteamParamStringArray),
+        ]
+        dll.SteamAPI_ISteamUGC_SetItemTags.restype = ctypes.c_bool
         dll.SteamAPI_ISteamUGC_SubmitItemUpdate.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_char_p]
         dll.SteamAPI_ISteamUGC_SubmitItemUpdate.restype = ctypes.c_uint64
         dll.SteamAPI_ISteamUtils_IsAPICallCompleted.argtypes = [
@@ -305,6 +388,70 @@ class SteamMetadataClient:
             raise MetadataError("Steam requires acceptance of the Workshop legal agreement")
         self._verify(plan, locale)
 
+    def update_tags(self, plan: MetadataPlan) -> bool:
+        current = self._query_tags(plan)
+        merged = merge_required_tags(current, plan.required_tags)
+        if merged == current:
+            return False
+        handle = self._dll.SteamAPI_ISteamUGC_StartItemUpdate(self._ugc, plan.app_id, plan.item_id)
+        if handle == INVALID_UPDATE_HANDLE:
+            raise MetadataError("Steam rejected the tag update handle")
+        encoded = [self._utf8(tag) for tag in merged]
+        strings = (ctypes.c_char_p * len(encoded))(*encoded)
+        values = SteamParamStringArray(
+            ctypes.cast(strings, ctypes.POINTER(ctypes.c_char_p)),
+            len(encoded),
+        )
+        if not self._dll.SteamAPI_ISteamUGC_SetItemTags(
+            self._ugc, handle, ctypes.byref(values)
+        ):
+            raise MetadataError("Steam rejected Workshop tags")
+        call = self._dll.SteamAPI_ISteamUGC_SubmitItemUpdate(
+            self._ugc, handle, self._utf8("Add required Workshop tags")
+        )
+        if not call:
+            raise MetadataError("Steam rejected tag submission")
+        result = self._wait(call)
+        if result.result != RESULT_OK:
+            raise MetadataError(f"Steam tag update failed with EResult {result.result}")
+        if result.item_id != plan.item_id:
+            raise MetadataError("Steam returned an unexpected Workshop item for tag update")
+        if result.needs_legal_agreement:
+            raise MetadataError("Steam requires acceptance of the Workshop legal agreement")
+        verified = self._query_tags(plan)
+        missing = {tag.casefold() for tag in plan.required_tags}.difference(
+            tag.casefold() for tag in verified
+        )
+        if missing:
+            raise MetadataError("Steam tag verification mismatch")
+        return True
+
+    def _query_tags(self, plan: MetadataPlan) -> tuple[str, ...]:
+        item_id = ctypes.c_uint64(plan.item_id)
+        query = self._dll.SteamAPI_ISteamUGC_CreateQueryUGCDetailsRequest(
+            self._ugc, ctypes.byref(item_id), 1
+        )
+        if query == INVALID_QUERY_HANDLE:
+            raise MetadataError("Steam rejected the tag verification query")
+        try:
+            call = self._dll.SteamAPI_ISteamUGC_SendQueryUGCRequest(self._ugc, query)
+            if not call:
+                raise MetadataError("Steam rejected the tag verification request")
+            self._wait_for_completion(call)
+            details = ctypes.create_string_buffer(UGC_DETAILS_BUFFER_BYTES)
+            if not self._dll.SteamAPI_ISteamUGC_GetQueryUGCResult(
+                self._ugc, query, 0, details
+            ):
+                raise MetadataError("Steam returned no tag verification result")
+            raw = details.raw
+            returned_item = int.from_bytes(raw[0:8], "little")
+            result = int.from_bytes(raw[8:12], "little", signed=True)
+            if result != RESULT_OK or returned_item != plan.item_id:
+                raise MetadataError("Steam returned an invalid Workshop item for tag verification")
+            return decode_details_tags(raw)
+        finally:
+            self._dll.SteamAPI_ISteamUGC_ReleaseQueryUGCRequest(self._ugc, query)
+
     def _wait(self, call: int) -> SubmitItemUpdateResult:
         self._wait_for_completion(call)
         result = SubmitItemUpdateResult()
@@ -386,14 +533,27 @@ def describe_plan(plan: MetadataPlan, steam_api: Path) -> dict[str, Any]:
         "title": plan.title,
         "description_sha256": hashlib.sha256(plan.description.encode("utf-8")).hexdigest(),
         "locales": list(plan.locales),
+        "required_tags": list(plan.required_tags),
         "steam_api": str(steam_api.resolve()),
         "steam_api_sha256": _sha256(steam_api),
     }
 
 
-def synchronize(plan: MetadataPlan, steam_api: Path, locales: Iterable[str]) -> None:
+def synchronize(
+    plan: MetadataPlan,
+    steam_api: Path,
+    locales: Iterable[str],
+    *,
+    tags_only: bool = False,
+) -> None:
     selected = tuple(locales)
     with SteamMetadataClient(steam_api, plan.app_id, plan.owner_id) as client:
+        if plan.required_tags:
+            changed = client.update_tags(plan)
+            state = "updated and verified" if changed else "already present"
+            print(f"tags: {state}", flush=True)
+        if tags_only:
+            return
         for index, locale in enumerate(selected, start=1):
             client.update(plan, locale)
             print(f"[{index}/{len(selected)}] {locale}: updated and verified", flush=True)
@@ -420,6 +580,11 @@ def main() -> int:
     parser.add_argument("--approve-item", type=int)
     parser.add_argument("--approve-steam-api-sha256")
     parser.add_argument("--locale", action="append", choices=sorted(SUPPORTED_LOCALES))
+    parser.add_argument(
+        "--tags-only",
+        action="store_true",
+        help="apply and verify required_tags without changing localized title or description",
+    )
     args = parser.parse_args()
     try:
         plan = load_plan(args.manifest.resolve())
@@ -434,7 +599,9 @@ def main() -> int:
         unknown = set(selected).difference(plan.locales)
         if unknown:
             raise MetadataError("selected locale is not declared by the manifest")
-        synchronize(plan, steam_api, selected)
+        if args.tags_only and not plan.required_tags:
+            raise MetadataError("--tags-only requires at least one manifest required_tags entry")
+        synchronize(plan, steam_api, selected, tags_only=args.tags_only)
         return 0
     except (MetadataError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
