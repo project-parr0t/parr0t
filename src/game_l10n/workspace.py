@@ -263,7 +263,7 @@ This private workspace contains game data. Resolve Parr0t from `game-l10n.json`;
 ## Core contract
 
 - Apply the repository `skills/request-scope-guard/SKILL.md` after every scope-changing user message and before optional or external effects. Git, provider, installation, launch, and publication permissions are separate; never infer one from access or another approval.
-- Deny new third-party acquisition, execution, adoption, service use, and data transmission. Apply `skills/third-party-consent/SKILL.md`; require risk disclosure, explicit user approval, and a consumed core record.
+- Deny unapproved third parties. Apply `skills/third-party-consent/SKILL.md`; require risk disclosure, explicit user approval, and a consumed core record. Exact locked dependencies are preapproved only after complete validation finds no known supply-chain attack history.
 - Select and activate the exact engine/version SDK before data-plane work. A different SDK may be a bound `reference` for `derive-new`; generated pass-through tools are not an adapter.
 - Require two independent complete ordered inventories, typed context analysis, primary translation, translation fallback for failures only, complete low-cost triage, selective strong review for flags/risk/sample, flagged-only rewrite, review fallback for failures only, deterministic validation, then packing. Do not shrink scope or reorder barriers.
 - During localization, root observes only core metadata, validated envelopes/receipts, direct-relay lifecycle, and core-owned usage. Never inspect private data, transcripts, logs, trees, or nested-worker output/status. Validate envelopes; record forbidden exposure.
