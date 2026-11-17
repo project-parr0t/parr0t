@@ -52,7 +52,8 @@ def _startup_prompt(workspace: Path, core: Path, mode: str = "rotation", *, guar
             "native-runtime --omp-isolation prompt로 다시 바인딩하고 기존 정확한 모델 매핑을 보존하라. "
             "릴레이/워커는 launch_contract에 따라 메시지 전송·대화 및 세션 기록 열람을 하지 않는다. "
             "agent:// 메시지와 history:// 열람을 사용하지 마라. 일반 호스트 Python과 도구로 실행하라. "
-            "이 경계는 프롬프트 지시이며 도구나 호스트가 강제하는 격리가 아니다. 실행 가드 등록을 기다리지 마라. "
+            "공식 런처의 프롬프트 도우미는 하위 프롬프트의 충돌하는 협업 안내와 호스트 메시지·기록 도구 호출만 제한한다. "
+            "일반 Python·프로세스 실행을 샌드박스화하지 않으며 실행 가드 등록을 기다리지 마라. "
         )
         +
         "최상위가 새 릴레이를 시작할 때 코어가 반환한 상대 릴레이 경로를 PARR0T_OMP_RELAY=경로 형식의 단독 줄로 전달하라. "
@@ -89,17 +90,18 @@ def _plan_command(
     if executable is None:
         raise ValueError("E_OMP_CONTROL_EXECUTABLE_REQUIRED")
     core = Path(__file__).resolve().parents[2]
-    guard = Path(__file__).with_name("templates") / "omp-isolation-guard.mjs" if guarded else None
-    if guard is not None and not guard.is_file():
-        raise ValueError("E_OMP_CONTROL_GUARD_REQUIRED")
+    templates = Path(__file__).with_name("templates")
+    extension = templates / ("omp-isolation-guard.mjs" if guarded else "omp-prompt-isolation.mjs")
+    if not extension.is_file():
+        raise ValueError("E_OMP_CONTROL_GUARD_REQUIRED" if guarded else "E_OMP_CONTROL_PROMPT_HELPER_REQUIRED")
+    guard = extension if guarded else None
     launch_dir = workspace / ".game-l10n" / "omp-control" / uuid4().hex
     session_dir = launch_dir / "sessions"
     command = [
         executable, "--cwd", str(workspace), "--model", model,
         "--session-dir", str(session_dir), "--no-prewalk", "--no-title",
     ]
-    if guard is not None:
-        command.extend(["--trusted-extension", str(guard.resolve()), "--parr0t-workspace", str(workspace)])
+    command.extend(["--trusted-extension", str(extension.resolve()), "--parr0t-workspace", str(workspace)])
     command.append(_startup_prompt(workspace, core, mode, guarded=guarded))
     return command, launch_dir, guard
 
@@ -127,6 +129,7 @@ def _launch(
     environment.pop("PARR0T_OMP_GUARD_SESSION", None)
     environment.pop("PARR0T_OMP_GUARD_WORKSPACE", None)
     environment.pop("PARR0T_OMP_CONTROL_DIRECTORY", None)
+    environment.pop("PARR0T_OMP_PROMPT_WORKSPACE", None)
     if guarded:
         environment["PARR0T_OMP_CONTROL_DIRECTORY"] = str(launch_dir)
     process = subprocess.Popen(
