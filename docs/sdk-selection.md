@@ -36,11 +36,11 @@ game-l10n sdk-select --workspace <workspace> --target-engine <engine> --target-v
 8. Activate the implementation that will actually execute the decision:
 
 ```text
-# Run this from the exact selected SDK checkout/worktree for reuse/extend.
+# Bind the configured SDK checkout/worktree for reuse/extend.
 game-l10n sdk-activate --workspace <workspace>
 
-# Or bind the already registered portable snapshot without Git metadata.
-game-l10n sdk-activate --workspace <workspace> --runtime-root <extracted-sdk-snapshot>
+# Or explicitly bind an inventoried Git checkout or registered portable snapshot.
+game-l10n sdk-activate --workspace <workspace> --runtime-root <selected-sdk-runtime>
 
 # For derive-new, run from main after replacing both generated workspace tools,
 # and bind the exact clean reference checkout as well.
@@ -51,6 +51,8 @@ game-l10n sdk-activate --workspace <workspace>
 ```
 
 `reuse` requires either a clean runtime at the exact inventoried Git commit or an exact content match to the registered portable snapshot. `extend` requires provable ancestry; an unchanged portable snapshot may still be reused, but modifying it cannot establish ancestry and therefore needs a Git worktree for the extension. `derive-new` binds both the new workspace adapter and the exact Git or content-bound reference. `private-new` binds the new workspace adapter. Generated pass-through tools never count as an adapter. The activation record fingerprints the runtime and, when applicable, the workspace tool manifest; changing, moving, or replacing either invalidates it.
+
+A separate control-plane core may activate and validate the selected SDK without running from its checkout. For `reuse`/`extend`, activation defaults to the configured `sdk_root`; an explicit `--runtime-root` overrides it. Later checks validate the recorded SDK path and its complete binding, not the control-plane core's checkout. Changed SDK content, commit, worktree state, workspace tools, or references still invalidate activation; an explicit mismatching validation runtime is rejected.
 
 The repository choice in the private game workspace is unrelated. `disabled` prohibits initializing or publishing that game workspace; it never blocks downloading, registering, or activating an SDK. A top-level agent must not turn that choice into a terminal blocker.
 
