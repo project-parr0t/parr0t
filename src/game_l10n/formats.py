@@ -169,14 +169,25 @@ def read_existing_translations(path: Path) -> dict[str, dict[str, str]]:
 
 
 def read_translation_results(path: Path) -> list[TranslationResult]:
-    if path.suffix.lower() != ".json":
-        raise ValueError("Resumable held results must use the JSON result format")
-    payload = json.loads(path.read_text(encoding="utf-8-sig"))
-    rows = payload.get("results", []) if isinstance(payload, dict) else []
-    if not isinstance(rows, list):
-        raise ValueError("Held result artifact is malformed")
+    suffix = path.suffix.lower()
+    if suffix == ".jsonl":
+        def rows() -> Iterable[Any]:
+            with path.open("r", encoding="utf-8-sig") as handle:
+                for line in handle:
+                    if line.strip():
+                        yield json.loads(line)
+    elif suffix == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        raw_rows = payload.get("results", []) if isinstance(payload, dict) else []
+        if not isinstance(raw_rows, list):
+            raise ValueError("Held result artifact is malformed")
+
+        def rows() -> Iterable[Any]:
+            yield from raw_rows
+    else:
+        raise ValueError("Authoritative results require lossless JSON or JSONL, not CSV exports")
     results: list[TranslationResult] = []
-    for row in rows:
+    for row in rows():
         if not isinstance(row, dict):
             raise ValueError("Held result rows must be objects")
         value = dict(row)

@@ -21,12 +21,6 @@ from .errors import ConfigurationError, ProviderFailure
 from .prompts import REVIEW_ISSUE_CODES
 from .provider_policy import validate_provider_policy
 
-_DEFAULT_FOCUSED_TEXT_INPUT_CHARS = 24_000
-_FOCUSED_TEXT_SCHEMA_NAMES = (
-    "game_translation",
-    "game_translation_review_judge",
-    "game_translation_review_rewrite",
-)
 
 
 def _parse_plain_review_verdict(value: str) -> dict[str, Any]:
@@ -567,10 +561,18 @@ class CompatibleChatProvider(ModelProvider):
                 self._output_retry_key(user, schema_name), None
             )
 
-    def _enforce_input_budget(self, system: str, user: str, schema_name: str) -> None:
+    def _prepare_input(self, system: str, user: str, schema_name: str) -> str:
+        """Compact serialization only; never truncate bound semantic material."""
         limit = self.task_max_input_chars.get(schema_name, self.max_input_chars)
-        if limit is not None and len(system) + len(user) > limit:
-            raise ProviderFailure("budget_exhausted", retryable=False)
+        if limit is None or len(system) + len(user) <= limit:
+            return user
+        try:
+            compact = json.dumps(json.loads(user), ensure_ascii=False, separators=(",", ":"))
+        except (ValueError, TypeError):
+            compact = user
+        if len(system) + len(compact) > limit:
+            raise ProviderFailure("input_capacity_exceeded", retryable=False)
+        return compact
 
     def generate_json(
         self, *, system: str, user: str, schema: dict[str, Any], schema_name: str
@@ -591,7 +593,7 @@ class CompatibleChatProvider(ModelProvider):
                 "type": "json_schema",
                 "json_schema": {"name": schema_name, "strict": True, "schema": schema},
             }
-        self._enforce_input_budget(system, user, schema_name)
+        user = self._prepare_input(system, user, schema_name)
         payload = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -658,7 +660,7 @@ class CompatibleChatProvider(ModelProvider):
         if self.api_key_env and not api_key:
             raise ProviderFailure("authentication_error", retryable=False)
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        self._enforce_input_budget(system, user, schema_name)
+        user = self._prepare_input(system, user, schema_name)
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -713,8 +715,13 @@ class CommandProvider(ModelProvider):
     No shell is used. This prevents game text from becoming executable command text.
     """
 
-    def __init__(self, name: str, command: list[str], *, timeout: float | None = None, cwd: str | None = None):
+    def __init__(self, name: str, command: list[str], *, timeout: float | None = None, cwd: str | None = None, model: str | None = None):
         super().__init__(name)
+        if model is not None and (
+            not isinstance(model, str) or not model or any(ord(char) < 32 for char in model)
+        ):
+            raise ConfigurationError("command model must be an exact nonempty selector")
+        self.model = model
         if (
             not isinstance(command, list)
             or not command
@@ -737,7 +744,8 @@ class CommandProvider(ModelProvider):
         self, *, system: str, user: str, schema: dict[str, Any], schema_name: str
     ) -> dict[str, Any]:
         request = json.dumps(
-            {"protocol": "game-l10n-provider/v1", "system": system, "input": user, "schema": schema, "schema_name": schema_name},
+            {"protocol": "game-l10n-provider/v1", "system": system, "input": user, "schema": schema, "schema_name": schema_name,
+             **({"model": self.model} if self.model is not None else {})},
             ensure_ascii=False,
         )
         try:
@@ -763,7 +771,10 @@ class CommandProvider(ModelProvider):
         return _parse_json_object(completed.stdout)
 
     def fingerprint(self) -> dict[str, Any]:
-        return {**super().fingerprint(), "command": list(self.command), "cwd": self.cwd}
+        return {
+            **super().fingerprint(), "command": list(self.command), "cwd": self.cwd,
+            **({"model": self.model} if self.model is not None else {}),
+        }
 
 
 class ScriptedProvider(ModelProvider):
@@ -794,6 +805,13 @@ class ProviderRegistry:
         except KeyError as exc:
             raise ConfigurationError(f"Unknown provider: {name}") from exc
 
+    def model_bindings(self) -> dict[str, str]:
+        """Read exact declared models without resolving or executing a route."""
+        return {
+            name: model for name, provider in self._providers.items()
+            if isinstance(model := getattr(provider, "model", None), str) and model
+        }
+
     def fingerprints(self, names: list[str]) -> list[dict[str, Any]]:
         return [self.get(name).fingerprint() for name in names]
 
@@ -817,19 +835,6 @@ class ProviderRegistry:
                     review_verdict_format=item.get("review_verdict_format", "json"),
                 )
             elif kind == "compatible_chat":
-                task_max_input_chars = item.get("task_max_input_chars")
-                if (
-                    task_max_input_chars is None
-                    and item.get("name") == "deepseek"
-                    and config.get("provider_preset")
-                    in {"openai-deepseek", "codex-app-deepseek"}
-                ):
-                    # Apply the current preset safety budget to old private
-                    # workspaces without rewriting their stored configuration.
-                    task_max_input_chars = {
-                        schema_name: _DEFAULT_FOCUSED_TEXT_INPUT_CHARS
-                        for schema_name in _FOCUSED_TEXT_SCHEMA_NAMES
-                    }
                 provider = CompatibleChatProvider(
                     **common,
                     model=item["model"],
@@ -848,7 +853,7 @@ class ProviderRegistry:
                     max_output_tokens=item.get("max_output_tokens", 2048),
                     task_max_output_tokens=item.get("task_max_output_tokens"),
                     max_input_chars=item.get("max_input_chars"),
-                    task_max_input_chars=task_max_input_chars,
+                    task_max_input_chars=item.get("task_max_input_chars"),
                     review_verdict_format=item.get("review_verdict_format", "json"),
                 )
             elif kind == "command":
@@ -857,6 +862,7 @@ class ProviderRegistry:
                     command=item["command"],
                     timeout=item.get("timeout"),
                     cwd=item.get("cwd"),
+                    model=item.get("model"),
                 )
                 if provider.cwd is not None and not Path(provider.cwd).is_absolute():
                     provider.cwd = str(project_root / provider.cwd)

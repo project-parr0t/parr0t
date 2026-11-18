@@ -21,7 +21,7 @@
         <label data-localization>기존 한국어<select name="koreanPolicy"><option value="check">있으면 확인 후 중단</option><option value="skip">존재 여부 검사 생략</option><option value="rewrite">원어부터 재번역</option></select></label>
         <label data-localization>제작 방식<select name="delivery"><option value="patch">복원 가능한 패치</option><option value="mod">모드</option></select></label>
         <label class="toggle" data-localization><input type="checkbox" name="fonts">게임에 맞는 한국어 폰트 설정</label>
-        <label class="toggle wide" data-localization><input type="checkbox" name="images">UI 이미지 속 글자 번역</label>
+        <label class="toggle wide" data-localization><input type="checkbox" name="images">플레이어 노출 이미지 속 글자 번역</label>
         <label class="wide">게임 폴더 <span class="optional">선택</span><input name="gamePath" type="text" placeholder="경로를 입력하거나, 요청할 때 게임 폴더 첨부" autocomplete="off" spellcheck="false"></label>
       </div>
       <details class="settings" id="model-settings">
@@ -30,15 +30,16 @@
           <label>기초 사용 모델<input name="baseModel" type="text" placeholder="번역 모델 ID · 기존 설정 유지" autocomplete="off" spellcheck="false"></label>
           <label>약검수 모델<input name="triageModel" type="text" placeholder="정확한 모델 ID · 기존 설정 유지" autocomplete="off" spellcheck="false"></label>
           <label>강검수 모델<input name="strongModel" type="text" placeholder="정확한 모델 ID · 기존 설정 유지" autocomplete="off" spellcheck="false"></label>
+          <label>수정 모델<input name="rewriteModel" type="text" placeholder="정확한 모델 ID · 기존 설정 유지" autocomplete="off" spellcheck="false"></label>
           <label class="toggle"><input type="checkbox" name="analyzeContext" checked>문맥 파악</label>
           <label id="context-model-field" class="wide">문맥 파악 모델<input name="contextModel" type="text" placeholder="정확한 모델 ID · 기존 설정 유지" autocomplete="off" spellcheck="false"></label>
         </div>
       </details>
       <fieldset>
-        <legend>검수 <span class="optional">Sol 최대 2회 · 최초 호출 포함</span></legend>
+        <legend>검수 <span class="optional">명시한 상한 우선 · 최초 호출 포함</span></legend>
         <div class="fields">
           <label>폴백 모델<select id="fallback-preset" aria-label="폴백 모델 목록"></select></label>
-          <label>폴백 최대 횟수<input name="fallbackAttempts" type="number" min="1" step="1" placeholder="직접 지정"></label>
+          <label>폴백 최대 횟수<input name="fallbackAttempts" type="number" min="1" step="1" placeholder="기존 상한 유지 · 없으면 3회"></label>
           <label class="wide" id="fallback-model-field" hidden>직접 입력한 폴백 모델 ID<input name="fallbackModel" type="text" placeholder="정확한 모델 ID" autocomplete="off" spellcheck="false"></label>
         </div>
         <div class="catalog-control"><label class="toggle"><input type="checkbox" id="use-proxy" aria-describedby="local-access-help">localhost 연결 요청</label><span id="catalog-status" role="status" aria-live="polite"></span></div>
@@ -47,10 +48,10 @@
           <summary>검수 제한</summary>
           <div class="fields">
             <label>최대 약검수<input name="triageMaxCalls" type="number" min="1" step="1" placeholder="횟수 · 기존 설정 유지"></label>
-            <label>최대 강검수<input name="strongMaxCalls" type="number" min="1" step="1" placeholder="횟수 · Sol은 최대 2회"></label>
-            <label class="wide">검수 최대 동시 실행 서브에이전트<input name="reviewMaxWorkers" type="number" min="1" max="64" step="1" placeholder="기존 설정 유지"></label>
-            <label>약검수 최대 동시 실행 서브에이전트<input name="triageMaxWorkers" type="number" min="1" max="64" step="1" placeholder="기존 설정 유지"></label>
-            <label>강검수 최대 동시 실행 서브에이전트<input name="strongMaxWorkers" type="number" min="1" max="64" step="1" placeholder="기존 설정 유지"></label>
+            <label>최대 강검수<input name="strongMaxCalls" type="number" min="1" step="1" placeholder="횟수 · 기존 설정 유지"></label>
+            <label class="wide">검수 최대 동시 실행 서브에이전트<input name="reviewMaxWorkers" type="number" min="1" step="1" placeholder="기존 설정 유지"></label>
+            <label>약검수 최대 동시 실행 서브에이전트<input name="triageMaxWorkers" type="number" min="1" step="1" placeholder="기존 설정 유지"></label>
+            <label>강검수 최대 동시 실행 서브에이전트<input name="strongMaxWorkers" type="number" min="1" step="1" placeholder="기존 설정 유지"></label>
           </div>
         </details>
       </fieldset>

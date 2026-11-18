@@ -66,6 +66,10 @@ class TargetLanguagePolicyTests(unittest.TestCase):
                 require_target_language_policy(work, config)["target_language"],
                 "en",
             )
+            repeated = record_target_language_policy(
+                work, target_language="en", user_requested=True
+            )
+            self.assertEqual(repeated, recorded)
 
 
 if __name__ == "__main__":

@@ -43,6 +43,8 @@ class RuntimeApprovalTests(unittest.TestCase):
                 target_path=game,
                 consume=True,
             )
+            # Windows PowerShell writes consumed receipts as UTF-8 with a BOM.
+            approval_path.write_text(approval_path.read_text(encoding="utf-8"), encoding="utf-8-sig")
             with self.assertRaisesRegex(RuntimeApprovalError, "E_RUNTIME_APPROVAL_CONSUMED"):
                 require_runtime_approval(
                     work,
@@ -161,6 +163,31 @@ class RuntimeApprovalTests(unittest.TestCase):
                     artifact_path=artifact,
                     target_path=other,
                     user_confirmed=True,
+                )
+
+
+    def test_explicit_bounded_workflow_reuse_does_not_renew_or_widen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work, game, _, artifact = self._fixture(Path(directory))
+            path, approval = create_runtime_approval(
+                work, action="install", artifact_path=artifact, target_path=game,
+                ttl_minutes=7 * 24 * 60, workflow_reuse=True, user_confirmed=True,
+            )
+            for _ in range(2):
+                receipt = require_runtime_approval(
+                    work, path, action="install", artifact_path=artifact,
+                    target_path=game, consume=True,
+                )
+                self.assertIsNone(receipt["consumed_at_utc"])
+                self.assertEqual(receipt["expires_at_utc"], approval["expires_at_utc"])
+            with self.assertRaisesRegex(RuntimeApprovalError, "ACTION_MISMATCH"):
+                require_runtime_approval(
+                    work, path, action="launch", artifact_path=artifact, target_path=game,
+                )
+            artifact.write_bytes(b"changed")
+            with self.assertRaisesRegex(RuntimeApprovalError, "ARTIFACT_MISMATCH"):
+                require_runtime_approval(
+                    work, path, action="install", artifact_path=artifact, target_path=game,
                 )
 
 

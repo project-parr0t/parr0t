@@ -9,9 +9,9 @@ Apply `docs/third-party-consent.md`. New third-party use is deny-by-default.
 
 ## Stop before acquisition or use
 
-Do not download, clone, install, execute, vendor, copy, add as a dependency or submodule, call as a service, or send data to a third party until the user explicitly approves the exact component and action. Installed or reachable does not mean approved. Open source, popularity, convenience, credentials, urgency, and broad instructions such as “fix”, “test”, “build”, “deploy”, or “publish” do not imply consent.
+Do not download, clone, install, execute, vendor, copy, add as a dependency or submodule, call as a service, or send data to a third party until the user explicitly approves the exact component and action, unless the exact bytes and use are already covered by complete, current repository validation and authoritative notice/advisory review. Installed or reachable does not mean approved. Open source, popularity, convenience, credentials, urgency, and broad instructions such as “fix”, “test”, “build”, “deploy”, or “publish” do not imply consent.
 
-Parr0t dependencies are preapproved only when complete validation passed without skips for the exact locked version, source, digest, closure, and use scope, and authoritative package/project notices plus recognized advisories show no known supply-chain attack history affecting them at validation time. Bind the approval to those exact bytes. Any changed input, stale/incomplete validation, credible later compromise report, security-related yank, or provenance anomaly revokes it. Ordinary reuse within the validated scope needs no one-shot approval record; everything else does.
+Repository-declared dependencies are preapproved only when complete validation passed without skips for the exact locked version, source, digest, closure, and use scope, and authoritative package/project notices plus recognized advisories show no known supply-chain attack history affecting them at validation time. Bind approval to those exact bytes and scope. Any changed input, stale/incomplete validation, credible later compromise report, security-related yank, or provenance anomaly revokes it. Ordinary reuse within the validated scope needs no duplicate one-shot approval. Everything outside that scope requires fresh exact authorization.
 
 ## Investigate without importing
 
@@ -28,9 +28,7 @@ State, in the user's language:
 
 Ask for approval of that exact proposal. No response means no approval. Approval of one component, version, action, or data scope never authorizes another.
 
-## Record and consume consent
-
-After explicit approval, create a short-lived one-shot record with `game-l10n approve-third-party --risk-disclosed --user-confirmed`. Immediately before the external effect, consume it with `game-l10n consume-third-party-approval` using the same action, identity, source, version, and digest. If validation fails, do not perform the action and do not substitute another third party.
+After actual explicit user approval, record consent with `game-l10n approve-third-party --risk-disclosed --user-confirmed`. A one-shot record may be used for a single action. A bounded reusable record may be created with `--workflow-reuse` only when the user explicitly approves workflow reuse for the exact same component, action, purpose, and data scope; honor its declared expiry and do not invent a universal one-day limit or treat reuse as expanded authorization. Immediately before each external effect, consume/validate approval against the same action, identity, source, version, digest, purpose, and data scope. If validation fails, do not perform the action and do not substitute another third party.
 
 Service/API actions may use `not-applicable` only where no executable artifact exists. Downloaded or executed code requires an immutable `sha256:` or `git:` pin.
 

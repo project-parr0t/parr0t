@@ -450,7 +450,7 @@ function Use-RuntimeApproval([string]$Root, $Manifest, [string]$Action) {
         throw "E_RUNTIME_APPROVAL_INVALID_PATH"
     }
     $approval = Get-Content -LiteralPath $approvalPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($approval.schema -ne "parr0t.runtime-approval/v1" -or $approval.one_shot -ne $true) {
+    if ($approval.schema -ne "parr0t.runtime-approval/v1" -or $approval.one_shot -isnot [bool]) {
         throw "E_RUNTIME_APPROVAL_SCHEMA"
     }
     if ($approval.authorization_source -cne "explicit_user_instruction") {
@@ -478,10 +478,12 @@ function Use-RuntimeApproval([string]$Root, $Manifest, [string]$Action) {
     catch { throw "E_RUNTIME_APPROVAL_EXPIRY_INVALID" }
     if ($expires -le [DateTimeOffset]::UtcNow) { throw "E_RUNTIME_APPROVAL_EXPIRED" }
 
-    $approval.consumed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
-    $temporary = New-PatchTemporaryFile $approvalPath
-    $approval | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporary -Encoding UTF8
-    Move-Item -LiteralPath $temporary -Destination $approvalPath -Force
+    if ($approval.one_shot) {
+        $approval.consumed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+        $temporary = New-PatchTemporaryFile $approvalPath
+        $approval | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporary -Encoding UTF8
+        Move-Item -LiteralPath $temporary -Destination $approvalPath -Force
+    }
 }
 
 function Test-Package($Manifest) {

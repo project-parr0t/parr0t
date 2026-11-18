@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +9,9 @@ from pathlib import Path
 from game_l10n.errors import ThirdPartyApprovalError
 from game_l10n.third_party_approval import create_third_party_approval, require_third_party_approval
 from game_l10n.workspace import initialize_workspace
+from game_l10n.third_party_approval import consume_offline_processing, validated_offline_processing
+from game_l10n.third_party_approval import _approval_lock
+from game_l10n.store import stable_hash
 
 
 class ThirdPartyApprovalTests(unittest.TestCase):
@@ -84,14 +89,95 @@ class ThirdPartyApprovalTests(unittest.TestCase):
                     digest="git:" + "a" * 40,
                 )
 
-    def test_workspace_contract_denies_unapproved_third_party_use(self) -> None:
+
+
+    def test_explicit_workflow_reuse_keeps_exact_scope_and_expiry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             work = self._workspace(Path(directory))
-            contract = (work / "AGENTS.md").read_text(encoding="utf-8")
-            self.assertIn("skills/third-party-consent/SKILL.md", contract)
-            self.assertIn("explicit user approval", contract)
-            self.assertIn("complete validation", contract)
-            self.assertIn("no known supply-chain attack history", contract)
+            path, payload = self._approval(work, workflow_reuse=True, ttl_minutes=7 * 24 * 60)
+            identity = {key: payload[key] for key in (
+                "action", "name", "publisher", "source", "version", "digest", "purpose", "data_scope"
+            )}
+            for _ in range(2):
+                receipt = require_third_party_approval(work, path, **identity, consume=True)
+                self.assertIsNone(receipt["consumed_at_utc"])
+                self.assertEqual(receipt["expires_at_utc"], payload["expires_at_utc"])
+            identity["data_scope"] = "Additional data"
+            with self.assertRaisesRegex(ThirdPartyApprovalError, "WORKFLOW_SCOPE_MISMATCH"):
+                require_third_party_approval(work, path, **identity)
+
+    def test_offline_processing_requires_exact_script_and_argv_consent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work = self._workspace(root)
+            script = root / "fixture.py"
+            script.write_text("pass\n", encoding="utf-8")
+            argv = [str(script.resolve()), "--offline"]
+            sha = hashlib.sha256(script.read_bytes()).hexdigest()
+            entry = {"argv": argv, "sha256": sha}
+            with self.assertRaisesRegex(ThirdPartyApprovalError, "APPROVAL_REQUIRED"):
+                validated_offline_processing(work, [entry])
+            approval, _ = self._approval(
+                work, action="execute", digest="sha256:" + sha,
+                purpose="Bound offline image processing",
+                data_scope="offline_processing:" + stable_hash(argv),
+                workflow_reuse=True,
+            )
+            bound = validated_offline_processing(work, [{**entry, "approval_path": str(approval)}])
+            self.assertEqual(bound[0]["argv"], argv)
+            self.assertEqual(bound[0]["sha256"], sha)
+            self.assertIs(bound[0]["reusable"], True)
+            self.assertIn("expires_at_utc", bound[0])
+            script.write_text("pass # changed\n", encoding="utf-8")
+            with self.assertRaisesRegex(ThirdPartyApprovalError, "SCRIPT_MISMATCH"):
+                validated_offline_processing(work, [{**entry, "approval_path": str(approval)}])
+
+
+    def test_offline_validation_is_pure_and_consumption_requires_exact_durable_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work = self._workspace(root)
+            script = root / "fixture.py"
+            script.write_text("pass\n", encoding="utf-8")
+            argv = [str(script.resolve()), "--offline"]
+            sha = hashlib.sha256(script.read_bytes()).hexdigest()
+            approval, _ = self._approval(
+                work, action="execute", digest="sha256:" + sha,
+                purpose="Bound offline image processing",
+                data_scope="offline_processing:" + stable_hash(argv),
+            )
+            entries = [{"argv": argv, "sha256": sha, "approval_path": str(approval)}]
+            bound = validated_offline_processing(work, entries)
+            self.assertIsNone(json.loads(approval.read_text(encoding="utf-8"))["consumed_at_utc"])
+            task_path = work / "task.json"
+            task_path.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ThirdPartyApprovalError, "BINDING_MISMATCH"):
+                consume_offline_processing(work, entries, binding_path=task_path)
+            self.assertIsNone(json.loads(approval.read_text(encoding="utf-8"))["consumed_at_utc"])
+            task = {
+                "schema": "parr0t.data-plane-task.v1", "worker_role": "image_ui_inventory",
+                "offline_processing": bound,
+            }
+            task["task_id"] = stable_hash(task)
+            task_path.write_text(json.dumps(task), encoding="utf-8")
+            with _approval_lock(approval):
+                with self.assertRaisesRegex(ThirdPartyApprovalError, "BUSY"):
+                    consume_offline_processing(work, entries, binding_path=task_path)
+            self.assertIsNone(json.loads(approval.read_text(encoding="utf-8"))["consumed_at_utc"])
+            self.assertEqual(consume_offline_processing(work, entries, binding_path=task_path), bound)
+            receipt = json.loads(approval.read_text(encoding="utf-8"))
+            self.assertIsNotNone(receipt["consumed_at_utc"])
+            self.assertEqual(consume_offline_processing(work, entries, binding_path=task_path), bound)
+            self.assertEqual(validated_offline_processing(work, entries, binding_path=task_path), bound)
+            other_task = work / "other-task.json"
+            other_task.write_bytes(task_path.read_bytes())
+            with self.assertRaisesRegex(ThirdPartyApprovalError, "CONSUMED"):
+                consume_offline_processing(work, entries, binding_path=other_task)
+            task["additional_scope"] = "changed"
+            task["task_id"] = stable_hash({key: value for key, value in task.items() if key != "task_id"})
+            task_path.write_text(json.dumps(task), encoding="utf-8")
+            with self.assertRaisesRegex(ThirdPartyApprovalError, "CONSUMED"):
+                consume_offline_processing(work, entries, binding_path=task_path)
 
 
 if __name__ == "__main__":

@@ -68,10 +68,11 @@ function authority(ctx) {
 }
 function parameters(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)
-      || Object.keys(input).some(key => !["mode", "logs"].includes(key))
-      || !["analysis", "shutdown"].includes(input.mode)
+      || Object.keys(input).some(key => !["mode", "logs", "user_requested"].includes(key))
+      || !["localization", "pause", "analysis", "shutdown"].includes(input.mode)
+      || input.user_requested !== true
       || (input.logs !== undefined && (!Array.isArray(input.logs) || input.logs.some(log => typeof log !== "string" || !log.trim() || log.includes("\0"))))
-      || (input.mode !== "analysis" && input.logs?.length)) fail("invalid lifecycle request");
+      || (input.mode !== "analysis" && input.logs?.length)) fail("invalid lifecycle request: explicit user_requested assertion required");
 }
 // Called before either extension's role-specific tool policy, including root.
 export function checkFrameworkToolCall(event, ctx, workspace, depth = 0) {
@@ -113,10 +114,65 @@ export function checkFrameworkToolCall(event, ctx, workspace, depth = 0) {
   }
   if (tool === "write" && typeof input.path === "string" && /^xd:\/\//i.test(decode(input.path))) {
     const device = name(input.path);
-    if (MUTATORS.has(device) || WRAPPERS.has(device) || device === TOOL) {
+    if (device === TOOL) fail("lifecycle changes require the registered root tool, not a writable device");
+    if (MUTATORS.has(device) || WRAPPERS.has(device)) {
       checkFrameworkToolCall({ toolName: device, input: input.content }, ctx, workspace, depth + 1);
     }
   }
+}
+
+function privateFrameworkTarget(target, workspace, cwd) {
+  const decoded = decode(target);
+  if (/^(?:agent|history|sessions?|irc):\/\//i.test(decoded)) return true;
+  let local = decoded;
+  if (/^file:\/\//i.test(decoded)) {
+    // Preserve escaped filename characters until URL conversion.
+    const url = /^file:\/\//i.test(target) ? target : decoded;
+    local = fileURLToPath(url.replace(/:(?:raw(?::.*)?|[-\d,+:]+(?::raw)?)$/i, ""));
+  } else if (/^[a-z][a-z0-9+.-]*:\/\//i.test(decoded)) return false;
+  const relative = path.relative(workspace, resolvedTarget(local.replace(/:(?:raw(?::.*)?|[-\d,+:]+(?::raw)?)$/i, ""), cwd)).replace(/\\/g, "/");
+  return /^\.game-l10n\/(?:data-plane|native\/(?:tasks|results)|diagnostics\/logs)(?:\/|$)/.test(relative)
+    && !/(?:^|\/)(?:relay|receipt|control-envelope(?:\.[^/]*)?)\.json$/.test(relative);
+}
+
+export function hasFrameworkExposure(event, ctx, workspace) {
+  if (ctx.agent?.kind !== "main" || event.isError || !event.input) return false;
+  const tool = name(event.toolName);
+  if (/(?:history|sessions?|messages?|irc)/.test(tool)) return true;
+  const input = event.input;
+  if (tool === "task") return (input.tasks ?? [input]).some(item =>
+    item.agent === "seance" || (typeof item.sourceSession === "string" && item.sourceSession.trim()));
+  // Glob returns filenames only. A public grep zero-match receipt contains no
+  // semantic source; never infer exposure from its searched directory alone.
+  if (tool === "glob" || (tool === "grep" && event.details?.matchCount === 0)) return false;
+  if (!["read", "grep"].includes(tool)) return false;
+  if (tool === "grep") {
+    const files = event.details?.files ?? event.details?.fileMatches?.map(file => file.path);
+    if (Array.isArray(files) && files.length) {
+      const bases = [ctx.cwd];
+      for (const key of ["cwd", "searchPath"]) {
+        if (typeof event.details[key] === "string") bases.push(event.details[key]);
+      }
+      // Use public returned-file provenance, including a broad "." search;
+      // do not inspect source snippets or mistake metadata-only hits for leaks.
+      return files.some(file => typeof file === "string" && bases.some(base =>
+        privateFrameworkTarget(file, workspace, base)));
+    }
+  }
+  for (const field of ["path", "target", "uri", "url"]) {
+    if (typeof input[field] === "string" && input[field].split(";").some(target =>
+      privateFrameworkTarget(target, workspace, ctx.cwd))) return true;
+  }
+  return false;
+}
+
+export async function recordFrameworkExposure(event, ctx, workspace) {
+  if (!hasFrameworkExposure(event, ctx, workspace)) return;
+  const result = await invoke(pythonFromPath(), [
+    "record-control-plane-leak", "--workspace", workspace,
+    "--incident-code", "parent_opened_data_plane",
+  ], workspace);
+  if (result.isError) fail("source/history exposure recorded incompletely; stop localization and repair control state");
 }
 function pythonFromPath() {
   for (const executable of process.platform === "win32" ? ["python.exe", "python3.exe"] : ["python3", "python"]) {
@@ -170,10 +226,13 @@ async function invoke(executable, argv, workspace, proof, signal) {
     if (signal?.aborted) cancel();
     child.once("error", () => { signal?.removeEventListener("abort", cancel); reject(new Error(PREFIX + "native invocation failed")); });
     child.stdin.on("error", () => {}); // Early Python rejection may close stdin.
-    child.stdin.end(JSON.stringify(proof));
+    child.stdin.end(proof === undefined ? undefined : JSON.stringify(proof));
     child.once("close", (code, terminationSignal) => {
       signal?.removeEventListener("abort", cancel);
-      const clean = stream => Buffer.concat(chunks[stream]).toString("utf8").replaceAll(proof.token, "[redacted]");
+      const clean = stream => {
+        const text = Buffer.concat(chunks[stream]).toString("utf8");
+        return proof === undefined ? text : text.replaceAll(proof.token, "[redacted]");
+      };
       const details = { exitCode: code, signal: terminationSignal, stdout: clean("stdout"), stderr: clean("stderr"), cancelled: Boolean(signal?.aborted), outputComplete: !truncated };
       resolve({ content: [{ type: "text", text: JSON.stringify(details) }], details, isError: code !== 0 || details.cancelled || truncated });
     });
@@ -183,22 +242,19 @@ export default function registerFrameworkModeApproval(pi, getWorkspace) {
   const z = pi.zod;
   pi.registerTool({
     name: TOOL,
-    label: "Parr0t Framework Mode (User Approval)",
-    description: "Root-only lifecycle change. Requires an interactive host confirmation of the exact workspace, mode and diagnostic log paths; flags are not user consent.",
-    parameters: z.object({ mode: z.string(), logs: z.array(z.string()).optional() }).strict(),
+    label: "Parr0t Framework Mode (Root User Request)",
+    description: "Root-only lifecycle change bound to an explicit user request. Set user_requested:true only for the user's requested pause, analysis, shutdown or clean localization resume; no additional interactive dialog.",
+    parameters: z.object({ mode: z.string(), user_requested: z.boolean(), logs: z.array(z.string()).optional() }).strict(),
     async execute(_id, input, signal, _onUpdate, ctx) {
       const identity = authority(ctx);
       parameters(input);
-      if (ctx.hasUI !== true || typeof ctx.ui?.confirm !== "function") fail("interactive user confirmation unavailable");
       if (signal?.aborted) fail("request cancelled");
       const workspace = realpathSync(getWorkspace(ctx));
       const logs = (input.logs ?? []).map(log => path.resolve(workspace, log));
       const current = revision(workspace);
       const request = { mode: input.mode };
-      const message = [`Workspace: ${JSON.stringify(workspace)}`, `Mode: ${request.mode}`, "Selected diagnostic logs:", JSON.stringify(logs)].join("\n");
-      if (await ctx.ui.confirm("Approve Parr0t framework mode change?", message) !== true) fail("user cancelled lifecycle change");
       const after = authority(ctx);
-      if (identity.agent !== after.agent || identity.session !== after.session || realpathSync(getWorkspace(ctx)) !== workspace || revision(workspace) !== current) fail("host session or lifecycle changed during confirmation");
+      if (identity.agent !== after.agent || identity.session !== after.session || realpathSync(getWorkspace(ctx)) !== workspace || revision(workspace) !== current) fail("host session or lifecycle changed during authorization");
       if (signal?.aborted) fail("request cancelled");
       const python = pythonFromPath();
       const id = randomBytes(16).toString("hex");

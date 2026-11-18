@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -32,9 +32,11 @@ function host(workspace, kind = "main", depth = 0, name = "Anything", factory = 
   const shape = { optional() { return this; }, strict() { return this; } };
   const pi = {
     registerFlag() {}, getFlag() { return kind === "main" ? workspace : undefined; },
-    zod: { string: () => shape, array: () => shape, object: () => shape },
+    zod: { string: () => shape, boolean: () => shape, array: () => shape, object: () => shape },
     on(name, handler) { handlers.set(name, handler); },
     registerTool(tool) { tools.set(tool.name, tool); },
+    getAllTools() { return [...tools.values()]; },
+    getActiveTools() { return [...tools.keys()]; },
   };
   const ctx = {
     cwd: workspace,
@@ -73,8 +75,9 @@ async function fixture(factory = guard) {
   };
   writeJson(relayPath, relayMetadata);
   const taskPath = path.join(workspace, relayMetadata.task_path);
-  function setPolicy({ semantic = false, network = false, sources = [] } = {}) {
+  function setPolicy({ semantic = false, network = false, sources = [], ...payload } = {}) {
     writeJson(taskPath, {
+      ...payload,
       content_source_policy: {
         schema: "parr0t.content-source-policy.v1",
         policy_digest: semantic ? "synthetic-semantic-policy" : "synthetic-inventory-policy",
@@ -273,10 +276,13 @@ describe("live framework instruction lifecycle", () => {
     const policy = await reviewer.emit("before_agent_start", { prompt: "Inspect reusable code directly", systemPrompt: ["Host policy"] });
     expect(policy.systemPrompt[0]).toBe("Host policy");
     let delivered = 0;
-    for (const toolName of ["read", "bash", "eval", "lsp"]) {
-      await reviewer.call(toolName, { path: "synthetic.py", code: "synthetic", command: "synthetic" }, () => delivered++);
+    for (const toolName of ["read", "lsp"]) {
+      await reviewer.call(toolName, { path: "synthetic.py", action: "diagnostics" }, () => delivered++);
     }
-    expect(delivered).toBe(4);
+    expect(delivered).toBe(2);
+    for (const toolName of ["bash", "eval", "builtin"]) {
+      expect((await reviewer.call(toolName, { command: "write agent://Main", code: "tool.write({path:'agent://Main'})" })).block).toBe(true);
+    }
     const execution = await reviewer.exec({ argv: ["-c", "print('SYNTHETIC_DIAGNOSTIC_EXEC')"] });
     expect(execution.isError).toBe(false);
     expect(execution.details.stdout.trim()).toBe("SYNTHETIC_DIAGNOSTIC_EXEC");
@@ -287,7 +293,7 @@ describe("live framework instruction lifecycle", () => {
     Object.assign(descendant.ctx.agent, { id: "DiagnosticReview-2", parentId: reviewer.ctx.agent.id });
     await descendant.emit("session_start");
     await descendant.emit("before_agent_start", { prompt: "Inspect code", systemPrompt: [] });
-    expect((await descendant.call("bash", { command: "synthetic" }))?.block).not.toBe(true);
+    expect((await descendant.call("bash", { command: "synthetic" })).block).toBe(true);
     writeJson(path.join(f.workspace, ".game-l10n/framework-session.json"), framework("shutdown", 2));
     expect((await reviewer.call("bash", { command: "synthetic" })).block).toBe(true);
     writeJson(path.join(f.workspace, ".game-l10n/framework-session.json"), framework("localization", 3));
@@ -374,6 +380,152 @@ describe("file-backed OMP host/message isolation", () => {
     expect((await worker.call("glob", { path: task }))?.block).not.toBe(true);
     expect((await worker.call("read", { path: path.join(f.workspace, "..", "outside.json") })).block).toBe(true);
   });
+  test("unchanged exact inventory assets and approved offline scripts work without external-source grants", async () => {
+    const f = await fixture();
+    const game = mkdtempSync(path.join(os.tmpdir(), "parr0t-bound-asset-"));
+    temporary.push(game);
+    const asset = path.join(game, "synthetic-image.bin");
+    const other = path.join(game, "unbound.bin");
+    writeFileSync(asset, "synthetic pixels");
+    writeFileSync(other, "not granted");
+    const output = path.join(f.workspace, "localized.json");
+    const script = path.join(f.workspace, "approved-offline.py");
+    writeFileSync(script, "import json,sys\nfrom pathlib import Path\nPath(sys.argv[2]).write_text(json.dumps({'bytes':len(Path(sys.argv[1]).read_bytes())}))\n");
+    const argv = [script, asset, output];
+    const digest = file => createHash("sha256").update(readFileSync(file)).digest("hex");
+    const payload = {
+      semantic: true, output_artifact: output,
+      bound_local_assets: [{ path: asset, sha256: digest(asset) }],
+      offline_processing: [{ argv, sha256: digest(script) }],
+    };
+    f.setPolicy(payload);
+    const worker = await f.child(2);
+    expect((await worker.call("read", { path: asset }))?.block).not.toBe(true);
+    for (const path of [game, other, `${game}/*`]) expect((await worker.call("read", { path })).block).toBe(true);
+    expect((await worker.call("parr0t_exec", { argv }))?.block).not.toBe(true);
+    expect((await worker.exec({ argv })).isError).toBe(false);
+    expect(JSON.parse(readFileSync(output, "utf8"))).toEqual({ bytes: 16 });
+    const replay = await worker.exec({ argv });
+    expect(replay.isError).toBe(true);
+    expect(replay.details.stderr).toContain("E_OFFLINE_PROCESS_SCOPE");
+    const reusable = { ...payload.offline_processing[0], reusable: true };
+    f.setPolicy({ ...payload, offline_processing: [reusable] });
+    expect((await worker.exec({ argv })).isError).toBe(false);
+    f.setPolicy({ ...payload, offline_processing: [{ ...reusable, expires_at_utc: "2000-01-01T00:00:00+00:00" }] });
+    expect((await worker.call("parr0t_exec", { argv })).block).toBe(true);
+    f.setPolicy(payload);
+    expect((await worker.call("parr0t_exec", { argv: [...argv, "extra"] })).block).toBe(true);
+    expect((await worker.call("lsp", { file: f.relayMetadata.task_path, action: "diagnostics" }))?.block).not.toBe(true);
+    expect((await worker.call("ast_edit", { paths: [output], ops: [] }))?.block).not.toBe(true);
+    expect((await worker.call("ast_edit", { paths: [asset], ops: [] })).block).toBe(true);
+    writeFileSync(asset, "changed");
+    expect((await worker.call("read", { path: asset })).block).toBe(true);
+    expect((await worker.call("parr0t_exec", { argv })).block).toBe(true);
+    writeFileSync(asset, "synthetic pixels");
+    writeFileSync(script, "print('changed')");
+    expect((await worker.call("parr0t_exec", { argv })).block).toBe(true);
+  });
+
+  test("offline processing denies unbound reads, network and subprocesses even inside an approved script", async () => {
+    const f = await fixture();
+    const script = path.join(f.workspace, "approved-scoped.py");
+    const privateFile = path.join(f.workspace, "unbound-private.txt");
+    writeFileSync(privateFile, "not granted");
+    for (const code of [
+      `from pathlib import Path\nPath(${JSON.stringify(privateFile)}).read_bytes()\n`,
+      "import socket\nsocket.socket()\n",
+      "import subprocess\nsubprocess.run(['python','--version'])\n",
+    ]) {
+      writeFileSync(script, code);
+      const argv = [script];
+      f.setPolicy({ semantic: true, offline_processing: [{ argv, sha256: createHash("sha256").update(code).digest("hex") }] });
+      const worker = await f.child(2);
+      const result = await worker.exec({ argv });
+      expect(result.isError).toBe(true);
+      expect(result.details.stderr).toContain("E_OFFLINE_PROCESS_SCOPE");
+      expect(result.details.stdout).toBe("");
+    }
+  });
+
+  test("worker LSP keeps bound source immutable while admitting bounded read-only actions", async () => {
+    const f = await fixture();
+    const game = mkdtempSync(path.join(os.tmpdir(), "parr0t-lsp-source-"));
+    temporary.push(game);
+    const source = path.join(game, "unchanged-source.txt");
+    const destination = path.join(f.workspace, "arbitrary-renamed.txt");
+    const data = "synthetic unchanged source";
+    writeFileSync(source, data);
+    f.setPolicy({ semantic: true, bound_local_assets: [{
+      path: source, sha256: createHash("sha256").update(data).digest("hex"),
+    }] });
+    const worker = await f.child(2);
+    let reads = 0;
+    for (const action of ["diagnostics", "hover", "symbols"]) {
+      const decision = await worker.call("lsp", { action, file: source }, input => {
+        expect(readFileSync(input.file, "utf8")).toBe(data);
+        reads++;
+      });
+      expect(decision?.block).not.toBe(true);
+    }
+    expect(reads).toBe(3);
+    let mutations = 0;
+    for (const input of [
+      { action: "rename_file", file: source, new_name: destination },
+      { action: "rename_file", file: source, new_name: destination, apply: false },
+      { action: "rename", file: source, new_name: "other", apply: true },
+      { action: "code_actions", file: source, apply: true },
+      { action: "request", file: source, method: "workspace/executeCommand" },
+      { action: "reload", file: source },
+      { action: "diagnostics", file: source, new_name: destination },
+      { action: "hover", file: source, apply: true },
+      { action: "diagnostics", path: source, file: destination },
+    ]) {
+      const decision = await worker.call("lsp", input, () => {
+        mutations++;
+        renameSync(source, destination);
+      });
+      expect(decision?.block).toBe(true);
+    }
+    expect(mutations).toBe(0);
+    expect(readFileSync(source, "utf8")).toBe(data);
+    expect(existsSync(destination)).toBe(false);
+  });
+  test("inspection-only image inventory enforces unchanged assets and approved offline argv without translation approval", async () => {
+    const f = await fixture();
+    const game = mkdtempSync(path.join(os.tmpdir(), "parr0t-inspection-bound-"));
+    temporary.push(game);
+    const asset = path.join(game, "selected-image.bin");
+    const unrelated = path.join(game, "unrelated-image.bin");
+    writeFileSync(asset, "fixture image bytes");
+    writeFileSync(unrelated, "not authorized");
+    const output = path.join(f.workspace, "inspection-result.json");
+    const script = path.join(f.workspace, "approved-inspection.py");
+    writeFileSync(script, "import sys\nfrom pathlib import Path\nPath(sys.argv[2]).write_bytes(Path(sys.argv[1]).read_bytes())\n");
+    const argv = [script, asset, output];
+    const digest = file => createHash("sha256").update(readFileSync(file)).digest("hex");
+    f.setPolicy({ semantic: false, worker_role: "image_ui_inventory",
+      bound_local_assets: [{ path: asset, sha256: digest(asset) }],
+      output_artifact: output, offline_processing: [{ argv, sha256: digest(script) }] });
+    const worker = await f.child(2);
+    expect((await worker.call("read", { path: asset }))?.block).not.toBe(true);
+    expect((await worker.call("read", { path: path.join(f.workspace, f.relayMetadata.task_path) }))?.block).not.toBe(true);
+    for (const path of [game, unrelated, `${game}/*`, f.workspace]) {
+      for (const tool of ["read", "grep", "glob"]) expect((await worker.call(tool, { path })).block).toBe(true);
+    }
+    expect((await worker.call("write", { path: asset, content: "changed" })).block).toBe(true);
+    expect((await worker.call("write", { path: path.join(f.workspace, "unbound.json"), content: "{}" })).block).toBe(true);
+    expect((await worker.call("parr0t_exec", { argv: ["-c", "print('unbound')"] })).block).toBe(true);
+    await expect(worker.exec({ argv: ["-c", "print('unbound')"] })).rejects.toThrow("network-denied");
+    expect((await worker.exec({ argv })).isError).toBe(false);
+    expect(readFileSync(output, "utf8")).toBe("fixture image bytes");
+    const task = JSON.parse(readFileSync(path.join(f.workspace, f.relayMetadata.task_path), "utf8"));
+    expect(task.content_source_policy.semantic_content_generation).toBe(false);
+    expect(task.content_source_policy.allowed_external_sources).toEqual([]);
+    writeFileSync(asset, "changed after task binding");
+    expect((await worker.call("read", { path: asset })).block).toBe(true);
+    expect((await worker.call("parr0t_exec", { argv })).block).toBe(true);
+  });
+
   test("semantic workers admit only an exact externally granted read target", async () => {
     const f = await fixture();
     const exact = "https://example.invalid/exact-source";
@@ -418,6 +570,20 @@ describe("file-backed OMP host/message isolation", () => {
       }
     }
   });
+  test("worker model selectors preserve host-supported literal spaces and reject controls, paths and aliases", async () => {
+    const f = await fixture();
+    const relay = await f.child(1);
+    for (const model of ["vendor/model name", "vendor/\uBAA8\uB378 name@upstream:high"]) {
+      const decision = await relay.call("task", { tasks: [{ task: "Synthetic exact-bound work", model }] });
+      expect(decision?.block).not.toBe(true);
+      expect(decision.input.tasks[0].model).toBe(model);
+    }
+    for (const model of [" vendor/model", "vendor/model ", "vendor/model\tname", "vendor/model\u200bname",
+      "vendor/*", "vendor/[model]", "vendor/../model", "C:/model", "/vendor/model", "~model", "@task", "inherit"]) {
+      expect((await relay.call("task", { tasks: [{ task: "Synthetic work", model }] })).block).toBe(true);
+    }
+  });
+
   test("relay task remains available, workers cannot delegate or wait", async () => {
     const f = await fixture();
     const relay = await f.child(1);
@@ -498,6 +664,7 @@ describe("file-backed OMP host/message isolation", () => {
       writeFileSync(guardPath, readFileSync(template));
       writeFileSync(path.join(path.dirname(guardPath), "framework-mode-approval.mjs"), readFileSync(path.join(path.dirname(template), "framework-mode-approval.mjs")));
       writeFileSync(path.join(packageRoot, "templates/native-relay-lifecycle.mjs"), readFileSync(path.join(path.dirname(template), "native-relay-lifecycle.mjs")));
+      writeFileSync(path.join(packageRoot, "templates/omp-prompt-isolation.mjs"), readFileSync(path.join(path.dirname(template), "omp-prompt-isolation.mjs")));
       writeFileSync(path.join(packageRoot, "templates/native-python.py"), readFileSync(path.join(path.dirname(template), "native-python.py")));
       writeFileSync(path.join(packageRoot, "__init__.py"), "");
       const cliPath = path.join(packageRoot, "cli.py");
@@ -615,6 +782,7 @@ describe("file-backed OMP host/message isolation", () => {
     writeFileSync(copied, original);
     writeFileSync(path.join(path.dirname(copied), "framework-mode-approval.mjs"), readFileSync(path.join(path.dirname(template), "framework-mode-approval.mjs")));
     writeFileSync(path.join(path.dirname(copied), "native-relay-lifecycle.mjs"), readFileSync(path.join(path.dirname(template), "native-relay-lifecycle.mjs")));
+    writeFileSync(path.join(path.dirname(copied), "omp-prompt-isolation.mjs"), readFileSync(path.join(path.dirname(template), "omp-prompt-isolation.mjs")));
     const loaded = (await import(pathToFileURL(copied).href)).default;
     const root = host(f.workspace, "main", 0, "Anything", loaded);
     await root.emit("session_start");

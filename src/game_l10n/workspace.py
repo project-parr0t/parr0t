@@ -20,6 +20,7 @@ from .errors import ConfigurationError
 from .language_policy import (
     LANGUAGE_POLICY_PATH,
     LANGUAGE_POLICY_SCHEMA,
+    normalize_language_tag,
     require_target_language_policy,
 )
 from .privacy import require_external_workdir, scan_tools
@@ -78,11 +79,6 @@ CONFIG_TEMPLATE: dict[str, Any] = {
             "max_output_tokens": 8192,
             "review_verdict_format": "plain",
             "task_max_output_tokens": {"game_translation_review_judge": 24},
-            "task_max_input_chars": {
-                "game_translation": 24000,
-                "game_translation_review_judge": 24000,
-                "game_translation_review_rewrite": 24000
-            },
         },
         {
             "name": "openai-sol",
@@ -101,8 +97,8 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "context_analyzers": ["openai-sol", "deepseek"],
         "translators": ["openai-luna", "openai-sol", "deepseek"],
         "translator_retries": {
-            "openai-luna": 5,
-            "openai-sol": 3,
+            "openai-luna": 0,
+            "openai-sol": 0,
         },
         "review_triagers": ["openai-luna"],
         "reviewers": ["openai-sol", "deepseek"],
@@ -118,7 +114,7 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         ],
         "require_review": True,
         "review_max_rounds": 2,
-        "review_attempt_limits": {"openai-sol": 2},
+        "review_attempt_limits": {"openai-sol": 2, "deepseek": 3},
         "max_workers": 8,
         "context_max_workers": 6,
         "retry_refusals_once": False,
@@ -131,7 +127,7 @@ CONFIG_TEMPLATE: dict[str, Any] = {
             "timeout",
             "integrity_invalid"
         ],
-        "defer_fallbacks_until_primary_complete": True,
+        "defer_fallbacks_until_primary_complete": False,
         "preserve_source_on_failure": True,
         "review_refusal_policy": "fallback",
     },
@@ -144,7 +140,7 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "unpack": ["python", "tools/unpack.py", "{input}", "{output}"],
         "pack": ["python", "tools/pack.py", "{input}", "{output}"],
     },
-    "repository": {"initial_choice": "pending"},
+    "repository": {"initial_choice": "disabled"},
     "sdk_selection": {
         "status": "pending",
         "inventory_fingerprint": "",
@@ -155,18 +151,18 @@ CONFIG_TEMPLATE: dict[str, Any] = {
     "execution": {
         "scope_mode": "minimum_requested_artifact",
         "validation_profile": "proportional",
-        "same_failure_limit": 2,
         "reuse_unchanged_checks": True,
         "delegate_simple_tasks": False,
         "native_shard_policy_version": 5,
         "native_shard_records": 64,
         "native_shard_min_records": 8,
         "native_shard_material_tokens": 8000,
-        "native_review_shard_records": 2048,
+        "native_review_shard_records": 256,
         "native_review_shard_min_records": 64,
-        "native_review_shard_material_tokens": 262144,
+        "native_review_shard_material_tokens": 65_536,
+        "native_review_split_max_depth": 11,
+        "native_review_split_max_record_amplification": None,
         "large_inventory_threshold_records": 10000,
-        "startup_full_inventory_scan_limit": 2,
         "startup_per_record_artifacts_allowed": False,
         "startup_attestation_fast_path": True,
         "native_worker_history": "none",
@@ -183,12 +179,9 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "max_root_model_calls_per_turn": None,
         "max_root_input_tokens_per_turn": None,
         "max_root_progress_messages_per_wave": 0,
-        "max_worker_model_calls_per_task": 16,
-        "max_semantic_model_calls_per_task": 1,
         "per_record_semantic_call_loop_allowed": False,
         "detail_contract_schema": "parr0t.detail-contract.v1",
         "free_form_execution_contract_allowed": False,
-        "bulk_budget_gate_records": 4096,
         "bulk_max_elapsed_minutes": None,
         "bulk_max_input_tokens": None,
         "bulk_max_provider_cost_usd": None,
@@ -213,23 +206,17 @@ CONFIG_TEMPLATE: dict[str, Any] = {
         "rotate_after_leak": True,
         **CONTROL_OBSERVATION_POLICY,
     },
-    "image_localization": {
-        "default_policy": "disabled",
-        "explicit_user_request_required": True,
-        "definite_player_visible_ui_binding_required": True,
-        "recursive_ocr_allowed": False,
-    },
     "coverage": {
         "require_independent_inventory": True,
         "separate_static_and_runtime_completion": True,
         "runtime_execution_requires_user_approval": True,
     },
     "failure_queue": {
-        "resume_only_after_user_request": True,
-        "hold_patch_when_blocking_target_fails": True,
+        "automatic_resume": True,
+        "allow_incomplete_artifact": False,
     },
     "release_checkpoint": {
-        "required_for_distribution": True,
+        "required_for_distribution": False,
         "reuse_verified_unchanged_targets": True,
         "selective_user_corrections": True,
         "locale_fallback": "best_effort_declared",
@@ -256,32 +243,32 @@ This private workspace contains game data. Resolve Parr0t from `game-l10n.json`;
 ## First action
 
 1. Before listing, opening, searching, or reading any file inside a configured game root, read the repository `AGENTS.md` and `docs/agent-usage.md`.
-2. Run `game-l10n status --workspace <this-directory>` and perform only its single `next_actions` entry.
+2. Run `game-l10n status --workspace <this-directory>`. Follow its primary action and any independently ready `parallel_work`; do not make unrelated failures a whole-job stop.
 3. For `establish_text_free_control_plane`, read the required contracts and run `game-l10n enter-control-plane --workspace <this-directory> --contracts-read --source-unopened`. After exposure, record a leak; use rotation or explicit incident acceptance under the core contract.
-4. Resolve later `required_contracts` against `contract_base`; reuse unchanged checkpoints. Localization ends only at attested `local_patch_ready`; explicit framework shutdown/analysis withdraws localization-only directives under the core contract.
+4. Resolve later `required_contracts` against `contract_base`; reuse unchanged digests/checkpoints. Localization ends at honestly attested `local_patch_ready`; explicit pause, analysis or shutdown suspends work. A clean suspension can resume in the same session; actual exposure requires canonical recovery.
 
 ## Core contract
 
 - Apply the repository `skills/request-scope-guard/SKILL.md` after every scope-changing user message and before optional or external effects. Git, provider, installation, launch, and publication permissions are separate; never infer one from access or another approval.
-- Deny unapproved third parties. Apply `skills/third-party-consent/SKILL.md`; require risk disclosure, explicit user approval, and a consumed core record. Exact locked dependencies are preapproved only after complete validation finds no known supply-chain attack history.
-- Apply `skills/translation-source-isolation/SKILL.md` to every semantic localization worker. It defines default-deny content access, exact task-bound grants, immutable policy/direct-model provenance, and taint rejection.
+- Deny unapproved third parties. Apply `skills/third-party-consent/SKILL.md`; record explicit consent once for its exact component, action, purpose and data scope. Reuse only an explicitly reusable unchanged workflow grant. Fully validated immutable dependencies retain their scoped exception.
+- Apply `skills/translation-source-isolation/SKILL.md` to semantic workers. Preserve selected-model provenance and task bindings; reuse already-approved sources within their scope, and version explicit authorization additions without relabeling old tasks or successes.
 - Select and activate the exact engine/version SDK before data-plane work. A different SDK may be a bound `reference` for `derive-new`; generated pass-through tools are not an adapter.
-- Require two independent complete ordered inventories, typed context analysis, primary translation, translation fallback for failures only, complete low-cost triage, selective strong review for flags/risk/sample, flagged-only rewrite, review fallback for failures only, deterministic validation, then packing. Do not shrink scope or reorder barriers.
+- Honor the selected coverage assurance mode and typed context. Translate, review, repair and validate independent ready cohorts without whole-job barriers; failed-only fallback follows the configured authorized route order. Never claim independent coverage in primary-only mode.
 - During localization, root observes only core metadata, validated envelopes/receipts, relay lifecycle, and core-owned usage; never private data or nested-worker output/status. Follow `docs/control-plane-contract.md` for exposure.
-- Prepared relays alone own data-plane work. A v4 context relay starts all bound slots before endings, records lifecycle through core, finalizes in source order, seals once, and returns only its receipt. Parent never reads private data or dispatches workers directly.
-- Record exposure; rotate by default. Explicit incident acceptance follows `docs/control-plane-contract.md`. Only the top-level controller may request shutdown/analysis through host-confirmed one-shot user approval; `--user-requested` alone, failures, relays and workers grant no authority. Analysis reads only approved diagnostic snapshots. Never auto-launch replacements or treat exposed history as clean.
+- Prepared relays own data-plane work. Record each actually admitted slot's lifecycle, represent denied/unstarted slots honestly, and finalize successful fragments in source order. Failure termination does not require a fictitious start or successful finalizer. Parent never reads private data or dispatches workers directly.
+- Only the actual root may change lifecycle after an explicit user request. No second UI dialog is required; host-bound operation proofs still exclude workers. Clean pause/analysis/shutdown can resume without rotation; private diagnostic log exposure still requires canonical fresh recovery.
 - Normalize every refusal to `fallback_required` / “폴백 처리 필요”. It is a routing event, never an exclusion, batch cancellation, or content decision. `source_preserved` requires route evidence that every configured route was attempted and exhausted.
 - Use the locked target language (default: Korean). Another language requires `target-language-policy --user-requested`. Preserve relevant context, meaning, function, natural tone, voice, terminology, allusions, placeholders, markup, control codes, conditions, units, and order.
-- Provider roles are fixed by the selected preset. An API key does not select or alter a mode. Fresh native workers use no parent history and return metadata only. Manual/fallback handoff uses only `parr0t.translation-exchange/v1`.
-- Send external fallback only through the configured adapter. No job-local API loop, embedded context pack, or unchanged-success resend is allowed. Its per-target input preflight queues an oversized target without a network call or scope reduction.
-- Build and validate recoverable output here. Never mutate or launch the real game during automated validation. Real install, update, remove/restore, and launch each require their own explicit one-shot authorization.
-- Retryable failures stay in the metadata-only failure queue. Terminal source-preserved outcomes are recorded separately and are not retried as pending work; `metadata.blocking_on_failure=true` holds the entire patch.
+- Provider presets supply defaults, not frozen role chains. An API key never changes transport or permissions. Exact native models and approved adapter roles remain explicit; fresh workers inherit no parent history and return metadata only.
+- Use the configured fallback role, not a hard-coded provider alias. Reuse immutable context and successes. Capacity errors require safe sharding/compaction or concrete repair, not a fabricated user-budget exhaustion.
+- Build and validate recoverable output here. Approved offline SDK/parser/build tools are not game execution. Real install, update, restore/remove and launch remain separate explicitly authorized effects; bounded reuse must have been authorized.
+- Retry authorized recoverable failures automatically; respect an actual user pause/stop. Operational/admission errors advance only unfinished targets through a fresh core-selected approved native manifest or report actionable repair. Never count an unstarted request as semantic exhaustion. Unsafe blocking targets remain held unless a distinct, honestly incomplete artifact is explicitly authorized.
 - Keep publication dormant and unmentioned until the user requests it. SDK promotion also requires confirmed patch success and the original exact target identity. Its separate engine-only commit must pass `game-l10n verify-sdk-promotion`; never mix a `main`-owned path into that commit.
 - Native orchestration uses one disposable isolated relay per authorized wave and only the `native-pass-step` artifact. After termination run `--relay-ended`; core preserves results and queues missing tasks. Reload prose only when the contract digest/generation changes.
-- OMP defaults to prompt-only no-history/no-messaging instructions and normal tools; guards are optional. Preserve modes and worker bindings; see `docs/control-plane-contract.md`.
-- V7 tasks embed bound segments; never open the full source. Review starts at 256 records/65,536 estimated tokens or less (hard ceilings: 2,048/262,144). One semantic call ends the worker; core locks successes and emits smaller failed-only manifests.
-- Use proportional checks. Large inventories scan once per method and continue cached gap work while score improves. Use one cached residual task under `execution.residual_direct_records`; no local scheduler or supplemental pack. A native capacity failure must not auto-restart the root turn. Aggregate per wave; keep transitions silent; report only pass/checkpoint completion or blockers. Unchanged-observation limits belong only to `native-pass-step` waves, never data-plane stages or the job.
-- Never solicit whole-job usage ceilings. None applies unless user-stated and manifest-recorded; telemetry cannot stop work. Only reached DeepSeek fallback requests receive automatic input preflight.
+- OMP prompt mode loads the communication helper and provides `parr0t_process` / `xd://parr0t_process`; guarded mode adds its narrower executor. Registration belongs to the actual new host process/session, never the caller's tool list.
+- Task payloads bind the exact segments, model and execution policy. Review defaults to 256 records/65,536 estimated tokens; explicit positive task bounds and serialized split policy are honored. No hidden tighter split clamp or invented model-call counter applies.
+- Use proportional checks and cached evidence. Preserve complete task shards while siblings are pending. Repeated identical no-progress work must use an approved successor or deterministic repair, not another identical call or an automatic replacement root.
+- Never solicit whole-job usage ceilings. Only user-selected budget dimensions bind; telemetry alone cannot stop work. Host capacity and per-request input limits are not whole-job budgets.
 
 ## Status routes
 
@@ -1144,27 +1131,6 @@ def _apply_execution_defaults(config: dict[str, Any]) -> None:
     if not isinstance(execution, dict):
         raise ConfigurationError("Workspace execution policy must be an object")
     try:
-        policy_version = int(execution.get("native_shard_policy_version", 1))
-    except (TypeError, ValueError) as exc:
-        raise ConfigurationError("native_shard_policy_version must be an integer") from exc
-    if policy_version < 2 and (
-        (
-            execution.get("native_shard_records") == 256
-            and "native_shard_material_tokens" not in execution
-        )
-        or (
-            execution.get("native_shard_records") == 32
-            and execution.get("native_shard_material_tokens") == 12_000
-        )
-    ):
-        execution["native_shard_records"] = 64
-        execution["native_shard_material_tokens"] = 24_000
-    if (
-        policy_version < 5
-        and execution.get("native_shard_material_tokens") == 24_000
-    ):
-        execution["native_shard_material_tokens"] = 8_000
-    try:
         control_budget_policy_version = int(
             execution.get("control_turn_budget_policy_version", 1)
         )
@@ -1253,25 +1219,15 @@ def _apply_review_routing_defaults(config: dict[str, Any]) -> None:
 
 
 def _apply_translation_retry_defaults(config: dict[str, Any]) -> None:
-    """Upgrade only the two known preset topologies; never rewrite custom routing."""
+    """Supply omitted route defaults without inserting providers into a selected chain."""
 
     routing = config.setdefault("routing", {})
     if not isinstance(routing, dict):
         raise ConfigurationError("Workspace routing policy must be an object")
-    preset = str(config.get("provider_preset", ""))
-    translators = routing.get("translators")
-    if preset == CODEX_APP_PRESET:
-        if translators == ["native-luna", "deepseek"]:
-            routing["translators"] = ["native-luna", "native-sol", "deepseek"]
-        routing.setdefault(
-            "translator_retries", {"native-luna": 5, "native-sol": 3}
-        )
-    elif preset == "openai-deepseek":
-        if translators == ["openai-luna", "deepseek"]:
-            routing["translators"] = ["openai-luna", "openai-sol", "deepseek"]
-        routing.setdefault(
-            "translator_retries", {"openai-luna": 5, "openai-sol": 3}
-        )
+    translators = routing.get("translators", [])
+    routing.setdefault(
+        "translator_retries", {route: 0 for route in translators}
+    )
 
 
 def _apply_context_routing_defaults(config: dict[str, Any]) -> None:
@@ -1284,12 +1240,7 @@ def _apply_context_routing_defaults(config: dict[str, Any]) -> None:
     if isinstance(configured_workers, int) and not isinstance(
         configured_workers, bool
     ):
-        routing.setdefault("context_max_workers", min(6, max(1, configured_workers)))
-    if (
-        str(config.get("provider_preset", "")) == CODEX_APP_PRESET
-        and routing.get("context_analyzers") == ["native-sol"]
-    ):
-        routing["context_analyzers"] = ["native-sol", "native-luna"]
+        routing.setdefault("context_max_workers", max(1, configured_workers))
 
 
 def _apply_control_plane_defaults(config: dict[str, Any]) -> None:
@@ -1302,36 +1253,24 @@ def _apply_control_plane_defaults(config: dict[str, Any]) -> None:
         control_plane.setdefault(key, json.loads(json.dumps(value)))
 
 
-def _apply_image_localization_defaults(config: dict[str, Any]) -> None:
-    policy = config.setdefault("image_localization", {})
-    if not isinstance(policy, dict):
-        raise ConfigurationError("Workspace image_localization policy must be an object")
-    for key, value in CONFIG_TEMPLATE["image_localization"].items():
-        policy.setdefault(key, value)
-    if (
-        policy.get("default_policy") != "disabled"
-        or policy.get("explicit_user_request_required") is not True
-        or policy.get("definite_player_visible_ui_binding_required") is not True
-        or policy.get("recursive_ocr_allowed") is not False
-    ):
-        raise ConfigurationError(
-            "Workspace image-localization defaults cannot enable implicit image inspection or OCR"
-        )
 
 
 def initialize_workspace(
     work_dir: Path,
     sdk_root: Path,
     *,
-    git_choice: str = "pending",
+    git_choice: str = "disabled",
     game_roots: list[Path] | None = None,
     provider_preset: str = CODEX_APP_PRESET,
+    target_language: str = "ko",
 ) -> None:
     work_dir = work_dir.resolve()
     sdk_root = sdk_root.resolve()
     require_external_workdir(work_dir, sdk_root)
     work_dir.mkdir(parents=True, exist_ok=True)
     config = json.loads(json.dumps(CONFIG_TEMPLATE))
+    target_language = normalize_language_tag(target_language, field="target_language")
+    config["project"]["target_language"] = target_language
     if provider_preset not in {"openai-deepseek", CODEX_APP_PRESET, "custom"}:
         raise ConfigurationError(
             "provider_preset must be openai-deepseek, codex-app-deepseek, or custom"
@@ -1359,8 +1298,8 @@ def initialize_workspace(
             "context_analyzers": ["native-sol", "native-luna"],
             "translators": ["native-luna", "native-sol", "deepseek"],
             "translator_retries": {
-                "native-luna": 5,
-                "native-sol": 3,
+                "native-luna": 0,
+                "native-sol": 0,
             },
             "review_triagers": ["native-luna"],
             "reviewers": ["native-sol", "deepseek"],
@@ -1376,7 +1315,7 @@ def initialize_workspace(
             ],
             "require_review": True,
             "review_max_rounds": 2,
-            "review_attempt_limits": {"native-sol": 2},
+            "review_attempt_limits": {"native-sol": 2, "deepseek": 3},
             "max_workers": 8,
             "context_max_workers": 6,
             "retry_refusals_once": False,
@@ -1389,7 +1328,7 @@ def initialize_workspace(
                 "timeout",
                 "integrity_invalid",
             ],
-            "defer_fallbacks_until_primary_complete": True,
+            "defer_fallbacks_until_primary_complete": False,
             "preserve_source_on_failure": True,
             "review_refusal_policy": "fallback",
         }
@@ -1455,9 +1394,9 @@ def initialize_workspace(
         LANGUAGE_POLICY_PATH: json.dumps(
             {
                 "schema": LANGUAGE_POLICY_SCHEMA,
-                "target_language": "ko",
+                "target_language": target_language,
                 "revision": 0,
-                "authorization": "default_korean",
+                "authorization": "default_korean" if target_language == "ko" else "explicit_user_request",
             },
             ensure_ascii=False,
             indent=2,
@@ -1479,17 +1418,36 @@ def initialize_workspace(
         (work_dir / directory).mkdir(exist_ok=True)
 
 
+def _apply_autonomy_defaults(config: dict[str, Any]) -> None:
+    execution = config.setdefault("execution", {})
+    for obsolete in ("same_failure_limit", "startup_full_inventory_scan_limit",
+                     "max_worker_model_calls_per_task", "max_semantic_model_calls_per_task",
+                     "bulk_budget_gate_records"):
+        execution.pop(obsolete, None)
+    # Image authorization is represented by the actual recorded policy, not
+    # immutable decorative booleans in the workspace configuration.
+    config.pop("image_localization", None)
+    failures = config.setdefault("failure_queue", {})
+    previous_hold = failures.pop("hold_patch_when_blocking_target_fails", None)
+    failures.pop("resume_only_after_user_request", None)
+    failures.setdefault("automatic_resume", True)
+    failures.setdefault("allow_incomplete_artifact", previous_hold is False)
+    if any(not isinstance(failures[key], bool) for key in ("automatic_resume", "allow_incomplete_artifact")):
+        raise ConfigurationError("Failure continuation and artifact policy must be boolean")
+    config.setdefault("release_checkpoint", {}).setdefault("required_for_distribution", False)
+
+
 def load_config(work_dir: Path) -> dict[str, Any]:
     path = work_dir / "game-l10n.json"
     if not path.is_file():
         raise ConfigurationError(f"Workspace config not found: {path}")
     config = json.loads(path.read_text(encoding="utf-8"))
+    _apply_autonomy_defaults(config)
     _apply_execution_defaults(config)
     _apply_review_routing_defaults(config)
     _apply_translation_retry_defaults(config)
     _apply_context_routing_defaults(config)
     _apply_control_plane_defaults(config)
-    _apply_image_localization_defaults(config)
     require_target_language_policy(work_dir, config)
     lock_path = work_dir / MODE_LOCK_PATH
     mode_lock = (

@@ -13,17 +13,50 @@ from game_l10n.models import Segment
 from game_l10n.native_pass import (
     _imported_native_waves,
     _validate_manifest_rows,
-    import_native_shard,
+    import_native_shard as _import_native_shard,
     import_native_wave,
     merge_native_pass,
     native_control_step,
-    prepare_native_tasks,
+    prepare_native_tasks as _prepare_native_tasks,
     seal_native_wave_relay,
 )
 from game_l10n.native_followup import CANDIDATE_METADATA_KEY
 from game_l10n.store import stable_hash
 from tests.test_validators import optional_slot_fixture
-from tests import write_semantic_result_rows
+from tests import _result_manifest, write_semantic_result_rows as _write_semantic_result_rows
+
+FIXTURE_ROUTE = "native-fixture"
+FIXTURE_MODEL = "fixture-exact-model"
+
+
+def prepare_native_tasks(*args, **kwargs):
+    """Bind offline fixture execution explicitly, preserving per-test overrides."""
+    binding = dict(kwargs.get("route_binding") or {"provider": FIXTURE_ROUTE, "attempt": 1})
+    binding.setdefault("model", FIXTURE_MODEL)
+    kwargs["route_binding"] = binding
+    return _prepare_native_tasks(*args, **kwargs)
+
+
+def write_semantic_result_rows(path, rows, **bindings):
+    if not isinstance(rows, list):
+        rows = list(rows)
+    manifest = bindings.get("manifest") or _result_manifest(path, rows)
+    if manifest is not None:
+        bindings["manifest"] = manifest
+    bindings.setdefault("route", FIXTURE_ROUTE)
+    bindings.setdefault("model", FIXTURE_MODEL)
+    route = ((manifest or {}).get("route_binding") or {}).get("provider") or bindings["route"]
+    copied = [
+        {**row, **({"provider": route} if {"target_id", "status", "text"} <= set(row)
+                   and "provider" not in row else {})}
+        for row in rows
+    ]
+    return _write_semantic_result_rows(path, copied, **bindings)
+
+
+def import_native_shard(*args, **kwargs):
+    kwargs.setdefault("model", FIXTURE_MODEL)
+    return _import_native_shard(*args, **kwargs)
 
 
 def review_segment(segment_id: str, source: str = "S", candidate: str = "T") -> Segment:
@@ -42,6 +75,79 @@ def review_segment(segment_id: str, source: str = "S", candidate: str = "T") -> 
 
 
 class NativePassTests(unittest.TestCase):
+    def test_standalone_import_requires_exact_model_not_provider_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = root / "result.jsonl"
+            write_semantic_result_rows(result, [{"target_id": "line", "status": "success", "text": "T"}])
+            with self.assertRaisesRegex(ValueError, "E_NATIVE_MODEL_BINDING_REQUIRED"):
+                _import_native_shard(root, result, "fixture")
+            imported = _import_native_shard(root, result, "fixture", model=FIXTURE_MODEL)
+            self.assertEqual(imported["success"], 1)
+
+    def test_review_split_uses_bound_depth_without_hidden_amplification_limit(self) -> None:
+        from game_l10n.native_pass import _review_split_stop_reason
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            segments = [review_segment(str(index)) for index in range(8)]
+            prepare_native_tasks(
+                root, source, segments, root / "tasks", pass_kind="review",
+                max_records=4096, max_material_tokens=2_000_000,
+                review_split_max_depth=24,
+            )
+            manifest = json.loads((root / "tasks/manifest.json").read_text())
+            manifest["review_split"].update(depth=4, semantic_passes=5)
+            self.assertEqual(manifest["task_max_records"], 4096)
+            self.assertEqual(manifest["task_max_material_tokens"], 2_000_000)
+            self.assertEqual(manifest["worker_contract"]["failure_split"]["max_depth"], 24)
+            self.assertEqual(_review_split_stop_reason(
+                manifest, segments, attempted_records=40, root_records=8
+            ), "")
+            self.assertEqual(_review_split_stop_reason(
+                manifest, segments, attempted_records=40, root_records=8,
+                review_call_budget=5,
+            ), "review_call_limit")
+            manifest["review_split"]["depth"] = 24
+            self.assertEqual(_review_split_stop_reason(
+                manifest, segments, attempted_records=40, root_records=8
+            ), "split_depth_limit")
+
+    def test_user_budget_dimensions_are_independently_optional(self) -> None:
+        from game_l10n.native_pass import _native_budget_issue, _new_native_control_state
+        for field, value, expected in (
+            ("max_input_tokens", 7, "E_NATIVE_INPUT_BUDGET_EXHAUSTED"),
+            ("max_elapsed_minutes", 1, "E_NATIVE_ELAPSED_BUDGET_EXHAUSTED"),
+            ("max_provider_cost_usd", 0.5, "E_NATIVE_COST_BUDGET_EXHAUSTED"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "source.jsonl"
+                source.write_text("fixture", encoding="utf-8")
+                prepare_native_tasks(
+                    root, source, [Segment("line", "S")], root / "tasks",
+                    user_approved_budget=True, **{field: value},
+                )
+                manifest = json.loads((root / "tasks/manifest.json").read_text())
+                state = _new_native_control_state(manifest, "fixture")
+                self.assertEqual(_native_budget_issue(manifest["execution_contract"], state, 1), "")
+                state.update(input_tokens=7, provider_cost_usd=0.5,
+                             budget_started_at_epoch=state["created_at_epoch"] - 61)
+                self.assertEqual(_native_budget_issue(manifest["execution_contract"], state, 1), expected)
+
+    def test_oversized_single_target_reports_capacity_repair_not_user_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "E_NATIVE_INPUT_CAPACITY_EXCEEDED: compact"):
+                prepare_native_tasks(
+                    root, source, [Segment("line", "S" * 1000)], root / "tasks",
+                    max_material_tokens=1,
+                )
+            self.assertFalse((root / "tasks/manifest.json").exists())
+
     def test_terminal_seal_classifies_alternate_text_schema_without_losing_peer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -330,9 +436,9 @@ class NativePassTests(unittest.TestCase):
             manifest = json.loads((tasks / "manifest.json").read_text(encoding="utf-8"))
 
         self.assertEqual(summary["pass_kind"], "review")
-        self.assertEqual(summary["max_records"], 2048)
+        self.assertEqual(summary["max_records"], 256)
         self.assertEqual(summary["task_max_records"], 256)
-        self.assertEqual(summary["task_max_material_tokens"], 65_536)
+        self.assertEqual(summary["task_max_material_tokens"], 1_000_000)
         self.assertEqual(
             [item["records"] for item in manifest["tasks"]],
             [256] * 16,
@@ -347,7 +453,6 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(
             manifest["worker_contract"]["max_semantic_model_calls_per_task"], 1
         )
-        self.assertEqual(manifest["worker_contract"]["max_model_calls_per_task"], 16)
         self.assertEqual(manifest["worker_contract"]["failure_result_proof_fields"], [])
         self.assertFalse(manifest["worker_contract"]["per_record_semantic_call_loop_allowed"])
 
@@ -499,7 +604,7 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(rows[2]["status"], "success")
         self.assertEqual(rows[3]["status"], "refused")
 
-    def test_review_split_stops_at_two_times_record_amplification(self) -> None:
+    def test_review_split_honors_explicit_record_amplification_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source.jsonl"
@@ -516,6 +621,7 @@ class NativePassTests(unittest.TestCase):
                 route_binding={"provider": "native-luna", "attempt": 1},
                 max_records=4,
                 max_workers=8,
+                review_split_max_record_amplification=2.0,
             )
 
             root_step = native_control_step(root, tasks / "manifest.json", results)
@@ -1026,7 +1132,7 @@ class NativePassTests(unittest.TestCase):
             [f"fixture-{index}" for index in range(4)],
         )
 
-    def test_wave_import_is_atomic_when_any_result_breaks_its_task_binding(self) -> None:
+    def test_wave_import_keeps_valid_peer_and_rejects_entire_invalid_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source.jsonl"
@@ -1075,8 +1181,61 @@ class NativePassTests(unittest.TestCase):
                 import_native_wave(root, tasks / "manifest.json", results, 1)
             shard_root = root / ".game-l10n" / "native" / "shards"
             imported = list(shard_root.glob("*.jsonl")) if shard_root.exists() else []
+            self.assertEqual(len(imported), 1)
+            original = imported[0].read_bytes()
+            partial = merge_native_pass(
+                root, segments, root / "partial.jsonl", manifest_path=tasks / "manifest.json"
+            )
+            self.assertEqual(partial["records"], 2)
+            self.assertFalse(partial["complete"])
+            self.assertEqual(
+                [json.loads(line)["target_id"] for line in original.splitlines()],
+                ["fixture-0", "fixture-1"],
+            )
+            self._write_rows(results / "task-0002.jsonl", [
+                {"target_id": s.id, "status": "success", "text": "TARGET"} for s in segments[2:]
+            ])
+            repaired = import_native_wave(root, tasks / "manifest.json", results, 1)
+            self.assertEqual(repaired["success"], 4)
+            self.assertEqual(imported[0].read_bytes(), original)
+            self._write_rows(results / "task-0001.jsonl", [
+                {"target_id": s.id, "status": "success", "text": "CHANGED"} for s in segments[:2]
+            ])
+            with self.assertRaisesRegex(ValueError, "E_NATIVE_IMPORTED_TASK_CHANGED"):
+                import_native_wave(root, tasks / "manifest.json", results, 1)
+            self.assertEqual(imported[0].read_bytes(), original)
 
-        self.assertEqual(imported, [])
+    def test_review_tier_is_explicit_even_when_route_has_a_legacy_alias(self) -> None:
+        from game_l10n.native_pass import _native_review_call_budget
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            (root / "game-l10n.json").write_text(json.dumps({"routing": {
+                "review_triagers": ["native-luna"], "reviewers": ["native-luna"],
+                "triage_max_workers": 17, "strong_max_workers": 3,
+                "triage_max_calls": 1, "strong_max_calls": 5,
+                "review_attempt_limits": {"native-luna": 4},
+            }}))
+            prepared = prepare_native_tasks(
+                root, source, [review_segment("line")], root / "tasks",
+                pass_kind="review", review_tier="strong", max_workers=128,
+                route_binding={"provider": "native-luna", "model": "configured-model", "attempt": 1},
+            )
+            manifest = json.loads((root / "tasks/manifest.json").read_text())
+            self.assertEqual(prepared["max_workers"], 3)
+            self.assertEqual(manifest["execution_contract"]["review_tier"], "strong")
+            self.assertEqual(_native_review_call_budget(root, root / "tasks/manifest.json", manifest), 4)
+            original = (root / "tasks/manifest.json").read_bytes()
+            with self.assertRaisesRegex(ValueError, "E_NATIVE_TASK_MANIFEST_IMMUTABLE"):
+                prepare_native_tasks(
+                    root, source, [review_segment("line")], root / "tasks",
+                    pass_kind="review", review_tier="strong", max_workers=128,
+                    route_binding={"provider": "native-luna", "model": "configured-model", "attempt": 1},
+                    review_split_max_depth=24,
+                )
+            self.assertEqual((root / "tasks/manifest.json").read_bytes(), original)
+
 
     def test_translation_route_binding_rejects_a_result_from_another_model(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1096,7 +1255,7 @@ class NativePassTests(unittest.TestCase):
             manifest = json.loads((tasks / "manifest.json").read_text())
             self.assertEqual(
                 manifest["route_binding"],
-                {"provider": "native-sol", "attempt": 2},
+                {"provider": "native-sol", "model": FIXTURE_MODEL, "attempt": 2},
             )
             self._write_rows(
                 results / "task-0001.jsonl",
@@ -1315,9 +1474,6 @@ class NativePassTests(unittest.TestCase):
             manifest["worker_contract"]["model_controller_role_allowed"]
         )
         self.assertEqual(
-            manifest["worker_contract"]["max_model_calls_per_task"], 16
-        )
-        self.assertEqual(
             manifest["worker_contract"]["max_semantic_model_calls_per_task"], 1
         )
         self.assertFalse(
@@ -1404,14 +1560,6 @@ class NativePassTests(unittest.TestCase):
             manifest["execution_contract"]["automatic_root_turn_restart_allowed"]
         )
         self.assertEqual(
-            manifest["execution_contract"]["max_unchanged_progress_observations"],
-            1,
-        )
-        self.assertEqual(
-            manifest["execution_contract"]["max_control_actions_without_progress"],
-            2,
-        )
-        self.assertEqual(
             manifest["execution_contract"]["progress_reporting"],
             "completion_checkpoint_or_blocker_only",
         )
@@ -1477,7 +1625,6 @@ class NativePassTests(unittest.TestCase):
                 tasks,
                 max_records=2,
                 max_workers=1,
-                bulk_budget_gate_records=4,
             )
             manifest = json.loads(
                 (tasks / "manifest.json").read_text(encoding="utf-8")
@@ -1537,20 +1684,15 @@ class NativePassTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "E_DETAIL_CONTRACT_CONFLICT"):
                 import_native_wave(root, manifest_path, results, 1)
 
-    def test_detail_policy_may_tighten_but_not_disable_bulk_gate(self) -> None:
+    def test_positive_worker_counts_above_old_ceiling_are_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "fixture-source.jsonl"
+            source = root / "source.jsonl"
             source.write_text("fixture", encoding="utf-8")
-
-            with self.assertRaisesRegex(ValueError, "cannot exceed the core default"):
-                prepare_native_tasks(
-                    root,
-                    source,
-                    [Segment("fixture-1", "SOURCE")],
-                    root / "tasks",
-                    bulk_budget_gate_records=4097,
-                )
+            summary = prepare_native_tasks(
+                root, source, [Segment("line", "S")], root / "tasks", max_workers=128
+            )
+            self.assertEqual(summary["max_workers"], 128)
 
     def test_small_residual_pass_uses_one_direct_task_without_controller(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2041,7 +2183,7 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(blocked["counts"]["imported_tasks"], 0)
         self.assertEqual(resumed["action"], "aggregate_completed_pass")
 
-    def test_native_control_step_stops_repeated_unchanged_observation(self) -> None:
+    def test_native_control_step_waits_for_owned_worker_without_invented_progress_cap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source.jsonl"
@@ -2059,8 +2201,8 @@ class NativePassTests(unittest.TestCase):
             second = native_control_step(root, tasks / "manifest.json", results)
 
         self.assertEqual(first["action"], "dispatch_isolated_wave_relay")
-        self.assertEqual(second["action"], "checkpoint_and_stop")
-        self.assertEqual(second["issue_codes"], ["E_NATIVE_NO_MEASURABLE_PROGRESS"])
+        self.assertEqual(second["action"], "wait_for_active_wave")
+        self.assertEqual(second["issue_codes"], [])
 
     def test_legacy_unapproved_root_limit_is_not_enforced(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2093,6 +2235,7 @@ class NativePassTests(unittest.TestCase):
                     "execution_contract": contract,
                     "result_contract": manifest["result_contract"],
                     "language_binding": manifest["language_binding"],
+                    "route_binding": manifest["route_binding"],
                     "execution_namespace": manifest["execution_namespace"],
                 }
             )
@@ -2211,7 +2354,6 @@ class NativePassTests(unittest.TestCase):
                 tasks,
                 max_records=2,
                 max_workers=1,
-                bulk_budget_gate_records=4,
             )
             manifest_path = tasks / "manifest.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -2228,6 +2370,7 @@ class NativePassTests(unittest.TestCase):
                     "execution_contract": manifest["execution_contract"],
                     "result_contract": manifest["result_contract"],
                     "language_binding": manifest["language_binding"],
+                    "route_binding": manifest["route_binding"],
                     "execution_namespace": manifest["execution_namespace"],
                 }
             )
@@ -2316,7 +2459,6 @@ class NativePassTests(unittest.TestCase):
                 tasks,
                 max_records=2,
                 max_workers=1,
-                bulk_budget_gate_records=4,
                 max_elapsed_minutes=60,
                 max_input_tokens=100,
                 provider_cost_unmetered=True,

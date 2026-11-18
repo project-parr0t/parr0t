@@ -1,4 +1,4 @@
-"""Plan SDK core updates; apply only explicit local targets with checked evidence."""
+"""Plan pinned Core updates; apply only explicit local targets with checked evidence."""
 from __future__ import annotations
 
 import argparse
@@ -25,10 +25,18 @@ SCHEMA = "parr0t.branch-update.v1"
 
 
 def local_ref(name: str) -> str:
+    if name.startswith("refs/") and not name.startswith("refs/heads/"):
+        raise ValueError("Update targets must be explicit local branch names")
     branch = name.removeprefix("refs/heads/")
-    if not re.fullmatch(r"sdk-[a-z0-9][a-z0-9.-]*", branch):
-        raise ValueError("Update targets must be explicit local sdk-* branch names")
-    return "refs/heads/" + branch
+    if not branch or branch == "HEAD" or branch.startswith("-"):
+        raise ValueError("Update targets must be explicit local branch names")
+    target = "refs/heads/" + branch
+    checked = subprocess.run(
+        ["git", "check-ref-format", target], capture_output=True, shell=False,
+    )
+    if checked.returncode:
+        raise ValueError("Update target is not a valid local branch name")
+    return target
 
 
 def complete_validation(proof: object) -> bool:
@@ -119,7 +127,7 @@ def plan_updates(repo: Path, state: Path, *, main_ref: str = "origin/main", refs
     plans = plan_branches(repo, main_ref, refs)
     rows, pending = [], []
     for plan in plans[1:]:
-        if not plan["sdk"]:
+        if not plan["sdk"] and refs is None:
             continue
         row = {**plan, "action": "validation_required"}
         rows.append(row)
@@ -189,12 +197,6 @@ def apply_updates(repo: Path, report: dict) -> dict:
             merged = merge_tree(repo, row)
             if merged != row["merge_tree"]:
                 raise ValueError("E_BRANCH_UPDATE_STALE_TREE")
-            signing = subprocess.run(
-                ["git", "-C", str(repo), "config", "--bool", "--get", "commit.gpgsign"],
-                capture_output=True, text=True, shell=False,
-            )
-            if signing.returncode not in {0, 1}:
-                raise ValueError("E_BRANCH_UPDATE_SIGNING_CONFIG")
             validation = row.get("validation", {})
             validation_key = validation.get("validation_key")
             if not isinstance(validation_key, str) or not validation_key:
@@ -205,17 +207,26 @@ def apply_updates(repo: Path, report: dict) -> dict:
                 raise ValueError("E_BRANCH_UPDATE_VALIDATION_CONTENT_MISMATCH")
             if validation.get("main_commit") != report.get("main_commit"):
                 raise ValueError("E_BRANCH_UPDATE_VALIDATION_MAIN_MISMATCH")
-            message = (
-                f"Merge core {report['main_commit'][:12]} into {target.removeprefix('refs/heads/')}\n\n"
-                f"Parr0t-Core: {report['main_commit']}\n"
-                f"Parr0t-Validated-Tree: {merged}\n"
-                f"Parr0t-Validation-Key: {validation_key}"
-            )
-            args = ["commit-tree", merged, "-p", row["commit"], "-p", report["main_commit"],
-                    "-m", message]
-            if signing.stdout.strip() == "true":
-                args.append("-S")
-            commit = git(repo, *args).decode().strip()
+            if row["merge_base"] == row["commit"]:
+                commit = report["main_commit"]
+            else:
+                signing = subprocess.run(
+                    ["git", "-C", str(repo), "config", "--bool", "--get", "commit.gpgsign"],
+                    capture_output=True, text=True, shell=False,
+                )
+                if signing.returncode not in {0, 1}:
+                    raise ValueError("E_BRANCH_UPDATE_SIGNING_CONFIG")
+                message = (
+                    f"Merge core {report['main_commit'][:12]} into {target.removeprefix('refs/heads/')}\n\n"
+                    f"Parr0t-Core: {report['main_commit']}\n"
+                    f"Parr0t-Validated-Tree: {merged}\n"
+                    f"Parr0t-Validation-Key: {validation_key}"
+                )
+                args = ["commit-tree", merged, "-p", row["commit"], "-p", report["main_commit"],
+                        "-m", message]
+                if signing.stdout.strip() == "true":
+                    args.append("-S")
+                commit = git(repo, *args).decode().strip()
             # An explicitly requested clean linked worktree can be advanced by
             # the same validated fast-forward. Dirty worktrees are held. This
             # removes the former manual-merge escape hatch without checking out,
@@ -250,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cache-dir", type=Path,
                         help="Stable external evidence/dependency cache; default: one repository-wide sibling cache")
     parser.add_argument("--main-ref", default="origin/main")
-    parser.add_argument("--branch", action="append", help="Local sdk-* target; repeatable. Omit for origin SDK planning")
+    parser.add_argument("--branch", action="append", help="Explicit local target; repeatable. Omit for origin SDK planning")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--environment-key", default="")
     parser.add_argument("--jobs", type=int, choices=range(1, 9), default=DEFAULT_VALIDATION_JOBS)
@@ -258,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--provision-dependencies", action="store_true",
                         help="Install required branch-declared Python test dependencies into the external state directory")
     parser.add_argument("--apply", action="store_true",
-                        help="Create local merge commits and advance named local SDK refs or their exact clean worktrees")
+                        help="Advance named local branches or exact clean worktrees using validated fast-forwards/merges")
     args = parser.parse_args(argv)
     if args.apply and not args.branch:
         parser.error("--apply requires explicit --branch targets")
