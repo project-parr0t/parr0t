@@ -454,7 +454,7 @@ def require_native_workers_ended(work_dir: Path, relay_path: Path) -> None:
         admission = work_dir / ".game-l10n/native/omp-launch-admissions" / f"{key}.json"
         if not admission.exists():
             continue
-        _load(work_dir, relay_path)
+        _load_launch_evidence(work_dir, relay_path)
         record = json.loads(admission.read_text(encoding="utf-8"))
         if (
             record.get("schema") != "parr0t.omp-native-admission.v1"
@@ -576,7 +576,7 @@ def _contract_for_relay(work_dir: Path, relay: dict, relay_path: Path) -> dict |
     return contract
 
 
-def _load(work_dir: Path, relay_path: Path) -> tuple[dict, dict, dict]:
+def _load_launch_evidence(work_dir: Path, relay_path: Path) -> tuple[dict, dict, dict]:
     require_control_plane_ready(work_dir)
     relay_path = relay_path.resolve()
     if not relay_path.is_relative_to(work_dir.resolve() / ".game-l10n"):
@@ -588,20 +588,14 @@ def _load(work_dir: Path, relay_path: Path) -> tuple[dict, dict, dict]:
         if runtime and runtime["host"] == "omp" and runtime.get("transport", "collaboration") == "collaboration":
             raise ValueError(ISOLATION_ISSUE)
         raise ValueError("E_NATIVE_LAUNCH_INVALID: legacy relay has no launch contract")
-    if contract.get("host") == "omp" and contract.get("transport", "collaboration") == "collaboration":
-        runtime = native_runtime(work_dir, required=True)
-        isolation = runtime_isolation(work_dir, runtime)
-        if isolation is None or contract.get("message_isolation") != isolation:
-            raise ValueError(ISOLATION_ISSUE)
-    expected = _contract_for_relay(work_dir, relay, relay_path)
-    if isinstance(expected, dict):
-        # A mapping added for another route or a clean control-generation
-        # refresh does not change this wave's locked host/model/task binding.
-        expected["runtime_fingerprint"] = contract.get("runtime_fingerprint")
-    if contract != expected:
-        raise ValueError("E_NATIVE_LAUNCH_INVALID: runtime binding changed")
-    if "command_argv" in relay and relay["command_argv"] != _relay_command_argv(work_dir, relay_path, relay):
-        raise ValueError("E_NATIVE_LAUNCH_INVALID: lifecycle commands changed")
+    tasks = contract.get("tasks")
+    if (
+        not isinstance(contract.get("host"), str) or not contract["host"]
+        or not exact_native_model(contract.get("model"))
+        or not isinstance(tasks, list) or not all(isinstance(task, str) for task in tasks)
+        or len(set(tasks)) != len(tasks)
+    ):
+        raise ValueError("E_NATIVE_LAUNCH_INVALID: recorded launch contract changed")
     path = _ledger_path(work_dir, relay_path)
     ledger = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {
         "schema": LAUNCH_SCHEMA, "relay_fingerprint": stable_hash(relay),
@@ -624,6 +618,24 @@ def _load(work_dir: Path, relay_path: Path) -> tuple[dict, dict, dict]:
         or ledger.get("model_failure_code") not in (None, *MODEL_FAILURE_CODES)
     ):
         raise ValueError("E_NATIVE_LAUNCH_INVALID: launcher evidence changed")
+    return relay, contract, ledger
+
+
+def _load(work_dir: Path, relay_path: Path) -> tuple[dict, dict, dict]:
+    relay, contract, ledger = _load_launch_evidence(work_dir, relay_path)
+    if contract.get("host") == "omp" and contract.get("transport", "collaboration") == "collaboration":
+        runtime = native_runtime(work_dir, required=True)
+        isolation = runtime_isolation(work_dir, runtime)
+        if isolation is None or contract.get("message_isolation") != isolation:
+            raise ValueError(ISOLATION_ISSUE)
+    expected = _contract_for_relay(work_dir, relay, relay_path)
+    if isinstance(expected, dict):
+        # Unrelated routes do not change this launch's locked execution identity.
+        expected["runtime_fingerprint"] = contract.get("runtime_fingerprint")
+    if contract != expected:
+        raise ValueError("E_NATIVE_LAUNCH_INVALID: runtime binding changed")
+    if "command_argv" in relay and relay["command_argv"] != _relay_command_argv(work_dir, relay_path, relay):
+        raise ValueError("E_NATIVE_LAUNCH_INVALID: lifecycle commands changed")
     return relay, contract, ledger
 
 
@@ -722,6 +734,28 @@ def native_launch_summary(work_dir: Path, relay_path: Path) -> dict[str, Any]:
             "legacy_unverified_results": len(contract.get("legacy_results", [])),
             "observed_model_workers": 0, "model_evidence": "message_isolation_unverified",
         }
+    return _summarize_native_launch(work_dir, relay_path, contract, ledger)
+
+
+def native_launch_evidence(work_dir: Path, relay_path: Path) -> dict[str, Any]:
+    """Read checkpoint observations; never certify a current dispatch runtime."""
+    _, contract, ledger = _load_launch_evidence(work_dir, relay_path)
+    summary = _summarize_native_launch(work_dir, relay_path, contract, ledger)
+    if contract.get("host") == "omp" and contract.get("transport", "collaboration") == "collaboration":
+        try:
+            isolation = runtime_isolation(work_dir, native_runtime(work_dir, required=True))
+        except ValueError as error:
+            if str(error) != ISOLATION_ISSUE:
+                raise
+            isolation = None
+        if isolation is None or contract.get("message_isolation") != isolation:
+            summary["issue_codes"] = [ISOLATION_ISSUE]
+    return summary
+
+
+def _summarize_native_launch(
+    work_dir: Path, relay_path: Path, contract: dict, ledger: dict,
+) -> dict[str, Any]:
     launch_observed = ledger["capability"] != "unknown" or bool(ledger["workers"])
     if not launch_observed and contract.get("host") == "omp":
         relay_digest = sha256(relay_path.read_bytes()).hexdigest()

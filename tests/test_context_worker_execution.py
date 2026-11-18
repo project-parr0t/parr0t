@@ -177,6 +177,59 @@ class ContextWorkerExecutionTests(unittest.TestCase):
         self.assertTrue(sealed["execution"]["complete"])
         self.assertEqual(sealed["counts"]["success"], 2)
 
+    def test_checkpoint_resume_recompiles_launch_without_the_old_runtime(self) -> None:
+        from game_l10n.omp_isolation import tool_transport_contract
+
+        configure_native_runtime(self.work, "omp", {"native-sol": "fixture/sol"}, omp_isolation="prompt")
+        name = "checkpoint resume"
+        self.prepare_snapshot(name)
+        relay = self.output / "relay.json"
+        old_task_id = self.task["task_id"]
+        obsolete = self.work.parent / "deleted-runtime" / "native-python.py"
+        old_transport = tool_transport_contract(prompt=True)
+        old_transport["relay_python_argv_prefix"] = [sys.executable, "-I", "-B", str(obsolete)]
+        with patch("game_l10n.native_runtime.tool_transport_contract", return_value=old_transport):
+            bind_data_plane_launch(self.work, relay)
+            contract = json.loads(relay.read_text(encoding="utf-8"))["launch_contract"]
+            record_native_launch(self.work, relay, event="capability-available")
+            record_native_launch(
+                self.work, relay, event="worker-started", task="worker-1",
+                worker_id="checkpoint-worker", model=contract["model"],
+            )
+            record_data_plane_relay_event(self.work, relay, event="worker-started", slot=1)
+        original_relay = relay.read_bytes()
+        ledger = next(self.output.glob("relay-*-launch.json"))
+        original_ledger = ledger.read_bytes()
+        with self.assertRaisesRegex(ValueError, "cannot rebind"):
+            bind_data_plane_launch(self.work, relay)
+        with self.assertRaisesRegex(ValueError, "runtime binding changed"):
+            record_native_launch(
+                self.work, relay, event="worker-started", task="worker-2",
+                worker_id="must-not-start", model=contract["model"],
+            )
+        claim_path, claim = self.claim(1)
+        result_path = self.result(claim)
+        self.run_command("commit-context-fragment", claim_path=claim_path, result_path=result_path)
+        result_bytes = result_path.read_bytes()
+        with self.assertRaisesRegex(ConfigurationError, "actual started workers must end"):
+            seal_data_plane_task(self.work, relay, worker_ended=True)
+        record_data_plane_relay_event(self.work, relay, event="worker-ended", slot=1)
+        sealed = seal_data_plane_task(self.work, relay, worker_ended=True)
+        self.assertEqual(sealed["issue_codes"], ["relay_execution_incomplete"])
+        self.assertEqual(sealed["counts"], {"total": 2, "success": 1, "pending": 1, "error": 1})
+        self.assertTrue(sealed["execution"]["complete"])
+        self.assertFalse(sealed["execution"]["finalizer_started"])
+        self.assertEqual(relay.read_bytes(), original_relay)
+        self.assertEqual(ledger.read_bytes(), original_ledger)
+        self.assertFalse(obsolete.exists())
+        prepared = self.prepare_snapshot(name)
+        self.assertNotEqual(prepared["task_id"], old_task_id)
+        bind_data_plane_launch(self.work, relay)
+        _, remaining = self.claim(1)
+        self.assertEqual(remaining["source_index"], 1)
+        self.assertEqual(result_path.read_bytes(), result_bytes)
+        self.assertFalse(obsolete.parent.exists())
+
     def test_partial_admission_failure_ends_without_starting_missing_slots_or_finalizer(self) -> None:
         bind_omp_isolation(self, self.work)
         configure_native_runtime(self.work, "omp", {"native-sol": "fixture/sol"}, omp_isolation="guarded")
