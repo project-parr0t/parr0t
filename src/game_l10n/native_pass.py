@@ -14,6 +14,11 @@ from .control_plane import (
     require_control_plane_ready,
     review_control_contract,
 )
+from .content_source_policy import (
+    content_source_policy,
+    validate_content_source_policy,
+    validate_output_provenance,
+)
 from .language_policy import DEFAULT_TARGET_LANGUAGE, language_policy_digest
 from .models import Segment
 from .native_followup import CANDIDATE_METADATA_KEY
@@ -206,13 +211,31 @@ def _result_contract() -> dict[str, Any]:
         "format": "jsonl",
         "one_row_per_bound_target": True,
         "ordered_like_task": True,
-        "canonical_fields": ["target_id", "status", "text", "provider", "issues"],
+        "canonical_fields": [
+            "target_id",
+            "status",
+            "text",
+            "provider",
+            "issues",
+            "content_provenance",
+        ],
         "required_fields": ["target_id", "status", "text"],
-        "optional_fields": ["provider", "issues", "split_depth", "semantic_attempts"],
+        "optional_fields": [
+            "provider",
+            "issues",
+            "content_provenance",
+            "split_depth",
+            "semantic_attempts",
+        ],
         "status_values": sorted(ALLOWED_STATUSES),
         "success_text_required_unless_source_authorizes_empty": True,
         "non_success_text_must_be_empty": True,
         "route_bound_success_provider": "route_binding.provider",
+        "content_provenance_schema": "parr0t.content-provenance.v1",
+        "missing_content_provenance_action": "reject",
+        "exact_runtime_model_field": "route_binding.model",
+        "provider_route_alias_field": "route_binding.provider",
+        "unauthorized_external_provenance_action": "reject",
         "alternate_text_fields_allowed": False,
     }
 
@@ -497,6 +520,48 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _manifest_contract_payload(
+    manifest: dict[str, Any], *, include_content_source_policy: bool
+) -> dict[str, Any]:
+    payload = {
+        "worker_contract": manifest.get("worker_contract"),
+        "detail_contract": manifest.get("detail_contract"),
+        "execution_contract": manifest.get("execution_contract"),
+    }
+    if manifest.get("result_contract") is not None:
+        payload["result_contract"] = manifest["result_contract"]
+    if manifest.get("route_binding") is not None:
+        payload["route_binding"] = manifest["route_binding"]
+    if "execution_namespace" in manifest:
+        payload["execution_namespace"] = manifest["execution_namespace"]
+    if manifest.get("language_binding") is not None:
+        payload["language_binding"] = manifest["language_binding"]
+    if (
+        include_content_source_policy
+        and manifest.get("content_source_policy") is not None
+    ):
+        payload["content_source_policy"] = manifest["content_source_policy"]
+    return payload
+
+
+def _bound_manifest_content_source_policy(
+    manifest: dict[str, Any],
+) -> dict[str, Any] | None:
+    policy = manifest.get("content_source_policy")
+    if (
+        manifest.get("version", 0) < TASK_MANIFEST_VERSION
+        or not isinstance(policy, dict)
+        or manifest.get("contract_fingerprint")
+        != stable_hash(
+            _manifest_contract_payload(
+                manifest, include_content_source_policy=True
+            )
+        )
+    ):
+        return None
+    return policy
+
+
 def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
     try:
         manifest_path.resolve().relative_to(work_dir.resolve())
@@ -535,9 +600,19 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
         )
         if route_binding is not None and (
             not isinstance(route_binding, dict)
-            or set(route_binding) != {"provider", "attempt"}
+            or set(route_binding) not in (
+                {"provider", "attempt"},
+                {"provider", "model", "attempt"},
+            )
             or not isinstance(route_binding.get("provider"), str)
             or not route_binding["provider"]
+            or (
+                "model" in route_binding
+                and (
+                    not isinstance(route_binding.get("model"), str)
+                    or not route_binding["model"]
+                )
+            )
             or not isinstance(route_binding.get("attempt"), int)
             or isinstance(route_binding["attempt"], bool)
             or route_binding["attempt"] < 1
@@ -552,8 +627,33 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
         # Manifests prepared before the explicit result contract remain
         # resumable. Newly prepared manifests bind the canonical schema into
         # the same immutable contract fingerprint.
+        previous_result_contract = dict(_result_contract())
+        previous_result_contract["missing_content_provenance_action"] = (
+            "normalize_from_bound_direct_model_transport"
+        )
+        previous_result_contract.pop("exact_runtime_model_field")
+        previous_result_contract.pop("provider_route_alias_field")
+        legacy_result_contract = dict(_result_contract())
+        legacy_result_contract["canonical_fields"] = [
+            "target_id", "status", "text", "provider", "issues"
+        ]
+        legacy_result_contract["optional_fields"] = [
+            "provider", "issues", "split_depth", "semantic_attempts"
+        ]
+        for field in (
+            "content_provenance_schema",
+            "missing_content_provenance_action",
+            "exact_runtime_model_field",
+            "provider_route_alias_field",
+            "unauthorized_external_provenance_action",
+        ):
+            legacy_result_contract.pop(field)
         if result_contract is not None:
-            if result_contract != _result_contract():
+            if result_contract not in (
+                _result_contract(),
+                previous_result_contract,
+                legacy_result_contract,
+            ):
                 raise ValueError(
                     "E_DETAIL_CONTRACT_CONFLICT: native result contract was changed"
                 )
@@ -567,7 +667,39 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
             fingerprint_payload["execution_namespace"] = namespace
         if language_binding is not None:
             fingerprint_payload["language_binding"] = language_binding
-        expected_fingerprint = stable_hash(fingerprint_payload)
+        source_policy = (
+            payload.get("content_source_policy")
+            if version >= TASK_MANIFEST_VERSION
+            else None
+        )
+        if source_policy is not None:
+            try:
+                validate_content_source_policy(source_policy)
+            except ValueError:
+                raise ValueError(
+                    "E_DETAIL_CONTRACT_CONFLICT: content-source policy was changed"
+                ) from None
+            if (
+                source_policy["task_kind"]
+                not in (
+                    {"review", "triage", "strong_review"}
+                    if pass_kind == "review"
+                    else {pass_kind}
+                )
+                or source_policy["route"] != f"native-pass:{pass_kind}"
+            ):
+                raise ValueError(
+                    "E_DETAIL_CONTRACT_CONFLICT: content-source policy scope changed"
+                )
+            if (
+                pass_kind == "review"
+                and source_policy["task_kind"] == "review"
+                and source_policy["authorization"] != "default_deny"
+            ):
+                raise ValueError(
+                    "E_DETAIL_CONTRACT_CONFLICT: authorized review policy "
+                    "must bind exact triage or strong_review scope"
+                )
         expected_detail = _detail_contract(pass_kind, manifest_version=version)
         legacy_detail = json.loads(json.dumps(expected_detail))
         # Host repair is execution-only. Preserve the immutable fingerprints and
@@ -584,10 +716,36 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
             != "parr0t.detail-contract.v1"
         ):
             raise ValueError("E_DETAIL_CONTRACT_CONFLICT: execution contract is missing")
-        if contract_fingerprint != expected_fingerprint:
-            raise ValueError("E_DETAIL_CONTRACT_CONFLICT: contract fingerprint is invalid")
         budget_gate = execution_contract.get("bulk_budget_gate", {})
         pilot_waves = budget_gate.get("pilot_waves_without_approved_budget", 0)
+        legacy_contract_shape = (
+            version < TASK_MANIFEST_VERSION
+            or result_contract is None
+            or result_contract == legacy_result_contract
+            or detail_contract == legacy_detail
+            or "control_turn_budget_user_approved" not in execution_contract
+            or "execution_namespace" not in payload
+            or pilot_waves != 0
+        )
+        if version >= TASK_MANIFEST_VERSION and source_policy is None:
+            if not legacy_contract_shape:
+                raise ValueError(
+                    "E_DETAIL_CONTRACT_CONFLICT: content-source policy is missing"
+                )
+        legacy_fingerprint = stable_hash(fingerprint_payload)
+        if source_policy is not None:
+            fingerprint_payload["content_source_policy"] = source_policy
+        expected_fingerprint = stable_hash(fingerprint_payload)
+        legacy_policy_is_safe = (
+            source_policy is None
+            or source_policy["authorization"] == "default_deny"
+        )
+        if contract_fingerprint != expected_fingerprint and not (
+            legacy_contract_shape
+            and legacy_policy_is_safe
+            and contract_fingerprint == legacy_fingerprint
+        ):
+            raise ValueError("E_DETAIL_CONTRACT_CONFLICT: contract fingerprint is invalid")
         if version >= TASK_MANIFEST_VERSION:
             review_split = payload.get("review_split")
             if pass_kind == "review":
@@ -676,6 +834,7 @@ def _validate_manifest_task_file(
             if manifest.get("version", 0) >= TASK_MANIFEST_VERSION
             else None
         ),
+        content_source_policy=_bound_manifest_content_source_policy(manifest),
     )
     if len(target_ids) != task["records"]:
         raise ValueError("Native task record count does not match its manifest binding")
@@ -764,6 +923,7 @@ def _task_target_ids(
     *,
     require_payload: bool = False,
     language_binding: dict[str, Any] | None = None,
+    content_source_policy: dict[str, Any] | None = None,
 ) -> list[str]:
     rows = _read_jsonl(task_path)
     ids: list[str] = []
@@ -790,6 +950,11 @@ def _task_target_ids(
                 raise ValueError("Native task segment payload does not match its target binding")
         if language_binding is not None and row.get("language_binding") != language_binding:
             raise ValueError("Native task target language binding is missing or changed")
+        if (
+            content_source_policy is not None
+            and row.get("content_source_policy") != content_source_policy
+        ):
+            raise ValueError("Native task content-source policy is missing or changed")
         ids.append(target_id)
     if len(ids) != len(set(ids)):
         raise ValueError("Native task file contains duplicate target bindings")
@@ -862,22 +1027,105 @@ def prepare_native_tasks(
     route_binding: dict[str, Any] | None = None,
     language_binding: dict[str, Any] | None = None,
     _review_split: dict[str, Any] | None = None,
+    content_source_grant: Path | None = None,
+    content_source_scope: str = "",
+    content_source_task_kind: str | None = None,
+    _content_source_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     require_control_plane_ready(work_dir)
+    explicit_content_source_policy = (
+        _content_source_policy is not None
+        or content_source_grant is not None
+        or bool(content_source_scope)
+    )
     if pass_kind not in PASS_KINDS:
         raise ValueError(f"pass_kind must be one of: {', '.join(sorted(PASS_KINDS))}")
     language_binding = _normalized_language_binding(language_binding)
     if route_binding is not None and (
-        set(route_binding) != {"provider", "attempt"}
+        set(route_binding) not in (
+            {"provider", "attempt"},
+            {"provider", "model", "attempt"},
+        )
         or not isinstance(route_binding.get("provider"), str)
         or not route_binding["provider"]
+        or (
+            "model" in route_binding
+            and (
+                not isinstance(route_binding.get("model"), str)
+                or not route_binding["model"]
+            )
+        )
         or not isinstance(route_binding.get("attempt"), int)
         or isinstance(route_binding["attempt"], bool)
         or route_binding["attempt"] < 1
     ):
         raise ValueError(
-            "route_binding requires an exact provider and positive attempt"
+            "route_binding requires an exact provider, runtime model, and positive attempt"
         )
+    fingerprint = stable_hash_sequence(asdict(segment) for segment in segments)
+    if (
+        _content_source_policy is None
+        and content_source_grant is None
+        and not content_source_scope
+    ):
+        resume_manifest_path = output_dir.resolve() / "manifest.json"
+        resume_manifest_within_workspace = True
+        try:
+            resume_manifest_path.relative_to(work_dir.resolve())
+        except ValueError:
+            resume_manifest_within_workspace = False
+        if (
+            resume_manifest_within_workspace
+            and resume_manifest_path.is_file()
+        ):
+            resume_manifest = _load_task_manifest(
+                work_dir, resume_manifest_path
+            )
+            if (
+                resume_manifest.get("source_fingerprint") == fingerprint
+                and resume_manifest.get("pass_kind", "translation") == pass_kind
+            ):
+                _content_source_policy = (
+                    _bound_manifest_content_source_policy(resume_manifest)
+                )
+    policy_route = f"native-pass:{pass_kind}"
+    semantic_task_kind = (
+        content_source_task_kind
+        or (
+            str(_content_source_policy.get("task_kind"))
+            if isinstance(_content_source_policy, dict)
+            else ""
+        )
+        or pass_kind
+    )
+    allowed_policy_kinds = (
+        {"review", "triage", "strong_review"}
+        if pass_kind == "review"
+        else {pass_kind}
+    )
+    if semantic_task_kind not in allowed_policy_kinds:
+        raise ValueError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
+    if _content_source_policy is None:
+        source_policy = content_source_policy(
+            work_dir,
+            task_kind=semantic_task_kind,
+            route=policy_route,
+            scope_id=content_source_scope,
+            grant_path=content_source_grant,
+        )
+    else:
+        source_policy = validate_content_source_policy(_content_source_policy)
+        if (
+            source_policy["task_kind"] != semantic_task_kind
+            or source_policy["route"] != policy_route
+        ):
+            raise ValueError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
+    if (
+        pass_kind == "review"
+        and source_policy["task_kind"] == "review"
+        and source_policy["authorization"] != "default_deny"
+    ):
+        raise ValueError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
     if max_records is None:
         max_records = (
             DEFAULT_REVIEW_MAX_RECORDS
@@ -1001,7 +1249,6 @@ def prepare_native_tasks(
     except ValueError as exc:
         raise ValueError("Native task source and output must stay inside the private workspace") from exc
 
-    fingerprint = stable_hash_sequence(asdict(segment) for segment in segments)
     if review_split is not None and not review_split["root_source_fingerprint"]:
         review_split = {**review_split, "root_source_fingerprint": fingerprint}
     task_max_records = (
@@ -1019,6 +1266,20 @@ def prepare_native_tasks(
     execution_namespace = output_dir.resolve().relative_to(work_dir.resolve()).as_posix()
     if manifest_path.is_file():
         manifest = _load_task_manifest(work_dir, manifest_path)
+        preserve_legacy_unbound_policy = (
+            _bound_manifest_content_source_policy(manifest) is None
+            and not explicit_content_source_policy
+        )
+        if (
+            manifest.get("version") == TASK_MANIFEST_VERSION
+            and manifest.get("source_fingerprint") == fingerprint
+            and manifest.get("pass_kind", "translation") == pass_kind
+            and manifest.get("content_source_policy") != source_policy
+            and not preserve_legacy_unbound_policy
+        ):
+            raise ValueError(
+                "E_CONTENT_SOURCE_POLICY_IMMUTABLE: prepare a new task namespace"
+            )
         if (
             manifest.get("version") == TASK_MANIFEST_VERSION
             and manifest.get("source_fingerprint") == fingerprint
@@ -1035,6 +1296,10 @@ def prepare_native_tasks(
             and manifest.get("execution_namespace", execution_namespace) == execution_namespace
             and manifest.get("language_binding") == language_binding
             and manifest.get("task_payload_schema") == TASK_PAYLOAD_SCHEMA
+            and (
+                manifest.get("content_source_policy") == source_policy
+                or preserve_legacy_unbound_policy
+            )
         ):
             task_rows = manifest.get("tasks", [])
             expected_execution_contract = _execution_contract(
@@ -1079,6 +1344,7 @@ def prepare_native_tasks(
                     "history_mode": "none",
                     "task_payload_schema": TASK_PAYLOAD_SCHEMA,
                     "contract_fingerprint": manifest["contract_fingerprint"],
+                    "content_source_policy": manifest.get("content_source_policy"),
                     "execution_contract": execution_contract,
                     "manifest": str(manifest_path),
                     "artifacts": [
@@ -1141,6 +1407,7 @@ def prepare_native_tasks(
                 "ordinal": ordinal,
                 "segment": asdict(segment),
                 "language_binding": language_binding,
+                "content_source_policy": source_policy,
             }
             for ordinal, segment, _ in batch
         ]
@@ -1197,6 +1464,7 @@ def prepare_native_tasks(
             "result_contract": result_contract,
             **({"route_binding": route_binding} if route_binding is not None else {}),
             "language_binding": language_binding,
+            "content_source_policy": source_policy,
             "execution_namespace": execution_namespace,
         }
     )
@@ -1217,6 +1485,7 @@ def prepare_native_tasks(
         "route_binding": route_binding,
         "execution_namespace": execution_namespace,
         "language_binding": language_binding,
+        "content_source_policy": source_policy,
         "worker_contract": worker_contract,
         "detail_contract": detail_contract,
         "execution_contract": execution_contract,
@@ -1242,6 +1511,7 @@ def prepare_native_tasks(
         "history_mode": "none",
         "task_payload_schema": TASK_PAYLOAD_SCHEMA,
         "contract_fingerprint": contract_fingerprint,
+        "content_source_policy": source_policy,
         "execution_contract": execution_contract,
         "manifest": str(manifest_path),
         "artifacts": [
@@ -1253,7 +1523,14 @@ def prepare_native_tasks(
     }
 
 
-def _validate_row(row: dict[str, Any], *, segment: Segment | None = None) -> dict[str, Any]:
+def _validate_row(
+    row: dict[str, Any],
+    *,
+    segment: Segment | None = None,
+    content_policy: dict[str, Any] | None = None,
+    provenance_model: str = "",
+    provenance_route: str = "",
+) -> dict[str, Any]:
     target_id = row.get("target_id")
     status = row.get("status")
     text = row.get("text", "")
@@ -1279,6 +1556,43 @@ def _validate_row(row: dict[str, Any], *, segment: Segment | None = None) -> dic
         "provider": str(row.get("provider", "native-worker")),
         "issues": issues,
     }
+    if content_policy is not None and not (
+        status == "error"
+        and result["provider"] == "native-control"
+        and len(issues) == 1
+        and issues[0] in OPERATIONAL_RESULT_ISSUES
+        and "content_provenance" not in row
+    ):
+        result["content_provenance"] = validate_output_provenance(
+            row.get("content_provenance"),
+            policy=content_policy,
+            model=provenance_model,
+            route=provenance_route,
+        )
+    elif "content_provenance" in row:
+        provenance = row["content_provenance"]
+        if (
+            not isinstance(provenance, dict)
+            or set(provenance)
+            != {
+                "schema",
+                "mode",
+                "model",
+                "route",
+                "policy_digest",
+                "external_sources_used",
+            }
+            or provenance.get("schema") != "parr0t.content-provenance.v1"
+            or provenance.get("mode") != "direct_model"
+            or not isinstance(provenance.get("model"), str)
+            or not provenance["model"]
+            or not isinstance(provenance.get("route"), str)
+            or not provenance["route"]
+            or not isinstance(provenance.get("policy_digest"), str)
+            or not isinstance(provenance.get("external_sources_used"), list)
+        ):
+            raise ValueError("E_OUTPUT_PROVENANCE_INVALID")
+        result["content_provenance"] = dict(provenance)
     for field in ("split_depth", "semantic_attempts"):
         if field in row:
             value = row[field]
@@ -1319,13 +1633,16 @@ def _normalize_review_failure(
         row, max_depth=max_depth, max_calls=max_calls
     ):
         return row
-    return {
+    normalized = {
         "target_id": row["target_id"],
         "status": "error",
         "text": "",
         "provider": "native-control",
         "issues": ["review_split_proof_missing"],
     }
+    if "content_provenance" in row:
+        normalized["content_provenance"] = dict(row["content_provenance"])
+    return normalized
 
 
 def _validate_manifest_rows(
@@ -1372,16 +1689,36 @@ def _validate_manifest_rows(
                     raise ValueError("Optional-slot composition references an unbound target")
         # Cache only a fully validated source; reuse once per wave/import scan.
         bound_segments.update((segment.id, segment) for segment in ordered)
+    content_policy = _bound_manifest_content_source_policy(manifest)
+    route_binding = manifest.get("route_binding") or {}
+    provenance_route = route_binding.get("provider") or (
+        "native-luna"
+        if manifest.get("pass_kind", "translation") == "translation"
+        else "native-sol"
+    )
+    provenance_model = route_binding.get("model") or provenance_route
+    if route_binding:
+        expected_provider = route_binding["provider"]
+        for row in rows:
+            if (
+                row.get("status") != "error"
+                and row.get("provider", "native-worker") != expected_provider
+            ):
+                raise ValueError(
+                    "Native result provider does not match its route binding"
+                )
     validated = [
         _validate_row(
             row,
             segment=bound_segments.get(row["target_id"])
             if isinstance(row.get("target_id"), str) else None,
+            content_policy=content_policy,
+            provenance_model=provenance_model,
+            provenance_route=provenance_route,
         )
         for row in rows
     ]
-    route_binding = manifest.get("route_binding")
-    if route_binding is not None:
+    if route_binding:
         expected_provider = route_binding["provider"]
         for row in validated:
             if row["status"] != "error" and row.get("provider") != expected_provider:
@@ -1408,7 +1745,22 @@ def import_native_shard(work_dir: Path, source: Path, shard_name: str) -> dict[s
     safe_name = SAFE_NAME.sub("-", shard_name.casefold()).strip("-.")
     if not safe_name:
         raise ValueError("Native shard name is empty after normalization")
-    rows = [_validate_row(row) for row in _read_jsonl(source)]
+    source_policy = content_source_policy(
+        work_dir,
+        task_kind="translation",
+        route="native-pass:translation",
+    )
+    rows = []
+    for row in _read_jsonl(source):
+        provider = str(row.get("provider", "native-worker"))
+        rows.append(
+            _validate_row(
+                row,
+                content_policy=source_policy,
+                provenance_model=provider,
+                provenance_route=provider,
+            )
+        )
     ids = [row["target_id"] for row in rows]
     if len(ids) != len(set(ids)):
         raise ValueError("Native shard contains duplicate target IDs")
@@ -1466,16 +1818,29 @@ def import_native_wave(
         if not result_path.is_file():
             raise ValueError("Native wave result is incomplete")
         try:
-            rows = _validate_manifest_rows(
-                work_dir, manifest, _read_jsonl(result_path), bound_segments=bound_segments
-            )
+            raw_rows = _read_jsonl(result_path)
         except (ValueError, json.JSONDecodeError):
-            raise ValueError("E_NATIVE_WAVE_RESULT_INVALID: Native wave result is invalid") from None
-        result_ids = [row["target_id"] for row in rows]
+            raise ValueError(
+                "E_NATIVE_WAVE_RESULT_INVALID: Native wave result is invalid"
+            ) from None
+        result_ids = [row.get("target_id") for row in raw_rows]
         if result_ids != expected_ids:
-            raise ValueError("Native wave result does not match its exclusive task binding")
+            raise ValueError(
+                "Native wave result does not match its exclusive task binding"
+            )
         if wave_ids.intersection(result_ids):
             raise ValueError("Native wave results overlap")
+        try:
+            rows = _validate_manifest_rows(
+                work_dir, manifest, raw_rows, bound_segments=bound_segments
+            )
+        except (ValueError, json.JSONDecodeError) as exc:
+            if str(exc) in {
+                "E_EXTERNAL_CONTENT_PROVENANCE_DENIED",
+                "E_OUTPUT_PROVENANCE_INVALID",
+            }:
+                raise ValueError(str(exc)) from None
+            raise ValueError("E_NATIVE_WAVE_RESULT_INVALID: Native wave result is invalid") from None
         wave_ids.update(result_ids)
         planned.append((_manifest_shard_path(work_dir, manifest, task), rows))
 
@@ -1505,6 +1870,13 @@ def _native_control_plan_fingerprint(manifest: dict[str, Any]) -> str:
         yield {"pass_kind": manifest.get("pass_kind", "translation")}
         if manifest.get("route_binding") is not None:
             yield {"route_binding": manifest["route_binding"]}
+        source_policy = _bound_manifest_content_source_policy(manifest)
+        if source_policy is not None:
+            yield {
+                "content_source_policy_digest": source_policy[
+                    "policy_digest"
+                ]
+            }
         if "execution_namespace" in manifest:
             yield {"execution_namespace": manifest["execution_namespace"]}
         for task in manifest["tasks"]:
@@ -1572,14 +1944,20 @@ def _write_wave_relay_dispatch(
             "child_leak_action": "quarantine_relay_and_return_categorical_receipt",
             "worker_message_template": (
                 "Workspace: {workspace}. Execute only the bound {pass_kind} task {task}. "
-                "Read {manifest} for its immutable worker, detail, execution and route contracts. "
-                "Read workspace policy/configuration for shared context references; load shared "
-                "context once and use only evidence relevant to the assigned task records. "
+                "Read {manifest} for its immutable worker, detail, execution, route and "
+                "content_source_policy contracts. Read only the exact task and context "
+                "artifacts bound by that manifest; unrelated workspace paths and every "
+                "outside-workspace local target are forbidden. External translation "
+                "services, browser translation, remote dictionaries, implicit web search "
+                "and every ungranted external content source are forbidden. Model-provider "
+                "transport invokes only the selected model and is not a content source. "
                 "Never open the complete source_artifact or delegate. Write one ordered JSONL "
-                "result to {result}, with target_id, status, text, provider and issues for every "
-                "bound target. Use the locked task language and exact route_binding.provider "
-                "when present. Obey the manifest's one semantic batch contract and return only "
-                "the prescribed metadata/artifact path, never source or translated text."
+                "result to {result}, with target_id, status, text, provider, issues and "
+                "direct-model content_provenance for every bound target. Bind provenance.model "
+                "to exact route_binding.model and provenance.route/provider to the separate "
+                "route_binding.provider alias. Obey the manifest's one semantic batch contract "
+                "and return only the prescribed metadata/artifact path, never source or "
+                "translated text."
             ),
             "terminal_seal_command": (
                 "game-l10n seal-native-wave-relay --workspace <workspace> "
@@ -1921,9 +2299,21 @@ def seal_native_wave_relay(
             payload.get("route_binding") is not None
             and (
                 not isinstance(payload["route_binding"], dict)
-                or set(payload["route_binding"]) != {"provider", "attempt"}
+                or set(payload["route_binding"]) not in (
+                    {"provider", "attempt"},
+                    {"provider", "model", "attempt"},
+                )
                 or not isinstance(payload["route_binding"].get("provider"), str)
                 or not payload["route_binding"]["provider"]
+                or (
+                    "model" in payload["route_binding"]
+                    and (
+                        not isinstance(
+                            payload["route_binding"].get("model"), str
+                        )
+                        or not payload["route_binding"]["model"]
+                    )
+                )
                 or not isinstance(payload["route_binding"].get("attempt"), int)
                 or isinstance(payload["route_binding"]["attempt"], bool)
                 or payload["route_binding"]["attempt"] < 1
@@ -2773,6 +3163,7 @@ def _prepare_review_split_child(
         },
         language_binding=current_manifest.get("language_binding"),
         route_binding=current_manifest.get("route_binding"),
+        _content_source_policy=_bound_manifest_content_source_policy(current_manifest),
     )
     child_manifest_path = child_tasks / "manifest.json"
     child_manifest = _load_task_manifest(work_dir, child_manifest_path)

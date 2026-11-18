@@ -15,6 +15,7 @@ from game_l10n.models import Segment
 from game_l10n.native_resume import native_resume_status
 from game_l10n.store import stable_hash
 from tests.test_native_pass import review_segment
+from tests import write_semantic_result_rows
 
 
 class NativeResumeTests(unittest.TestCase):
@@ -64,12 +65,19 @@ class NativeResumeTests(unittest.TestCase):
             if task["wave"] != wave:
                 continue
             rows = [json.loads(line) for line in (manifest_path.parent / task["file"]).read_text().splitlines()]
-            (results / task["file"]).write_text("".join(json.dumps({
-                "target_id": row["target_id"],
-                "status": "refused" if refused and index >= 2 else "success",
-                "text": "" if refused and index >= 2 else "PRIVATE_TARGET_SENTINEL",
-                "provider": manifest["route_binding"]["provider"],
-            }) + "\n" for index, row in enumerate(rows)), encoding="utf-8")
+            write_semantic_result_rows(
+                results / task["file"],
+                [
+                    {
+                        "target_id": row["target_id"],
+                        "status": "refused" if refused and index >= 2 else "success",
+                        "text": "" if refused and index >= 2 else "PRIVATE_TARGET_SENTINEL",
+                        "provider": manifest["route_binding"]["provider"],
+                    }
+                    for index, row in enumerate(rows)
+                ],
+                manifest=manifest,
+            )
         return native_pass.native_control_step(root, manifest_path, results)
 
     def _read_only(self, root: Path, **kwargs) -> dict:

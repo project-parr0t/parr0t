@@ -10,6 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from .content_source_policy import create_content_source_grant
 from .control_plane import (
     LEAK_INCIDENT_CODES,
     CONTROL_HANDOFF_PATH,
@@ -96,6 +97,7 @@ from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, P
 from .native_followup import collect_native_followup, prepare_native_followup
 from .native_translation_retry import (
     STATE_NAME as NATIVE_RETRY_STATE_NAME,
+    _load_state as _load_native_retry_state,
     advance_native_translation_retries,
     require_pre_fallback_retry_state,
     start_native_translation_retries,
@@ -120,6 +122,8 @@ from .native_pass import (
     DEFAULT_REVIEW_MAX_MATERIAL_TOKENS,
     DEFAULT_REVIEW_MAX_RECORDS,
     DEFAULT_REVIEW_MIN_RECORDS,
+    _load_task_manifest,
+    _bound_manifest_content_source_policy,
     import_native_shard,
     import_native_wave,
     merge_native_pass,
@@ -1549,6 +1553,16 @@ def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
         config=config,
         sdk_activation=activation,
         purpose=purpose,
+        content_source_grant=(
+            _path_in_workspace(
+                work_dir,
+                getattr(args, "content_source_grant", None),
+                must_exist=True,
+            )
+            if getattr(args, "content_source_grant", None)
+            else None
+        ),
+        content_source_scope=getattr(args, "content_source_scope", None) or "",
     )
     if result.get("status") == "ready":
         bind_data_plane_launch(work_dir, work_dir / result["relay_path"])
@@ -1823,13 +1837,46 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     output = _path_in_workspace(work_dir, args.output)
     execution = config.get("execution", {})
-    pass_kind = args.pass_kind
+    requested_pass_kind = args.pass_kind
+    if requested_pass_kind in {"triage", "strong_review"}:
+        exact_tier = "triage" if requested_pass_kind == "triage" else "strong"
+        if args.review_tier not in {None, exact_tier}:
+            raise ConfigurationError("E_NATIVE_REVIEW_TIER_INVALID")
+        args.review_tier = exact_tier
+        pass_kind = "review"
+    else:
+        pass_kind = requested_pass_kind
+    content_source_task_kind = (
+        "triage"
+        if pass_kind == "review" and args.review_tier == "triage"
+        else "strong_review"
+        if pass_kind == "review" and args.review_tier == "strong"
+        else pass_kind
+    )
     route_binding = None
     codex_app_mode = effective_execution_mode(config) == CODEX_APP_EXECUTION_MODE
     custom_native_mode = config.get("provider_preset") == "custom"
     declared_native_roles = native_role_models(config)
     ordered_native_review = bool(declared_native_roles) and pass_kind in {"review", "rewrite"}
     segments = read_segments(source)
+    retry_state = None
+    if getattr(args, "retry_state", None):
+        retry_state_path = _path_in_workspace(
+            work_dir, args.retry_state, must_exist=True
+        )
+        if retry_state_path.name != NATIVE_RETRY_STATE_NAME:
+            raise ConfigurationError("Native retry state path is not canonical")
+        retry_state = _load_native_retry_state(
+            work_dir, retry_state_path.parent
+        )
+        if (
+            retry_state["next_action"] != "native_retry"
+            or (work_dir / retry_state["pending_artifact"]).resolve() != source
+            or pass_kind != "translation"
+            or getattr(args, "content_source_grant", None)
+            or getattr(args, "content_source_scope", None)
+        ):
+            raise ConfigurationError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
     if custom_native_mode or ordered_native_review:
         if pass_kind == "translation":
             plan = _native_translation_route_plan(config)
@@ -1903,6 +1950,20 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
         raise ConfigurationError(
             "Native provider/attempt and review tier must match a Codex App native pass"
         )
+    if route_binding is not None:
+        runtime_models = native_runtime(work_dir, required=True)["models"]
+        model = runtime_models.get(route_binding["provider"])
+        if not isinstance(model, str) or not model:
+            raise ConfigurationError(
+                "E_NATIVE_RUNTIME_INVALID: native route has no exact model"
+            )
+        route_binding["model"] = model
+    if retry_state is not None and (
+        route_binding is None
+        or route_binding["provider"] != retry_state["next_provider"]
+        or route_binding["attempt"] != retry_state["next_attempt"]
+    ):
+        raise ConfigurationError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
     stored_records = execution.get("native_shard_records")
     stored_material = execution.get("native_shard_material_tokens")
     legacy_default = int(execution.get("native_shard_policy_version", 1)) < 2 and (
@@ -2027,6 +2088,22 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
         control_turn_budget_user_approved=control_turn_budget_user_approved,
         route_binding=route_binding,
         language_binding=language_binding(work_dir, config),
+        content_source_grant=(
+            _path_in_workspace(
+                work_dir,
+                getattr(args, "content_source_grant", None),
+                must_exist=True,
+            )
+            if getattr(args, "content_source_grant", None)
+            else None
+        ),
+        content_source_scope=getattr(args, "content_source_scope", None) or "",
+        content_source_task_kind=content_source_task_kind,
+        _content_source_policy=(
+            retry_state["content_source_policy"]
+            if retry_state is not None
+            else None
+        ),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -2061,6 +2138,7 @@ def cmd_prepare_native_followup(args: argparse.Namespace) -> int:
     primary_results = _path_in_workspace(
         work_dir, args.primary_results, must_exist=True
     )
+    retry_summary = None
     if effective_execution_mode(config) == CODEX_APP_EXECUTION_MODE or (
         config.get("provider_preset") == "custom" and _native_translation_route_plan(config)
     ):
@@ -2069,12 +2147,12 @@ def cmd_prepare_native_followup(args: argparse.Namespace) -> int:
                 "E_NATIVE_PRE_FALLBACK_RETRY_REQUIRED: complete the configured native "
                 "translation attempts before follow-up"
             )
-        require_pre_fallback_retry_state(
+        retry_summary = require_pre_fallback_retry_state(
             work_dir,
             _path_in_workspace(work_dir, args.retry_state, must_exist=True),
             source,
             primary_results,
-            route_plan=_native_translation_route_plan(config),
+            route_plan=_native_translation_retry_plan(work_dir, config),
         )
     result = prepare_native_followup(
         work_dir,
@@ -2086,6 +2164,21 @@ def cmd_prepare_native_followup(args: argparse.Namespace) -> int:
         external_fallback=(config.get("provider_preset") != "custom" or
                            len(_native_translation_route_plan(config)) <
                            len(config.get("routing", {}).get("translators", []))),
+        content_source_policy=(
+            retry_summary["content_source_policy"]
+            if retry_summary is not None
+            else None
+        ),
+        retry_lineage=(
+            retry_summary.get("primary_lineage")
+            if retry_summary is not None
+            else None
+        ),
+        retry_route_plan=(
+            retry_summary["route_plan"]
+            if retry_summary is not None
+            else None
+        ),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -2104,6 +2197,20 @@ def _native_translation_route_plan(config: dict[str, Any]) -> list[dict[str, Any
         for route in routes
     ]
 
+def _native_translation_retry_plan(
+    work_dir: Path, config: dict[str, Any]
+) -> list[dict[str, Any]]:
+    plan = _native_translation_route_plan(config)
+    models = native_runtime(work_dir, required=True)["models"]
+    if any(item["provider"] not in models for item in plan):
+        raise ConfigurationError(
+            "E_NATIVE_RUNTIME_INVALID: retry route has no exact runtime model"
+        )
+    return [
+        {**item, "model": models[item["provider"]]}
+        for item in plan
+    ]
+
 
 def cmd_start_native_translation_retries(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
@@ -2117,13 +2224,55 @@ def cmd_start_native_translation_retries(args: argparse.Namespace) -> int:
             "E_PROVIDER_MODE_DRIFT: native retries require configured native translation routes"
         )
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
+    segments = read_segments(source)
+    content_policy = None
+    primary_lineage = None
+    if getattr(args, "content_source_manifest", None):
+        manifest_path = _path_in_workspace(
+            work_dir, args.content_source_manifest, must_exist=True
+        )
+        policy_manifest = _load_task_manifest(work_dir, manifest_path)
+        source_fingerprint = stable_hash_sequence(
+            asdict(segment) for segment in segments
+        )
+        expected_namespace = manifest_path.parent.resolve().relative_to(
+            work_dir
+        ).as_posix()
+        manifest_source = (
+            work_dir / str(policy_manifest.get("source_artifact", ""))
+        ).resolve()
+        bound_policy = _bound_manifest_content_source_policy(policy_manifest)
+        if (
+            policy_manifest.get("pass_kind", "translation") != "translation"
+            or policy_manifest.get("source_fingerprint") != source_fingerprint
+            or manifest_source != source
+            or policy_manifest.get("execution_namespace") != expected_namespace
+            or bound_policy is None
+        ):
+            raise ConfigurationError(
+                "E_CONTENT_SOURCE_POLICY_IMMUTABLE: manifest is unrelated to "
+                "the retry input lineage"
+            )
+        content_policy = bound_policy
+        primary_lineage = {
+            "manifest": manifest_path.relative_to(work_dir).as_posix(),
+            "manifest_contract_fingerprint": policy_manifest[
+                "contract_fingerprint"
+            ],
+            "source_fingerprint": source_fingerprint,
+            "execution_namespace": expected_namespace,
+            "content_source_policy_digest": content_policy["policy_digest"],
+            "route_binding": policy_manifest.get("route_binding"),
+        }
     result = start_native_translation_retries(
         work_dir,
         source,
-        read_segments(source),
+        segments,
         _path_in_workspace(work_dir, args.results, must_exist=True),
         _path_in_workspace(work_dir, args.output),
-        route_plan=_native_translation_route_plan(config),
+        route_plan=_native_translation_retry_plan(work_dir, config),
+        content_policy=content_policy,
+        primary_lineage=primary_lineage,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -2147,7 +2296,7 @@ def cmd_advance_native_translation_retries(args: argparse.Namespace) -> int:
         work_dir,
         state.parent,
         _path_in_workspace(work_dir, args.results, must_exist=True),
-        route_plan=_native_translation_route_plan(config),
+        route_plan=_native_translation_retry_plan(work_dir, config),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -2483,6 +2632,15 @@ def cmd_process_translation_exchange(args: argparse.Namespace) -> int:
     if executable_fallbacks:
         _require_provider_credential(config, "deepseek")
     orchestrator = _codex_app_fallback_orchestrator(work_dir)
+    fallback_provider = next(
+        (
+            item
+            for item in config.get("providers", [])
+            if isinstance(item, dict) and item.get("name") == "deepseek"
+        ),
+        {},
+    )
+    fallback_model = str(fallback_provider.get("model", ""))
     with live_processing_ui(
         operation="fallback_processing", total_records=executable_fallbacks
     ) as progress:
@@ -2492,6 +2650,7 @@ def cmd_process_translation_exchange(args: argparse.Namespace) -> int:
             bundle,
             lambda segments: orchestrator.translate_many(segments),
             route="deepseek",
+            model=fallback_model,
             retry_failures=bool(args.user_requested_retry),
             max_input_tokens=(
                 int(max_input_tokens) if max_input_tokens is not None else None
@@ -3219,6 +3378,37 @@ def cmd_approve_runtime(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_grant_content_source(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    grant_path, grant = create_content_source_grant(
+        work_dir,
+        authority=args.authority,
+        scope_id=args.scope_id,
+        task_kinds=args.task_kind,
+        routes=args.route,
+        external_sources=args.external_source,
+        user_confirmed=bool(args.user_confirmed),
+        validation_contract=(
+            _path_in_workspace(work_dir, args.validation_contract, must_exist=True)
+            if args.validation_contract
+            else None
+        ),
+    )
+    print(
+        json.dumps(
+            {
+                "grant": grant_path.relative_to(work_dir).as_posix(),
+                "grant_id": grant["grant_id"],
+                "authority": grant["authority"],
+                "scope_id": grant["scope_id"],
+                "status": "recorded_not_used",
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def cmd_approve_third_party(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
@@ -3641,9 +3831,12 @@ def build_parser() -> argparse.ArgumentParser:
     native_prepare.add_argument("--output", required=True, help="Private task directory")
     native_prepare.add_argument(
         "--pass-kind",
-        choices=["translation", "review", "rewrite"],
+        choices=["translation", "triage", "strong_review", "review", "rewrite"],
         default="translation",
-        help="Use review to enable 2048-record batches and bounded failed-subset splitting",
+        help=(
+            "Use triage or strong_review for exact review-grant scope; legacy "
+            "review remains accepted only with --review-tier"
+        ),
     )
     native_prepare.add_argument(
         "--native-provider",
@@ -3653,6 +3846,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--route-attempt",
         type=int,
         help="Bind a native translation pass to its configured attempt ordinal",
+    )
+    native_prepare.add_argument(
+        "--retry-state",
+        help=(
+            "Canonical native retry state whose exact pending input, route, "
+            "attempt, and content-source policy are inherited"
+        ),
     )
     native_prepare.add_argument(
         "--review-tier",
@@ -3722,6 +3922,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--user-approved-control-turn-budget",
         action="store_true",
         help="Assert that the user explicitly requested the supplied control-turn limit",
+    )
+    native_prepare.add_argument(
+        "--content-source-grant",
+        help="Exact immutable external content-source grant for this new task namespace",
+    )
+    native_prepare.add_argument(
+        "--content-source-scope",
+        help="Exact scope ID bound by --content-source-grant",
     )
     native_prepare.set_defaults(func=cmd_prepare_native_pass)
 
@@ -3950,6 +4158,13 @@ def build_parser() -> argparse.ArgumentParser:
     native_retry_start.add_argument("--input", required=True)
     native_retry_start.add_argument("--results", required=True)
     native_retry_start.add_argument("--output", required=True)
+    native_retry_start.add_argument(
+        "--content-source-manifest",
+        help=(
+            "Prepared native translation manifest whose immutable content-source "
+            "policy is preserved across retries"
+        ),
+    )
     native_retry_start.set_defaults(func=cmd_start_native_translation_retries)
 
     native_retry_advance = sub.add_parser(
@@ -4069,6 +4284,14 @@ def build_parser() -> argparse.ArgumentParser:
     data_plane_prepare.add_argument(
         "--output",
         help="Private task directory; defaults under .game-l10n/data-plane",
+    )
+    data_plane_prepare.add_argument(
+        "--content-source-grant",
+        help="Exact immutable external content-source grant for this new task namespace",
+    )
+    data_plane_prepare.add_argument(
+        "--content-source-scope",
+        help="Exact scope ID bound by --content-source-grant",
     )
     data_plane_prepare.set_defaults(func=cmd_prepare_data_plane_task)
 
@@ -4445,6 +4668,37 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_installed.add_argument("--workspace", required=True)
     inspect_installed.add_argument("--target", required=True, help="Exact configured game root")
     inspect_installed.set_defaults(func=cmd_inspect_installed_state)
+
+    content_source_grant = sub.add_parser(
+        "grant-content-source",
+        help="Record an exact user or validation-session grant for external content sources",
+    )
+    content_source_grant.add_argument("--workspace", required=True)
+    content_source_grant.add_argument(
+        "--authority",
+        choices=["explicit_user", "validation_session"],
+        required=True,
+    )
+    content_source_grant.add_argument("--scope-id", required=True)
+    content_source_grant.add_argument(
+        "--task-kind",
+        action="append",
+        choices=[
+            "translation",
+            "rewrite",
+            "review",
+            "localization_context",
+            "image_localization",
+        ],
+        required=True,
+    )
+    content_source_grant.add_argument("--route", action="append", required=True)
+    content_source_grant.add_argument(
+        "--external-source", action="append", required=True
+    )
+    content_source_grant.add_argument("--user-confirmed", action="store_true")
+    content_source_grant.add_argument("--validation-contract")
+    content_source_grant.set_defaults(func=cmd_grant_content_source)
 
     approve_runtime = sub.add_parser(
         "approve-runtime",

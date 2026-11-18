@@ -24,6 +24,11 @@ const EXEC_VERBS = {
   "seal-data-plane-task": { values: ["--workspace", "--relay"], flags: ["--worker-ended"] },
   "seal-native-wave-relay": { values: ["--workspace", "--dispatch", "--ended-task"], flags: ["--relay-ended"] },
 };
+const WORKER_EXEC_VERBS = {
+  "claim-context-chunk": { values: ["--workspace", "--task", "--slot"] },
+  "commit-context-fragment": { values: ["--workspace", "--task", "--claim", "--result"] },
+  "finalize-context-fragments": { values: ["--workspace", "--task"] },
+};
 
 function fail(message, issueCode = "isolation_policy_denied") {
   throw Object.assign(new Error(`PARR0T_OMP_ISOLATION: ${message}`), { issueCode });
@@ -168,7 +173,18 @@ function relayFromPrompt(prompt, workspace) {
   const proof = metadata.launch_contract?.message_isolation;
   const keys = ["schema", "control_generation", "session_id", "process_id", "guard_sha256"];
   if (!proof || Object.keys(proof).length !== keys.length || Object.keys(registration).length !== keys.length || keys.some(key => proof[key] !== registration[key]) || registration.schema !== SCHEMA || registration.session_id !== process.env[SESSION_ENV] || registration.control_generation !== generation(workspace) || registration.guard_sha256 !== GUARD_SHA256) fail("relay isolation proof is absent or stale");
-  return { path: relayPath, metadata, native };
+  const privatePath = resolvedLocal(metadata[native ? "manifest" : "task_path"], workspace);
+  const privateContract = JSON.parse(readFileSync(privatePath, "utf8"));
+  const contentPolicy = privateContract.content_source_policy;
+  if (!contentPolicy || contentPolicy.schema !== "parr0t.content-source-policy.v1"
+      || typeof contentPolicy.policy_digest !== "string"
+      || typeof contentPolicy.semantic_content_generation !== "boolean"
+      || typeof contentPolicy.content_network_access !== "boolean"
+      || !Array.isArray(contentPolicy.allowed_external_sources)
+      || contentPolicy.content_network_access !== Boolean(contentPolicy.allowed_external_sources.length)) {
+    fail("content-source policy is absent or invalid", "content_source_policy_invalid");
+  }
+  return { path: relayPath, metadata, native, contentPolicy, privatePath, privateContract };
 }
 function relayRead(value, cwd, relay) {
   const target = resolvedLocal(value.replace(/:(?:raw:)?(?:\d|[-,]|raw).*$/, ""), cwd);
@@ -221,6 +237,80 @@ function relayArguments(argv, cwd, workspace, relay) {
     if (event.startsWith("worker-")) {
       if (!/^\d+$/.test(options.get("--slot") ?? "")) fail("worker lifecycle requires a numeric slot", "relay_arguments_invalid");
     } else if (options.has("--slot")) fail("finalizer lifecycle takes no slot", "relay_arguments_invalid");
+  }
+  return ["-I", "-B", PYTHON_ENTRY, ...argv.slice(2)];
+}
+function exactExternalRead(value, relay) {
+  if (!relay.contentPolicy.content_network_access || typeof value !== "string") return false;
+  const normalized = normalize(value);
+  return relay.contentPolicy.allowed_external_sources.some(source => normalize(source) === normalized);
+}
+function semanticReadPath(value, cwd) {
+  return resolvedLocal(value.replace(/:(?:raw:)?(?:\d|[-,]|raw).*$/, ""), cwd);
+}
+function semanticReadTarget(value, cwd, workspace, relay) {
+  if (exactExternalRead(value, relay)) return true;
+  if (typeof value !== "string") return false;
+  let target;
+  try { target = semanticReadPath(value, cwd); } catch { return false; }
+  if (!inside(workspace, target)) return false;
+  const exact = [relay.privatePath];
+  if (relay.native) {
+    if (typeof relay.privateContract.source_artifact === "string") {
+      exact.push(resolvedLocal(relay.privateContract.source_artifact, workspace));
+    }
+    for (const binding of relay.metadata.task_bindings) {
+      if (typeof binding.task === "string") exact.push(resolvedLocal(binding.task, workspace));
+    }
+  } else {
+    for (const [key, artifact] of Object.entries(relay.privateContract)) {
+      if (key.startsWith("input_") && typeof artifact === "string") {
+        exact.push(resolvedLocal(artifact, workspace));
+      }
+    }
+  }
+  return exact.some(artifact => artifact === target);
+}
+function semanticWriteTarget(value, cwd, workspace, relay) {
+  const target = resolvedLocal(value, cwd);
+  if (!inside(workspace, target)) return false;
+  if (relay.native) {
+    return relay.metadata.task_bindings.some(item =>
+      typeof item.result === "string"
+      && resolvedLocal(item.result, workspace) === target);
+  }
+  const exact = [
+    relay.privateContract.output_artifact,
+    relay.privateContract.output_envelope,
+  ].filter(value => typeof value === "string");
+  if (exact.some(value => resolvedLocal(value, workspace) === target)) return true;
+  if (relay.privateContract.worker_role === "context_analyzer") {
+    const progress = path.join(workspace, ".game-l10n", "context-progress");
+    return inside(progress, target);
+  }
+  const imageRoot = relay.privateContract.output_image_root;
+  return typeof imageRoot === "string"
+    && inside(resolvedLocal(imageRoot, workspace), target);
+}
+function workerArguments(argv, cwd, workspace, relay) {
+  if (!relay.contentPolicy.semantic_content_generation) return ["-B", ...argv];
+  if (relay.native || argv[0] !== "-m" || argv[1] !== "game_l10n.cli") fail("semantic worker process tools are network-denied", "content_network_denied");
+  const verb = argv[2];
+  const spec = WORKER_EXEC_VERBS[verb];
+  if (!spec) fail("semantic worker command is not a local core protocol verb", "content_network_denied");
+  const options = new Map();
+  for (let index = 3; index < argv.length; index++) {
+    const key = argv[index];
+    if (!spec.values.includes(key) || options.has(key)) fail("invalid semantic worker protocol arguments", "content_network_denied");
+    const value = argv[++index];
+    if (typeof value !== "string" || !value || value.startsWith("-")) fail("invalid semantic worker protocol arguments", "content_network_denied");
+    options.set(key, value);
+  }
+  if (options.size !== spec.values.length || resolvedLocal(options.get("--workspace"), cwd) !== workspace) fail("semantic worker protocol binding mismatch", "content_network_denied");
+  const task = resolvedLocal(options.get("--task"), workspace);
+  if (task !== resolvedLocal(relay.metadata.task_path, workspace)) fail("semantic worker task binding mismatch", "content_network_denied");
+  for (const key of ["--claim", "--result"]) {
+    if (options.has(key) && !inside(workspace, resolvedLocal(options.get(key), workspace))) fail("semantic worker artifact left workspace", "content_network_denied");
   }
   return ["-I", "-B", PYTHON_ENTRY, ...argv.slice(2)];
 }
@@ -514,13 +604,47 @@ export default function isolationGuard(pi) {
         const cwd = resolvedLocal(event.input.cwd ?? workspace, ctx.cwd);
         if (!inside(workspace, cwd) && cwd !== CORE) fail("execution cwd must be inside workspace or the exact core root");
         if (ctx.agent.depth === 1) relayArguments(event.input.argv, cwd, workspace, relay);
-        else if (ctx.agent.depth < 2) fail("unsupported subagent depth");
+        else if (ctx.agent.depth >= 2) workerArguments(event.input.argv, cwd, workspace, relay);
+        else fail("unsupported subagent depth");
         return;
       }
       if (ctx.agent.depth === 1) {
         if (event.toolName !== "read" || !relay || typeof event.input.path !== "string") fail("relay local tool is forbidden");
         relayRead(event.input.path, ctx.cwd, relay);
         return;
+      }
+      if (
+        relay.contentPolicy.semantic_content_generation
+        && ["read", "grep", "glob"].includes(event.toolName)
+      ) {
+        const target = event.input.path ?? (event.toolName === "read" ? undefined : ".");
+        if (
+          typeof target !== "string"
+          || target.split(";").some(part =>
+            !semanticReadTarget(part, ctx.cwd, workspace, relay))
+        ) {
+          fail(
+            "semantic workers may read only exact bound task, source, and context artifacts",
+            "content_source_policy_denied",
+          );
+        }
+        return;
+      }
+      if (
+        relay.contentPolicy.semantic_content_generation
+        && (event.toolName === "write" || event.toolName === "edit")
+      ) {
+        const semanticTargets = event.toolName === "edit"
+          ? editPaths(event.input)
+          : [event.input.path];
+        if (semanticTargets.some(target =>
+          typeof target !== "string"
+          || !semanticWriteTarget(target, ctx.cwd, workspace, relay))) {
+          fail(
+            "semantic worker writes must target bound result artifacts",
+            "content_source_policy_denied",
+          );
+        }
       }
       const targets = event.toolName === "edit" ? editPaths(event.input) : [event.input.path ?? (event.toolName === "grep" || event.toolName === "glob" ? "." : undefined)];
       for (const target of targets) {
@@ -536,7 +660,7 @@ export default function isolationGuard(pi) {
   pi.registerTool({
     name: "parr0t_exec",
     label: "Parr0t Native Python",
-    description: "Run native Python argv without an OMP shell/eval bridge or implicit deadline. Relay: fixed core CLI metadata lifecycle commands only. Workers: bound local game-data work. Subagents may be spawned only through built-in task, never eval agent/workpool or shared callbacks. This is not an OS sandbox.",
+    description: "Run native Python argv without an OMP shell/eval bridge or implicit deadline. Relay: fixed core CLI metadata lifecycle commands only. Semantic workers: local core protocol commands only under content-network denial. Inventory workers: bound local inspection. Subagents may be spawned only through built-in task, never eval agent/workpool or shared callbacks. This is not an OS sandbox.",
     parameters: z.object({ argv: z.array(z.string()), cwd: z.string().optional() }),
     async execute(_id, params, signal, _onUpdate, ctx) {
       if (!ready || fatal) fail("guard startup failed");
@@ -552,7 +676,8 @@ export default function isolationGuard(pi) {
         if (!relay) fail("relay binding is unavailable");
         relay = relayFromPrompt(`PARR0T_OMP_RELAY=${relay.path}`, workspace);
         if (ctx.agent.depth === 1) argv = relayArguments(params.argv, cwd, workspace, relay);
-        else if (ctx.agent.depth < 2) fail("unsupported subagent depth");
+        else if (ctx.agent.depth >= 2) argv = workerArguments(params.argv, cwd, workspace, relay);
+        else fail("unsupported subagent depth");
       } else if (ctx.agent.kind !== "main" && childRole !== "diagnostic") fail("unknown host identity");
       return await executePython(python, argv, cwd, signal);
     },

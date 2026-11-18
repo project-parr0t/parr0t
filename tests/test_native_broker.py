@@ -26,6 +26,7 @@ from game_l10n.native_runtime import (
     record_native_launch,
 )
 from game_l10n.store import stable_hash
+from tests import write_semantic_result_rows
 
 
 class NativeBrokerTests(unittest.TestCase):
@@ -86,10 +87,27 @@ class NativeBrokerTests(unittest.TestCase):
                         elif task.get("manifest"):
                             source = fixture.root / task["task"]
                             result = fixture.root / task["result"]
-                            result.parent.mkdir(parents=True, exist_ok=True)
-                            result.write_text("".join(json.dumps({"target_id": json.loads(line)["target_id"],
-                                "status": "success", "text": "TARGET", "provider": "native-luna", "issues": []}) + "\n"
-                                for line in source.read_text(encoding="utf-8").splitlines()), encoding="utf-8")
+                            manifest = json.loads(
+                                (fixture.root / task["manifest"]).read_text(
+                                    encoding="utf-8"
+                                )
+                            )
+                            write_semantic_result_rows(
+                                result,
+                                [
+                                    {
+                                        "target_id": json.loads(line)["target_id"],
+                                        "status": "success",
+                                        "text": "TARGET",
+                                        "provider": "native-luna",
+                                        "issues": [],
+                                    }
+                                    for line in source.read_text(
+                                        encoding="utf-8"
+                                    ).splitlines()
+                                ],
+                                manifest=manifest,
+                            )
                         workers.append(row)
                     fixture.executions[key] = {"request_id": key, "status": "completed", "workers": workers,
                         "usage": {"input_tokens": 20, "provider_cost_usd": 0.001},
