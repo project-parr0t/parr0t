@@ -16,6 +16,10 @@ from ..coverage import verify_inventory_pair
 from ..errors import GameL10nError
 from ..models import Segment
 from ..validators import DEFAULT_PROTECTED_PATTERNS, validate_integrity
+from .display import (
+    MAP_INFO, IndependentInventory, binding_metadata, display_accounting, independent_segments, script_displays,
+    source_census, structural_facts, target_id,
+)
 
 
 EXPECTED_ENGINE_VERSION = "1.6.1"
@@ -24,22 +28,18 @@ ENGINE_NAME = "RPG Maker MV"
 STATIC_SCOPE_SCHEMA = "parr0t.static-scope.v1"
 STATIC_SCOPE_CAPABILITY = "rpg-maker-mv-fixed-runtime-graph-v1"
 PRIMARY_SCOPE_METHOD = {
-    "name": "rpg-maker-mv-runtime-graph-bfs",
-    "implementation_fingerprint": "rpg-maker-mv-runtime-graph-bfs-v1",
+    "name": "rpg-maker-mv-format-extractor-bfs",
+    "implementation_fingerprint": "rpg-maker-mv-format-extractor-bfs-v2",
 }
 INDEPENDENT_SCOPE_METHOD = {
-    "name": "rpg-maker-mv-runtime-graph-fixed-point",
-    "implementation_fingerprint": "rpg-maker-mv-runtime-graph-fixed-point-v1",
+    "name": "rpg-maker-mv-source-location-audit-fixed-point",
+    "implementation_fingerprint": "rpg-maker-mv-source-location-audit-fixed-point-v2",
 }
 
 PROTECTED_TOKEN_RE = re.compile(
     r"\\(?:[A-Za-z]+(?:\[[^\]\r\n]*\])?|[.!|^><{}$\\])"
     r"|%(?:\d+\$)?[-+#0 ']*\d*(?:\.\d+)?[diouxXeEfFgGcrsa%]"
     r"|%\d+|\{\{[^{}]*\}\}|\{[A-Za-z_][A-Za-z0-9_.:-]*\}|</?[A-Za-z][^>\r\n]*>"
-)
-SCRIPT_DISPLAY_RE = re.compile(
-    r"(?:\$gameMessage\.add|\.setName|\.setNickname|\.setProfile)\s*\(\s*"
-    r"((?:\"(?:\\.|[^\"\\])*\")|(?:'(?:\\.|[^'\\])*'))\s*\)"
 )
 SCRIPT_DISPLAY_ONLY_RE = re.compile(
     r"^\s*(?:(?:\$gameMessage\.add|[A-Za-z_$][\w$\.\[\]]*\.(?:setName|setNickname|setProfile))"
@@ -360,7 +360,7 @@ def build_static_display_scope(
 
 
 def _apply_static_display_scope(
-    extractor: "_Extractor", scope: StaticDisplayScope
+    extractor: "_Extractor | IndependentInventory", scope: StaticDisplayScope
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     candidate_segments = list(extractor.segments)
     included: list[dict[str, Any]] = []
@@ -453,15 +453,18 @@ def _source_inventory_document(
     method: Mapping[str, str],
     tracking: Mapping[str, Any],
     exclusions: list[dict[str, Any]],
+    census: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
         "schema": "parr0t.source-inventory.v1",
         "method": method["name"],
         "implementation_fingerprint": method["implementation_fingerprint"],
         "coverage": {
-            "declared_complete": True,
+            "declared_complete": not census["pending_display_dependencies"],
             "exclusions": exclusions,
             "static_scope": dict(tracking),
+            "display_scope": display_accounting(census, segments),
+            "pending_display_dependencies": census["pending_display_dependencies"],
         },
         "segments": segments,
     }
@@ -658,6 +661,7 @@ class _Extractor:
         self.segments: list[dict[str, Any]] = []
         self.mappings: list[dict[str, Any]] = []
         self.contexts: list[dict[str, Any]] = []
+        self.source_evidence: list[dict[str, Any]] = []
         self.counts: Counter[str] = Counter()
         self.issues: Counter[str] = Counter()
         self.seen: set[tuple[str, str, tuple[int, int] | None]] = set()
@@ -687,8 +691,7 @@ class _Extractor:
         if key in self.seen:
             raise RpgMakerMvError("DUPLICATE_EXTRACTION_PATH")
         self.seen.add(key)
-        identity = f"{filename}#{key[1]}#{span or ''}"
-        identifier = "mv-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        identifier = target_id(filename, paths[0], span)
         metadata: dict[str, Any] = {
             "kind": kind,
             "file": filename,
@@ -697,6 +700,7 @@ class _Extractor:
             "protected_tokens": PROTECTED_TOKEN_RE.findall(value),
             "preserve_control_code_order": True,
             "context": dict(context or {}),
+            **binding_metadata(filename, paths[0], value, kind, span),
         }
         if kind == "battle_message" or (kind == "database" and str((context or {}).get('field', '')).startswith('message')):
             metadata.update(ui_slot_role="template_fragment", ui_render_pattern="{name}{value}")
@@ -754,10 +758,21 @@ class _Extractor:
         scene: str,
         details: Mapping[str, Any],
     ) -> None:
-        self.contexts.append(
+        self.source_evidence.append(
             {"scene": scene, "file": filename, "path": base, "details": dict(details), "commands": commands}
         )
-        comments: list[str] = []
+        flow = [
+            {"command_index": index, "code": command.get("code", 0),
+             "indent": command.get("indent", 0),
+             "control_facts": structural_facts(command.get("parameters", []))}
+            for index, command in enumerate(commands)
+            if isinstance(command, dict) and command.get("code") in {
+                101, 102, 111, 112, 113, 115, 117, 201, 301, 402, 403, 404, 411, 412, 413
+            }
+        ]
+        self.contexts.append(
+            {"scene": scene, "file": filename, "path": base, "details": dict(details), "flow": flow}
+        )
         message: dict[str, Any] = {}
         branches: dict[int, str] = {}
         index = 0
@@ -771,11 +786,8 @@ class _Extractor:
             if not isinstance(parameters, list):
                 raise RpgMakerMvError("INVALID_EVENT_PARAMETERS")
             self.counts["event_commands"] += 1
-            if code in {108, 408} and parameters and isinstance(parameters[0], str):
-                comments = (comments + [parameters[0]])[-8:]
-            elif code == 101:
+            if code == 101:
                 message = {
-                    "face_resource": parameters[0] if parameters else "",
                     "face_index": parameters[1] if len(parameters) > 1 else 0,
                     "background": parameters[2] if len(parameters) > 2 else 0,
                     "position": parameters[3] if len(parameters) > 3 else 2,
@@ -788,7 +800,7 @@ class _Extractor:
                 **details,
                 "command_index": index,
                 "indent": indent,
-                "comments": list(comments),
+                "flow_position": index,
                 "message": dict(message),
                 "branches": dict(branches),
             }
@@ -875,23 +887,16 @@ class _Extractor:
             elif code in {355, 655}:
                 self.counts["script_commands_preserved"] += 1
                 script = parameters[0] if parameters and isinstance(parameters[0], str) else ""
-                for match in SCRIPT_DISPLAY_RE.finditer(script):
-                    literal = match.group(1)
-                    try:
-                        decoded = decode_js_literal(literal)
-                    except RpgMakerMvError:
-                        self.issues["SCRIPT_LITERAL_DECODING_UNSUPPORTED"] += 1
-                        continue
+                displays, pending = script_displays(script, self.documents)
+                self.issues["UNRESOLVED_DISPLAY_ARGUMENT"] += len(pending)
+                for item in displays:
+                    before = len(self.segments)
                     self.add(
-                        filename,
-                        [base + [index, "parameters", 0]],
-                        decoded,
-                        "script_display_text",
-                        scene,
-                        context=context,
-                        span=match.span(1),
-                        quote=literal[0],
+                        filename, [base + [index, "parameters", 0]], item["source"],
+                        item["kind"], scene, context=context, span=item["span"], quote=item["quote"],
                     )
+                    if len(self.segments) > before and "projection" in item:
+                        self.mappings[-1]["projection"] = item["projection"]
             index += 1
 
     def run(self) -> None:
@@ -911,8 +916,6 @@ class _Extractor:
                         filename,
                         context={
                             "record_id": row.get("id", index),
-                            "record_name": row.get("name", ""),
-                            "note": row.get("note", ""),
                             "field": field,
                         },
                     )
@@ -941,7 +944,6 @@ class _Extractor:
                     [index, "list"],
                     f"common:{index}",
                     {
-                        "name": row.get("name", ""),
                         "trigger": row.get("trigger"),
                         "switch_id": row.get("switchId"),
                     },
@@ -958,8 +960,7 @@ class _Extractor:
                         [index, "pages", page_index, "list"],
                         f"troop:{index}:page:{page_index}",
                         {
-                            "name": row.get("name", ""),
-                            "conditions": page.get("conditions", {}),
+                            "conditions": structural_facts(page.get("conditions", {})),
                         },
                     )
 
@@ -976,14 +977,6 @@ class _Extractor:
                 raise RpgMakerMvError(f"INVALID_MAP_DOCUMENT:{filename}")
             map_id = int(re.search(r"\d+", filename).group())
             self.add(filename, [["displayName"]], data.get("displayName"), "map_name", f"map:{map_id}")
-            if map_id < len(infos) and isinstance(infos[map_id], dict):
-                self.add(
-                    "MapInfos.json",
-                    [[map_id, "name"]],
-                    infos[map_id].get("name"),
-                    "map_name",
-                    f"map:{map_id}",
-                )
             for event_index, event in enumerate(data.get("events", [])):
                 if not isinstance(event, dict):
                     continue
@@ -996,15 +989,9 @@ class _Extractor:
                         ["events", event_index, "pages", page_index, "list"],
                         f"map:{map_id}:event:{event_index}:page:{page_index}",
                         {
-                            "map_name": (
-                                infos[map_id].get("name", "")
-                                if map_id < len(infos) and isinstance(infos[map_id], dict)
-                                else ""
-                            ),
-                            "event_name": event.get("name", ""),
-                            "conditions": page.get("conditions", {}),
+                            "map_display_name": data.get("displayName", ""),
+                            "conditions": structural_facts(page.get("conditions", {})),
                             "trigger": page.get("trigger"),
-                            "note": event.get("note", ""),
                         },
                     )
 
@@ -1016,39 +1003,36 @@ class _Extractor:
 
 
 def extract_external_text(extractor: _Extractor, sources: Mapping[str, str]) -> None:
-    """Select statically bound first-argument literals without evaluating JavaScript.
-
-    Indirect values and concatenations require a separate dataflow audit. Callers
-    supply only scripts reachable from the selected runtime entry point.
-    """
-    lexical = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|\x27(?:\\.|[^\x27\\])*\x27|`(?:\\.|[^`\\])*`', re.S)
-    display = re.compile(r'(?:\.drawText(?:Ex)?|\.addCommand|\.setText|\$gameMessage\.add|\.setName|\.setNickname|\.setProfile)\s*\(\s*$')
+    """Select supported display operands without evaluating JavaScript."""
     for filename, text in sorted(sources.items()):
-        candidates = []
-        if filename.endswith('.js'):
-            masked = list(text)
-            for match in lexical.finditer(text):
-                literal = match[0]
-                if literal.startswith(('//', '/*')):
-                    masked[match.start():match.end()] = ' ' * len(literal)
-                    continue
-                if literal[0] not in {'"', "'"}:
-                    continue
-                if display.search(''.join(masked[:match.start()])) and re.match(r'\s*[,)]', text[match.end():]):
-                    candidates.append((decode_js_literal(literal), match.span(), 'script_display_text', literal[0], []))
-                masked[match.start():match.end()] = ' ' * len(literal)
-        elif filename.endswith('.html'):
-            for match in re.finditer(r'<title\b[^>]*>(.*?)</title\s*>', text, re.I | re.S):
-                candidates.append((html.unescape(match[1]), match.span(1), 'html_title', None, ['title']))
-        for value, span, kind, quote, identity_path in candidates:
+        if filename.endswith(".js"):
+            candidates, pending = script_displays(text, extractor.documents)
+            extractor.issues["UNRESOLVED_DISPLAY_ARGUMENT"] += len(pending)
+        elif filename.endswith(".html"):
+            candidates = [
+                {"source": html.unescape(match[1]), "span": match.span(1),
+                 "kind": "html_title", "quote": None}
+                for match in re.finditer(r"<title\b[^>]*>(.*?)</title\s*>", text, re.I | re.S)
+            ]
+        else:
+            continue
+        for item in candidates:
+            span, kind = item["span"], item["kind"]
             before = len(extractor.segments)
-            extractor.add(filename, [['text']], value, kind, filename, span=span, quote=quote)
+            extractor.add(filename, [["text"]], item["source"], kind, filename,
+                          span=span, quote=item["quote"])
             if len(extractor.segments) == before:
                 continue
-            identity_span = span if kind == 'script_display_text' else None
-            identifier = 'mv-' + hashlib.sha256(f'{filename}#{_json_pointer(identity_path)}#{identity_span or ""}'.encode()).hexdigest()[:24]
-            extractor.segments[-1]['id'] = extractor.mappings[-1]['id'] = identifier
-            extractor.segments[-1]['metadata'].update(json_pointer=_json_pointer(identity_path), source_span=list(span))
+            identity_path = ["title"] if kind == "html_title" else []
+            identity_span = None if kind == "html_title" else span
+            identifier = target_id(filename, identity_path, identity_span)
+            extractor.segments[-1]["id"] = extractor.mappings[-1]["id"] = identifier
+            extractor.segments[-1]["metadata"].update(
+                json_pointer=_json_pointer(identity_path), source_span=list(span),
+                **binding_metadata(filename, identity_path, item["source"], kind, identity_span),
+            )
+            if "projection" in item:
+                extractor.mappings[-1]["projection"] = item["projection"]
 
 
 def extract_bound_external_text(
@@ -1134,10 +1118,13 @@ def extract_game(
                 external_paths.append(path)
     external_sources = {p.relative_to(runtime_root).as_posix(): p.read_text(encoding='utf-8-sig') for p in external_paths}
     extract_external_text(extractor, external_sources)
+    independent = IndependentInventory(independent_segments(documents, external_sources))
+    census = source_census(documents, external_sources)
     scope = build_static_display_scope(documents, external_sources)
     static_tracking, static_exclusions, static_ledger = _apply_static_display_scope(
         extractor, scope
     )
+    independent_tracking, independent_exclusions, _ = _apply_static_display_scope(independent, scope)
     if not extractor.segments:
         raise RpgMakerMvError("NO_TRANSLATABLE_SEGMENTS")
 
@@ -1161,9 +1148,10 @@ def extract_game(
         )
 
     segment_path = output_root / "segments.jsonl"
+    pending_files = {entry["file"] for entry in census["pending_display_dependencies"]}
     for path in external_paths:
         filename = path.relative_to(runtime_root).as_posix()
-        if not any(entry['file'] == filename for entry in extractor.mappings):
+        if filename not in pending_files and not any(entry['file'] == filename for entry in extractor.mappings):
             continue
         baseline = output_root / 'baseline' / filename
         baseline.parent.mkdir(parents=True, exist_ok=True)
@@ -1183,6 +1171,12 @@ def extract_game(
             "ordered_scenes": extractor.contexts,
         },
     )
+    _write_json(output_root / "source-evidence.json", {
+        "engine": ENGINE_NAME, "version": layout.version,
+        "purpose": "read_only_roundtrip_evidence_not_semantic_context",
+        "ordered_scenes": extractor.source_evidence,
+    })
+    _write_json(output_root / "source-census.json", census)
     _write_json(output_root / "static-scope.json", static_ledger)
     primary_inventory = output_root / "primary-inventory.json"
     independent_inventory = output_root / "independent-inventory.json"
@@ -1193,19 +1187,21 @@ def extract_game(
             PRIMARY_SCOPE_METHOD,
             static_tracking,
             static_exclusions,
+            census,
         ),
     )
     _write_json(
         independent_inventory,
         _source_inventory_document(
-            extractor.segments,
+            independent.segments,
             INDEPENDENT_SCOPE_METHOD,
-            static_tracking,
-            static_exclusions,
+            independent_tracking,
+            independent_exclusions,
+            census,
         ),
     )
     inventory_attestation = verify_inventory_pair(primary_inventory, independent_inventory)
-    if inventory_attestation["status"] != "static_verified":
+    if set(inventory_attestation["issue_codes"]) - {"INVENTORY_NOT_DECLARED_COMPLETE"}:
         raise RpgMakerMvError("STATIC_SCOPE_INVENTORY_MISMATCH")
     _write_json(output_root / "inventory-attestation.json", inventory_attestation)
     manifest = {
@@ -1217,6 +1213,8 @@ def extract_game(
         "segments": extractor.mappings,
         "segment_count": len(extractor.segments),
         "context_script": "context-script.json",
+        "source_evidence": "source-evidence.json",
+        "source_census": "source-census.json",
         "static_scope": "static-scope.json",
         "primary_inventory": "primary-inventory.json",
         "independent_inventory": "independent-inventory.json",
@@ -1240,6 +1238,7 @@ def extract_game(
             "runtime_complete": False,
         },
         "inventory_status": inventory_attestation["status"],
+        "pending_display_dependency_count": len(census["pending_display_dependencies"]),
         "issue_codes": dict(extractor.issues),
         "source_unchanged": True,
     }
@@ -1344,6 +1343,10 @@ def _load_baselines(
                     for entry in bindings:
                         start, end = entry["span"]
                         literal = value[start:end]
+                        if entry.get("kind") == "script_display_projection":
+                            if literal != entry.get("projection", {}).get("expression"):
+                                return False
+                            continue
                         try:
                             decoded = (decode_js_literal(literal) if entry.get("kind") == "script_display_text"
                                        else html.unescape(literal) if entry.get("kind") == "html_title"
@@ -1416,6 +1419,57 @@ def inspect_script_span_bindings(manifest_path: Path, game_root: Path) -> dict[s
                 if matches(data.decode(encoding)[start:end]):
                     counts[name] += 1
     return {"status": "inspected", "span_counts": dict(counts)}
+
+def _validate_display_projection(
+    entry: Mapping[str, Any], original: str, baselines: Mapping[str, Any]
+) -> None:
+    projection = entry.get("projection")
+    match = MAP_INFO.fullmatch(original)
+    if (
+        not isinstance(projection, dict) or match is None
+        or projection.get("file") != "MapInfos.json"
+        or projection.get("path") != [int(match[1]), "name"]
+        or projection.get("expression") != original
+        or "MapInfos.json" not in baselines
+        or _get_path(baselines["MapInfos.json"], projection["path"]) != entry["source"]
+    ):
+        raise RpgMakerMvError("DISPLAY_PROJECTION_SOURCE_MISMATCH")
+
+
+def _verify_span_surroundings(
+    entries: list[dict[str, Any]], original: str, current: str, baselines: Mapping[str, Any]
+) -> None:
+    cursor = 0
+    chunks: list[str] = []
+    for entry in sorted(entries, key=lambda row: row["span"]):
+        start, end = entry["span"]
+        if start < cursor or end > len(original):
+            raise RpgMakerMvError("INVALID_SPAN_MAPPING")
+        chunks.append(re.escape(original[cursor:start]))
+        kind = entry.get("kind")
+        if kind in {"script_display_text", "script_display_projection"}:
+            quote = str(entry.get("quote", ""))
+            if quote not in {'"', "'"}:
+                raise RpgMakerMvError("INVALID_SCRIPT_QUOTE")
+            literal = re.escape(quote) + r'(?:\\[^\r\n]|[^' + re.escape(quote) + r'\\\r\n])*' + re.escape(quote)
+            if kind == "script_display_projection":
+                _validate_display_projection(entry, original[start:end], baselines)
+                chunks.append("(?:" + re.escape(original[start:end]) + "|" + literal + ")")
+            else:
+                if original[start:end][:1] != quote:
+                    raise RpgMakerMvError("INVALID_SCRIPT_QUOTE")
+                chunks.append(literal)
+        elif kind == "html_title":
+            chunks.append(r'(?:[^<&]|&(?:[A-Za-z][A-Za-z0-9]*|#[0-9]+|#x[0-9A-Fa-f]+);)*')
+        elif kind == "plugin_display_text":
+            chunks.append(r"[\s\S]*")
+        else:
+            raise RpgMakerMvError("INVALID_EXTERNAL_SPAN_KIND")
+        cursor = end
+    chunks.append(re.escape(original[cursor:]))
+    if not isinstance(current, str) or not re.fullmatch("".join(chunks), current):
+        raise RpgMakerMvError("PATCH_CHANGED_UNMAPPED_DATA")
+
 
 
 def apply_translations(
@@ -1515,6 +1569,9 @@ def apply_translations(
                 if decode_js_literal(original) != source:
                     raise RpgMakerMvError("SCRIPT_SPAN_SOURCE_MISMATCH")
                 replacement = encode_js_literal(target, str(entry.get("quote", "")))
+            elif entry.get("kind") == "script_display_projection":
+                _validate_display_projection(entry, original, baselines)
+                replacement = original if target == source else encode_js_literal(target, '"')
             elif entry.get("kind") == "html_title":
                 if html.unescape(original) != source:
                     raise RpgMakerMvError("HTML_SPAN_SOURCE_MISMATCH")
@@ -1570,10 +1627,14 @@ def apply_translations(
     output_root.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="mv-patch-", dir=output_root.parent) as temporary:
         temporary_root = Path(temporary)
+        mapped_files = {entry["file"] for entry in manifest["segments"]}
         for item in manifest["files"]:
             relative = _safe_relative_path(str(item["patch_path"]), label="patch_path")
             target = temporary_root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
+            if item.get("storage") == "text" and item["file"] not in mapped_files:
+                target.write_bytes((manifest_path.parent / item["baseline"]).read_bytes())
+                continue
             output_text = (documents[item['file']]['text'] if item.get('storage') == 'text'
                            else json.dumps(documents[item["file"]], ensure_ascii=False, separators=(",", ":")))
             target.write_bytes(output_text.encode("utf-8"))
@@ -1647,26 +1708,7 @@ def _verify_patch_loaded(
             original = baselines[item['file']]['text']
             current = (patch_root / relative).read_bytes().decode('utf-8-sig')
             entries = sorted((entry for entry in manifest['segments'] if entry['file'] == item['file']), key=lambda entry: entry['span'])
-            cursor = 0
-            chunks = []
-            for entry in entries:
-                start, end = entry['span']
-                if start < cursor or end > len(original):
-                    raise RpgMakerMvError('INVALID_SPAN_MAPPING')
-                chunks.append(re.escape(original[cursor:start]))
-                if entry.get('kind') == 'script_display_text':
-                    quote = str(entry.get('quote', ''))
-                    if quote not in {'"', "'"} or original[start:end][:1] != quote:
-                        raise RpgMakerMvError('INVALID_SCRIPT_QUOTE')
-                    chunks.append(re.escape(quote) + r'(?:\\[^\r\n]|[^' + re.escape(quote) + r'\\\r\n])*' + re.escape(quote))
-                elif entry.get('kind') == 'html_title':
-                    chunks.append(r'(?:[^<&]|&(?:[A-Za-z][A-Za-z0-9]*|#[0-9]+|#x[0-9A-Fa-f]+);)*')
-                else:
-                    raise RpgMakerMvError('INVALID_EXTERNAL_SPAN_KIND')
-                cursor = end
-            chunks.append(re.escape(original[cursor:]))
-            if not re.fullmatch(''.join(chunks), current):
-                raise RpgMakerMvError('PATCH_CHANGED_UNMAPPED_DATA')
+            _verify_span_surroundings(entries, original, current, baselines)
             continue
         try:
             output_document = json.loads((patch_root / relative).read_text(encoding="utf-8"))
@@ -1675,6 +1717,15 @@ def _verify_patch_loaded(
         differences = _leaf_differences(baselines[item["file"]], output_document)
         if not differences.issubset(allowed[item["file"]]):
             raise RpgMakerMvError("PATCH_CHANGED_UNMAPPED_DATA")
+        span_groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        for entry in manifest["segments"]:
+            if entry["file"] == item["file"] and "span" in entry:
+                span_groups.setdefault(tuple(entry["paths"][0]), []).append(entry)
+        for path, entries in span_groups.items():
+            _verify_span_surroundings(
+                entries, _get_path(baselines[item["file"]], path),
+                _get_path(output_document, path), baselines,
+            )
     _source_snapshot(game_root, manifest["files"])
     return {"status": "verified", "output_files": len(actual_paths), "source_unchanged": True}
 
