@@ -23,6 +23,7 @@ from game_l10n.review_policy import judge_calls
 from game_l10n.workspace import initialize_workspace, load_config
 from tests.omp_isolation_fixture import bind_omp_isolation
 from tests.test_native_pass import review_segment
+from tests import write_semantic_result_rows
 
 
 class PromptNativeReviewTests(unittest.TestCase):
@@ -99,8 +100,9 @@ class PromptNativeReviewTests(unittest.TestCase):
                     rows.append({"target_id": target, "status": status, "text": text,
                                  "provider": provider, "issues": []})
                 destination = self.root / binding["result"]
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+                write_semantic_result_rows(
+                    destination, rows, manifest=manifest
+                )
                 launches.append((contract["route"], contract["model"], ids))
             seal_native_wave_relay(self.root, relay_path, relay_ended=True)
         self.fail("native review did not reach its existing bounded aggregation barrier")

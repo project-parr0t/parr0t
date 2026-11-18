@@ -15,6 +15,7 @@ from game_l10n.native_review import collect_native_review
 from tests.test_native_pass import review_segment
 from game_l10n.orchestrator import OrchestratorConfig
 
+from tests import write_semantic_result_rows
 
 class NativeReviewTests(unittest.TestCase):
     def test_delivery_preserves_failures_and_only_includes_pending_when_authorized(self):
@@ -186,8 +187,7 @@ class NativeReviewTests(unittest.TestCase):
             rows = [{"target_id": s.id, "status": "success" if i < 2 else "error",
                      "text": ["U", "T", ""][i], "issues": []}
                     for i, s in enumerate(segments)]
-            (results / "task-0001.jsonl").write_text(
-                "\n".join(json.dumps(row) for row in rows) + "\n")
+            write_semantic_result_rows(results / "task-0001.jsonl", rows)
             import_native_wave(root, tasks / "manifest.json", results, 1)
             args = (root, source, tasks / "manifest.json", root / "collected")
             summary = collect_native_rewrite(*args)
@@ -283,8 +283,7 @@ class NativeReviewTests(unittest.TestCase):
             rows = [{"target_id": s.id, "status": "success" if i < 3 else "error",
                      "text": texts[i], "issues": [] if i < 3 else ["worker_ended_without_result"]}
                     for i, s in enumerate(segments)]
-            (results / "task-0001.jsonl").write_text(
-                "\n".join(json.dumps(row) for row in rows) + "\n")
+            write_semantic_result_rows(results / "task-0001.jsonl", rows)
             import_native_wave(root, tasks / "manifest.json", results, 1)
             summary = collect_native_review(root, source, tasks / "manifest.json",
                                             root / "collected", tier="triage", sample_percent=0)
@@ -318,10 +317,13 @@ class NativeReviewTests(unittest.TestCase):
             tasks, results = root / "tasks", root / "results"
             prepare_native_tasks(root, source, segments, tasks, pass_kind="review")
             results.mkdir()
-            (results / "task-0001.jsonl").write_text("\n".join(
-                json.dumps({"target_id": s.id, "status": "success", "text": text})
-                for s, text in zip(segments, texts, strict=True)
-            ) + "\n")
+            write_semantic_result_rows(
+                results / "task-0001.jsonl",
+                [
+                    {"target_id": s.id, "status": "success", "text": text}
+                    for s, text in zip(segments, texts, strict=True)
+                ],
+            )
             import_native_wave(root, tasks / "manifest.json", results, 1)
             summary = collect_native_review(root, source, tasks / "manifest.json",
                                             root / "collected", tier="strong")
@@ -343,9 +345,10 @@ class NativeReviewTests(unittest.TestCase):
             tasks, results = root / "tasks", root / "results"
             prepare_native_tasks(root, source, [segment], tasks, pass_kind="review")
             results.mkdir()
-            (results / "task-0001.jsonl").write_text(json.dumps({
-                "target_id": segment.id, "status": "success", "text": "OK",
-            }) + "\n")
+            write_semantic_result_rows(
+                results / "task-0001.jsonl",
+                [{"target_id": segment.id, "status": "success", "text": "OK"}],
+            )
             import_native_wave(root, tasks / "manifest.json", results, 1)
             triage = collect_native_review(root, source, tasks / "manifest.json",
                                            root / "triage", tier="triage", sample_percent=100)
@@ -509,9 +512,17 @@ class NativeReviewTests(unittest.TestCase):
             tasks, results = root / "tasks", root / "results"
             prepare_native_tasks(root, source, segments, tasks, pass_kind="review")
             results.mkdir()
-            (results / "task-0001.jsonl").write_text("\n".join(json.dumps({
-                "target_id": s.id, "status": "success", "text": '{"verdict":"ok","issues":[]}',
-            }) for s in segments) + "\n")
+            write_semantic_result_rows(
+                results / "task-0001.jsonl",
+                [
+                    {
+                        "target_id": s.id,
+                        "status": "success",
+                        "text": '{"verdict":"ok","issues":[]}',
+                    }
+                    for s in segments
+                ],
+            )
             import_native_wave(root, tasks / "manifest.json", results, 1)
             summary = collect_native_review(
                 root, source, tasks / "manifest.json", root / "collected", tier="triage",
