@@ -229,8 +229,10 @@ class NativeBrokerTests(unittest.TestCase):
         self.assertEqual(native_launch_summary(self.root, relay)["started_workers"], 1)
 
     def test_explicit_transport_and_exact_models_are_required(self):
-        with self.assertRaisesRegex(ValueError, "E_NATIVE_RUNTIME_INVALID"):
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_HOST_PROFILE_INVALID"):
             configure_native_runtime(self.root, "unknown-host", {}, transport="native-host-api")
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_RUNTIME_INVALID"):
+            configure_native_runtime(self.root, "fixture-host", {"native-custom": "inherit"}, transport="native-host-api")
         configure_native_runtime(self.root, "codex", {})
         with self.assertRaisesRegex(ValueError, "E_NATIVE_BROKER_NOT_SELECTED"):
             run_native_broker(self.root, self.root / "missing.json")
@@ -354,7 +356,7 @@ class NativeBrokerTests(unittest.TestCase):
                 _drive(client, path, identity, [{"task_key": "probe"}], poll_seconds=0)
         self.assertEqual(json.loads(path.read_text())["status"], "requested")
 
-    def test_ended_unstarted_wave_can_change_transport_on_same_host_and_model(self):
+    def test_explicit_transport_change_uses_fresh_manifest_on_same_host_and_model(self):
         profile = native_host_profile(self.root, "fixture-host")
         self.host_id = "codex"
         configure_native_host(self.root, "codex", profile["endpoint"])
@@ -372,12 +374,16 @@ class NativeBrokerTests(unittest.TestCase):
         seal_native_wave_relay(self.root, relay, relay_ended=True)
         configure_native_runtime(self.root, "codex", {}, transport="native-host-api")
         self.probe()
-        resumed = native_control_step(self.root, self.root / "tasks/manifest.json", self.root / "results",
-            require_relay_receipt=True, require_runtime=True, resume_relay=True)
+        prepare_native_tasks(self.root, source, segments, self.root / "replacement-tasks", max_records=1,
+                             route_binding={"provider": "native-luna", "model": "fixture/luna", "attempt": 1})
+        resumed = native_control_step(self.root, self.root / "replacement-tasks/manifest.json", self.root / "replacement-results",
+            require_relay_receipt=True, require_runtime=True)
         self.assertEqual(resumed["relay"]["executor"], "native-host-api")
         self.assertEqual(resumed["route_binding"]["attempt"], 1)
         self.assertEqual((self.root / "tasks/task-0001.jsonl").read_bytes(), task_bytes)
-        self.assertFalse(run_native_broker(self.root, relay, poll_seconds=0)["issue_codes"])
+        replacement = self.root / resumed["relay"]["dispatch"]
+        self.assertNotEqual(replacement, relay)
+        self.assertFalse(run_native_broker(self.root, replacement, poll_seconds=0)["issue_codes"])
 
     def test_http_parser_errors_do_not_echo_host_prose(self):
         import http.client

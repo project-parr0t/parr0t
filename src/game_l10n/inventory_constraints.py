@@ -21,6 +21,11 @@ from .validators import preflight_constraint_issues
 CONSTRAINT_SCHEMA = "parr0t.inventory-constraint-pending.v1"
 CONSTRAINT_ACTION = "await_inventory_constraint_repair"
 CONSTRAINT_CODE = "inventory_constraint_repair_required"
+CONSTRAINT_REPAIR_ACTIONS = (
+    "verify_inventory",
+    "repair_cached_inventory_constraints",
+    "correct_inventory_scope_with_evidence",
+)
 
 def has_inventory_constraint(codes: Any) -> bool:
     """Accept inventory diagnostics, never mixed provider or transport failure."""

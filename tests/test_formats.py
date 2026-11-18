@@ -38,6 +38,36 @@ class FormatTests(unittest.TestCase):
             self.assertEqual([(row.segment_id, row.source, row.text) for row in corrected],
                              [("fixture", source, text), ("peer", "S", "T")])
 
+    def test_lossless_results_preserve_review_authority_and_unicode_boundaries(self) -> None:
+        from game_l10n.formats import read_translation_results, write_results
+        from game_l10n.models import AttemptRecord, TranslationResult
+        text = "TARGET\u0085next\u2028line\u2029paragraph"
+        row = TranslationResult(
+            "fixture", "SOURCE", text, "reviewed",
+            reviewer="native-exact-review",
+            candidate_generation=3, candidate_digest=stable_hash(text),
+            acceptance_authority="reviewer", review_outcome="approved",
+            attempts=[AttemptRecord(
+                "review", "native-exact-review", "approved",
+                model="fixture/model:variant@upstream:high", candidate_generation=3,
+            )],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for suffix in (".json", ".jsonl"):
+                with self.subTest(suffix=suffix):
+                    path = Path(directory) / ("results" + suffix)
+                    write_results(path, [row])
+                    loaded = read_translation_results(path)
+                    self.assertEqual(
+                        (loaded[0].text, loaded[0].candidate_generation,
+                         loaded[0].acceptance_authority, loaded[0].review_outcome),
+                        (text, 3, "reviewer", "approved"),
+                    )
+                    self.assertEqual(loaded[0].attempts[0].model,
+                                     "fixture/model:variant@upstream:high")
+                    self.assertEqual(loaded[0].attempts[0].candidate_generation, 3)
+                    self.assertEqual(loaded[0].candidate_digest, stable_hash(text))
+
     def test_neighbor_enrichment_preserves_explicit_context_across_formats(self) -> None:
         rows = [
             {"id": "a", "source": "A", "previous": "external-before", "next": "external-after", "extra": "first"},

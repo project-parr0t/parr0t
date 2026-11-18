@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any
@@ -38,6 +40,7 @@ from .control_plane import (
 from .coverage import require_inventory_attestation, validate_inventory_display_scope
 from .errors import ConfigurationError, ProviderError
 from .extractor_preparation import (
+    ACTION as EXTRACTOR_PREPARATION_ACTION,
     ATTESTATION_PATH as EXTRACTOR_ATTESTATION_PATH,
     PURPOSE as EXTRACTOR_PREPARATION_PURPOSE,
     require_extractor_preparation,
@@ -54,6 +57,7 @@ from .image_localization import (
 from .inventory_constraints import (
     CONSTRAINT_ACTION,
     CONSTRAINT_CODE,
+    CONSTRAINT_REPAIR_ACTIONS,
     CONSTRAINT_SCHEMA,
     artifact_digest,
     has_inventory_constraint,
@@ -104,7 +108,6 @@ CONTEXT_RESULT_ISSUE_CODES = {
 }
 
 MIN_CONTEXT_CHUNK_CHARS = 2048
-MAX_CONTEXT_WORKERS = 32
 
 
 def _chunk_localization(chunk: list[Segment], localization: dict[str, Any] | None) -> dict[str, Any]:
@@ -317,6 +320,7 @@ def _write_context_manifest(
     content_source_policy: dict[str, Any] | None = None,
     semantic_route: str = "",
     runtime_model: str = "",
+    source_policies: list[dict[str, Any]] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     semantic = semantic_context_segments(segments, preflight)
     resolved_mode = (
@@ -328,6 +332,12 @@ def _write_context_manifest(
     ordered_ids = [item.id for item in semantic]
     positions = {item_id: index for index, item_id in enumerate(ordered_ids)}
     fragment_index = _context_fragment_index(work_dir)
+    policies = {
+        policy["policy_digest"]: validate_content_source_policy(policy)
+        for policy in (source_policies or [])
+    }
+    if content_source_policy is not None:
+        policies[content_source_policy["policy_digest"]] = content_source_policy
     reusable: list[tuple[int, int, dict[str, Any], list[dict[str, Any]], Path]] = []
     for binding_id, candidates in fragment_index.items():
         for _, payload in candidates:
@@ -346,13 +356,18 @@ def _write_context_manifest(
             ):
                 continue
             chunk = [by_id[item_id] for item_id in ids]
+            original_policy = policies.get(binding.get("content_source_policy_digest"))
+            if binding.get("content_source_policy_digest") is not None and original_policy is None:
+                continue
             expected_binding = _context_binding(
                 chunk,
                 source_inventory_fingerprint=source_inventory_fingerprint,
                 resolved_context_mode=resolved_mode,
                 contract_fingerprints=contract_fingerprints,
                 localization=localization,
-                content_source_policy=content_source_policy,
+                content_source_policy=original_policy,
+                semantic_route=str(binding.get("semantic_route", "")),
+                runtime_model=str(binding.get("runtime_model", "")),
             )
             if binding_id != expected_binding["binding_id"]:
                 continue
@@ -361,7 +376,7 @@ def _write_context_manifest(
                 fragment_index,
                 binding=expected_binding,
                 rows=rows,
-                content_source_policy=content_source_policy,
+                content_source_policy=original_policy,
             )
             if found is not None:
                 reusable.append(
@@ -428,6 +443,7 @@ def _write_context_manifest(
         "preflight_policy_version": CONTEXT_PREFLIGHT_POLICY_VERSION,
         "configured_context_mode": context_mode,
         "resolved_context_mode": resolved_mode,
+        "content_source_policies": list(policies.values()),
         "context_contract_fingerprints": contract_fingerprints,
         **(
             {"content_source_policy_digest": content_source_policy["policy_digest"]}
@@ -495,14 +511,18 @@ DATA_PLANE_PROFILES: dict[str, dict[str, str]] = {
 }
 
 
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_bytes(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    temporary.write_bytes(content)
     temporary.replace(path)
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    _atomic_bytes(
+        path,
+        (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+    )
 
 
 def _relative(work_dir: Path, path: Path) -> str:
@@ -515,30 +535,438 @@ def _relative(work_dir: Path, path: Path) -> str:
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
-def _data_plane_route_chain(config: dict[str, Any], worker_role: str) -> list[str]:
-    """Return only explicitly configured native routes for supported roles."""
-
+def _data_plane_route_chain(
+    config: dict[str, Any], worker_role: str, runtime: dict[str, Any] | None,
+) -> list[str]:
+    """Use configured role routes, never require an unused legacy model slot."""
     routing = config.get("routing", {})
     if not isinstance(routing, dict):
         raise ConfigurationError("E_DATA_PLANE_ROUTE_INVALID: routing must be an object")
     configured = routing.get("data_plane_routes", {})
-    if not isinstance(configured, dict) or set(configured) - {"inventory_reconciler"}:
+    if not isinstance(configured, dict) or set(configured) - set(DATA_PLANE_PROFILES):
         raise ConfigurationError("E_DATA_PLANE_ROUTE_INVALID: unsupported data-plane route role")
-    if worker_role != "inventory_reconciler":
+    if worker_role == "context_analyzer":
         return []
-    routes = configured.get("inventory_reconciler", ["native-sol"])
+    routes = configured.get(worker_role)
+    if routes is None:
+        role_routes = routing.get("translators" if worker_role == "image_localizer" else "context_analyzers", [])
+        candidates = [
+            route for route in role_routes
+            if isinstance(route, str) and route.startswith("native-")
+            and (runtime is None or route in runtime["models"])
+        ]
+        if candidates:
+            routes = candidates
+        elif runtime is not None:
+            default_route = next(
+                (route for route in ("native-context", "native-sol") if route in runtime["models"]), None,
+            )
+            if default_route is not None:
+                routes = [default_route]
+            elif len(runtime["models"]) == 1:
+                routes = list(runtime["models"])
+            else:
+                raise ConfigurationError("E_DATA_PLANE_ROUTE_REQUIRED: configure the exact native route for this role")
+        else:
+            routes = ["native-sol"]
     if (
-        not isinstance(routes, list)
-        or not routes
-        or any(
-            not isinstance(route, str)
-            or re.fullmatch(r"native-[a-z0-9][a-z0-9._-]*", route) is None
-            for route in routes
-        )
+        not isinstance(routes, list) or not routes
+        or any(not isinstance(route, str) or re.fullmatch(r"native-[a-z0-9][a-z0-9._-]*", route) is None for route in routes)
         or len(set(routes)) != len(routes)
     ):
         raise ConfigurationError("E_DATA_PLANE_ROUTE_INVALID: invalid configured native route chain")
     return list(routes)
+
+
+def _approved_operational_fallback(task: dict[str, Any], issue_codes: list[str]) -> bool:
+    """Only the immutable task policy can authorize its observed failure category."""
+    policy = task.get("execution_environment_policy")
+    observed = set(issue_codes) & DATA_PLANE_OPERATIONAL_FAILURE_CODES
+    return bool(
+        observed and isinstance(policy, dict)
+        and policy.get("schema") == "parr0t.execution-environment-policy.v1"
+        and policy.get("host") == "omp" and policy.get("authorization") == "user_requested"
+        and policy.get("fallback_strategy") == "next_configured_native_route"
+        and policy.get("preserve_successes") is True and policy.get("preserve_isolation") is True
+        and policy.get("silent_model_switch_allowed") is False
+        and isinstance(policy.get("fallback_on"), list)
+        and all(isinstance(code, str) for code in policy["fallback_on"])
+        and observed <= set(policy["fallback_on"])
+    )
+
+
+def _validated_image_candidate_preparation(
+    work_dir: Path, config: dict[str, Any], evidence: dict[str, Any],
+) -> tuple[dict[str, Any], set[str]]:
+    from .image_localization import _safe_relative, require_image_inspection_requested
+
+    policy = require_image_inspection_requested(work_dir)
+    context = config["extractor_requirements"]["source_metadata"]["image_candidate_discovery"]
+    if context["requested_scope"] != policy["requested_scope"]:
+        raise ConfigurationError("E_IMAGE_CANDIDATE_INPUT_CHANGED")
+    original_path = (work_dir / context["path"]).resolve()
+    _relative(work_dir, original_path)
+    original_body = original_path.read_bytes()
+    if hashlib.sha256(original_body).hexdigest() != context["sha256"]:
+        raise ConfigurationError("E_IMAGE_CANDIDATE_INPUT_CHANGED")
+    original = json.loads(original_body)
+    if (
+        not isinstance(original, dict) or original.get("schema") != "parr0t.image-inspection-candidates.v1"
+        or original.get("requested_scope") != policy["requested_scope"]
+        or not isinstance(original.get("unexamined_sources"), list)
+        or not isinstance(original.get("resolved_source_bindings", []), list)
+    ):
+        raise ConfigurationError("E_IMAGE_CANDIDATE_INPUT_CHANGED")
+    cache = (work_dir / "inputs/image-assets").resolve()
+    if not is_within(cache, work_dir):
+        raise ConfigurationError("E_IMAGE_CANDIDATE_SOURCE_INVALID")
+    roots = [Path(root).resolve() for root in config["game_roots"] if Path(root).resolve() != cache]
+    if original.get("source_roots") != [str(root) for root in roots]:
+        raise ConfigurationError("E_IMAGE_CANDIDATE_INPUT_CHANGED")
+    path = work_dir / "inputs/image-inspection-candidates.json"
+    body = path.read_bytes()
+    digest = hashlib.sha256(body).hexdigest()
+    if not any(record.get("outputs", {}).get("inputs/image-inspection-candidates.json") == digest for record in evidence["checks"]):
+        raise ConfigurationError("E_IMAGE_CANDIDATE_OUTPUT_UNATTESTED")
+    payload = json.loads(body)
+    if (
+        payload.get("schema") != "parr0t.image-inspection-candidates.v1"
+        or payload.get("requested_scope") != policy["requested_scope"]
+        or payload.get("unexamined_sources") != []
+        or not isinstance(payload.get("source_bindings"), list)
+        or not isinstance(payload.get("bound_local_assets"), list)
+    ):
+        raise ConfigurationError("E_IMAGE_CANDIDATE_DISCOVERY_INCOMPLETE")
+    source_records = [*original["unexamined_sources"], *original.get("resolved_source_bindings", [])]
+    originals = {
+        (item.get("source_root_index"), item.get("relative_path")): item.get("sha256")
+        for item in source_records
+    }
+    if len(originals) != len(source_records):
+        raise ConfigurationError("E_IMAGE_CANDIDATE_SOURCE_INVALID")
+    resolved: set[str] = set()
+    covered = set()
+    for binding in payload["source_bindings"]:
+        if not isinstance(binding, dict) or set(binding) != {"source_root_index", "relative_path", "sha256", "status"}:
+            raise ConfigurationError("E_IMAGE_CANDIDATE_SOURCE_INVALID")
+        index, relative = binding["source_root_index"], _safe_relative(binding["relative_path"])
+        key = (index, relative)
+        if (
+            type(index) is not int or not 0 <= index < len(roots)
+            or binding["status"] != "complete" or key in covered
+            or not isinstance(binding["sha256"], str)
+            or originals.get(key) != binding["sha256"]
+        ):
+            raise ConfigurationError("E_IMAGE_CANDIDATE_SOURCE_INVALID")
+        source = (roots[index] / relative).resolve()
+        if not is_within(source, roots[index]) or not source.is_file() or _digest(source) != binding["sha256"]:
+            raise ConfigurationError("E_IMAGE_CANDIDATE_INPUT_CHANGED")
+        resolved.add(str(source))
+        covered.add(key)
+    if covered != set(originals):
+        raise ConfigurationError("E_IMAGE_CANDIDATE_DISCOVERY_INCOMPLETE")
+    seen = set()
+    for entry in payload["bound_local_assets"]:
+        if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
+            raise ConfigurationError("E_IMAGE_CANDIDATE_SOURCE_INVALID")
+        source = Path(entry["path"]).resolve()
+        if (
+            str(source) != entry["path"] or str(source) in seen
+            or not any(is_within(source, root) for root in [*roots, cache])
+            or not source.is_file() or _digest(source) != entry["sha256"]
+        ):
+            raise ConfigurationError("E_IMAGE_CANDIDATE_INPUT_CHANGED")
+        seen.add(str(source))
+    return payload, resolved
+
+
+def validate_image_candidate_preparation(
+    work_dir: Path, config: dict[str, Any], evidence: dict[str, Any],
+) -> None:
+    """Require real complete output before the new SDK capability is ready."""
+    if "bounded-image-font-candidate-discovery" not in (config.get("extractor_requirements") or {}).get("required_capabilities", []):
+        return
+    try:
+        _validated_image_candidate_preparation(work_dir.resolve(), config, evidence)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise ConfigurationError("E_IMAGE_CANDIDATE_DISCOVERY_INCOMPLETE") from error
+
+
+def _sdk_image_candidates(
+    work_dir: Path, config: dict[str, Any] | None = None,
+    sdk_activation: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], set[str]] | None:
+    if not (work_dir / "inputs/image-inspection-candidates.json").is_file():
+        return None
+    try:
+        if config is None:
+            from .workspace import load_config
+            config = load_config(work_dir)
+        if "bounded-image-font-candidate-discovery" not in (config.get("extractor_requirements") or {}).get("required_capabilities", []):
+            return None
+        evidence = json.loads((work_dir / EXTRACTOR_ATTESTATION_PATH).read_text(encoding="utf-8"))
+        activation = sdk_activation if sdk_activation is not None else evidence["binding"]["activation"]
+        require_extractor_preparation(work_dir, config, activation)
+        return _validated_image_candidate_preparation(work_dir, config, evidence)
+    except (ConfigurationError, OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def image_candidate_source_roots(
+    work_dir: Path, game_roots: list[Path], *, config: dict[str, Any] | None = None,
+    sdk_activation: dict[str, Any] | None = None,
+) -> list[Path]:
+    """Expose only readiness-attested derived image inputs, without execution."""
+    work_dir = work_dir.resolve()
+    cache = (work_dir / "inputs/image-assets").resolve()
+    roots = [Path(root).resolve() for root in game_roots if Path(root).resolve() != cache]
+    if config is None and (work_dir / "inputs/image-inspection-candidates.json").is_file():
+        try:
+            from .workspace import load_config
+            config = load_config(work_dir)
+        except (ConfigurationError, OSError, ValueError):
+            return roots
+    if config is not None and roots != [
+        Path(root).resolve() for root in config.get("game_roots", [])
+        if Path(root).resolve() != cache
+    ]:
+        return roots
+    validated = _sdk_image_candidates(work_dir, config, sdk_activation)
+    if validated is not None and any(is_within(Path(entry["path"]), cache) for entry in validated[0]["bound_local_assets"]):
+        return [*roots, cache]
+    return roots
+
+
+def _image_candidate_repair(
+    work_dir: Path, output_dir: Path, config: dict[str, Any], discovery: dict[str, Any],
+    inputs: dict[str, str],
+) -> dict[str, Any]:
+    previous = config.get("extractor_requirements") or {}
+    requirements = {
+        **previous,
+        "required_capabilities": sorted(set(previous.get("required_capabilities", [])) | {"bounded-image-font-candidate-discovery"}),
+        "required_formats": sorted(set(previous.get("required_formats", [])) | {"image-font-resources"}),
+        "source_metadata": {
+            **previous.get("source_metadata", {}),
+            "image_candidate_discovery": {
+                "path": inputs["input_image_candidates"], "sha256": inputs["input_image_candidates_sha256"],
+                "requested_scope": discovery["requested_scope"],
+                "output_manifest": "inputs/image-inspection-candidates.json", "asset_root": "inputs/image-assets",
+                "output_contract": {
+                    "schema": "parr0t.image-inspection-candidates.v1",
+                    "required_fields": ["schema", "requested_scope", "bound_local_assets", "unexamined_sources", "source_bindings"],
+                    "bound_local_assets": "unique canonical absolute file paths and sha256, under original roots or fixed asset_root",
+                    "source_bindings": "one {source_root_index,relative_path,sha256,status:complete} for every original unexamined source AND retained resolved_source_bindings entry; unchanged bytes required",
+                    "unexamined_sources": "must be empty; incomplete discovery cannot attest readiness",
+                    "checks": "functional check output must be the exact output_manifest and attest every decoded asset hash; no echo or fabricated absence",
+                },
+                "observed_sdk_output_sha256": (
+                    _digest(work_dir / "inputs/image-inspection-candidates.json")
+                    if (work_dir / "inputs/image-inspection-candidates.json").is_file() else ""
+                ),
+            },
+        },
+    }
+    metadata = previous.get("source_metadata", {})
+    prior_context = metadata.get("image_candidate_discovery")
+    active_context = requirements["source_metadata"]["image_candidate_discovery"]
+    if prior_context is not None and prior_context != active_context:
+        history = metadata.get("image_candidate_discovery_history", [])
+        if not isinstance(prior_context, dict) or not isinstance(history, list):
+            raise ConfigurationError("E_IMAGE_CANDIDATE_REQUIREMENTS_INVALID")
+        requirements["source_metadata"]["image_candidate_discovery_history"] = [*history, prior_context]
+    path = output_dir / "candidate-inputs" / (stable_hash(requirements) + "-requirements.json")
+    if path.exists():
+        if json.loads(path.read_text(encoding="utf-8")) != requirements:
+            raise ConfigurationError("E_IMAGE_CANDIDATE_INPUT_CHANGED")
+    else:
+        _atomic_json(path, requirements)
+    return {
+        "status": "pending", "worker_role": "image_ui_inventory", "dispatch_allowed": False,
+        "next_action": EXTRACTOR_PREPARATION_ACTION, "candidate_discovery": inputs["input_image_candidates"],
+        "extractor_requirements_path": _relative(work_dir, path), "extractor_requirements_sha256": _digest(path),
+        "issue_codes": ["image_source_inventory_required"], "repair_actions": [EXTRACTOR_PREPARATION_ACTION],
+    }
+
+
+def _image_inventory_candidates(
+    work_dir: Path, output_dir: Path, roots: list[Path], inventory_path: Path,
+    config: dict[str, Any], sdk_activation: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Discover exact read-only candidates without granting a source-tree reader."""
+    from .image_localization import (
+        bound_inspection_assets, bound_local_assets, require_image_inspection_requested,
+    )
+
+    policy = require_image_inspection_requested(work_dir)
+    image_suffixes = {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".dib", ".tif", ".tiff",
+        ".tga", ".dds", ".ktx", ".ktx2", ".pvr", ".astc", ".pkm", ".basis",
+        ".exr", ".hdr", ".svg", ".ico", ".cur", ".icns", ".psd", ".avif", ".heic", ".heif",
+    }
+    font_suffixes = {".ttf", ".otf", ".ttc", ".otc", ".woff", ".woff2", ".fnt", ".fon", ".bdf", ".pcf"}
+    non_media_suffixes = {
+        ".txt", ".json", ".jsonl", ".csv", ".tsv", ".xml", ".yaml", ".yml",
+        ".ini", ".cfg", ".conf", ".md", ".log", ".css", ".js", ".mjs", ".cjs",
+        ".ts", ".py", ".pyc", ".rpy", ".rpyc", ".lua", ".rb", ".ks", ".tjs",
+        ".cs", ".h", ".c", ".cpp", ".hlsl", ".glsl", ".shader", ".pdb", ".map",
+        ".ogg", ".wav", ".mp3", ".flac", ".aac", ".m4a", ".mp4", ".webm", ".avi",
+        ".ogv", ".mov", ".mkv", ".srt", ".vtt", ".sig", ".manifest",
+    }
+    font_only = policy["requested_scope"] == "font_visual_inspection"
+    suffixes = font_suffixes if font_only else image_suffixes | font_suffixes
+    known_suffixes = non_media_suffixes | image_suffixes | font_suffixes
+    assets: dict[str, dict[str, str]] = {}
+    candidates: set[Path] = set()
+    unexamined: list[dict[str, Any]] = []
+    inputs: dict[str, str] = {}
+    metadata_issues: list[str] = []
+
+    def snapshot(path: Path, name: str) -> Path:
+        body = path.read_bytes()
+        digest = hashlib.sha256(body).hexdigest()
+        destination = (output_dir / "candidate-inputs" / digest / name).resolve()
+        _relative(work_dir, destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            if _digest(destination) != digest:
+                raise ConfigurationError("E_IMAGE_CANDIDATE_INPUT_CHANGED")
+        else:
+            temporary = destination.with_name(destination.name + ".tmp")
+            temporary.write_bytes(body)
+            temporary.replace(destination)
+        return destination
+    sdk_candidates = _sdk_image_candidates(work_dir, config, sdk_activation)
+    resolved_sources: set[str] = set()
+    if sdk_candidates is not None:
+        sdk_payload, resolved_sources = sdk_candidates
+        for entry in sdk_payload["bound_local_assets"]:
+            assets[entry["path"]] = entry
+        sdk_input = snapshot(work_dir / "inputs/image-inspection-candidates.json", "sdk-image-candidates.json")
+        inputs["input_image_sdk_candidates"] = _relative(work_dir, sdk_input)
+        inputs["input_image_sdk_candidates_sha256"] = _digest(sdk_input)
+
+    if inventory_path.is_file():
+        try:
+            prior_inventory = snapshot(inventory_path, "image-inventory.json")
+            for entry in bound_local_assets(work_dir, prior_inventory, game_roots=roots, inspection_only=True):
+                if Path(entry["path"]).suffix.lower() in suffixes:
+                    assets[entry["path"]] = entry
+            inputs["input_image_inventory"] = _relative(work_dir, prior_inventory)
+            inputs["input_image_inventory_sha256"] = _digest(prior_inventory)
+        except (ConfigurationError, OSError, ValueError):
+            metadata_issues.append("prior_image_inventory_unavailable")
+    attestation_path = work_dir / ".game-l10n/inventory-attestation.json"
+    if policy["status"] == "requested" and attestation_path.is_file():
+        try:
+            attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+            primary = Path(attestation["primary_path"]).resolve()
+            if not is_within(primary, work_dir):
+                raise ConfigurationError("E_IMAGE_CANDIDATE_INPUT_INVALID")
+            verified = require_inventory_attestation(work_dir, primary)
+            binding = verified["file_bindings"]["primary"]
+            metadata = {
+                "schema": "parr0t.image-source-inventory-metadata.v1",
+                "primary_path": _relative(work_dir, primary), "primary_sha256": _digest(primary),
+                "file_binding": binding, "raw_source_text_is_not_bound": True,
+            }
+            source_inventory = output_dir / "candidate-inputs" / (stable_hash(metadata) + "-source-inventory.json")
+            if source_inventory.exists():
+                if json.loads(source_inventory.read_text(encoding="utf-8")) != metadata:
+                    raise ConfigurationError("E_IMAGE_CANDIDATE_INPUT_CHANGED")
+            else:
+                _atomic_json(source_inventory, metadata)
+            current = primary.stat()
+            if binding != {"size": current.st_size, "mtime_ns": current.st_mtime_ns}:
+                raise ConfigurationError("E_IMAGE_CANDIDATE_INPUT_CHANGED")
+            inputs["input_image_source_inventory"] = _relative(work_dir, source_inventory)
+            inputs["input_image_source_inventory_sha256"] = _digest(source_inventory)
+        except (ConfigurationError, OSError, ValueError, KeyError, TypeError):
+            metadata_issues.append("canonical_source_inventory_unavailable")
+    for root_index, root in enumerate(roots):
+        if not root.is_dir():
+            raise ConfigurationError("E_IMAGE_CANDIDATE_SOURCE_INVALID: source root is not a directory")
+
+        def failed(error: OSError) -> None:
+            unexamined.append({"source_root_index": root_index, "reason": "source_directory_unreadable"})
+
+        for directory, names, filenames in os.walk(root, topdown=True, onerror=failed, followlinks=False):
+            folder = Path(directory)
+            kept = []
+            for name in sorted(names):
+                path = folder / name
+                if name in {".game-l10n", ".git", ".omp"} or path.resolve() in {work_dir / ".game-l10n", work_dir / "localized"}:
+                    continue
+                try:
+                    info = path.lstat()
+                    linked = stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+                except OSError:
+                    linked = True
+                if linked:
+                    unexamined.append({"source_root_index": root_index, "relative_path": path.relative_to(root).as_posix(), "reason": "linked_source_unexamined"})
+                else:
+                    kept.append(name)
+            names[:] = kept
+            for name in sorted(filenames):
+                path = folder / name
+                relative = path.relative_to(root).as_posix()
+                try:
+                    info = path.lstat()
+                    linked = stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+                    if linked or not stat.S_ISREG(info.st_mode):
+                        raise OSError()
+                    canonical = path.resolve()
+                    if str(canonical) in assets:
+                        continue
+                    if str(canonical) in resolved_sources:
+                        continue
+                    if path.suffix.lower() in suffixes:
+                        candidates.add(canonical)
+                    elif path.suffix.lower() not in known_suffixes:
+                        with path.open("rb") as source:
+                            header = source.read(64)
+                        font = header[:4] in {b"\x00\x01\x00\x00", b"OTTO", b"ttcf", b"wOFF", b"wOF2", b"true", b"typ1"}
+                        image = (
+                            header.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"BM", b"DDS "))
+                            or (header[:4] == b"RIFF" and header[8:12] == b"WEBP")
+                        )
+                        if font or (image and not font_only):
+                            candidates.add(canonical)
+                        elif not image:
+                            unexamined.append({"source_root_index": root_index, "relative_path": relative, "sha256": _digest(canonical), "reason": "opaque_source_requires_sdk_inventory"})
+                except OSError:
+                    unexamined.append({"source_root_index": root_index, "relative_path": relative, "reason": "source_file_unexamined"})
+    if candidates:
+        for entry in bound_inspection_assets(work_dir, sorted(candidates), game_roots=roots):
+            assets[entry["path"]] = entry
+    discovery = {
+        "schema": "parr0t.image-inspection-candidates.v1",
+        "requested_scope": policy["requested_scope"], "request_revision": policy["request_revision"],
+        "method": "canonical_inventory_and_read_only_file_discovery",
+        "source_roots": [str(root) for root in roots],
+        "asset_source_roots": [
+            str(root) for root in (
+                [*roots, (work_dir / "inputs/image-assets").resolve()]
+                if sdk_candidates is not None and any(
+                    is_within(Path(entry["path"]), (work_dir / "inputs/image-assets").resolve())
+                    for entry in sdk_candidates[0]["bound_local_assets"]
+                ) else roots
+            )
+        ],
+        "bound_local_assets": [assets[path] for path in sorted(assets)],
+        "resolved_source_bindings": sdk_candidates[0]["source_bindings"] if sdk_candidates is not None else [],
+        "unexamined_sources": unexamined, "metadata_issue_codes": sorted(set(metadata_issues)),
+        "candidate_classification_is_not_display_or_completeness_evidence": True,
+    }
+    path = output_dir / "candidate-inputs" / (stable_hash(discovery) + ".json")
+    if path.exists():
+        if json.loads(path.read_text(encoding="utf-8")) != discovery:
+            raise ConfigurationError("E_IMAGE_CANDIDATE_INPUT_CHANGED")
+    else:
+        _atomic_json(path, discovery)
+    inputs["input_image_candidates"] = _relative(work_dir, path)
+    inputs["input_image_candidates_sha256"] = _digest(path)
+    return discovery, inputs
 
 
 def _operational_failure_path(relay_path: Path, task_id: str) -> Path:
@@ -605,7 +1033,6 @@ def current_data_plane_operational_failure(
     workers = failure.get("workers")
     if (
         not isinstance(workers, list)
-        or not workers
         or any(
             not isinstance(row, dict) or not isinstance(row.get("worker_id"), str)
             for row in workers
@@ -628,13 +1055,15 @@ def current_data_plane_operational_failure(
         ]
     except (ConfigurationError, OSError, ValueError, TypeError, KeyError):
         return None
-    if workers != expected_workers:
+    if any(worker not in expected_workers for worker in workers) or (
+        failure.get("terminal") is True and failure.get("terminal_workers", workers) != expected_workers
+    ):
         return None
     return {
         "failure_code": failure["failure_code"],
-        "worker_ids": [row["worker_id"] for row in workers],
+        "worker_ids": [row["worker_id"] for row in expected_workers],
         "owner": failure.get("owner"),
-        "cancellation_required": failure.get("terminal") is not True,
+        "cancellation_required": bool(expected_workers) and failure.get("terminal") is not True,
         "terminal": failure.get("terminal") is True,
     }
 
@@ -679,6 +1108,10 @@ def _load_context_manifest(
         or manifest_id != task.get("context_manifest_id")
         or not isinstance(chunks, list)
         or (
+            manifest.get("content_source_policies") is not None
+            and manifest["content_source_policies"] != task.get("context_source_policies")
+        )
+        or (
             manifest.get("content_source_policy_digest") is not None
             and manifest.get("content_source_policy_digest")
             != task["content_source_policy"]["policy_digest"]
@@ -711,11 +1144,20 @@ def _context_progress(
             or not rows
         ):
             raise ConfigurationError("E_CONTEXT_MANIFEST_INVALID: chunk binding is invalid")
+        source_policy = next(
+            (policy for policy in manifest.get("content_source_policies", [manifest.get("content_source_policy")])
+             if policy is not None and policy.get("policy_digest") == binding.get("content_source_policy_digest")),
+            None,
+        )
+        if binding.get("content_source_policy_digest") is not None and source_policy is None:
+            raise ConfigurationError("E_CONTEXT_MANIFEST_INVALID: fragment source policy lineage is missing")
+        if source_policy is not None:
+            validate_content_source_policy(source_policy)
         found = _find_context_fragment(
             index,
             binding=binding,
             rows=rows,
-            content_source_policy=manifest.get("content_source_policy"),
+            content_source_policy=source_policy,
         )
         if found is None:
             pending.append(chunk)
@@ -1317,7 +1759,8 @@ def _safe_execution_summary(value: Any) -> dict[str, Any] | None:
         "implicit_timeout_allowed",
         "complete",
     }
-    if not isinstance(value, dict) or set(value) != fields:
+    optional = {"terminal_unstarted_slots", "finalizer_skipped"}
+    if not isinstance(value, dict) or set(value) - optional != fields:
         return None
     integer_fields = ("required_workers", "started_workers", "terminal_workers")
     if any(
@@ -1330,10 +1773,12 @@ def _safe_execution_summary(value: Any) -> dict[str, Any] | None:
     terminal = value["terminal_workers"]
     unstarted = value.get("unstarted_slots")
     unterminated = value.get("unterminated_slots")
+    terminal_unstarted = value.get("terminal_unstarted_slots", [])
+    finalizer_skipped = value.get("finalizer_skipped", False)
     if value.get("tracking_required") is False:
         if (
             required < 1
-            or required > MAX_CONTEXT_WORKERS
+            or terminal_unstarted != [] or finalizer_skipped is not False
             or started != 0
             or terminal != 0
             or unstarted != []
@@ -1350,7 +1795,7 @@ def _safe_execution_summary(value: Any) -> dict[str, Any] | None:
         value["tracking_required"] is not True
         or value["finalizer_required"] is not True
         or required < 0
-        or required > MAX_CONTEXT_WORKERS
+        or not isinstance(terminal_unstarted, list) or type(finalizer_skipped) is not bool
         or started < 0
         or started > required
         or terminal < 0
@@ -1362,10 +1807,10 @@ def _safe_execution_summary(value: Any) -> dict[str, Any] | None:
             or isinstance(slot, bool)
             or slot < 1
             or slot > required
-            for slot in unstarted + unterminated
+            for slot in unstarted + unterminated + terminal_unstarted
         )
-        or len(set(unstarted + unterminated)) != len(unstarted) + len(unterminated)
-        or started != required - len(unstarted)
+        or len(set(unstarted + unterminated + terminal_unstarted)) != len(unstarted) + len(unterminated) + len(terminal_unstarted)
+        or started != required - len(unstarted) - len(terminal_unstarted)
         or terminal != started - len(unterminated)
         or any(
             not isinstance(value.get(key), bool)
@@ -1381,11 +1826,12 @@ def _safe_execution_summary(value: Any) -> dict[str, Any] | None:
         or value["implicit_timeout_allowed"] is not False
         or value["finalizer_terminal"] and not value["finalizer_started"]
         or value["finalizer_started"] and terminal != required
+        or finalizer_skipped and value["finalizer_started"]
         or value["complete"]
         is not (
-            terminal == required
+            terminal + len(terminal_unstarted) == required
             and (
-                not value["finalizer_required"] or value["finalizer_terminal"]
+                not value["finalizer_required"] or value["finalizer_terminal"] or finalizer_skipped
             )
         )
     ):
@@ -1580,6 +2026,8 @@ def current_inventory_constraint(
             "binding": state["state_fingerprint"],
             "job_terminal": False,
             "dispatch_allowed": False,
+            "deterministic_repair_allowed": True,
+            "repair_actions": list(CONSTRAINT_REPAIR_ACTIONS),
         }
     except (ConfigurationError, OSError, ValueError, TypeError, AttributeError, KeyError):
         return None
@@ -1679,6 +2127,8 @@ def prepare_data_plane_task(
     purpose: str = "",
     content_source_grant: Path | None = None,
     content_source_scope: str = "",
+    offline_processing: list[dict[str, Any]] | None = None,
+    inspection_assets: list[Path] | None = None,
 ) -> dict[str, Any]:
     """Prepare one exact, private discovery, inventory, or context worker task.
 
@@ -1690,8 +2140,8 @@ def prepare_data_plane_task(
     require_control_plane_ready(work_dir)
     require_control_plane_entry(work_dir)
     runtime = native_runtime(work_dir)
-    if runtime:
-        runtime_isolation(work_dir, runtime)
+    isolation = runtime_isolation(work_dir, runtime) if runtime else None
+    isolation_fingerprint = stable_hash(isolation) if isolation is not None else None
     control_generation = int(control_plane_state(work_dir).get("generation", 0))
     profile = DATA_PLANE_PROFILES.get(worker_role)
     if profile is None:
@@ -1737,14 +2187,21 @@ def prepare_data_plane_task(
             "E_DATA_PLANE_TASK_SDK_ACTIVATION: data-plane tasks require an active SDK"
         )
     if worker_role in {"image_ui_inventory", "image_localizer"}:
-        require_image_localization_requested(work_dir)
+        if worker_role == "image_localizer":
+            require_image_localization_requested(work_dir)
+        else:
+            from .image_localization import require_image_inspection_requested
+
+            require_image_inspection_requested(work_dir)
         image_state = public_image_localization_state(work_dir)
         required_state = (
             "scope_required"
             if worker_role == "image_ui_inventory"
             else "localization_required"
         )
-        if image_state.get("status") != required_state:
+        if image_state.get("status") not in ({required_state, "scope_incomplete"} if worker_role == "image_ui_inventory" else {required_state}) and not (
+            worker_role == "image_ui_inventory" and image_state.get("status") == "inspection_only"
+        ):
             raise ConfigurationError(
                 "E_IMAGE_TASK_STATE: image data-plane task is not the next required action"
             )
@@ -1764,19 +2221,23 @@ def prepare_data_plane_task(
         if profile["counterpart"]
         else None
     )
-    route_chain = _data_plane_route_chain(config, worker_role)
+    route_chain = _data_plane_route_chain(config, worker_role, runtime)
     route_index = 0
     worker_route = route_chain[0] if route_chain else ""
     worker_model_family = "native" if route_chain else ""
 
     attempt = 1
+    task_revision = 1
     previous_context_receipt_success = 0
     previous_context_baseline = 0
     previous_context_no_progress = 0
     previous_issue_codes: list[str] = []
     previous_receipt_closes = False
+    runtime_repaired = False
+    retry_repaired_runtime = False
     previous_task_path = output_dir / "task.json"
     previous_source_policy: dict[str, Any] | None = None
+    previous_task: dict[str, Any] = {}
     if previous_task_path.is_file():
         try:
             previous_task = json.loads(previous_task_path.read_text(encoding="utf-8"))
@@ -1790,6 +2251,11 @@ def prepare_data_plane_task(
                 and not isinstance(previous_attempt, bool)
                 and previous_attempt >= 1
             )
+            if valid_previous_attempt:
+                previous_revision = previous_task.get("task_revision", previous_attempt)
+                if type(previous_revision) is not int or previous_revision < 1:
+                    raise ConfigurationError("E_DATA_PLANE_TASK_INVALID: prior task revision is invalid")
+                task_revision = previous_revision + 1
             previous_receipt_path = data_plane_receipt_path(work_dir, worker_role, purpose=purpose)
             previous_receipt = (
                 json.loads(previous_receipt_path.read_text(encoding="utf-8"))
@@ -1829,10 +2295,68 @@ def prepare_data_plane_task(
                 and previous_receipt.get("control_generation") == control_generation
             )
             previous_receipt_closes = receipt_closes_previous
-            if worker_role == "inventory_reconciler" and receipt_closes_previous:
+            if receipt_closes_previous:
+                prior_relay = {}
+                prior_relay_path = output_dir / "relay.json"
+                if prior_relay_path.is_file():
+                    require_native_workers_ended(work_dir, prior_relay_path)
+                    prior_relay, _ = _load_bound_data_plane_relay(work_dir, prior_relay_path)
+                if previous_receipt.get("execution", {}).get("complete", True) is not True:
+                    return {
+                        "status": "pending", "worker_role": worker_role,
+                        "next_action": "wait_for_active_data_plane_workers",
+                        "dispatch_allowed": False,
+                    }
+            runtime_blocked = bool(
+                receipt_closes_previous and set(previous_receipt.get("issue_codes", [])) & RUNTIME_ISSUES
+            )
+            prior_isolation = previous_task.get("execution_isolation_fingerprint")
+            if "execution_isolation_fingerprint" not in previous_task and runtime_blocked:
+                prior_relay, _ = _load_bound_data_plane_relay(work_dir, output_dir / "relay.json")
+                prior_proof = prior_relay.get("launch_contract", {}).get("message_isolation")
+                prior_isolation = stable_hash(prior_proof) if prior_proof is not None else None
+            isolation_repaired = (
+                bool(set(previous_issue_codes) & {ISOLATION_ISSUE, "execution_guard_denied"})
+                and isolation_fingerprint is not None and prior_isolation != isolation_fingerprint
+            )
+            runtime_repaired = (
+                "execution_runtime_fingerprint" in previous_task
+                and previous_task["execution_runtime_fingerprint"] != (runtime or {}).get("fingerprint")
+            ) or isolation_repaired
+            if receipt_closes_previous and "operational_error" in previous_issue_codes:
+                prior_binding = prior_relay.get("launch_contract", {})
+                selected_route = previous_task.get("worker_route") or previous_task.get("context_route")
+                selected_model = (runtime or {}).get("models", {}).get(selected_route)
+                selected_binding_repaired = bool(
+                    selected_model and prior_binding.get("model")
+                    and (
+                        selected_model != prior_binding["model"]
+                        or (runtime or {}).get("host") != prior_binding.get("host")
+                    )
+                )
+                retry_repaired_runtime = selected_binding_repaired or isolation_repaired
+            if receipt_closes_previous and "operational_error" in previous_issue_codes and not retry_repaired_runtime and not _approved_operational_fallback(previous_task, previous_issue_codes):
+                return {
+                    "status": "pending", "worker_role": worker_role,
+                    "next_action": "repair_native_runtime", "dispatch_allowed": False,
+                    "reason": "bound_execution_policy_does_not_authorize_failure",
+                    "issue_codes": ["native_route_repair_required"],
+                    "repair_actions": ["repair_native_runtime", "prepare_fresh_authorized_task"],
+                }
+            if route_chain and receipt_closes_previous:
                 previous_codes = previous_receipt.get("issue_codes", [])
                 previous_index = previous_task.get("data_plane_route_index", 0)
-                if "operational_error" in previous_codes:
+                if retry_repaired_runtime:
+                    previous_route = previous_task.get("worker_route")
+                    if previous_route not in route_chain:
+                        return {
+                            "status": "pending", "worker_role": worker_role,
+                            "next_action": "repair_native_runtime", "dispatch_allowed": False,
+                            "issue_codes": ["native_route_repair_required"],
+                            "repair_actions": ["configure_approved_data_plane_route"],
+                        }
+                    route_index = route_chain.index(previous_route)
+                elif "operational_error" in previous_codes:
                     if (
                         not isinstance(previous_index, int)
                         or isinstance(previous_index, bool)
@@ -1847,6 +2371,9 @@ def prepare_data_plane_task(
                             "status": "pending",
                             "worker_role": worker_role,
                             "reason": "no_configured_route_successor",
+                            "next_action": "repair_native_runtime", "dispatch_allowed": False,
+                            "issue_codes": ["native_route_repair_required"],
+                            "repair_actions": ["repair_native_runtime", "extend_approved_data_plane_routes"],
                         }
                 else:
                     route_index = previous_index if (
@@ -1856,20 +2383,15 @@ def prepare_data_plane_task(
                     ) else 0
                 worker_route = route_chain[route_index]
                 worker_model_family = "native"
-            runtime_blocked = bool(
-                receipt_closes_previous and set(previous_receipt.get("issue_codes", [])) & RUNTIME_ISSUES
-            )
-            if runtime_blocked:
-                previous_relay_path = output_dir / "relay.json"
-                previous_relay, _ = _load_bound_data_plane_relay(work_dir, previous_relay_path)
+            if runtime_blocked and "operational_error" not in previous_issue_codes and not runtime_repaired:
                 return {
-                    "schema": previous_relay["schema"], "status": "ready",
-                    "worker_role": worker_role, "stage": profile["stage"],
-                    "relay_path": _relative(work_dir, previous_relay_path),
-                    "task_id": previous_task["task_id"], "control_generation": control_generation,
+                    "status": "pending", "next_action": "repair_native_runtime",
+                    "worker_role": worker_role, "dispatch_allowed": False,
+                    "issue_codes": ["native_route_repair_required"],
+                    "repair_actions": ["repair_native_runtime", "configure_approved_data_plane_route"],
                 }
             if valid_previous_attempt and receipt_closes_previous:
-                attempt = previous_attempt + 1
+                attempt = previous_attempt if runtime_blocked or "operational_error" in previous_issue_codes else previous_attempt + 1
             elif valid_previous_attempt:
                 if previous_task.get("control_generation") != control_generation:
                     # A recorded parent leak invalidates only the old control-plane
@@ -1882,6 +2404,32 @@ def prepare_data_plane_task(
                         work_dir, previous_relay_path
                     )
                     if bound_task.get("task_id") == previous_task.get("task_id"):
+                        if content_source_grant is not None or content_source_scope:
+                            policy = bound_task["content_source_policy"]
+                            proposed = content_source_policy(
+                                work_dir, task_kind=policy["task_kind"], route=policy["route"],
+                                scope_id=content_source_scope, grant_path=content_source_grant,
+                            )
+                            if proposed != policy:
+                                raise ConfigurationError("E_DATA_PLANE_TASK_ACTIVE: end the current bound task before revising content scope")
+                        if offline_processing is not None:
+                            from .third_party_approval import validated_offline_processing
+
+                            proposed_processing = validated_offline_processing(
+                                work_dir, offline_processing, binding_path=previous_task_path,
+                            )
+                            if proposed_processing != bound_task.get("offline_processing", []):
+                                raise ConfigurationError("E_DATA_PLANE_TASK_ACTIVE: end the current bound task before revising offline processing")
+                        if inspection_assets is not None:
+                            if worker_role != "image_ui_inventory":
+                                raise ConfigurationError("E_IMAGE_INSPECTION_SCOPE_INVALID")
+                            from .image_localization import bound_inspection_assets
+
+                            proposed_assets = bound_inspection_assets(
+                                work_dir, inspection_assets, game_roots=[Path(root) for root in roots],
+                            )
+                            if proposed_assets != bound_task.get("bound_local_assets", []):
+                                raise ConfigurationError("E_DATA_PLANE_TASK_ACTIVE: end the current bound task before revising inspection assets")
                         return {
                             "schema": previous_relay["schema"],
                             "status": "ready",
@@ -1890,14 +2438,16 @@ def prepare_data_plane_task(
                             "relay_path": _relative(work_dir, previous_relay_path),
                             "task_id": previous_task["task_id"],
                             "control_generation": control_generation,
+                            **({"candidate_discovery": bound_task["input_image_candidates"]} if bound_task.get("input_image_candidates") else {}),
                         }
         except (OSError, json.JSONDecodeError):
             attempt = 1
     # Every attempt and control-plane generation owns a distinct response path.
     # Older envelopes remain immutable evidence and can never be resealed as a
     # later attempt merely because their file name was reused.
+    revision_suffix = f".revision-{task_revision}" if task_revision > 1 else ""
     envelope = (
-        output_dir / f"control-envelope.g{control_generation}.attempt-{attempt}.json"
+        output_dir / f"control-envelope.g{control_generation}.attempt-{attempt}{revision_suffix}.json"
     ).resolve()
     relay_max_workers = 1
     worker_delegation_allowed = False
@@ -1906,6 +2456,7 @@ def prepare_data_plane_task(
         "worker_role": worker_role,
         "stage": profile["stage"],
         "attempt": attempt,
+        "task_revision": task_revision,
         "control_generation": control_generation,
         "workspace_root": str(work_dir.resolve()),
         "source_roots": [] if worker_role == "context_analyzer" else roots,
@@ -1937,6 +2488,14 @@ def prepare_data_plane_task(
     }
     if purpose:
         private_payload["purpose"] = purpose
+        if ((config.get("extractor_requirements") or {}).get("source_metadata") or {}).get("image_candidate_discovery"):
+            private_payload["requirements"].extend([
+                "obey_the_exact_image_candidate_discovery_output_contract_in_extractor_requirements",
+                "inspect_opaque_sources_only_with_bounded_deterministic_sdk_code_never_whole_root_semantic_reads",
+                "decode_only_image_font_candidates_into_inputs_image_assets_preserve_original_source_bytes",
+                "do_not_acquire_dependencies_execute_the_game_or_infer_new_processing_authority",
+                "functional_checks_must_publish_the_exact_candidate_manifest_and_resolve_every_bound_source",
+            ])
         private_payload["extractor_requirements"] = config.get("extractor_requirements")
         private_payload["preparation_contract"] = {
             "profile_path": "tools/extractor-preparation.json",
@@ -1971,13 +2530,9 @@ def prepare_data_plane_task(
             scope_id=content_source_scope,
             grant_path=content_source_grant,
         )
-        if previous is not None and proposed != previous:
-            raise ConfigurationError(
-                "E_CONTENT_SOURCE_POLICY_IMMUTABLE: retries cannot widen content access"
-            )
         return proposed
 
-    if worker_role == "inventory_reconciler":
+    if route_chain:
         private_payload.update(
             data_plane_route_chain=route_chain,
             data_plane_route_index=route_index,
@@ -2037,6 +2592,25 @@ def prepare_data_plane_task(
                 "E_DATA_PLANE_TASK_ROUTE: context analysis requires configured routes"
             )
         route_index = (attempt - 1) % len(context_routes)
+        if previous_receipt_closes and retry_repaired_runtime:
+            previous_route = previous_task.get("context_route")
+            if previous_route not in context_routes:
+                return {
+                    "status": "pending", "worker_role": worker_role,
+                    "next_action": "repair_native_runtime", "dispatch_allowed": False,
+                    "issue_codes": ["native_route_repair_required"],
+                    "repair_actions": ["configure_approved_context_routes"],
+                }
+            route_index = context_routes.index(previous_route)
+        elif previous_receipt_closes and "operational_error" in previous_issue_codes:
+            route_index = int(previous_task.get("context_route_index", 0)) + 1
+            if route_index >= len(context_routes):
+                return {
+                    "status": "pending", "worker_role": worker_role,
+                    "next_action": "repair_native_runtime", "dispatch_allowed": False,
+                    "issue_codes": ["native_route_repair_required"],
+                    "repair_actions": ["repair_native_runtime", "extend_approved_context_routes"],
+                }
         route_cycle = (attempt - 1) // len(context_routes)
         worker_route = context_routes[route_index]
         runtime_model = (
@@ -2066,25 +2640,23 @@ def prepare_data_plane_task(
         context_no_progress_attempts = (
             0 if made_progress else previous_context_no_progress + (1 if attempt > 1 else 0)
         )
+        if previous_task.get("context_base_chunk_chars", base_context_chunk_chars) != base_context_chunk_chars:
+            context_no_progress_attempts = 0
         failed_route_cycles = context_no_progress_attempts // len(context_routes)
+        minimum_chunk_chars = min(MIN_CONTEXT_CHUNK_CHARS, base_context_chunk_chars)
         context_chunk_chars = max(
-            MIN_CONTEXT_CHUNK_CHARS,
-            base_context_chunk_chars // (2**failed_route_cycles),
+            minimum_chunk_chars,
+            base_context_chunk_chars >> min(failed_route_cycles, base_context_chunk_chars.bit_length()),
         )
-        configured_context_workers = min(
-            MAX_CONTEXT_WORKERS,
-            max(
-                1,
-                int(
-                    config.get("routing", {}).get(
-                        "context_max_workers",
-                        config.get("routing", {}).get("max_workers", 1),
-                    )
-                ),
-            ),
+        requested_context_workers = int(
+            config.get("routing", {}).get(
+                "context_max_workers", config.get("routing", {}).get("max_workers", 1),
+            )
         )
+        if requested_context_workers < 1:
+            raise ConfigurationError("E_DATA_PLANE_TASK_ROUTE: context worker count must be positive")
         from .native_runtime import native_worker_ceiling
-        configured_context_workers = native_worker_ceiling(work_dir, worker_route, configured_context_workers)
+        configured_context_workers = native_worker_ceiling(work_dir, worker_route, requested_context_workers)
         context_segments = read_segments(primary_path)
         context_preflight = build_context_preflight(context_segments)
         context_fingerprints = context_contract_fingerprints()
@@ -2092,6 +2664,14 @@ def prepare_data_plane_task(
             work_dir / ".game-l10n" / "context-progress" / "preflight.json"
         )
         _atomic_json(context_preflight_path, context_preflight)
+        source_policies = {
+            policy["policy_digest"]: validate_content_source_policy(policy)
+            for policy in previous_task.get("context_source_policies", [])
+        }
+        if previous_source_policy is not None:
+            source_policies[previous_source_policy["policy_digest"]] = validate_content_source_policy(previous_source_policy)
+        source_policies[source_policy["policy_digest"]] = source_policy
+        private_payload["context_source_policies"] = list(source_policies.values())
         context_manifest_path, context_manifest = _write_context_manifest(
             work_dir,
             segments=context_segments,
@@ -2104,8 +2684,59 @@ def prepare_data_plane_task(
             content_source_policy=source_policy,
             semantic_route=worker_route,
             runtime_model=runtime_model,
+            source_policies=list(source_policies.values()),
         )
         _, pending_context_chunks = _context_progress(work_dir, context_manifest)
+        failure_bindings = list(previous_task.get("context_failure_bindings", []))
+        if made_progress:
+            failure_bindings = []
+        elif previous_receipt_closes and previous_task.get("context_attempt_binding"):
+            failure_bindings.append(previous_task["context_attempt_binding"])
+        attempt_binding = stable_hash({
+            "manifest": context_manifest["manifest_id"],
+            "route": worker_route, "model": runtime_model,
+            "chunk_chars": context_chunk_chars, "runtime": runtime,
+            "base_chunk_chars": base_context_chunk_chars, "max_workers": configured_context_workers,
+            "pending": [chunk["binding_id"] for chunk in pending_context_chunks],
+        })
+        if pending_context_chunks and attempt_binding in failure_bindings:
+            for alternative_index, alternative in enumerate(context_routes):
+                alternative_model = str(runtime["models"].get(alternative, alternative)) if runtime else alternative
+                alternative_workers = native_worker_ceiling(work_dir, alternative, requested_context_workers)
+                alternative_path, alternative_manifest = _write_context_manifest(
+                    work_dir, segments=context_segments, preflight=context_preflight,
+                    source_inventory_fingerprint=verified["primary_fingerprint"],
+                    context_mode=context_mode, chunk_chars=context_chunk_chars,
+                    contract_fingerprints=context_fingerprints,
+                    localization=_context_localization(work_dir, config),
+                    content_source_policy=source_policy, semantic_route=alternative,
+                    runtime_model=alternative_model,
+                    source_policies=list(source_policies.values()),
+                )
+                _, alternative_pending = _context_progress(work_dir, alternative_manifest)
+                alternative_binding = stable_hash({
+                    "manifest": alternative_manifest["manifest_id"],
+                    "route": alternative, "model": alternative_model,
+                    "chunk_chars": context_chunk_chars, "runtime": runtime,
+                    "base_chunk_chars": base_context_chunk_chars, "max_workers": alternative_workers,
+                    "pending": [chunk["binding_id"] for chunk in alternative_pending],
+                })
+                if alternative_binding not in failure_bindings:
+                    route_index, worker_route, runtime_model = alternative_index, alternative, alternative_model
+                    context_manifest_path, context_manifest = alternative_path, alternative_manifest
+                    pending_context_chunks, attempt_binding = alternative_pending, alternative_binding
+                    configured_context_workers = alternative_workers
+                    worker_model_family = worker_route.removeprefix("native-") if worker_route.startswith("native-") else "external"
+                    break
+            else:
+                return {
+                    "status": "pending", "worker_role": worker_role,
+                    "next_action": "repair_context_inputs", "dispatch_allowed": False,
+                    "job_terminal": False, "issue_codes": ["context_repair_required"],
+                    "repair_actions": ["repair_context_inputs", "extend_approved_context_routes"],
+                }
+        private_payload["context_attempt_binding"] = attempt_binding
+        private_payload["context_failure_bindings"] = list(dict.fromkeys(failure_bindings))
         relay_max_workers = min(
             configured_context_workers, len(pending_context_chunks)
         )
@@ -2172,9 +2803,9 @@ def prepare_data_plane_task(
                     "route_selection": "core_round_robin",
                     "chunk_reduction": "halve_only_after_a_complete_no_progress_route_cycle",
                     "progress_resets_chunk_reduction": True,
-                    "minimum_chunk_chars": MIN_CONTEXT_CHUNK_CHARS,
+                    "minimum_chunk_chars": minimum_chunk_chars,
                     "sealed_failure_is_job_terminal": False,
-                    "unchanged_progress_limit_applies": False,
+                    "unchanged_progress_limit_applies": True,
                 },
                 "context_preflight_contract": {
                     "schema": CONTEXT_PREFLIGHT_SCHEMA,
@@ -2252,6 +2883,11 @@ def prepare_data_plane_task(
                 "input_image_inventory_sha256": _digest(inventory_path),
                 "output_image_root": "localized/image-ui",
             }
+        )
+        from .image_localization import bound_local_assets
+
+        private_payload["bound_local_assets"] = bound_local_assets(
+            work_dir, inventory_path, game_roots=[Path(root) for root in roots],
         )
     if worker_role in {"primary_inventory", "independent_inventory", "inventory_reconciler"}:
         private_payload["requirements"].extend(
@@ -2365,11 +3001,11 @@ def prepare_data_plane_task(
         private_payload["requirements"].extend(
             [
                 "user_request_is_recorded_but_does_not_prove_any_image_is_a_target",
-                "start_from_engine_ui_bindings_or_user_identified_ui_assets",
+                "start_from_engine_display_bindings_or_user_identified_player_visible_assets",
                 "do_not_recursively_ocr_all_images",
                 "use_ocr_only_on_bounded_ui_candidates_and_confirm_each_text_region_visually",
-                "include_only_player_visible_images_with_definite_ui_binding_and_text",
-                "keep_uncertain_images_out_of_scope_and_account_for_them_without_guessing",
+                "include_requested_player_visible_ui_cg_scenery_or_other_bound_text_assets",
+                "account_for_unexamined_and_uncertain_requested_assets_without_claiming_no_targets",
                 "preserve_source_asset_paths_hashes_dimensions_regions_and_atlas_evidence",
                 "do_not_translate_edit_apply_pack_install_launch_or_delegate",
             ]
@@ -2427,16 +3063,90 @@ def prepare_data_plane_task(
     if source_policy is None:
         source_policy = _bound_source_policy(semantic_kind, policy_route)
     private_payload["content_source_policy"] = source_policy
+    if offline_processing:
+        if worker_role not in {"image_ui_inventory", "image_localizer"}:
+            raise ConfigurationError("E_DATA_PLANE_TASK_ROLE: offline image processing requires an image task")
+        from .third_party_approval import validated_offline_processing
+
+        private_payload["offline_processing"] = validated_offline_processing(work_dir, offline_processing)
     if source_policy["semantic_content_generation"]:
         private_payload["runtime_model"] = (
             str(runtime["models"].get(worker_route, worker_route))
             if runtime is not None
             else worker_route
         )
+    if inspection_assets is not None:
+        if worker_role != "image_ui_inventory":
+            raise ConfigurationError("E_IMAGE_INSPECTION_SCOPE_INVALID: inspection assets require an inspection task")
+        from .image_localization import bound_inspection_assets
+
+        private_payload["bound_local_assets"] = bound_inspection_assets(
+            work_dir, inspection_assets, game_roots=[Path(root) for root in roots],
+        )
+    elif worker_role == "image_ui_inventory":
+        discovery, image_inputs = _image_inventory_candidates(
+            work_dir, output_dir, [Path(root) for root in roots], artifact, config, sdk_activation,
+        )
+        candidate_binding = stable_hash({
+            "requested_scope": discovery["requested_scope"], "source_roots": discovery["source_roots"],
+            "bound_local_assets": discovery["bound_local_assets"], "unexamined_sources": discovery["unexamined_sources"],
+        })
+        if discovery["unexamined_sources"] and (
+            not discovery["bound_local_assets"]
+            or (
+                previous_receipt_closes and "image_scope_unexamined" in previous_issue_codes
+                and previous_task.get("image_candidate_binding") == candidate_binding
+            )
+        ):
+            return _image_candidate_repair(work_dir, output_dir, config, discovery, image_inputs)
+        private_payload["image_source_roots"] = discovery["asset_source_roots"]
+        private_payload["image_candidate_binding"] = candidate_binding
+        private_payload["bound_local_assets"] = discovery["bound_local_assets"]
+        private_payload.update(image_inputs)
+        private_payload["requirements"].extend([
+            "read_the_bound_image_candidate_manifest_and_canonical_metadata_inputs",
+            "when_writing_source_root_index_use_image_source_roots_in_exact_order",
+            "candidate_file_presence_is_not_player_visibility_or_completeness_evidence",
+            "never_read_unexamined_opaque_linked_or_unlisted_source_files",
+            "retain_unexamined_sources_in_scope_coverage_until_sdk_evidence_resolves_them",
+            "full_requested_scope_is_not_limited_to_previously_confirmed_ui_images",
+        ])
+    from .native_runtime import active_execution_environment_policy
+
+    private_payload["execution_environment_policy"] = active_execution_environment_policy(work_dir)
+    private_payload["execution_runtime_fingerprint"] = (runtime or {}).get("fingerprint")
+    private_payload["execution_isolation_fingerprint"] = isolation_fingerprint
     task_id = stable_hash(private_payload)
     task = {**private_payload, "task_id": task_id}
     task_path = output_dir / "task.json"
+    if previous_task and previous_task.get("task_id") != task_id:
+        if re.fullmatch(r"[a-f0-9]{64}", str(previous_task.get("task_id", ""))) is None:
+            raise ConfigurationError("E_DATA_PLANE_RELAY_INVALID: prior task identity changed")
+        history_dir = output_dir / "history" / str(previous_task["task_id"])
+        history_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("task.json", "relay.json", "relay-lifecycle.json", "receipt.json"):
+            previous_path, archived_path = output_dir / name, history_dir / name
+            if previous_path.is_file() and not archived_path.exists():
+                archived_path.write_bytes(previous_path.read_bytes())
+    previous_task_bytes = (
+        task_path.read_bytes()
+        if private_payload.get("offline_processing") and task_path.is_file()
+        else None
+    )
     _atomic_json(task_path, task)
+    if private_payload.get("offline_processing"):
+        from .third_party_approval import consume_offline_processing
+
+        try:
+            consume_offline_processing(
+                work_dir, offline_processing, binding_path=task_path,
+            )
+        except Exception:
+            if previous_task_bytes is None:
+                task_path.unlink(missing_ok=True)
+            else:
+                _atomic_bytes(task_path, previous_task_bytes)
+            raise
     if worker_role == "inventory_reconciler":
         _inventory_constraint_locator(work_dir, output_dir, task_id)
     lifecycle_path = output_dir / "relay-lifecycle.json"
@@ -2506,6 +3216,7 @@ def prepare_data_plane_task(
         "relay_path": _relative(work_dir, relay_path),
         "task_id": task_id,
         "control_generation": control_generation,
+        **({"candidate_discovery": task["input_image_candidates"]} if task.get("input_image_candidates") else {}),
     }
 
 
@@ -2700,7 +3411,6 @@ def _load_bound_data_plane_relay(
         or relay.get("max_workers", 0) < (
             0 if relay.get("worker_role") == "context_analyzer" else 1
         )
-        or relay.get("max_workers", 0) > MAX_CONTEXT_WORKERS
         or (
             relay.get("worker_role") != "context_analyzer"
             and relay.get("max_workers") != 1
@@ -2763,14 +3473,17 @@ def _load_bound_data_plane_relay(
         route_chain = task["data_plane_route_chain"]
         route_index = task.get("data_plane_route_index")
         if (
-            task.get("worker_role") != "inventory_reconciler"
+            task.get("worker_role") not in DATA_PLANE_PROFILES
             or not isinstance(route_chain, list)
             or not route_chain
             or not isinstance(route_index, int)
             or isinstance(route_index, bool)
             or not 0 <= route_index < len(route_chain)
             or task.get("worker_route") != route_chain[route_index]
-            or relay.get("worker_route") != route_chain[route_index]
+            or (
+                relay_schema not in {LEGACY_DATA_PLANE_RELAY_SCHEMA, LEGACY_DATA_PLANE_RELAY_V2_SCHEMA}
+                and relay.get("worker_route") != route_chain[route_index]
+            )
         ):
             raise ConfigurationError("E_DATA_PLANE_RELAY_INVALID: route binding is invalid")
 
@@ -2824,12 +3537,12 @@ def _validated_relay_lifecycle(
         or not isinstance(worker_states, dict)
         or set(worker_states) != {str(slot) for slot in required_slots}
         or any(
-            value not in {"pending", "running", "ended"}
+            value not in {"pending", "running", "ended", "not_started"}
             for value in worker_states.values()
         )
         or state.get("finalizer_required") is not plan["finalizer_required"]
         or state.get("finalizer_state")
-        not in ({"pending", "running", "ended"} if plan["finalizer_required"] else {"not_required"})
+        not in ({"pending", "running", "ended", "not_started"} if plan["finalizer_required"] else {"not_required"})
         or not isinstance(state.get("event_count"), int)
         or isinstance(state.get("event_count"), bool)
         or state.get("event_count", -1) < 0
@@ -2869,22 +3582,25 @@ def _relay_execution_summary(
     worker_states = state["worker_states"]
     unstarted = [slot for slot in required_slots if worker_states[str(slot)] == "pending"]
     unterminated = [slot for slot in required_slots if worker_states[str(slot)] == "running"]
+    terminal_unstarted = [slot for slot in required_slots if worker_states[str(slot)] == "not_started"]
     terminal_workers = sum(
         worker_states[str(slot)] == "ended" for slot in required_slots
     )
     finalizer_state = state["finalizer_state"]
     finalizer_required = bool(state["finalizer_required"])
     complete = (
-        terminal_workers == len(required_slots)
-        and (not finalizer_required or finalizer_state == "ended")
+        terminal_workers + len(terminal_unstarted) == len(required_slots)
+        and (not finalizer_required or finalizer_state in {"ended", "not_started"})
     )
     return {
         "tracking_required": True,
         "required_workers": len(required_slots),
-        "started_workers": len(required_slots) - len(unstarted),
+        "started_workers": len(required_slots) - len(unstarted) - len(terminal_unstarted),
         "terminal_workers": terminal_workers,
         "unstarted_slots": unstarted,
         "unterminated_slots": unterminated,
+        "terminal_unstarted_slots": terminal_unstarted,
+        "finalizer_skipped": finalizer_state == "not_started",
         "finalizer_required": finalizer_required,
         "finalizer_started": finalizer_state in {"running", "ended"},
         "finalizer_terminal": finalizer_state == "ended",
@@ -2942,8 +3658,8 @@ def record_data_plane_failure(
                 "observed_model": worker["observed_model"],
             }
         )
-    if not workers:
-        raise ConfigurationError("E_DATA_PLANE_FAILURE_INVALID: no bound worker start was recorded")
+    if not workers and failure_code != "execution_guard_denied":
+        raise ConfigurationError("E_DATA_PLANE_FAILURE_INVALID: provider failure needs an actual bound worker")
     failure_path = _operational_failure_path(relay_path, str(task["task_id"]))
     if failure_path.exists():
         raise ConfigurationError("E_DATA_PLANE_FAILURE_INVALID: operational failure is already recorded")
@@ -2970,7 +3686,7 @@ def record_data_plane_failure(
         "worker_role": relay["worker_role"],
         "workers": workers,
         "owner": owner,
-        "cancellation_required": True,
+        "cancellation_required": bool(workers),
         "cancellation_owner": "actual_host_relay_owner",
     }
 def record_data_plane_relay_event(
@@ -3385,11 +4101,29 @@ def _seal_bound_data_plane_task(
             )
         _atomic_json(state_path, context_state)
     elif result["worker_role"] == "image_ui_inventory" and result["status"] == "success":
-        verify_image_ui_inventory(
+        discovery = None
+        if task.get("input_image_candidates"):
+            discovery_path = (work_dir / task["input_image_candidates"]).resolve()
+            if (
+                not is_within(discovery_path, work_dir) or not discovery_path.is_file()
+                or _digest(discovery_path) != task.get("input_image_candidates_sha256")
+            ):
+                raise ConfigurationError("E_IMAGE_CANDIDATE_INPUT_CHANGED")
+            discovery = json.loads(discovery_path.read_text(encoding="utf-8"))
+        scope_receipt = verify_image_ui_inventory(
             work_dir,
             artifact_path,
             game_roots=[Path(item) for item in task.get("source_roots", [])],
+            candidate_discovery=discovery,
         )
+        if scope_receipt["status"] == "scope_incomplete":
+            result["status"] = "partial"
+            result["issue_codes"] = sorted(set(result["issue_codes"]) | {"image_scope_unexamined"})
+            pending = max(1, result["counts"].get("pending", 0))
+            result["counts"] = {
+                **result["counts"], "pending": pending,
+                "total": max(result["counts"]["total"], result["counts"].get("success", 0) + result["counts"].get("error", 0) + pending),
+            }
     elif result["worker_role"] == "image_localizer" and result["status"] == "success":
         inventory_path = (work_dir / str(task.get("input_image_inventory", ""))).resolve()
         if (
@@ -3500,6 +4234,60 @@ def _seal_ended_data_plane_task(
     }
 
 
+def _close_failed_execution(work_dir: Path, relay: dict[str, Any]) -> dict[str, Any]:
+    state = _validated_relay_lifecycle(work_dir, relay)
+    if state is None:
+        return _relay_execution_summary(work_dir, relay)
+    if "running" in state["worker_states"].values() or state["finalizer_state"] == "running":
+        raise ConfigurationError(
+            "E_DATA_PLANE_RELAY_EXECUTION_INCOMPLETE: actual started workers must end before replacement"
+        )
+    if "launch_contract" in relay:
+        from .native_runtime import _load
+
+        relay_path = (work_dir / relay["task_path"]).parent / "relay.json"
+        _, contract, ledger = _load(work_dir, relay_path)
+        fingerprint = hashlib.sha256(relay_path.read_bytes()).hexdigest()
+        for name in ledger["workers"]:
+            if name not in contract["tasks"]:
+                continue
+            if name == "finalizer":
+                pending = state["finalizer_state"] == "pending"
+            else:
+                slot = name.removeprefix("worker-")
+                pending = state["worker_states"].get(slot) == "pending"
+            if not pending:
+                continue
+            key = hashlib.sha256(f"{fingerprint}\0{name}".encode()).hexdigest()
+            admission = work_dir / ".game-l10n/native/omp-launch-admissions" / f"{key}.json"
+            try:
+                record = json.loads(admission.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                record = {}
+            if (
+                record.get("schema") != "parr0t.omp-native-admission.v1"
+                or record.get("relay_sha256") != fingerprint or record.get("task") != name
+                or record.get("state") not in {"ended", "failed"}
+            ):
+                raise ConfigurationError("E_DATA_PLANE_RELAY_EXECUTION_INCOMPLETE: record the actual admitted worker terminal event")
+            if name == "finalizer":
+                state["finalizer_state"] = "ended"
+            else:
+                state["worker_states"][slot] = "ended"
+    state["worker_states"] = {
+        slot: "not_started" if value == "pending" else value
+        for slot, value in state["worker_states"].items()
+    }
+    if state["finalizer_state"] == "pending":
+        state["finalizer_state"] = "not_started"
+    state.pop("state_fingerprint")
+    state["event_count"] += 1
+    _atomic_json(
+        work_dir / relay["execution_plan"]["lifecycle_path"], _with_state_fingerprint(state),
+    )
+    return _relay_execution_summary(work_dir, relay)
+
+
 def seal_data_plane_task(
     work_dir: Path,
     relay_path: Path,
@@ -3519,10 +4307,6 @@ def seal_data_plane_task(
         if not worker_ended:
             raise ConfigurationError(
                 "E_DATA_PLANE_CANCELLATION_REQUIRED: cancel the recorded child through its host owner and seal only after it ends"
-            )
-        if not execution["complete"]:
-            raise ConfigurationError(
-                "E_DATA_PLANE_RELAY_EXECUTION_INCOMPLETE: every bound worker must reach terminal lifecycle"
             )
         failure = json.loads(operational_failure_path.read_text(encoding="utf-8"))
         expected_failure = {
@@ -3560,8 +4344,10 @@ def seal_data_plane_task(
             for name, row in ledger["workers"].items()
             if name in contract["tasks"]
         ]
-        if failure.get("workers") != expected_workers:
+        if not isinstance(failure.get("workers"), list) or any(worker not in expected_workers for worker in failure["workers"]):
             raise ConfigurationError("E_DATA_PLANE_FAILURE_INVALID: worker binding changed")
+        execution = _close_failed_execution(work_dir, relay)
+        failure["terminal_workers"] = expected_workers
         failure["terminal"] = True
         _atomic_json(operational_failure_path, failure)
         try:
@@ -3596,6 +4382,7 @@ def seal_data_plane_task(
             )
     if not execution["complete"]:
         if worker_ended:
+            execution = _close_failed_execution(work_dir, relay)
             return _seal_ended_data_plane_task(
                 work_dir,
                 relay,

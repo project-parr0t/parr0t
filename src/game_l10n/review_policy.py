@@ -1,4 +1,4 @@
-"""Metadata-only review-call limits; missing user policy is not exhaustion."""
+"""Metadata-only explicit review limits with a documented fallback preset default."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,16 +9,12 @@ from .model_policy import (
     model_selection_authorization, native_role_bindings, native_role_models,
 )
 
-SOL_REVIEW_CALLS = 2
+DEFAULT_REVIEW_FALLBACK_CALLS = 3
 JUDGE_STAGES = frozenset({"review", "review-confirm", "review-grace-retry", "review-refusal-retry"})
 REVIEW_SETTING_FIELDS = ("triage_max_calls", "strong_max_calls", "review_max_workers", "triage_max_workers", "strong_max_workers")
 TRIAGE_STAGES = frozenset({"review-triage", "review-triage-confirm", "review-triage-grace-retry", "review-triage-refusal-retry"})
 
 
-class ReviewPolicyRequired(ValueError):
-    def __init__(self, provider: str) -> None:
-        super().__init__("E_REVIEW_FALLBACK_POLICY_REQUIRED")
-        self.provider = provider
 
 
 def validate_review_limits(limits: Any) -> None:
@@ -30,9 +26,6 @@ def validate_review_limits(limits: Any) -> None:
         raise ValueError("E_REVIEW_CALL_POLICY_INVALID")
 
 
-def is_sol_route(provider: str, model: str = "") -> bool:
-    identity = model.split("@", 1)[0].split(":", 1)[0].rsplit("/", 1)[-1]
-    return identity == "gpt-6.1-sol" if model else provider in {"native-sol", "openai-sol"}
 
 
 def review_call_limit(
@@ -40,16 +33,12 @@ def review_call_limit(
     tier_limit: int | None = None,
 ) -> int | None:
     validate_review_limits(limits)
-    if is_sol_route(provider, model):
-        count = limits.get(provider, SOL_REVIEW_CALLS)
-        if count > SOL_REVIEW_CALLS:
-            raise ValueError("E_SOL_REVIEW_CALL_LIMIT")
-    elif provider in limits:
+    if provider in limits:
         count = limits[provider]
     elif reviewers and provider == reviewers[0]:
         count = None
     else:
-        raise ReviewPolicyRequired(provider)
+        count = DEFAULT_REVIEW_FALLBACK_CALLS
     if tier_limit is None:
         return count
     return min(count, tier_limit) if count is not None else tier_limit
@@ -57,18 +46,25 @@ def review_call_limit(
 
 def judge_calls(attempts: list[Any], provider: str, *, model: str = "", stage_prefix: str = "review") -> int:
     stages = TRIAGE_STAGES if stage_prefix == "review-triage" else JUDGE_STAGES
-    sol = is_sol_route(provider, model)
     matching = [attempt for attempt in attempts if attempt.stage in stages
-                and (attempt.provider == provider or (bool(model) and attempt.model == model)
-                     or (sol and is_sol_route(attempt.provider, attempt.model)))]
-    return max(len(matching), max((attempt.ordinal for attempt in matching), default=0))
+                and (attempt.model == model if model and attempt.model
+                     else attempt.provider == provider)]
+    semantic = [attempt for attempt in matching if getattr(attempt, "operational", None) is not True]
+    last_ordinal = max((attempt.ordinal for attempt in semantic), default=0)
+    operational_ordinals = {
+        attempt.ordinal for attempt in matching
+        if getattr(attempt, "operational", None) is True and 0 < attempt.ordinal < last_ordinal
+    }
+    # Ordinals preserve event lineage. Subtract only proven nonsemantic events;
+    # unobserved compact-history gaps still conservatively consume the budget.
+    return max(len(semantic), last_ordinal - len(operational_ordinals))
 
 
 def validate_review_settings(settings: dict[str, Any]) -> None:
     for key in REVIEW_SETTING_FIELDS:
         value = settings.get(key)
         if value is not None and (not isinstance(value, int) or isinstance(value, bool)
-                                  or value < 1 or (key.endswith("workers") and value > 64)):
+                                  or value < 1):
             raise ValueError("E_REVIEW_TIER_POLICY_INVALID")
 
 
@@ -83,7 +79,7 @@ def review_policy_status(config: dict[str, Any], work_dir: Path | None = None) -
     limits = routing.get("review_attempt_limits", {})
     validate_review_limits(limits)
     validate_review_settings(routing)
-    missing = [name for name in routing.get("reviewers", [])[1:] if name not in limits]
+    defaulted = [name for name in routing.get("reviewers", [])[1:] if name not in limits]
     requested = native_role_bindings(config)
     pending = []
     if work_dir is not None and requested:
@@ -95,12 +91,11 @@ def review_policy_status(config: dict[str, Any], work_dir: Path | None = None) -
         bound = runtime["models"] if runtime else {}
         pending = [route for route, model in requested.items() if bound.get(route) != model]
     return {
-        "status": ("native_binding_required" if pending else
-                   "user_configuration_required" if missing else "configured"),
-        "sol_max_calls": SOL_REVIEW_CALLS,
+        "status": "native_binding_required" if pending else "configured",
+        "default_fallback_max_calls": DEFAULT_REVIEW_FALLBACK_CALLS,
         "review_attempt_limits": dict(limits),
         "review_limits": {key: routing[key] for key in REVIEW_SETTING_FIELDS if routing.get(key) is not None},
-        "missing_fallback_providers": missing,
+        "defaulted_fallback_providers": defaulted,
         "requested_native_models": native_role_models(config),
         "model_authorizations": {
             route: model_selection_authorization(config, route, model)
@@ -124,8 +119,8 @@ def configure_review_policy(
     if set(settings) - set(REVIEW_SETTING_FIELDS):
         raise ValueError("E_REVIEW_TIER_POLICY_INVALID")
     validate_review_settings(settings)
-    if (model is None) != (max_calls is None):
-        raise ReviewPolicyRequired(provider or "")
+    if model is None and max_calls is not None:
+        raise ValueError("E_REVIEW_MODEL_BINDING_INVALID")
     config = load_config(work_dir)
     routing = config["routing"]
     try:
@@ -135,7 +130,8 @@ def configure_review_policy(
     bind_requested = False
     selected = {}
     if model is not None:
-        validate_review_limits({"requested": max_calls})
+        if max_calls is not None:
+            validate_review_limits({"requested": max_calls})
         if not isinstance(model, str) or not model.strip():
             raise ValueError("E_REVIEW_MODEL_BINDING_INVALID")
         fallback_routes = routing.get("reviewers", [])[1:]
@@ -158,8 +154,8 @@ def configure_review_policy(
             bind_requested = True
         else:
             raise ValueError("E_REVIEW_MODEL_BINDING_INVALID")
-        if is_sol_route(route, model) and max_calls > SOL_REVIEW_CALLS:
-            raise ValueError("E_SOL_REVIEW_CALL_LIMIT")
+        if max_calls is None:
+            max_calls = routing.get("review_attempt_limits", {}).get(route, DEFAULT_REVIEW_FALLBACK_CALLS)
         routing.setdefault("review_attempt_limits", {})[route] = max_calls
         selected = {"provider": route, "model": model}
     routing.update(settings)
@@ -173,7 +169,7 @@ def configure_review_policy(
         except ValueError as error:
             # Preserve the exact request and limit as pending; no model ran.
             binding_issue = str(error).split(":", 1)[0]
-    result = {**review_policy_status(config, work_dir), **selected}
+    result = {**review_policy_status(load_config(work_dir), work_dir), **selected}
     if binding_issue:
         result["binding_issue_code"] = binding_issue
     return result

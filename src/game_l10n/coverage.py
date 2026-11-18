@@ -966,7 +966,54 @@ def save_inventory_attestation(
     return attestation
 
 
-def require_inventory_attestation(work_dir: Path, primary_path: Path) -> dict[str, Any]:
+def require_inventory_attestation(
+    work_dir: Path, primary_path: Path, *, config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if config is None:
+        config_path = work_dir / "game-l10n.json"
+        config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
+    require_independent = config.get("coverage", {}).get("require_independent_inventory", True)
+    if not isinstance(require_independent, bool):
+        raise ConfigurationError("coverage.require_independent_inventory must be boolean")
+    if not require_independent:
+        document = _inventory_document(primary_path)
+        primary = document.payload
+        if primary["coverage"]["declared_complete"] is not True:
+            raise ConfigurationError("Primary-only source inventory is not declared complete")
+        if any(
+            exclusion["affects_user_visible_text"]
+            for exclusion in primary["coverage"].get("exclusions", [])
+        ):
+            raise ConfigurationError("Primary-only source inventory excludes user-visible text")
+        targets = {**primary, "segments": document.active_rows}
+        # Deterministic structure, identity and integrity are still mandatory.
+        _segment_map(targets)
+        _ui_contract_map(targets)
+        _localization_authority_map(targets)
+        previous_path = work_dir / ".game-l10n" / "inventory-attestation.json"
+        previous = json.loads(previous_path.read_text(encoding="utf-8")) if previous_path.is_file() else None
+        fingerprint = inventory_fingerprint(primary)
+        identity = _write_primary_identity_binding(
+            work_dir, primary_path, primary, previous,
+            primary_fingerprint=fingerprint, scope_correction=document.scope_correction,
+        )
+        state = {
+            "schema": "parr0t.inventory-attestation.v1",
+            "status": "primary_only",
+            "assurance_mode": "primary_only",
+            "assurance_complete": True,
+            "independent_verified": False,
+            "static_complete": False,
+            "primary_path": str(primary_path.resolve()),
+            "primary_fingerprint": fingerprint,
+            "primary_segments": len(document.active_rows),
+            "declared_complete": primary["coverage"]["declared_complete"],
+            "scope_correction": document.scope_correction,
+            "primary_identity_binding": identity,
+            "issue_codes": ["INDEPENDENT_INVENTORY_NOT_REQUESTED"],
+        }
+        _atomic_json(previous_path, state)
+        return state
     state_path = work_dir / ".game-l10n" / "inventory-attestation.json"
     if not state_path.is_file():
         raise ConfigurationError(
@@ -1125,6 +1172,7 @@ def completion_attestation(
     review_required: bool,
     target_language: str = "",
     language_binding: dict[str, Any] | None = None,
+    allow_incomplete_artifact: bool = False,
 ) -> dict[str, Any]:
     rows = list(results)
     segment_by_id = {item.id: item for item in segments}
@@ -1239,6 +1287,7 @@ def completion_attestation(
     if target_language_mismatches:
         issue_codes.append("TARGET_LANGUAGE_MISMATCH")
     issue_codes.extend(runtime.get("issue_codes", []))
+    issue_codes.extend(inventory.get("issue_codes", []))
     blocking_unresolved = sum(
         item.segment_id in unresolved_ids
         and bool(segment_by_id[item.segment_id].metadata.get("blocking_on_failure", False))
@@ -1255,6 +1304,16 @@ def completion_attestation(
     target_completion = bool(
         accounting_complete and blocking_unresolved == 0
     )
+    assurance_complete = inventory.get("assurance_complete", inventory["static_complete"])
+    assurance_completion = bool(
+        assurance_complete and full_inventory_scope and target_completion
+    )
+    incomplete_artifact = bool(
+        allow_incomplete_artifact
+        and alignment_complete and target_language_complete and full_inventory_scope
+        and not integrity_preserved
+        and not failed
+    )
     return {
         "schema": COMPLETION_SCHEMA,
         "source_inventory": {
@@ -1262,6 +1321,9 @@ def completion_attestation(
             "static_complete": inventory["static_complete"],
             "segment_count": inventory["primary_segments"],
             "fingerprint": inventory["primary_fingerprint"],
+            "assurance_mode": inventory.get("assurance_mode", "independent"),
+            "independent_verified": inventory.get("independent_verified", inventory["static_complete"]),
+            "declared_complete": inventory.get("declared_complete", inventory["static_complete"]),
         },
         "result_alignment": {
             "complete": alignment_complete,
@@ -1297,6 +1359,12 @@ def completion_attestation(
         "runtime_coverage": runtime,
         "accounting_complete": accounting_complete,
         "semantic_completion": bool(accounting_complete and not terminal_unresolved),
+        "assurance_completion": assurance_completion,
+        "incomplete_artifact_authorized": incomplete_artifact,
+        "artifact_assurance": (
+            "explicit_incomplete" if incomplete_artifact and not target_completion
+            else inventory.get("assurance_mode", "independent")
+        ),
         "target_completion": target_completion,
         "static_completion": bool(
             inventory["static_complete"]

@@ -51,7 +51,7 @@ from .review_selection import (
 )
 from .store import AuditLog, ResultStore, stable_hash
 from .review_policy import (
-    REVIEW_SETTING_FIELDS, ReviewPolicyRequired, judge_calls, review_call_limit,
+    REVIEW_SETTING_FIELDS, review_call_limit,
     review_worker_limit, validate_review_limits, validate_review_settings,
 )
 from .validators import preflight_constraint_issues, validate_integrity
@@ -115,11 +115,14 @@ class LocalizationOrchestrator:
         context_pack: ContextPack | None = None,
         work_dir: Path,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        metadata_only: bool = False,
     ):
-        if not config.translator_chain:
-            raise ValueError("translator_chain must not be empty")
+        if not (config.translator_chain or config.reviewer_chain or config.rewriter_chain):
+            raise ValueError("At least one execution role chain must be configured")
         if config.require_review and not config.reviewer_chain:
             raise ValueError("reviewer_chain must not be empty when require_review is true")
+        if not isinstance(config.max_workers, int) or isinstance(config.max_workers, bool) or config.max_workers < 1:
+            raise ValueError("max_workers must be a positive integer")
         if config.grace_retries < 0:
             raise ValueError("grace_retries must be zero or greater")
         unknown_attempt_routes = set(config.translator_retries) - set(
@@ -157,9 +160,11 @@ class LocalizationOrchestrator:
         self.characters = {item.name: item for item in (characters or [])}
         self.context_pack = context_pack
         self.work_dir = work_dir.resolve()
-        require_localization_mode(self.work_dir)
-        self.store = ResultStore(self.work_dir / ".game-l10n" / "cache.sqlite3")
-        self.audit = AuditLog(self.work_dir / ".game-l10n" / "audit.jsonl")
+        self._metadata_only = metadata_only
+        if not metadata_only:
+            self._require_execution()
+        self.store = None if metadata_only else ResultStore(self.work_dir / ".game-l10n" / "cache.sqlite3")
+        self.audit = None if metadata_only else AuditLog(self.work_dir / ".game-l10n" / "audit.jsonl")
         self._style_memory: dict[str, list[dict[str, Any]]] = {}
         self._memory_lock = threading.Lock()
         self._progress_callback = progress_callback
@@ -184,6 +189,11 @@ class LocalizationOrchestrator:
                 )
             )
         )
+
+    def _require_execution(self) -> None:
+        if self._metadata_only:
+            raise ValueError("E_METADATA_ONLY_EXECUTION_FORBIDDEN")
+        require_localization_mode(self.work_dir)
 
     def _emit_progress(self, stage: str, **statistics: int) -> None:
         if self._progress_callback is None:
@@ -488,6 +498,12 @@ class LocalizationOrchestrator:
         return dict(exc.usage)
 
     def _record(self, result: TranslationResult, record: AttemptRecord) -> None:
+        if record.provider != "deterministic-validator":
+            record.provider_fingerprint = stable_hash(
+                self.registry.get(record.provider).fingerprint()
+            )
+            if record.status != "error" and record.operational is None:
+                record.operational = False
         # The parent/orchestration plane receives categorical control metadata only.
         # Provider explanations and reviewer prose can echo private game dialogue, so
         # they must remain inside the short-lived provider call and never propagate.
@@ -521,6 +537,13 @@ class LocalizationOrchestrator:
         record.issue_code = record.reason
         if record.provider != "deterministic-validator" and record.issues:
             record.issues = [f"provider_reported_issues:{len(record.issues)}"]
+        if record.issue_code == FailureCode.INPUT_CAPACITY_EXCEEDED.value:
+            result.metadata["capacity_repair"] = {
+                "provider": record.provider,
+                "action": "compact_focused_context_or_configure_larger_input_capacity",
+                "capacity_fields": ["max_input_chars", "task_max_input_chars"],
+                "user_budget_exhausted": False,
+            }
         result.attempts.append(record)
         self.audit.append(
             {
@@ -536,12 +559,24 @@ class LocalizationOrchestrator:
                 "issue_code": record.issue_code,
                 "candidate_generation": record.candidate_generation,
                 "usage": record.usage,
+                "operational": record.operational,
+                "provider_fingerprint": record.provider_fingerprint,
+                "retryable": record.retryable,
             }
         )
 
     @staticmethod
     def _provider_model(provider: ModelProvider) -> str:
         return str(provider.fingerprint().get("model", ""))
+
+    @staticmethod
+    def _operational_failure(exc: Exception) -> bool | None:
+        if not isinstance(exc, ProviderFailure):
+            return None
+        return exc.code in {
+            "provider_error", "timeout", "rate_limited",
+            "authentication_error", "quota_exhausted",
+        }
 
     @staticmethod
     def _failure(exc: Exception) -> tuple[str, bool]:
@@ -571,6 +606,7 @@ class LocalizationOrchestrator:
 
     @staticmethod
     def _set_candidate(result: TranslationResult, text: str) -> None:
+        result.text = text
         digest = stable_hash(text)
         if digest != result.candidate_digest:
             result.candidate_generation = max(1, result.candidate_generation + 1)
@@ -585,7 +621,7 @@ class LocalizationOrchestrator:
         refusal_retry: bool = False,
         retry_feedback: list[dict[str, str]] | None = None,
     ) -> AgentEnvelope:
-        require_localization_mode(self.work_dir)
+        self._require_execution()
         system, user = translation_prompt(
             self.project,
             segment,
@@ -614,7 +650,7 @@ class LocalizationOrchestrator:
         *,
         refusal_retry: bool = False,
     ) -> ReviewVerdictEnvelope:
-        require_localization_mode(self.work_dir)
+        self._require_execution()
         plain_verdict = provider.fingerprint().get("review_verdict_format") == "plain"
         system, user = review_judge_prompt(
             self.project,
@@ -647,7 +683,7 @@ class LocalizationOrchestrator:
         refusal_retry: bool = False,
         retry_feedback: list[dict[str, str]] | None = None,
     ) -> AgentEnvelope:
-        require_localization_mode(self.work_dir)
+        self._require_execution()
         system, user = review_rewrite_prompt(
             self.project,
             segment,
@@ -676,12 +712,34 @@ class LocalizationOrchestrator:
         segment: Segment,
         anchors: list[dict[str, Any]],
     ) -> AgentEnvelope | None:
-        ordinal = 0
-        refusal_retried = False
+        previous = self._route_attempts(result, provider.name, "translate")
+        ordinal = self._next_ordinal(result, provider.name, "translate") - 1
+        semantic_calls = self._semantic_attempts_used(previous)
+        refusal_retried = any(item.status == "refused" for item in previous)
         attempt_limit = self._translation_attempt_limit(provider.name)
         retry_stage = "translate-grace-retry"
         feedback: list[dict[str, str]] = []
+        if previous and previous[-1].status == "refused":
+            retry_stage = "translate-refusal-retry"
+        elif previous and previous[-1].status == "success":
+            rejection = next((
+                item for item in reversed(result.attempts)
+                if item.stage == "integrity" and item.ordinal == previous[-1].ordinal
+                and item.candidate_generation == previous[-1].candidate_generation
+            ), None)
+            if rejection is not None:
+                retry_stage = "translate-integrity-retry"
+                feedback = [
+                    {"code": code, "detail": "Previously recorded deterministic validation failure"}
+                    for code in rejection.issues
+                ]
+        elif previous and previous[-1].retryable is None and previous[-1].operational is False:
+            retry_stage = "translate-status-retry"
+        allowed, _ = self._route_eligibility(result, provider.name, "translate")
+        if not allowed:
+            return None
         while True:
+            self._require_execution()
             ordinal += 1
             self._wait_for_provider(provider.name)
             started = time.monotonic()
@@ -708,6 +766,7 @@ class LocalizationOrchestrator:
                         model=self._provider_model(provider),
                         candidate_generation=result.candidate_generation,
                         usage=self._usage(envelope.raw),
+                        operational=False,
                     ),
                 )
             except Exception as exc:
@@ -726,13 +785,18 @@ class LocalizationOrchestrator:
                         issue_code=code,
                         candidate_generation=result.candidate_generation,
                         usage=self._failure_usage(exc),
+                        operational=self._operational_failure(exc),
+                        retryable=retryable,
                     ),
                 )
+                if self._operational_failure(exc) is True:
+                    return None
+                semantic_calls += 1
                 if retryable and (
-                    (attempt_limit is not None and ordinal < attempt_limit)
+                    (attempt_limit is not None and semantic_calls < attempt_limit)
                     or (
                         attempt_limit is None
-                        and self._can_grace_retry(code, ordinal)
+                        and self._can_grace_retry(code, semantic_calls)
                     )
                 ):
                     self._schedule_provider_retry(
@@ -741,8 +805,9 @@ class LocalizationOrchestrator:
                     retry_stage = "translate-grace-retry"
                     continue
                 return None
+            semantic_calls += 1
             if envelope.status is AgentStatus.REFUSED:
-                if attempt_limit is not None and ordinal < attempt_limit:
+                if attempt_limit is not None and semantic_calls < attempt_limit:
                     retry_stage = "translate-refusal-retry"
                     continue
                 if (
@@ -755,7 +820,7 @@ class LocalizationOrchestrator:
                     continue
                 return envelope
             if envelope.status is not AgentStatus.SUCCESS:
-                if attempt_limit is not None and ordinal < attempt_limit:
+                if attempt_limit is not None and semantic_calls < attempt_limit:
                     retry_stage = "translate-status-retry"
                     continue
                 return envelope
@@ -787,11 +852,11 @@ class LocalizationOrchestrator:
             )
             if (
                 attempt_limit is not None
-                and ordinal < attempt_limit
+                and semantic_calls < attempt_limit
             ) or (
                 attempt_limit is None
                 and self._can_grace_retry(
-                    FailureCode.INTEGRITY_INVALID.value, ordinal
+                    FailureCode.INTEGRITY_INVALID.value, semantic_calls
                 )
             ):
                 retry_stage = "translate-integrity-retry"
@@ -818,28 +883,38 @@ class LocalizationOrchestrator:
     ) -> ReviewVerdictEnvelope | None:
         limit = None
         if stage_prefix == "review":
-            try:
-                limit = review_call_limit(
-                    provider.name, self.config.reviewer_chain,
-                    self.config.review_attempt_limits, model=self._provider_model(provider),
-                    tier_limit=self.config.strong_max_calls,
-                )
-            except ReviewPolicyRequired:
-                result.metadata["review_policy_required"] = provider.name
-                result.text = candidate
-                if "E_REVIEW_FALLBACK_POLICY_REQUIRED" not in result.errors:
-                    result.errors.append("E_REVIEW_FALLBACK_POLICY_REQUIRED")
-                return None
-            result.metadata.pop("review_policy_required", None)
-            result.errors = [code for code in result.errors if code != "E_REVIEW_FALLBACK_POLICY_REQUIRED"]
+            limit = review_call_limit(
+                provider.name, self.config.reviewer_chain,
+                self.config.review_attempt_limits, model=self._provider_model(provider),
+                tier_limit=self.config.strong_max_calls,
+            )
         elif stage_prefix == "review-triage":
             limit = self.config.triage_max_calls
-        ordinal = 0
-        refusal_retried = False
+        pending: list[AttemptRecord] = []
+        ordinal_base = max((
+            item.ordinal for item in self._route_attempts(result, provider.name, stage_prefix)
+            if item.operational is not True and item.candidate_generation != result.candidate_generation
+        ), default=0)
+        for item in self._route_attempts(result, provider.name, stage_prefix):
+            if item.candidate_generation != result.candidate_generation:
+                continue
+            if item.status in {"approved", "rewrite"}:
+                pending.clear()
+                ordinal_base = max(ordinal_base, item.ordinal)
+            else:
+                pending.append(item)
+        ordinal = self._semantic_attempts_used(pending, ordinal_base=ordinal_base)
+        refusal_retried = any(item.status == "refused" for item in pending)
         retry_stage = f"{stage_prefix}-grace-retry"
+        if pending and pending[-1].status == "refused":
+            retry_stage = f"{stage_prefix}-refusal-retry"
+        allowed, _ = self._route_eligibility(result, provider.name, stage_prefix)
+        if not allowed:
+            return None
         while True:
-            if limit is not None and judge_calls(
-                result.attempts, provider.name, model=self._provider_model(provider), stage_prefix=stage_prefix,
+            self._require_execution()
+            if limit is not None and self._semantic_attempts_used(
+                self._route_attempts(result, provider.name, stage_prefix)
             ) >= limit:
                 return None
             ordinal += 1
@@ -871,11 +946,11 @@ class LocalizationOrchestrator:
                         "",
                         review.issues,
                         duration,
-                        ordinal=judge_calls(result.attempts, provider.name,
-                            model=self._provider_model(provider), stage_prefix=stage_prefix) + 1,
+                        ordinal=self._next_ordinal(result, provider.name, stage_prefix),
                         model=self._provider_model(provider),
                         candidate_generation=result.candidate_generation,
                         usage=self._usage(review.raw),
+                        operational=False,
                     ),
                 )
             except Exception as exc:
@@ -889,14 +964,17 @@ class LocalizationOrchestrator:
                         "error",
                         code,
                         duration_ms=duration,
-                        ordinal=judge_calls(result.attempts, provider.name,
-                            model=self._provider_model(provider), stage_prefix=stage_prefix) + 1,
+                        ordinal=self._next_ordinal(result, provider.name, stage_prefix),
                         model=self._provider_model(provider),
                         issue_code=code,
                         candidate_generation=result.candidate_generation,
                         usage=self._failure_usage(exc),
+                        retryable=retryable,
+                        operational=self._operational_failure(exc),
                     ),
                 )
+                if self._operational_failure(exc) is True:
+                    return None
                 if retryable and (limit is not None or self._can_grace_retry(code, ordinal)):
                     self._schedule_provider_retry(
                         provider.name, code, ordinal, exc
@@ -915,6 +993,16 @@ class LocalizationOrchestrator:
                     retry_stage = f"{stage_prefix}-grace-retry"
                     continue
                 return review
+            if stage_prefix == "review" and review.verdict in {ReviewVerdict.OK, ReviewVerdict.REWRITE}:
+                result.metadata["continuation_review"] = {
+                    "action": "rewrite" if review.verdict is ReviewVerdict.REWRITE else "approved",
+                    "provider": provider.name,
+                    "model": self._provider_model(provider),
+                    "provider_fingerprint": stable_hash(provider.fingerprint()),
+                    "candidate_generation": result.candidate_generation,
+                    "candidate_digest": result.candidate_digest,
+                    "issues": list(review.issues),
+                }
             return review
 
     def _rewrite_with_refusal_retry(
@@ -926,15 +1014,49 @@ class LocalizationOrchestrator:
         issue_codes: list[str],
         anchors: list[dict[str, Any]],
     ) -> AgentEnvelope | None:
-        ordinal = 0
-        refusal_retried = False
+        previous = self._route_attempts(result, provider.name, "review-rewrite")
+        ordinal = self._next_ordinal(result, provider.name, "review-rewrite") - 1
+        ordinal_base = max((
+            item.ordinal for item in previous
+            if item.operational is not True and item.candidate_generation != result.candidate_generation
+        ), default=0)
+        retry_ordinal = self._semantic_attempts_used(
+            [item for item in previous if item.candidate_generation == result.candidate_generation],
+            ordinal_base=ordinal_base,
+        )
+        refusal_retried = any(
+            item.status == "refused" and item.candidate_generation == result.candidate_generation
+            for item in previous
+        )
         retry_stage = "review-rewrite-grace-retry"
         feedback: list[dict[str, str]] = []
+        current = [
+            item for item in previous if item.candidate_generation == result.candidate_generation
+        ]
+        if current and current[-1].status == "refused":
+            retry_stage = "review-rewrite-refusal-retry"
+        elif current and current[-1].status == "success":
+            rejection = next((
+                item for item in reversed(result.attempts)
+                if item.stage == "integrity" and item.ordinal == current[-1].ordinal
+                and item.candidate_generation == current[-1].candidate_generation
+            ), None)
+            if rejection is not None:
+                retry_stage = "review-rewrite-integrity-retry"
+                feedback = [
+                    {"code": code, "detail": "Previously recorded deterministic validation failure"}
+                    for code in rejection.issues
+                ]
+        allowed, _ = self._route_eligibility(result, provider.name, "review-rewrite")
+        if not allowed:
+            return None
         while True:
+            self._require_execution()
             ordinal += 1
+            retry_ordinal += 1
             self._wait_for_provider(provider.name)
             started = time.monotonic()
-            stage = "review-rewrite" if ordinal == 1 else retry_stage
+            stage = "review-rewrite" if retry_ordinal == 1 else retry_stage
             try:
                 rewrite = self._call_review_rewrite(
                     provider,
@@ -961,6 +1083,7 @@ class LocalizationOrchestrator:
                         model=self._provider_model(provider),
                         candidate_generation=result.candidate_generation,
                         usage=self._usage(rewrite.raw),
+                        operational=False,
                     ),
                 )
             except Exception as exc:
@@ -979,9 +1102,13 @@ class LocalizationOrchestrator:
                         issue_code=code,
                         candidate_generation=result.candidate_generation,
                         usage=self._failure_usage(exc),
+                        retryable=retryable,
+                        operational=self._operational_failure(exc),
                     ),
                 )
-                if retryable and self._can_grace_retry(code, ordinal):
+                if self._operational_failure(exc) is True:
+                    return None
+                if retryable and self._can_grace_retry(code, retry_ordinal):
                     self._schedule_provider_retry(
                         provider.name, code, ordinal, exc
                     )
@@ -1017,7 +1144,7 @@ class LocalizationOrchestrator:
                     candidate_generation=result.candidate_generation,
                 ),
             )
-            if self._can_grace_retry(FailureCode.INTEGRITY_INVALID.value, ordinal):
+            if self._can_grace_retry(FailureCode.INTEGRITY_INVALID.value, retry_ordinal):
                 retry_stage = "review-rewrite-integrity-retry"
                 feedback = retry_feedback(integrity)
                 continue
@@ -1065,16 +1192,27 @@ class LocalizationOrchestrator:
                     max_length_ratio=self.config.max_length_ratio,
                 )
                 if integrity:
+                    result.metadata.pop("continuation_review", None)
                     return ReviewEnvelope(ReviewDecision.ERROR, text=working)
                 legacy_candidate_changed = verdict.text != working
                 revised = revised or legacy_candidate_changed
                 working = verdict.text
                 self._set_candidate(result, working)
+                if legacy_candidate_changed:
+                    result.metadata["continuation_review"].update({
+                        "action": "confirm" if verdict.verdict is ReviewVerdict.OK else "rewrite",
+                        "candidate_generation": result.candidate_generation,
+                        "candidate_digest": result.candidate_digest,
+                    })
             language_risk = target_language_review_reasons(
                 working, self.project.target_language, segment.metadata
             )
             if language_risk:
                 result.metadata["target_language_risk"] = language_risk
+                result.metadata["continuation_review"].update({
+                    "action": "rewrite",
+                    "issues": rewrite_issue_codes(verdict.issues, language_risk=True),
+                })
             if verdict.verdict is ReviewVerdict.OK and not language_risk:
                 if legacy_candidate_changed:
                     if round_index + 1 >= max_rounds:
@@ -1098,8 +1236,7 @@ class LocalizationOrchestrator:
                     raw=verdict.raw,
                 )
             if round_index + 1 >= max_rounds or (
-                limit is not None and judge_calls(result.attempts, provider.name,
-                    model=self._provider_model(provider)) >= limit
+                limit is not None and len(self._route_attempts(result, provider.name, "review")) >= limit
             ):
                 self._record(
                     result,
@@ -1134,6 +1271,15 @@ class LocalizationOrchestrator:
             revised = revised or rewrite.text != working
             working = rewrite.text
             self._set_candidate(result, working)
+            result.metadata["continuation_review"] = {
+                "action": "confirm",
+                "provider": provider.name,
+                "model": self._provider_model(provider),
+                "provider_fingerprint": stable_hash(provider.fingerprint()),
+                "candidate_generation": result.candidate_generation,
+                "candidate_digest": result.candidate_digest,
+                "issues": rewrite_issues,
+            }
         return ReviewEnvelope(ReviewDecision.ERROR, text=working)
 
     def _strong_review_reasons(
@@ -1180,6 +1326,7 @@ class LocalizationOrchestrator:
         result.review_outcome = ReviewDecision.APPROVED.value
         result.acceptance_authority = "reviewer"
         result.metadata["review_tier"] = "triage"
+        result.metadata.pop("strong_review_reasons", None)
         result.metadata["review_category"] = review_category(segment)
 
     def _triage_requires_strong_review(
@@ -1252,8 +1399,6 @@ class LocalizationOrchestrator:
                 candidate,
                 anchors,
             )
-            if result.metadata.get("review_policy_required"):
-                return candidate
             if review is not None and review.text:
                 candidate = review.text
                 self._set_candidate(result, candidate)
@@ -1278,13 +1423,15 @@ class LocalizationOrchestrator:
         return candidate
 
     def translate_one(self, segment: Segment, *, force: bool = False) -> TranslationResult:
-        require_localization_mode(self.work_dir)
+        self._require_execution()
+        if not self.config.translator_chain:
+            raise ValueError("E_TRANSLATION_ROUTE_REQUIRED: configure a translation role before translating")
         anchors = self._anchors(segment)
         cache_key = self._cache_key(segment, anchors)
         pending_result = None
         if not force:
             cached = self.store.get(cache_key)
-            if (cached is not None and cached.metadata.get("review_policy_required")
+            if (cached is not None and cached.status == "failed"
                     and cached.source == segment.source and cached.text
                     and cached.candidate_digest == stable_hash(cached.text)
                     and not validate_integrity(segment, cached.text, self.glossary,
@@ -1339,10 +1486,6 @@ class LocalizationOrchestrator:
                 candidate = self._run_strong_review(
                     result, segment, candidate, anchors
                 )
-            if result.metadata.get("review_policy_required"):
-                result.text = candidate
-                self.store.put(cache_key, result)
-                return result
             if result.status != "reviewed":
                 result.errors.append("All review routes were exhausted")
                 self._accept_after_review_refusal(result, segment, candidate)
@@ -1371,22 +1514,17 @@ class LocalizationOrchestrator:
         candidate identity; the independent reviewer must approve the current text under
         the current context pack.
         """
-        require_localization_mode(self.work_dir)
+        self._require_execution()
 
         if not self.config.require_review:
             raise ValueError("Existing candidates require an enabled independent review route")
         anchors = self._anchors(segment)
-        pending_key = stable_hash({"review_existing": self._cache_key(segment, anchors),
-                                   "candidate": stable_hash(candidate)})
-        pending = self.store.get(pending_key)
-        result = pending if pending and pending.metadata.get("review_policy_required") else TranslationResult(
+        result = TranslationResult(
             segment_id=segment.id,
             source=segment.source,
             translator="existing-candidate",
             metadata={**segment.metadata, "candidate_origin": "existing"},
         )
-        if result is pending:
-            candidate = result.text
         self._set_candidate(result, candidate)
         integrity = validate_integrity(
             segment,
@@ -1430,12 +1568,7 @@ class LocalizationOrchestrator:
         )
         if needs_strong_review:
             candidate = self._run_strong_review(result, segment, candidate, anchors)
-        if result.metadata.get("review_policy_required"):
-            result.text = candidate
-            self.store.put(pending_key, result)
-            return result
         if result.status == "reviewed":
-            self.store.put(pending_key, result)
             self._remember(segment, result.text)
             self.audit.append(
                 {"segment_id": result.segment_id, "stage": "complete", "status": result.status}
@@ -1464,7 +1597,7 @@ class LocalizationOrchestrator:
         segments: Iterable[Segment],
         candidates: dict[str, dict[str, str]],
     ) -> list[TranslationResult]:
-        require_localization_mode(self.work_dir)
+        self._require_execution()
         items = list(segments)
         expected_ids = {item.id for item in items}
         candidate_ids = set(candidates)
@@ -1534,10 +1667,15 @@ class LocalizationOrchestrator:
             for index in indexes:
                 yield index, observed(index)
             return
+        workers = min(workers, len(indexes))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(observed, index): index for index in indexes}
-            for future in as_completed(futures):
-                yield futures[future], future.result()
+            # Submit one bounded cohort at a time instead of allocating a future
+            # for every target in a potentially very large inventory.
+            for offset in range(0, len(indexes), workers):
+                cohort = indexes[offset:offset + workers]
+                futures = {pool.submit(observed, index): index for index in cohort}
+                for future in as_completed(futures):
+                    yield futures[future], future.result()
 
     def _legacy_deferred_batch_key(self, items: list[Segment]) -> str:
         return stable_hash(
@@ -2001,10 +2139,7 @@ class LocalizationOrchestrator:
                     fallback_pending=len(pending_review),
                     attempts=self._progress_attempts,
                 )
-                policy_pending = any(results[index].metadata.get("review_policy_required")
-                                     for index in pending_review)
-                if not policy_pending:
-                    completed_reviewers.add(reviewer_name)
+                completed_reviewers.add(reviewer_name)
                 if pending_review and route_index + 1 < len(self.config.reviewer_chain):
                     next_provider = self.config.reviewer_chain[route_index + 1]
                     for index in pending_review:
@@ -2027,8 +2162,6 @@ class LocalizationOrchestrator:
                     completed_translators,
                     completed_reviewers,
                 )
-                if policy_pending:
-                    break
 
         failed_translation = (
             set(pending_translation) | preflight_failures | acceptance_failures
@@ -2037,9 +2170,6 @@ class LocalizationOrchestrator:
         for index in sorted(failed_translation | failed_review):
             result = results[index]
             assert result is not None
-            if result.metadata.get("review_policy_required"):
-                result.text = candidates[index]
-                continue
             if index in failed_translation:
                 if index not in preflight_failures:
                     result.errors.append("All translation routes were exhausted")
@@ -2071,9 +2201,8 @@ class LocalizationOrchestrator:
             )
             self.store.put(cache_keys[index], result)
 
-        if not any(result.metadata.get("review_policy_required") for result in results if result):
-            state_path.unlink(missing_ok=True)
-            self.store.clear_staged_candidates(batch_key)
+        state_path.unlink(missing_ok=True)
+        self.store.clear_staged_candidates(batch_key)
         final_results = [result for result in results if result is not None]
         self._emit_progress(
             "finalizing",
@@ -2091,8 +2220,12 @@ class LocalizationOrchestrator:
         return final_results
 
     def translate_many(self, segments: Iterable[Segment], *, force: bool = False) -> list[TranslationResult]:
-        require_localization_mode(self.work_dir)
+        self._require_execution()
+        if not self.config.translator_chain:
+            raise ValueError("E_TRANSLATION_ROUTE_REQUIRED: configure a translation role before translating")
         items = list(segments)
+        if not items:
+            return []
         if self.config.defer_fallbacks_until_primary_complete:
             return self._translate_many_deferred(items, force=force)
         self._progress_total = len(items)
@@ -2140,5 +2273,454 @@ class LocalizationOrchestrator:
         # Style anchors are causal: later lines should see previously approved lines in script order.
         if self.config.max_workers <= 1 or self.config.use_style_memory:
             return [translate_observed(item) for item in items]
-        with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
-            return list(pool.map(translate_observed, items))
+        workers = min(self.config.max_workers, len(items))
+        results: list[TranslationResult] = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for offset in range(0, len(items), workers):
+                results.extend(pool.map(translate_observed, items[offset:offset + workers]))
+        return results
+
+    @staticmethod
+    def _attempt_role(stage: str) -> str:
+        for role in ("translate", "review-rewrite", "review-triage"):
+            if stage == role or stage.startswith(f"{role}-"):
+                return role
+        if stage in {"review", "review-confirm", "review-grace-retry", "review-refusal-retry"}:
+            return "review"
+        return ""
+
+    def _route_attempts(
+        self, result: TranslationResult, provider_name: str, role: str,
+    ) -> list[AttemptRecord]:
+        model = self._provider_model(self.registry.get(provider_name))
+        return [
+            item for item in result.attempts
+            if item.provider == provider_name and item.model == model
+            and item.status != "queued" and self._attempt_role(item.stage) == role
+        ]
+
+    @staticmethod
+    def _semantic_attempts_used(attempts: list[AttemptRecord], *, ordinal_base: int = 0) -> int:
+        """Honor compact call counters without charging proven operational events."""
+        count = 0
+        maximum = ordinal_base
+        operational_ordinals = set()
+        for item in attempts:
+            if item.operational is True:
+                if item.ordinal > ordinal_base:
+                    operational_ordinals.add(item.ordinal)
+            else:
+                count += 1
+                maximum = max(maximum, item.ordinal)
+        operational_count = sum(value < maximum for value in operational_ordinals)
+        return max(count, maximum - ordinal_base - operational_count)
+
+    def _next_ordinal(self, result: TranslationResult, provider_name: str, role: str) -> int:
+        attempts = self._route_attempts(result, provider_name, role)
+        return max(len(attempts), max((item.ordinal for item in attempts), default=0)) + 1
+
+    def _route_eligibility(
+        self, result: TranslationResult, provider_name: str, role: str,
+        *, next_candidate: bool = False,
+    ) -> tuple[bool, str]:
+        """Use captured identity/evidence, never inferred provider availability."""
+        provider = self.registry.get(provider_name)
+        model = self._provider_model(provider)
+        fingerprint = stable_hash(provider.fingerprint())
+        history = [
+            item for item in result.attempts
+            if item.provider == provider_name and item.status != "queued"
+            and self._attempt_role(item.stage)
+        ]
+        if any(not item.model and model and not item.provider_fingerprint for item in history):
+            return False, "historical_route_binding_unknown"
+        exact = [item for item in history if item.model == model]
+        if any(
+            item.operational is None or not item.provider_fingerprint
+            or isinstance(item.ordinal, bool) or item.ordinal < 1
+            for item in exact
+        ):
+            return False, "historical_failure_evidence_unknown"
+        current_transport = [
+            item for item in exact if item.provider_fingerprint == fingerprint
+        ]
+        if current_transport and current_transport[-1].operational is True:
+            return False, "operational_route_unchanged"
+        attempts = self._route_attempts(result, provider_name, role)
+        semantic = [item for item in attempts if item.operational is False]
+        semantic_maximum = max((item.ordinal for item in semantic), default=0)
+        later_operational = {item.ordinal for item in attempts
+                             if item.operational is True and item.ordinal > semantic_maximum}
+        if later_operational and max(later_operational) - semantic_maximum != len(later_operational):
+            return False, "historical_failure_evidence_unknown"
+        if role == "translate":
+            limit = self._translation_attempt_limit(provider_name)
+        elif role == "review":
+            limit = review_call_limit(
+                provider_name, self.config.reviewer_chain,
+                self.config.review_attempt_limits, model=model,
+                tier_limit=self.config.strong_max_calls,
+            )
+        elif role == "review-triage":
+            limit = self.config.triage_max_calls
+        else:
+            limit = None
+        if limit is not None and self._semantic_attempts_used(attempts) >= limit:
+            return False, "semantic_attempt_limit_consumed"
+        ordinal_base = max((
+            item.ordinal for item in semantic
+            if role != "translate" and item.candidate_generation != result.candidate_generation
+        ), default=0)
+        current = [
+            item for item in semantic
+            if role == "translate" or item.candidate_generation == result.candidate_generation
+        ]
+        if next_candidate:
+            current = []
+        if role == "review":
+            rounds = [item for item in semantic if item.status in {"approved", "rewrite"}]
+            round_limit = (
+                limit if limit is not None and (
+                    provider_name in self.config.review_attempt_limits
+                    or self.config.reviewer_chain[:1] == [provider_name]
+                ) else self.config.review_max_rounds
+            )
+            if len(rounds) >= round_limit:
+                return False, "semantic_review_rounds_consumed"
+            state = result.metadata.get("continuation_review", {})
+            confirming = (
+                isinstance(state, dict) and state.get("action") == "confirm"
+                and state.get("provider") == provider_name and state.get("model") == model
+                and state.get("candidate_digest") == result.candidate_digest
+                and state.get("candidate_generation") == result.candidate_generation
+            )
+            if current and current[-1].status in {"approved", "rewrite"}:
+                if not confirming or current[-1].stage == "review-confirm":
+                    return False, "candidate_judgment_consumed"
+                return True, ""
+            completed = max((
+                index for index, item in enumerate(current)
+                if item.status in {"approved", "rewrite"}
+            ), default=-1)
+            if completed >= 0:
+                ordinal_base = max(ordinal_base, current[completed].ordinal)
+            current = current[completed + 1:]
+        if not current:
+            return True, ""
+        last = current[-1]
+        if last.status == "error" and last.retryable is False:
+            return False, "non_retryable_failure_requires_repair"
+        if last.status == "error" and last.retryable is None and (
+            limit is None or role in {"review-triage", "review-rewrite"}
+        ):
+            return False, "semantic_attempt_limit_consumed"
+        if role != "translate" and last.status in {"approved", "rewrite"}:
+            return False, "candidate_stage_consumed"
+        if limit is not None:
+            return True, ""
+        code = last.issue_code
+        # Integrity rejection is a separate deterministic ledger entry, not a new call.
+        if last.status == "success":
+            position = result.attempts.index(last)
+            integrity = next((
+                item for item in result.attempts[position + 1:]
+                if item.stage == "integrity" and item.ordinal == last.ordinal
+                and item.candidate_generation == last.candidate_generation
+            ), None)
+            if integrity is None:
+                return False, "candidate_lineage_repair_required"
+            code = integrity.issue_code
+        if last.status == "refused":
+            allowed = self.config.retry_refusals_once and sum(
+                item.status == "refused" for item in current
+            ) < 2
+        else:
+            current_calls = [
+                item for item in attempts
+                if item.ordinal > ordinal_base
+                and (role == "translate" or item.candidate_generation == result.candidate_generation)
+            ]
+            allowed = self._can_grace_retry(code, self._semantic_attempts_used(current_calls, ordinal_base=ordinal_base))
+        return (True, "") if allowed else (False, "semantic_attempt_limit_consumed")
+
+    def _continuation_route(
+        self, result: TranslationResult, chain: list[str], role: str,
+        *, action: str | None = None,
+    ) -> dict[str, Any]:
+        issue = "configured_routes_consumed"
+        for name in chain:
+            eligible, code = self._route_eligibility(result, name, role)
+            if not eligible:
+                if code in {
+                    "historical_route_binding_unknown", "historical_failure_evidence_unknown",
+                    "operational_route_unchanged", "candidate_lineage_repair_required",
+                }:
+                    issue = code
+                continue
+            provider = self.registry.get(name)
+            return {
+                "eligible": True,
+                "next_action": action or role,
+                "route_binding": {
+                    "provider": name,
+                    "model": self._provider_model(provider),
+                    "provider_fingerprint": stable_hash(provider.fingerprint()),
+                    "ordinal": self._next_ordinal(result, name, role),
+                    "candidate_generation": result.candidate_generation,
+                    "candidate_digest": result.candidate_digest,
+                },
+                "issue_code": "",
+            }
+        return {
+            "eligible": False, "next_action": "repair",
+            "route_binding": None, "issue_code": issue,
+        }
+
+    def continuation_status(
+        self, segment: Segment, prior_result: TranslationResult,
+    ) -> dict[str, Any]:
+        """Describe the next authorized configured stage without calls or writes.
+
+        A changed captured provider fingerprint proves a configuration change; mere
+        passage of time, retryable flags, or missing legacy evidence prove no repair.
+        The caller retains authoritative job pause/stop and route-consent controls.
+        """
+        def status(action: str, issue: str = "", *, eligible: bool = False) -> dict[str, Any]:
+            return {
+                "eligible": eligible, "next_action": action,
+                "route_binding": None, "issue_code": issue,
+            }
+
+        result = prior_result
+        if result.segment_id != segment.id or result.source != segment.source:
+            return status("repair", "source_binding_mismatch")
+        if result.status in {"translated", "reviewed", "accepted_unreviewed"}:
+            return status("complete")
+        if preflight_constraint_issues(segment, extra_patterns=self.config.extra_protected_patterns):
+            return status("repair", "source_constraints_require_repair")
+        if not result.candidate_digest:
+            if result.candidate_generation or any(
+                item.status == "success"
+                and self._attempt_role(item.stage) in {"translate", "review-rewrite"}
+                and not any(
+                    rejection.stage == "integrity" and rejection.ordinal == item.ordinal
+                    and rejection.candidate_generation == item.candidate_generation
+                    for rejection in result.attempts[index + 1:]
+                )
+                for index, item in enumerate(result.attempts)
+            ):
+                return status("repair", "candidate_lineage_repair_required")
+            if not self.config.translator_chain:
+                return status("repair", "translation_route_required")
+            return self._continuation_route(result, self.config.translator_chain, "translate")
+        if (
+            result.candidate_generation < 1
+            or stable_hash(result.text) != result.candidate_digest
+        ):
+            return status("repair", "candidate_lineage_repair_required")
+        integrity = validate_integrity(
+            segment, result.text, self.glossary,
+            extra_patterns=self.config.extra_protected_patterns,
+            max_length_ratio=self.config.max_length_ratio,
+        )
+        state = result.metadata.get("continuation_review", {})
+        state_bound = (
+            isinstance(state, dict)
+            and state.get("candidate_generation") == result.candidate_generation
+            and state.get("candidate_digest") == result.candidate_digest
+            and state.get("action") in {"rewrite", "confirm", "approved"}
+            and any(
+                item.provider == state.get("provider")
+                and item.model == state.get("model")
+                and item.provider_fingerprint == state.get("provider_fingerprint")
+                and item.operational is False and item.status in {"approved", "rewrite"}
+                and self._attempt_role(item.stage) == "review"
+                and item.candidate_generation <= result.candidate_generation
+                for item in result.attempts
+            )
+        )
+        if state and not state_bound:
+            return status("repair", "review_lineage_repair_required")
+        if integrity:
+            return self._continuation_route(
+                result, self.config.rewriter_chain or self.config.reviewer_chain,
+                "review-rewrite",
+            )
+        if not self.config.require_review:
+            if target_language_review_reasons(result.text, self.project.target_language, segment.metadata):
+                return status("repair", "target_language_repair_required")
+            return status("accept", eligible=True)
+        if state_bound and state.get("action") == "approved":
+            name = state.get("provider")
+            if name in self.config.reviewer_chain:
+                provider = self.registry.get(name)
+                if (
+                    state.get("model") == self._provider_model(provider)
+                    and state.get("provider_fingerprint") == stable_hash(provider.fingerprint())
+                    and not target_language_review_reasons(
+                        result.text, self.project.target_language, segment.metadata,
+                    )
+                ):
+                    return status("accept-review", eligible=True)
+        if state_bound and state.get("action") == "rewrite":
+            issues = state.get("issues")
+            if not isinstance(issues, list) or not issues or any(
+                item not in REVIEW_ISSUE_CODES for item in issues
+            ):
+                return status("repair", "review_issue_evidence_unknown")
+            name = state.get("provider")
+            if name in self.config.reviewer_chain:
+                reviewer = self.registry.get(name)
+                can_confirm, _ = self._route_eligibility(
+                    result, name, "review", next_candidate=True,
+                )
+                if state.get("model") == self._provider_model(reviewer) and can_confirm:
+                    rewrite = self._continuation_route(
+                        result, self.config.rewriter_chain or [name], "review-rewrite",
+                    )
+                    if rewrite["eligible"]:
+                        return rewrite
+        if state_bound and state.get("action") == "confirm":
+            name = state.get("provider")
+            if name in self.config.reviewer_chain:
+                provider = self.registry.get(name)
+                if state.get("model") == self._provider_model(provider):
+                    confirmation = self._continuation_route(
+                        result, [name], "review", action="review-confirm",
+                    )
+                    if confirmation["eligible"]:
+                        return confirmation
+        if not state_bound and (
+            result.metadata.get("review_tier") != "strong_pending"
+            or result.metadata.get("strong_review_reasons") == ["triage_unresolved"]
+        ):
+            triage = self._continuation_route(
+                result, self.config.review_triager_chain, "review-triage",
+            )
+            if triage["eligible"]:
+                return triage
+        return self._continuation_route(result, self.config.reviewer_chain, "review")
+
+    def continue_many(
+        self,
+        segments: Iterable[Segment],
+        prior_results: dict[str, TranslationResult] | Iterable[TranslationResult],
+    ) -> list[TranslationResult]:
+        """Continue unfinished targets without replaying locked peers or old routes."""
+        self._require_execution()
+        items = list(segments)
+        if len({item.id for item in items}) != len(items):
+            raise ValueError("Continuation requires unique source target IDs")
+        if isinstance(prior_results, dict):
+            previous = prior_results
+        else:
+            values = list(prior_results)
+            previous = {item.segment_id: item for item in values}
+            if len(previous) != len(values):
+                raise ValueError("Continuation requires unique prior result IDs")
+        if any(key != value.segment_id for key, value in previous.items()):
+            raise ValueError("Continuation prior result keys must match segment IDs")
+        results: list[TranslationResult] = []
+        for segment in items:
+            prior = previous.get(segment.id)
+            if prior is not None and prior.source != segment.source:
+                raise ValueError(f"Continuation source does not match inventory: {segment.id}")
+            if prior is not None and prior.status in {"translated", "reviewed", "accepted_unreviewed"}:
+                results.append(prior)
+                self._remember_result(segment, prior)
+                continue
+            result = self._result_from_state(prior.to_dict()) if prior is not None else TranslationResult(
+                segment.id, segment.source, metadata=segment.metadata.copy(),
+            )
+            anchors = self._anchors(segment)
+            while True:
+                continuation = self.continuation_status(segment, result)
+                if not continuation["eligible"]:
+                    result.metadata["continuation"] = continuation
+                    break
+                action = continuation["next_action"]
+                binding = continuation["route_binding"]
+                if action == "accept":
+                    self._accept_translation_candidate(result, segment, result.text)
+                    break
+                if action == "accept-review":
+                    state = result.metadata["continuation_review"]
+                    result.status = "reviewed"
+                    result.reviewer = state["provider"]
+                    result.review_outcome = ReviewDecision.APPROVED.value
+                    result.acceptance_authority = "reviewer"
+                    result.metadata["review_tier"] = "strong"
+                    break
+                self._require_execution()
+                provider = self.registry.get(binding["provider"])
+                before = len(result.attempts)
+                if action == "translate":
+                    envelope = self._translate_with_refusal_retry(result, provider, segment, anchors)
+                    if envelope is not None and envelope.status is AgentStatus.SUCCESS:
+                        result.translator = provider.name
+                        self._set_candidate(result, envelope.text)
+                elif action == "review-triage":
+                    self._triage_with_provider(result, provider.name, segment, result.text, anchors)
+                elif action == "review-rewrite":
+                    state = result.metadata.get("continuation_review", {})
+                    integrity = validate_integrity(
+                        segment, result.text, self.glossary,
+                        extra_patterns=self.config.extra_protected_patterns,
+                        max_length_ratio=self.config.max_length_ratio,
+                    )
+                    issues = rewrite_issue_codes(
+                        state.get("issues", []), integrity=integrity,
+                    )
+                    envelope = self._rewrite_with_refusal_retry(
+                        result, provider, segment, result.text, issues, anchors,
+                    )
+                    if envelope is not None and envelope.status is AgentStatus.SUCCESS:
+                        self._set_candidate(result, envelope.text)
+                        if state.get("provider"):
+                            result.metadata["continuation_review"] = {
+                                **state, "action": "confirm",
+                                "candidate_generation": result.candidate_generation,
+                                "candidate_digest": result.candidate_digest,
+                            }
+                else:
+                    candidate = result.text
+                    verdict = self._judge_with_refusal_retry(
+                        result, provider, segment, candidate, anchors,
+                        confirmation=action == "review-confirm",
+                    )
+                    if verdict is not None and verdict.verdict in {ReviewVerdict.OK, ReviewVerdict.REWRITE}:
+                        if verdict.text and verdict.text != candidate:
+                            if validate_integrity(
+                                segment, verdict.text, self.glossary,
+                                extra_patterns=self.config.extra_protected_patterns,
+                                max_length_ratio=self.config.max_length_ratio,
+                            ):
+                                result.metadata.pop("continuation_review", None)
+                            else:
+                                self._set_candidate(result, verdict.text)
+                                result.metadata["continuation_review"].update({
+                                    "action": "confirm",
+                                    "candidate_generation": result.candidate_generation,
+                                    "candidate_digest": result.candidate_digest,
+                                })
+                        elif verdict.verdict is ReviewVerdict.OK and target_language_review_reasons(
+                            result.text, self.project.target_language, segment.metadata,
+                        ):
+                            result.metadata["continuation_review"]["action"] = "rewrite"
+                            result.metadata["continuation_review"]["issues"] = rewrite_issue_codes(
+                                verdict.issues, language_risk=True,
+                            )
+                if result.status in {"translated", "reviewed", "accepted_unreviewed"}:
+                    break
+                if len(result.attempts) == before:
+                    result.metadata["continuation"] = {
+                        "eligible": False, "next_action": "repair",
+                        "route_binding": None, "issue_code": "stage_did_not_advance",
+                    }
+                    break
+            if result.status in {"translated", "reviewed", "accepted_unreviewed"}:
+                result.metadata.pop("continuation", None)
+                self.store.put(self._cache_key(segment, anchors), result)
+                self._remember_result(segment, result)
+            results.append(result)
+        return results
