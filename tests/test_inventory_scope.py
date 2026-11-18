@@ -301,6 +301,25 @@ class InventoryScopeCorrectionTests(unittest.TestCase):
         self.basis_path.write_bytes(raw)
         self.assertTrue(verify_inventory_pair(self.primary_path, self.independent_path)["static_complete"])
 
+    def test_segment_consumer_rejects_raw_only_and_stale_display_evidence(self) -> None:
+        for mutation in ("raw_only", "stale_source", "control_with_projection_flag"):
+            with self.subTest(mutation=mutation):
+                self._correct()
+                row = self.primary["segments"][1]
+                original = deepcopy(row)
+                if mutation == "raw_only":
+                    row["metadata"]["display_scope_evidence"]["kind"] = "unclassified"
+                elif mutation == "stale_source":
+                    row["source"] = "CHANGED SYNTHETIC LABEL"
+                else:
+                    row["metadata"].update(
+                        storage_role="lookup_key", display_projection_required=True,
+                    )
+                self._write()
+                with self.assertRaises(ConfigurationError):
+                    read_segments(self.primary_path)
+                self.primary["segments"][1] = original
+
     def test_shared_basis_still_checks_each_methods_expected_digest(self) -> None:
         self._correct()
         self.independent["coverage"]["scope_correction"]["basis"]["sha256"] = "0" * 64

@@ -82,6 +82,7 @@ the missing extraction delta in the external workspace, stages deterministic
 synthetic/bounded **format** fixtures, and checks actual extraction/round-trip
 outcomes. It must not perform a third full source scan, either inventory, or a
 whole-game dry run. No-op/no-throw or self-echo checks are not format proof.
+For text discovery, the exercised format fixtures must also distinguish display-bearing fields and actual display dependencies from control/editor/diagnostic storage and unclassified raw records. Assert the resulting eligible targets, relevant context and unchanged excluded bytes through the real extractor/application path. An unresolved actual display consumer reports pending SDK capability instead of promoting its entire raw container into translation. Preparation must not prove eligibility by copying the expected inventory, relabeling one discovered list as two methods, or merely attaching source/evidence hashes.
 The parent never reads private source, fixtures, tasks, or evidence; it receives
 validated categorical status, counts, and paths only.
 
