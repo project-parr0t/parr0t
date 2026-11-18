@@ -3020,10 +3020,6 @@ def _record_data_plane_relay_event(
                     "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: worker start transition is invalid"
                 )
         else:
-            if any(value == "pending" for value in worker_states.values()):
-                raise ConfigurationError(
-                    "E_DATA_PLANE_RELAY_LIFECYCLE_INVALID: every required slot must start before any worker ends"
-                )
             if worker_states[key] == "running":
                 worker_states[key] = "ended"
             elif worker_states[key] != "ended":
