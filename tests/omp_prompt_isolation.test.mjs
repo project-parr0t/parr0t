@@ -1,15 +1,20 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import promptIsolation from "../src/game_l10n/templates/omp-prompt-isolation.mjs";
 
 const temporary = [];
 const originalWorkspace = process.env.PARR0T_OMP_PROMPT_WORKSPACE;
+const originalControl = process.env.PARR0T_OMP_CONTROL_DIRECTORY;
+beforeEach(() => { delete process.env.PARR0T_OMP_CONTROL_DIRECTORY; });
 afterEach(() => {
   for (const directory of temporary.splice(0)) rmSync(directory, { recursive: true, force: true });
   if (originalWorkspace === undefined) delete process.env.PARR0T_OMP_PROMPT_WORKSPACE;
   else process.env.PARR0T_OMP_PROMPT_WORKSPACE = originalWorkspace;
+  if (originalControl === undefined) delete process.env.PARR0T_OMP_CONTROL_DIRECTORY;
+  else process.env.PARR0T_OMP_CONTROL_DIRECTORY = originalControl;
 });
 function writeJson(file, value) {
   mkdirSync(path.dirname(file), { recursive: true });
@@ -21,7 +26,7 @@ function schema() {
 }
 const fakeZod = { string: schema, array: schema, object: schema };
 fakeZod.z = fakeZod;
-function host(workspace, kind = "sub", depth = kind === "main" ? 0 : 2) {
+function host(workspace, kind = "sub", depth = kind === "main" ? 0 : 2, api = {}) {
   const handlers = new Map();
   const flags = new Map();
   const tools = new Map();
@@ -33,12 +38,18 @@ function host(workspace, kind = "sub", depth = kind === "main" ? 0 : 2) {
     getFlag() { return kind === "main" ? workspace : undefined; },
     on(name, handler) { handlers.set(name, handler); },
     registerTool(tool) { tools.set(tool.name, tool); },
+    getAllTools() { return [...tools.values()]; },
+    getActiveTools() { return [...tools.keys()]; },
     async exec(command, args, options) {
       executions.push({ command, args, options });
       return executionResult;
     },
+    ...api,
   });
-  const ctx = { cwd: workspace, agent: { kind, depth, id: kind === "main" ? "SyntheticRoot" : "SyntheticChild" } };
+  const ctx = {
+    cwd: workspace, agent: { kind, depth, id: kind === "main" ? "SyntheticRoot" : "SyntheticChild" },
+    sessionManager: { getSessionId: () => "synthetic-host-session" },
+  };
   return {
     handlers, flags, tools, executions, executionResult, ctx,
     emit: async (name, event = {}) => handlers.get(name)?.(event, ctx),
@@ -73,6 +84,84 @@ async function deniedWithoutDelivery(session, tool, input) {
   expect(deliveries).toBe(0);
   return denial;
 }
+
+function controlLaunch(workspace) {
+  const directory = path.join(workspace, ".game-l10n", "omp-control", "a".repeat(32));
+  mkdirSync(directory, { recursive: true });
+  process.env.PARR0T_OMP_CONTROL_DIRECTORY = directory;
+  return directory;
+}
+
+describe("OMP prompt helper readiness", () => {
+  test("direct-loaded operation does not require readiness APIs or write a receipt", async () => {
+    const f = fixture();
+    const session = host(f.workspace, "main", 0, { getAllTools: undefined, getActiveTools: undefined });
+    await session.emit("session_start");
+    expect(existsSync(path.join(f.workspace, ".game-l10n", "omp-control"))).toBe(false);
+  });
+
+  test("proves the actual main session, native PID, loaded helper hash and active process tool", async () => {
+    const f = fixture();
+    const directory = controlLaunch(f.workspace);
+    const root = host(f.workspace, "main");
+    await root.emit("session_start");
+    const file = path.join(directory, "ready.json");
+    const receipt = readFileSync(file, "utf8");
+    expect(JSON.parse(receipt)).toEqual({
+      schema: "parr0t.omp-control-ready.v1", launch_id: "a".repeat(32),
+      session_id: root.ctx.sessionManager.getSessionId(), process_id: process.pid,
+      helper_sha256: createHash("sha256").update(readFileSync(new URL("../src/game_l10n/templates/omp-prompt-isolation.mjs", import.meta.url))).digest("hex"),
+      process_tool: "parr0t_process",
+    });
+    expect(JSON.parse(receipt).session_id).not.toBe(root.ctx.agent.id);
+    await root.emit("session_start");
+    const descendant = host(f.workspace);
+    descendant.ctx.sessionManager.getSessionId = () => "synthetic-descendant-session";
+    await descendant.emit("session_start");
+    expect(readFileSync(file, "utf8")).toBe(receipt);
+    const otherRoot = host(f.workspace, "main");
+    otherRoot.ctx.sessionManager.getSessionId = () => "synthetic-other-root-session";
+    await expect(otherRoot.emit("session_start")).rejects.toThrow("already registered to another host session");
+    expect(readFileSync(file, "utf8")).toBe(receipt);
+    expect(readdirSync(directory)).toEqual(["ready.json"]);
+  });
+
+  test("unavailable, unregistered and excluded tools never produce readiness or activate tools", async () => {
+    const f = fixture();
+    const directory = controlLaunch(f.workspace);
+    for (const [api, reason] of [
+      [{ getAllTools: undefined }, "host tool availability API required"],
+      [{ getAllTools: () => [] }, "parr0t_process is not registered"],
+      [{ getActiveTools: () => [] }, "parr0t_process is not active"],
+    ]) {
+      const session = host(f.workspace, "main", 0, {
+        ...api, setActiveTools() { throw new Error("must not activate an excluded tool"); },
+      });
+      await expect(session.emit("session_start")).rejects.toThrow(reason);
+      expect(readdirSync(directory)).toEqual([]);
+    }
+  });
+
+  test("invalid host identity or another workspace cannot claim launch readiness", async () => {
+    const f = fixture();
+    const directory = controlLaunch(f.workspace);
+    for (const sessionId of [undefined, "", "invalid/session", "x".repeat(129)]) {
+      const session = host(f.workspace, "main");
+      session.ctx.sessionManager.getSessionId = () => sessionId;
+      await expect(session.emit("session_start")).rejects.toThrow("host root session ID is unavailable");
+    }
+    const other = fixture();
+    await expect(host(other.workspace, "main").emit("session_start")).rejects.toThrow("workspace binding");
+    const wrongCwd = host(f.workspace, "main");
+    wrongCwd.ctx.cwd = other.workspace;
+    await expect(wrongCwd.emit("session_start")).rejects.toThrow("workspace binding");
+    for (const invalid of [path.join(f.workspace, "a".repeat(32)), path.join(directory, ".."), "relative-control"]) {
+      process.env.PARR0T_OMP_CONTROL_DIRECTORY = invalid;
+      await expect(host(f.workspace, "main").emit("session_start")).rejects.toThrow("invalid control launch");
+    }
+    expect(readdirSync(directory)).toEqual([]);
+  });
+});
 
 describe("OMP descendant communication boundary", () => {
   test("restricts every fresh descendant before session_start or the first user prompt", async () => {

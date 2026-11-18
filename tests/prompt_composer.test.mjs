@@ -33,6 +33,17 @@ test("incomplete or nonpositive fallback settings cannot produce a prompt", () =
   ]) assert.throws(() => buildPrompt(options));
 });
 
+test("invalid native model selections are rejected before producing executable instructions", () => {
+  for (const value of [String.raw`C:\Fixture Game\Data`, "/tmp/fixture-game", "fixture/model name", "default", "inherit", "task", "smol", "slow", "luna", "sol", "@fixture"]) {
+    for (const role of ["baseModel", "triageModel", "strongModel", "contextModel", "fallbackModel"]) {
+      assert.throws(() => buildPrompt({ [role]: value, ...(role === "fallbackModel" ? { fallbackAttempts: "2" } : {}) }),
+        /폴더 경로나 별칭 대신 정확한 모델 ID/);
+    }
+  }
+  assert.equal(buildPrompt({ analyzeContext: false, contextModel: String.raw`C:\Fixture Game\Data` }),
+    buildPrompt({ analyzeContext: false }));
+});
+
 test("migration binds the supplied repository without starting a blanket new localization", () => {
   const repositoryUrl = "https://github.com/fixture-owner/previous-project.git";
   const prompt = buildPrompt({ operation: "migrate", repositoryUrl, fonts: true, delivery: "mod", koreanPolicy: "skip" });

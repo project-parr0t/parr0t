@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import promptIsolation from "../src/game_l10n/templates/omp-prompt-isolation.mjs";
 
 // Opt-in, already-selected host only. Resolve its declared public exports rather
 // than assuming its installation location or acquiring any package.
@@ -49,11 +49,17 @@ async function runIntegration() {
   const root = process.env.PARR0T_OMP_HOST_PACKAGE;
   assert.ok(root, "PARR0T_OMP_HOST_PACKAGE must select an existing host package root");
   const {
-    ExtensionRunner, ExtensionRuntime, ExtensionToolWrapper, loadExtensionFromFactory,
+    ExtensionRunner, ExtensionRuntime, ExtensionToolWrapper, loadExtensions, loadExtensionFromFactory,
     wrapRegisteredTool, EventBus, SessionManager, Settings, AgentRegistry,
     AgentLifecycleManager, IrcBus, WriteTool, BashTool, MAIN_AGENT_ID,
   } = await publicHostModules(root);
   const workspace = mkdtempSync(path.join(os.tmpdir(), "parr0t-real-host-synthetic-"));
+  const helperPath = fileURLToPath(new URL("../src/game_l10n/templates/omp-prompt-isolation.mjs", import.meta.url));
+  const controlDirectory = path.join(workspace, ".game-l10n", "omp-control", "b".repeat(32));
+  const originalControl = process.env.PARR0T_OMP_CONTROL_DIRECTORY;
+  const originalWorkspace = process.env.PARR0T_OMP_PROMPT_WORKSPACE;
+  mkdirSync(controlDirectory, { recursive: true });
+  process.env.PARR0T_OMP_CONTROL_DIRECTORY = controlDirectory;
   const relative = ".game-l10n/native/relay/synthetic-wave.json";
   mkdirSync(path.dirname(path.join(workspace, relative)), { recursive: true });
   writeFileSync(path.join(workspace, relative), JSON.stringify({ schema: "parr0t.native-wave-relay.v1", task_bindings: [] }));
@@ -78,8 +84,10 @@ async function runIntegration() {
     runtime.flagValues.set("parr0t-workspace", workspace);
     const spawned = [];
     const dispatchedTasks = [];
-    const extension = await loadExtensionFromFactory(pi => {
-      promptIsolation(pi);
+    const loaded = await loadExtensions([helperPath], workspace, eventBus, runtime);
+    assert.deepEqual(loaded.errors, [], "Actual helper file must load through the selected host");
+    assert.equal(loaded.extensions.length, 1);
+    const consumer = await loadExtensionFromFactory(pi => {
       // A synthetic, model-free consumer of real host task dispatch. Its input
       // is exactly what ExtensionToolWrapper passes after extension rewriting.
       pi.registerTool({
@@ -108,11 +116,11 @@ async function runIntegration() {
           return { content: [{ type: "text", text: "Synthetic descendants created." }], details: {} };
         },
       });
-    }, workspace, eventBus, runtime, "synthetic-prompt-boundary");
+    }, workspace, eventBus, runtime, "synthetic-task-consumer");
     // No ModelRegistry is constructed: context model queries are lazy and this
     // offline fixture never invokes one. The runner, API, schemas and wrappers
     // below are the selected host implementations, not a mocked dispatcher.
-    const runner = new ExtensionRunner([extension], runtime, workspace, manager, undefined,
+    const runner = new ExtensionRunner([...loaded.extensions, consumer], runtime, workspace, manager, undefined,
       undefined, settings, undefined, undefined, identity);
     runner.onError(error => { throw new Error(`Unexpected selected-host extension error: ${error.error}`); });
     const toolSession = {
@@ -125,13 +133,23 @@ async function runIntegration() {
     function wrap(tool) { return new ExtensionToolWrapper(tool, runner, identity); }
     const write = wrap(new WriteTool(toolSession));
     const bash = wrap(new BashTool(toolSession));
+    const registeredTools = new Map(runner.getAllRegisteredTools().map(entry =>
+      [entry.definition.name, wrap(wrapRegisteredTool(entry, runner))]));
+    const activeTools = new Map(registeredTools);
+    // These runtime actions expose the actual wrappers dispatched below, not
+    // optimistic name lists. Removing an active wrapper removes availability.
+    runtime.getAllTools = () => runner.getAllRegisteredTools()
+      .filter(entry => registeredTools.has(entry.definition.name))
+      .map(entry => ({ name: entry.definition.name, description: entry.definition.description,
+        parameters: entry.definition.parameters, sourceInfo: entry.sourceInfo }));
+    runtime.getActiveTools = () => [...activeTools.keys()];
     function registered(name) {
-      const tool = runner.getAllRegisteredTools().find(entry => entry.definition.name === name);
-      assert.ok(tool, `Selected host did not register ${name}`);
-      return wrap(wrapRegisteredTool(tool, runner));
+      const tool = activeTools.get(name);
+      assert.ok(tool, `Selected host has no active wrapper for ${name}`);
+      return tool;
     }
     const session = {
-      id, runner, manager, spawned, dispatchedTasks, context,
+      id, runner, manager, spawned, dispatchedTasks, context, registeredTools, activeTools,
       write: input => write.execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
       bash: input => bash.execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
       task: input => registered("task").execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
@@ -157,7 +175,26 @@ async function runIntegration() {
     const parent = await makeSession(MAIN_AGENT_ID, "main", 0);
     const relay = await makeSession("SyntheticRelay", "sub", 1, parent.id);
     const peer = await makeSession("SyntheticPeer", "sub", 1, parent.id);
+    const readinessPath = path.join(controlDirectory, "ready.json");
+    parent.activeTools.delete("parr0t_process");
+    await assert.rejects(parent.runner.emit({ type: "session_start" }), /parr0t_process is not active/);
+    assert.equal(existsSync(readinessPath), false);
+    parent.activeTools.set("parr0t_process", parent.registeredTools.get("parr0t_process"));
     await parent.runner.emit({ type: "session_start" });
+    const receiptText = readFileSync(readinessPath, "utf8");
+    const receipt = JSON.parse(receiptText);
+    assert.deepEqual(receipt, {
+      schema: "parr0t.omp-control-ready.v1", launch_id: path.basename(controlDirectory),
+      session_id: parent.manager.getSessionId(), process_id: process.pid,
+      helper_sha256: createHash("sha256").update(readFileSync(helperPath)).digest("hex"),
+      process_tool: "parr0t_process",
+    });
+    assert.notEqual(receipt.session_id, parent.id);
+    assert.notEqual(receipt.session_id, relay.manager.getSessionId());
+    assert.notEqual(receipt.process_id, process.ppid);
+    await relay.runner.emit({ type: "session_start" });
+    await peer.runner.emit({ type: "session_start" });
+    assert.equal(readFileSync(readinessPath, "utf8"), receiptText);
     // Positive control proves the real write tool, URL handler and bus can
     // reach a controlled recipient; a later zero is not an absent endpoint.
     const rootDelivery = await parent.write({ path: `agent://${relay.id}`, content: "synthetic root control" });
@@ -183,6 +220,9 @@ async function runIntegration() {
     await deny(unmarked, relay.id);
     await unmarked.task({ tasks: [{ steps: ["Synthetic unmarked third-level task"] }] });
     await deny(unmarked.spawned[0], parent.id);
+    await unmarked.runner.emit({ type: "session_start" });
+    await unmarked.spawned[0].runner.emit({ type: "session_start" });
+    assert.equal(readFileSync(readinessPath, "utf8"), receiptText);
 
     // Once explicitly bound, task and steps reach the consumer with their own
     // standalone marker; propagation must not rely on the shared context.
@@ -292,6 +332,10 @@ print(json.dumps(native_launch_summary(w,w/sys.argv[3])))
       registry.unregister(session.id);
     }
     await lifecycle.dispose();
+    if (originalControl === undefined) delete process.env.PARR0T_OMP_CONTROL_DIRECTORY;
+    else process.env.PARR0T_OMP_CONTROL_DIRECTORY = originalControl;
+    if (originalWorkspace === undefined) delete process.env.PARR0T_OMP_PROMPT_WORKSPACE;
+    else process.env.PARR0T_OMP_PROMPT_WORKSPACE = originalWorkspace;
     rmSync(workspace, { recursive: true, force: true });
   }
 }
@@ -301,7 +345,7 @@ if (process.argv.includes("--parr0t-real-host-worker")) {
 } else {
   const { test } = await import("bun:test");
   const realHostTest = process.env.PARR0T_OMP_HOST_PACKAGE ? test : test.skip;
-  realHostTest("real selected host isolates nested sessions and executes native argv without model calls", async () => {
+  realHostTest("real selected host loads and proves the main helper before isolating descendants and executing native argv", async () => {
     // Host globals and extension registrations never enter the suite's process.
     const worker = Bun.spawn([process.execPath, fileURLToPath(import.meta.url), "--parr0t-real-host-worker"], {
       env: process.env, stdout: "pipe", stderr: "pipe",

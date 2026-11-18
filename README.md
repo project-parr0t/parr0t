@@ -29,7 +29,7 @@ game-l10n init-workspace "<external-workspace>" --sdk-root "<repository>" --game
 python -m game_l10n.omp_session --workspace "<external-workspace>" --model "<approved-provider/model-id>" --mode workspace --foreground
 ```
 
-`--model`에는 현재 OMP에서 허용된 정확한 최상위 모델 ID를 지정합니다. 새 세션에 위의 게임별 요청을 전달하세요. 기본 `prompt` 모드는 하위 에이전트의 충돌하는 협업 지시와 직접 메시지·기록 열람 경로를 제한하는 경량 훅을 연결하며, 일반 Python 실행은 유지합니다. 전체 실행 가드·전용 실행기가 필요하면 `--guarded`를 선택합니다. 어느 모드도 OS 샌드박스는 아닙니다. Codex의 기본 제공자 설정이나 전역 OMP 설정은 변경하지 않습니다. 이미 초기화된 작업은 첫 두 명령을 반복하지 않습니다.
+`--model`에는 현재 OMP에서 허용된 정확한 최상위 모델 ID를 지정합니다. 새 세션에 위의 게임별 요청을 전달하세요. 기본 `prompt` 모드는 하위 에이전트의 충돌하는 협업 지시와 직접 메시지·기록 열람 경로를 제한하는 경량 훅을 연결하며, 일반 Python 실행은 유지합니다. 도구 등록은 새 세션에 적용되며 기존 세션에 도구를 추가하지 않습니다. 분리 실행의 `helper_registered`와 실제 PID·세션 ID로 등록을 확인하고, `startup_pending`이면 중복 실행하지 않습니다. 전체 실행 가드·전용 실행기가 필요하면 `--guarded`를 선택합니다. 어느 모드도 OS 샌드박스는 아닙니다. Codex의 기본 제공자 설정이나 전역 OMP 설정은 변경하지 않습니다. 이미 초기화된 작업은 첫 두 명령을 반복하지 않습니다.
 
 명령만 확인하려면 마지막 명령에 `--print-command`를 추가합니다. 이 옵션은 세션이나 파일을 만들지 않습니다. 제어 세션 회전이 요구되는 작업은 `--mode rotation`을 사용하며, 이전 대화 기록을 불러오는 `omp --resume`와는 다릅니다. 워커 모델 바인딩과 호스트 조건은 [OMP 진입 규약](docs/control-plane-contract.md#omp-entry)을 따릅니다.
 

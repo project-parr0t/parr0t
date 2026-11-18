@@ -1,11 +1,15 @@
-import { readFileSync, realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { linkSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import registerFrameworkModeApproval, { checkFrameworkToolCall } from "./framework-mode-approval.mjs";
 import createNativeRelayLifecycle from "./native-relay-lifecycle.mjs";
 
 // Enforce child host-tool communication boundaries without an OS sandbox.
 // Native processes use the public exec API, never the embedded URL filesystem.
 const WORKSPACE_ENV = "PARR0T_OMP_PROMPT_WORKSPACE";
+const CONTROL_ENV = "PARR0T_OMP_CONTROL_DIRECTORY";
+const HELPER_SHA256 = createHash("sha256").update(readFileSync(fileURLToPath(import.meta.url))).digest("hex");
 const POLICY = [
   "Parr0t child communication boundary, including unmarked and diagnostic descendants.",
   "This role-specific policy supersedes generic Coop, Peers, collaboration, and blocker-message advice. Do not message Main, a parent, a peer, or any agent, even to report a blocker or ask a question. Do not use IRC, host message routing, agent://, history://, or session history tools. Do not inspect parent/peer/session history.",
@@ -183,9 +187,49 @@ export default function promptIsolation(pi) {
     return typeof configured === "string" && path.isAbsolute(configured)
       ? configured : process.env[WORKSPACE_ENV] ?? ctx.cwd;
   }
+  function registerReadiness(ctx) {
+    const launchDirectory = process.env[CONTROL_ENV];
+    if (launchDirectory === undefined) return;
+    const fail = reason => { throw new Error(`PARR0T_OMP_PROMPT_ISOLATION: ${reason}`); };
+    const configured = workspace(ctx);
+    if (typeof configured !== "string" || !path.isAbsolute(configured)
+        || typeof launchDirectory !== "string" || !path.isAbsolute(launchDirectory)) fail("invalid control launch workspace");
+    const root = realpathSync(configured);
+    const directory = path.resolve(launchDirectory);
+    const launchId = path.basename(directory);
+    if (!/^[a-f0-9]{32}$/.test(launchId)
+        || path.dirname(directory) !== path.join(root, ".game-l10n", "omp-control")
+        || realpathSync(directory) !== directory
+        || realpathSync(ctx.cwd) !== root) fail("invalid control launch directory or workspace binding");
+    const sessionId = ctx.sessionManager?.getSessionId?.();
+    if (typeof sessionId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(sessionId)) fail("host root session ID is unavailable");
+    if (typeof pi.getAllTools !== "function" || typeof pi.getActiveTools !== "function") fail("host tool availability API required");
+    const registered = pi.getAllTools();
+    const active = pi.getActiveTools();
+    if (!Array.isArray(registered) || !registered.some(tool => tool.name === "parr0t_process")) fail("parr0t_process is not registered in this host session");
+    if (!Array.isArray(active) || !active.includes("parr0t_process")) fail("parr0t_process is not active in this host session");
+    const receiptPath = path.join(directory, "ready.json");
+    const receipt = `${JSON.stringify({
+      schema: "parr0t.omp-control-ready.v1", launch_id: launchId, session_id: sessionId,
+      process_id: process.pid, helper_sha256: HELPER_SHA256, process_tool: "parr0t_process",
+    })}\n`;
+    let previous;
+    try { previous = readFileSync(receiptPath, "utf8"); }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+    if (previous === receipt) return;
+    if (previous !== undefined) fail("control launch is already registered to another host session");
+    const temporary = `${receiptPath}.${process.pid}.tmp`;
+    writeFileSync(temporary, receipt, { flag: "wx", mode: 0o600 });
+    // Publish atomically without replacing a competing main session's proof.
+    try { linkSync(temporary, receiptPath); }
+    finally { rmSync(temporary, { force: true }); }
+  }
   registerFrameworkModeApproval(pi, workspace);
   pi.on("session_start", (_event, ctx) => {
-    if (ctx.agent?.kind === "main") process.env[WORKSPACE_ENV] = workspace(ctx);
+    if (ctx.agent?.kind === "main") {
+      registerReadiness(ctx);
+      process.env[WORKSPACE_ENV] = workspace(ctx);
+    }
   });
   pi.on("before_agent_start", async (event, ctx) => {
     if (ctx.agent?.kind !== "sub") return;

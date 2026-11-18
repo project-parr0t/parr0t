@@ -22,6 +22,13 @@ export function buildPrompt(options = {}) {
   const roleModels = [["translation", "기초 번역 모델", baseModel], ["triage", "약검수 모델", triageModel], ["strong-review", "강검수 모델", strongModel]];
   if (analyzeContext) roleModels.push(["context", "문맥 파악 모델", contextModel]);
   if (roleModels.some(([, , value]) => /[\r\n]/.test(String(value)))) throw new Error("모델 ID는 한 줄로 입력하세요.");
+  for (const [, label, value] of [...roleModels, ["review-fallback", "폴백 검수 모델", model]]) {
+    const id = String(value).trim();
+    if (id && (!/^[A-Za-z0-9][A-Za-z0-9._:/@+\-]*$/.test(id)
+      || ["default", "inherit", "task", "smol", "slow", "luna", "sol"].includes(id))) {
+      throw new Error(`${label}: 폴더 경로나 별칭 대신 정확한 모델 ID를 입력하세요.`);
+    }
+  }
   const isSol = value => String(value).split("@", 1)[0].split(":", 1)[0].split("/").at(-1) === "gpt-6.1-sol";
   if (model && isSol(model) && BigInt(attempts) > 2n) throw new Error("Sol 모델의 검수는 최대 2회입니다.");
   const reviewLimits = [

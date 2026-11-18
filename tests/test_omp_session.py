@@ -45,6 +45,20 @@ class OmpSessionTests(unittest.TestCase):
     def plan(self, mode="workspace", *, guarded=False):
         return omp_session._plan_command(self.workspace, self.model, mode, guarded=guarded)
 
+    def write_registration(self, command, environment, *, guarded, overrides=None):
+        directory = Path(environment["PARR0T_OMP_CONTROL_DIRECTORY"])
+        extension = Path(command[command.index("--trusted-extension") + 1])
+        proof = {
+            "schema": "parr0t.omp-control-ready.v1", "launch_id": directory.name,
+            "process_id": 456, "session_id": "fresh-session:1",
+            "guard_sha256" if guarded else "helper_sha256":
+                omp_session.sha256(extension.read_bytes()).hexdigest(),
+        }
+        if not guarded:
+            proof["process_tool"] = "parr0t_process"
+        proof.update(overrides or {})
+        (directory / "ready.json").write_text(json.dumps(proof), encoding="utf-8")
+
     def rotation(self):
         state = suspend_control_plane(self.workspace)
         return patch.object(omp_session, "control_plane_state", return_value=state)
@@ -88,12 +102,14 @@ class OmpSessionTests(unittest.TestCase):
         self.assertTrue(Path(command[6]).is_relative_to(self.workspace.resolve()))
 
     def test_guarded_preview_preserves_strict_arguments(self):
+        before = set(self.workspace.rglob("*"))
         output = io.StringIO()
         with patch.object(omp_session.subprocess, "Popen") as spawn, redirect_stdout(output):
             code = omp_session.main(["--workspace", str(self.workspace), "--model", self.model,
                                      "--mode", "workspace", "--guarded", "--print-command"])
         self.assertEqual(code, 0)
         spawn.assert_not_called()
+        self.assertEqual(before, set(self.workspace.rglob("*")))
         command = json.loads(output.getvalue())
         self.assertEqual(command[9], "--trusted-extension")
         self.assertTrue(Path(command[10]).is_file())
@@ -155,7 +171,10 @@ class OmpSessionTests(unittest.TestCase):
                 self.assertNotIn("PARR0T_OMP_GUARD_SESSION", kwargs["env"])
                 self.assertNotIn("PARR0T_OMP_GUARD_WORKSPACE", kwargs["env"])
                 self.assertNotIn("PARR0T_OMP_PROMPT_WORKSPACE", kwargs["env"])
-                self.assertEqual("PARR0T_OMP_CONTROL_DIRECTORY" in kwargs["env"], guarded)
+                directory = Path(kwargs["env"]["PARR0T_OMP_CONTROL_DIRECTORY"])
+                self.assertEqual(directory.parent, self.workspace.resolve() / ".game-l10n" / "omp-control")
+                self.assertRegex(directory.name, r"^[a-f0-9]{32}$")
+                self.assertEqual(directory / "sessions", Path(spawn.call_args.args[0][6]))
                 child.wait.assert_called_once_with()
                 child.poll.assert_not_called()
 
@@ -169,118 +188,176 @@ class OmpSessionTests(unittest.TestCase):
         self.assertEqual(rotated[-1], first[-1])
         self.assertEqual(Path(rotated[-1][1:]).read_bytes(), self.original_request)
 
-    def test_prompt_launch_with_helper_returns_started_without_guard_registration(self):
-        child = Mock(pid=123)
-        output = io.StringIO()
-        with patch.object(omp_session, "os", self.windows_os), \
-                patch.object(omp_session.subprocess, "CREATE_NEW_CONSOLE", 16, create=True), \
-                patch.object(omp_session.subprocess, "Popen", return_value=child) as spawn, \
-                patch.object(omp_session.time, "monotonic") as clock, \
-                patch.object(omp_session.time, "sleep") as sleep, \
-                patch.object(omp_session, "sha256") as digest, \
-                redirect_stdout(output):
-            code = omp_session.main(["--workspace", str(self.workspace), "--model", self.model,
-                                     "--mode", "workspace"])
-        self.assertEqual(code, 0)
-        result = json.loads(output.getvalue())
-        self.assertEqual(result["status"], "started")
-        self.assertEqual(result["omp_isolation"], "prompt")
-        self.assertEqual(result["launcher_process_id"], 123)
-        self.assertIsNone(result["process_id"])
-        self.assertNotIn("session_id", result)
-        self.assertEqual(json.loads(Path(result["launch_record"]).read_text(encoding="utf-8"))["status"], "started")
-        spawn.assert_called_once()
-        command = spawn.call_args.args[0]
-        self.assertEqual(command[9], "--trusted-extension")
-        self.assertEqual(Path(command[10]).name, "omp-prompt-isolation.mjs")
-        self.assertEqual(command[11:13], ["--parr0t-workspace", str(self.workspace.resolve())])
-        self.assertEqual(command[4], self.model)
-        self.assertEqual(spawn.call_args.kwargs["creationflags"], 16)
-        self.assertNotIn("PARR0T_OMP_CONTROL_DIRECTORY", spawn.call_args.kwargs["env"])
-        child.wait.assert_not_called()
-        child.poll.assert_not_called()
-        clock.assert_not_called()
-        sleep.assert_not_called()
-        digest.assert_not_called()
-
-    def test_guarded_launch_requires_valid_registration_proof(self):
-        child = Mock(pid=123)
-
-        def registered(command, **kwargs):
-            directory = Path(kwargs["env"]["PARR0T_OMP_CONTROL_DIRECTORY"])
-            guard = Path(command[command.index("--trusted-extension") + 1])
-            proof = {"schema": "parr0t.omp-control-ready.v1", "launch_id": directory.name,
-                     "process_id": 456, "guard_sha256": omp_session.sha256(guard.read_bytes()).hexdigest(),
-                     "session_id": "fresh-session:1"}
-            (directory / "ready.json").write_text(json.dumps(proof), encoding="utf-8")
-            return child
-
-        output = io.StringIO()
-        with patch.object(omp_session, "os", self.windows_os), \
-                patch.object(omp_session.subprocess, "CREATE_NEW_CONSOLE", 16, create=True), \
-                patch.object(omp_session.subprocess, "Popen", side_effect=registered) as spawn, \
-                redirect_stdout(output):
-            code = omp_session.main(["--workspace", str(self.workspace), "--model", self.model,
-                                     "--mode", "workspace", "--guarded"])
-        self.assertEqual(code, 0)
-        result = json.loads(output.getvalue())
-        self.assertEqual(result["status"], "guard_registered")
-        self.assertEqual(result["omp_isolation"], "guarded")
-        self.assertEqual(result["process_id"], 456)
-        self.assertEqual(result["launcher_process_id"], 123)
-        self.assertEqual(result["session_id"], "fresh-session:1")
-        spawn.assert_called_once()
-        child.wait.assert_not_called()
-
-    def test_guarded_missing_or_invalid_proof_stays_pending_without_restart(self):
-        for invalid in (None, {"launch_id": "old"}, {"guard_sha256": "wrong"},
-                        {"process_id": True}, {"session_id": "invalid/session"}):
-            with self.subTest(invalid=invalid):
+    def test_detached_launch_requires_actual_helper_registration(self):
+        for guarded in (False, True):
+            with self.subTest(guarded=guarded):
                 child = Mock(pid=123)
                 child.poll.return_value = None
 
-                def unregistered(command, **kwargs):
-                    if invalid is not None:
-                        directory = Path(kwargs["env"]["PARR0T_OMP_CONTROL_DIRECTORY"])
-                        guard = Path(command[command.index("--trusted-extension") + 1])
-                        proof = {"schema": "parr0t.omp-control-ready.v1", "launch_id": directory.name,
-                                 "process_id": 456, "guard_sha256": omp_session.sha256(guard.read_bytes()).hexdigest(),
-                                 "session_id": "fresh-session:1", **invalid}
-                        (directory / "ready.json").write_text(json.dumps(proof), encoding="utf-8")
+                def registered(command, **kwargs):
+                    self.write_registration(command, kwargs["env"], guarded=guarded)
                     return child
 
+                output = io.StringIO()
                 with patch.object(omp_session, "os", self.windows_os), \
                         patch.object(omp_session.subprocess, "CREATE_NEW_CONSOLE", 16, create=True), \
-                        patch.object(omp_session.subprocess, "Popen", side_effect=unregistered) as spawn, \
-                        patch.object(omp_session.time, "monotonic", side_effect=[0, 0, 2]), \
-                        patch.object(omp_session.time, "sleep"):
-                    result = omp_session._launch(self.workspace, self.model, 1, mode="workspace", guarded=True)
-                self.assertEqual(result["status"], "startup_pending")
-                self.assertIsNone(result["process_id"])
-                self.assertNotIn("session_id", result)
+                        patch.object(omp_session.subprocess, "Popen", side_effect=registered) as spawn, \
+                        redirect_stdout(output):
+                    code = omp_session.main(["--workspace", str(self.workspace), "--model", self.model,
+                                             "--mode", "workspace"] + (["--guarded"] if guarded else []))
+                self.assertEqual(code, 0)
+                result = json.loads(output.getvalue())
+                self.assertEqual(result["status"], "guard_registered" if guarded else "helper_registered")
+                self.assertEqual(result["omp_isolation"], "guarded" if guarded else "prompt")
+                self.assertEqual(result["process_id"], 456)
+                self.assertEqual(result["launcher_process_id"], 123)
+                self.assertEqual(result["session_id"], "fresh-session:1")
+                self.assertEqual(result["model"], self.model)
+                self.assertEqual(result["mode"], "workspace")
+                self.assertEqual(result["user_request"], self.request)
+                saved = json.loads(Path(result["launch_record"]).read_text(encoding="utf-8"))
+                self.assertEqual(saved, {key: value for key, value in result.items() if key != "launch_record"})
+                self.assertEqual(spawn.call_args.kwargs["creationflags"], 16)
                 spawn.assert_called_once()
                 child.wait.assert_not_called()
 
-    def test_guarded_process_failure_does_not_restart(self):
-        child = Mock(pid=123)
-        child.poll.return_value = 7
-        with patch.object(omp_session, "os", self.windows_os), \
-                patch.object(omp_session.subprocess, "CREATE_NEW_CONSOLE", 16, create=True), \
-                patch.object(omp_session.subprocess, "Popen", return_value=child) as spawn:
-            result = omp_session._launch(self.workspace, self.model, mode="workspace", guarded=True)
-        self.assertEqual(result["status"], "startup_failed")
-        self.assertEqual(result["launcher_process_id"], 123)
-        spawn.assert_called_once()
-        child.wait.assert_not_called()
+    def test_missing_or_invalid_proof_stays_pending_without_restart(self):
+        for guarded in (False, True):
+            digest_field = "guard_sha256" if guarded else "helper_sha256"
+            invalid_proofs = [
+                None, {"schema": "other"}, {"launch_id": "0" * 32}, {digest_field: "wrong"},
+                {"process_id": True}, {"process_id": 0}, {"process_id": -1}, {"process_id": "456"},
+                {"session_id": None}, {"session_id": ""}, {"session_id": "invalid/session"},
+                {"session_id": "s" * 129},
+            ]
+            if not guarded:
+                invalid_proofs.extend([{"process_tool": None}, {"process_tool": "other"}])
+            for invalid in invalid_proofs:
+                with self.subTest(guarded=guarded, invalid=invalid):
+                    child = Mock(pid=123)
+                    child.poll.return_value = None
 
-    def test_guarded_pending_cli_is_not_reported_as_success(self):
-        output = io.StringIO()
-        with patch.object(omp_session, "_launch", return_value={"status": "startup_pending"}) as launch, \
-                redirect_stdout(output):
-            code = omp_session.main(["--workspace", str(self.workspace), "--model", self.model,
-                                     "--mode", "workspace", "--guarded"])
-        self.assertEqual(code, 1)
-        self.assertTrue(launch.call_args.kwargs["guarded"])
+                    def unregistered(command, **kwargs):
+                        if invalid is not None:
+                            self.write_registration(command, kwargs["env"], guarded=guarded, overrides=invalid)
+                        return child
+
+                    with patch.object(omp_session, "os", self.windows_os), \
+                            patch.object(omp_session.subprocess, "CREATE_NEW_CONSOLE", 16, create=True), \
+                            patch.object(omp_session.subprocess, "Popen", side_effect=unregistered) as spawn, \
+                            patch.object(omp_session.time, "monotonic", side_effect=[0, 0, 2]), \
+                            patch.object(omp_session.time, "sleep"):
+                        result = omp_session._launch(
+                            self.workspace, self.model, 1, mode="workspace", guarded=guarded,
+                        )
+                    self.assertEqual(result["status"], "startup_pending")
+                    self.assertEqual(result["launcher_process_id"], 123)
+                    self.assertIsNone(result["process_id"])
+                    self.assertNotIn("session_id", result)
+                    self.assertEqual(result["model"], self.model)
+                    self.assertEqual(result["mode"], "workspace")
+                    self.assertEqual(result["user_request"], self.request)
+                    spawn.assert_called_once()
+                    child.wait.assert_not_called()
+                    child.terminate.assert_not_called()
+                    child.kill.assert_not_called()
+
+    def test_registration_can_arrive_after_process_creation(self):
+        for guarded in (False, True):
+            with self.subTest(guarded=guarded):
+                child = Mock(pid=123)
+                child.poll.return_value = None
+                with patch.object(omp_session, "os", self.windows_os), \
+                        patch.object(omp_session.subprocess, "CREATE_NEW_CONSOLE", 16, create=True), \
+                        patch.object(omp_session.subprocess, "Popen", return_value=child) as spawn, \
+                        patch.object(omp_session.time, "monotonic", side_effect=[0, 0]), \
+                        patch.object(omp_session.time, "sleep") as sleep:
+                    sleep.side_effect = lambda _: self.write_registration(
+                        spawn.call_args.args[0], spawn.call_args.kwargs["env"], guarded=guarded,
+                    )
+                    result = omp_session._launch(
+                        self.workspace, self.model, 1, mode="workspace", guarded=guarded,
+                    )
+                self.assertEqual(result["status"], "guard_registered" if guarded else "helper_registered")
+                self.assertEqual(result["process_id"], 456)
+                spawn.assert_called_once()
+                child.poll.assert_called_once_with()
+                sleep.assert_called_once_with(0.1)
+
+    def test_process_exit_before_registration_fails_without_restart(self):
+        for guarded in (False, True):
+            for exit_code in (0, 7):
+                with self.subTest(guarded=guarded, exit_code=exit_code):
+                    child = Mock(pid=123)
+                    child.poll.return_value = exit_code
+                    output = io.StringIO()
+                    with patch.object(omp_session, "os", self.windows_os), \
+                            patch.object(omp_session.subprocess, "CREATE_NEW_CONSOLE", 16, create=True), \
+                            patch.object(omp_session.subprocess, "Popen", return_value=child) as spawn, \
+                            redirect_stdout(output):
+                        code = omp_session.main([
+                            "--workspace", str(self.workspace), "--model", self.model, "--mode", "workspace",
+                        ] + (["--guarded"] if guarded else []))
+                    result = json.loads(output.getvalue())
+                    self.assertEqual(code, 1)
+                    self.assertEqual(result["status"], "startup_failed")
+                    self.assertEqual(result["launcher_process_id"], 123)
+                    self.assertEqual(result["exit_code"], exit_code)
+                    self.assertIsNone(result["process_id"])
+                    spawn.assert_called_once()
+                    child.wait.assert_not_called()
+
+    def test_foreground_exit_records_registration_and_preserves_failure_code(self):
+        for guarded in (False, True):
+            for registration in ("valid", "invalid", "absent"):
+                for exit_code in (0, 23):
+                    with self.subTest(guarded=guarded, registration=registration, exit_code=exit_code):
+                        child = Mock(pid=123)
+                        child.wait.return_value = exit_code
+
+                        def registered(command, **kwargs):
+                            if registration != "absent":
+                                self.write_registration(
+                                    command, kwargs["env"], guarded=guarded,
+                                    overrides={"session_id": "invalid/session"} if registration == "invalid" else {},
+                                )
+                            return child
+
+                        output = io.StringIO()
+                        with patch.object(omp_session.subprocess, "Popen", side_effect=registered) as spawn, \
+                                redirect_stdout(output):
+                            code = omp_session.main([
+                                "--workspace", str(self.workspace), "--model", self.model,
+                                "--mode", "workspace", "--foreground",
+                            ] + (["--guarded"] if guarded else []))
+                        result = json.loads(output.getvalue())
+                        self.assertEqual(result["exit_code"], exit_code)
+                        self.assertEqual(code, exit_code or (0 if registration == "valid" else 1))
+                        if registration == "valid":
+                            self.assertEqual(result["status"], "exited")
+                            self.assertEqual(
+                                result["registration_status"], "guard_registered" if guarded else "helper_registered",
+                            )
+                            self.assertEqual(result["process_id"], 456)
+                            self.assertEqual(result["session_id"], "fresh-session:1")
+                        else:
+                            self.assertEqual(result["status"], "startup_failed")
+                            self.assertIsNone(result["process_id"])
+                            self.assertNotIn("registration_status", result)
+                        spawn.assert_called_once()
+                        child.wait.assert_called_once_with()
+                        child.poll.assert_not_called()
+
+    def test_detached_cli_rejects_nonregistered_status(self):
+        for guarded in (False, True):
+            for status in ("startup_pending", "startup_failed", "started"):
+                with self.subTest(guarded=guarded, status=status), \
+                        patch.object(omp_session, "_launch", return_value={"status": status}), \
+                        redirect_stdout(io.StringIO()):
+                    code = omp_session.main([
+                        "--workspace", str(self.workspace), "--model", self.model, "--mode", "workspace",
+                    ] + (["--guarded"] if guarded else []))
+                    self.assertEqual(code, 1)
 
 
     def test_missing_request_blocks_spawn_instead_of_starting_generic_task(self):
