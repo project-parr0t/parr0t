@@ -48,6 +48,7 @@ from game_l10n.native_runtime import (
     record_native_launch,
 )
 from game_l10n.workspace import initialize_workspace, load_config, record_sdk_selection
+from tests import context_result_provenance
 
 
 class ControlPlaneContractTests(unittest.TestCase):
@@ -1148,6 +1149,7 @@ class ControlPlaneContractTests(unittest.TestCase):
                             "features": [],
                         },
                         "issue_code": "",
+                        "content_provenance": context_result_provenance(claim),
                     }
                 ),
                 encoding="utf-8",

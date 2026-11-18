@@ -98,10 +98,22 @@ def _manifest(root: Path, relative: str) -> dict[str, Any]:
     route = manifest.get("route_binding")
     if route is not None:
         _require(
-            isinstance(route, dict) and set(route) == {"provider", "attempt"}
+            isinstance(route, dict)
+            and set(route) in (
+                {"provider", "attempt"},
+                {"provider", "model", "attempt"},
+            )
             and isinstance(route["provider"], str)
             and _PROVIDER.fullmatch(route["provider"]) is not None
-            and type(route["attempt"]) is int and route["attempt"] > 0,
+            and (
+                "model" not in route
+                or (
+                    isinstance(route["model"], str)
+                    and bool(route["model"])
+                )
+            )
+            and type(route["attempt"]) is int
+            and route["attempt"] > 0,
             "MANIFEST_INVALID",
         )
     return manifest

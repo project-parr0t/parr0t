@@ -9,6 +9,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .content_source_policy import (
+    direct_model_provenance,
+    validate_content_source_policy,
+    validate_output_provenance,
+)
 from .control_plane import CONTROL_ENVELOPE_SCHEMA, safe_artifact_path, validate_control_envelope
 from .errors import GameL10nError
 from .models import FailureCode, Segment, TranslationResult
@@ -321,7 +326,13 @@ def _jsonl_bytes(rows: Iterable[dict[str, Any]]) -> bytes:
     return b"".join(_canonical(row) for row in rows)
 
 
-def _read_jsonl(path: Path, *, allowed_keys: set[str]) -> list[dict[str, Any]]:
+def _read_jsonl(
+    path: Path,
+    *,
+    allowed_keys: set[str],
+    optional_keys: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    optional_keys = optional_keys or set()
     rows: list[dict[str, Any]] = []
     try:
         lines = path.read_text(encoding="utf-8").split("\n")
@@ -336,8 +347,15 @@ def _read_jsonl(path: Path, *, allowed_keys: set[str]) -> list[dict[str, Any]]:
             row = json.loads(line)
         except json.JSONDecodeError as error:
             raise TranslationExchangeError(f"Invalid JSONL row: {path.name}:{line_number}") from error
-        if not isinstance(row, dict) or set(row) != allowed_keys:
-            raise TranslationExchangeError(f"Unexpected exchange row shape: {path.name}:{line_number}")
+        keys = set(row) if isinstance(row, dict) else set()
+        if (
+            not isinstance(row, dict)
+            or not allowed_keys <= keys
+            or not keys <= allowed_keys | optional_keys
+        ):
+            raise TranslationExchangeError(
+                f"Unexpected exchange row shape: {path.name}:{line_number}"
+            )
         rows.append(row)
     return rows
 
@@ -365,6 +383,8 @@ def prepare_translation_exchange(
     exchange_id: str,
     mode: str,
     source_queue: str,
+    content_source_policy: dict[str, Any] | None = None,
+    retry_lineage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     work_dir = work_dir.resolve()
     output_dir = output_dir.resolve()
@@ -393,6 +413,24 @@ def prepare_translation_exchange(
         for item in target_ids
     ):
         raise TranslationExchangeError("Exchange target IDs must be unique opaque IDs")
+    if content_source_policy is not None:
+        content_source_policy = validate_content_source_policy(
+            content_source_policy
+        )
+        if (
+            content_source_policy["task_kind"] != "translation"
+            or content_source_policy["route"] != "native-pass:translation"
+        ):
+            raise TranslationExchangeError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
+    if retry_lineage is not None and (
+        not isinstance(retry_lineage, dict)
+        or (
+            content_source_policy is not None
+            and retry_lineage.get("content_source_policy_digest")
+            != content_source_policy["policy_digest"]
+        )
+    ):
+        raise TranslationExchangeError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
 
     rows: list[dict[str, Any]] = []
     for ordinal, segment in enumerate(segments):
@@ -426,6 +464,16 @@ def prepare_translation_exchange(
             "receipt": RECEIPT_NAME,
             "control_envelope": ENVELOPE_NAME,
         },
+        **(
+            {"content_source_policy": content_source_policy}
+            if content_source_policy is not None
+            else {}
+        ),
+        **(
+            {"retry_lineage": retry_lineage}
+            if retry_lineage is not None
+            else {}
+        ),
     }
     _atomic_json(output_dir / MANIFEST_NAME, manifest)
     return {
@@ -452,8 +500,34 @@ def _load_manifest(bundle: Path) -> dict[str, Any]:
         "request_sha256",
         "files",
     }
-    if not isinstance(payload, dict) or set(payload) != expected:
+    optional = {"content_source_policy", "retry_lineage"}
+    if not isinstance(payload, dict) or set(payload) - optional != expected:
         raise TranslationExchangeError("Exchange manifest shape is invalid")
+    if "content_source_policy" in payload:
+        try:
+            policy = validate_content_source_policy(
+                payload["content_source_policy"]
+            )
+        except ValueError as exc:
+            raise TranslationExchangeError(
+                "E_CONTENT_SOURCE_POLICY_IMMUTABLE"
+            ) from exc
+        lineage = payload.get("retry_lineage")
+        if (
+            policy["task_kind"] != "translation"
+            or policy["route"] != "native-pass:translation"
+            or (
+                lineage is not None
+                and (
+                    not isinstance(lineage, dict)
+                    or lineage.get("content_source_policy_digest")
+                    != policy["policy_digest"]
+                )
+            )
+        ):
+            raise TranslationExchangeError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
+    elif "retry_lineage" in payload:
+        raise TranslationExchangeError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
     if payload["schema"] != EXCHANGE_SCHEMA or payload["mode"] not in EXCHANGE_MODES:
         raise TranslationExchangeError("Exchange manifest schema or mode is unsupported")
     if not isinstance(payload["exchange_id"], str) or not _SAFE_ID.fullmatch(payload["exchange_id"]):
@@ -510,7 +584,11 @@ def seal_translation_exchange(work_dir: Path, bundle: Path) -> dict[str, Any]:
 
     success_rows = _read_jsonl(
         success_path,
-        allowed_keys={"target_id", "status", "text", "route", "attempt", "source_sha256", "context_sha256"},
+        allowed_keys={
+            "target_id", "status", "text", "route", "attempt",
+            "source_sha256", "context_sha256",
+        },
+        optional_keys={"content_provenance"},
     )
     failure_rows = _read_jsonl(
         failure_path,
@@ -533,6 +611,22 @@ def seal_translation_exchange(work_dir: Path, bundle: Path) -> dict[str, Any]:
             raise TranslationExchangeError("Success attempt must be a positive integer")
         if row["source_sha256"] != request["source_sha256"] or row["context_sha256"] != request["context_sha256"]:
             raise TranslationExchangeError("Success row is not bound to the current source and context")
+        policy = manifest.get("content_source_policy")
+        provenance = row.get("content_provenance")
+        if policy is not None:
+            if not isinstance(provenance, dict):
+                raise TranslationExchangeError("E_OUTPUT_PROVENANCE_INVALID")
+            try:
+                validate_output_provenance(
+                    provenance,
+                    policy=policy,
+                    model=str(provenance.get("model", "")),
+                    route=row["route"],
+                )
+            except ValueError as exc:
+                raise TranslationExchangeError(str(exc)) from None
+        elif provenance is not None:
+            raise TranslationExchangeError("E_OUTPUT_PROVENANCE_INVALID")
         resolved.add(target_id)
     for row in failure_rows:
         target_id = row["target_id"]
@@ -626,6 +720,7 @@ def process_translation_exchange(
     translator: Callable[[list[Segment]], list[TranslationResult]],
     *,
     route: str,
+    model: str = "",
     retry_failures: bool = False,
     max_input_tokens: int | None = None,
     baseline_input_tokens: int | None = None,
@@ -667,6 +762,10 @@ def process_translation_exchange(
     ):
         raise TranslationExchangeError("E_FALLBACK_BUDGET_REQUIRED")
     manifest = _load_manifest(bundle)
+    if "content_source_policy" in manifest and (
+        not isinstance(model, str) or not model
+    ):
+        raise TranslationExchangeError("E_OUTPUT_PROVENANCE_INVALID")
     if manifest["mode"] != "fallback" or manifest["source_queue"] != "translation_fallback_pending":
         raise TranslationExchangeError(
             "Automatic exchange processing requires a translation fallback bundle"
@@ -680,7 +779,11 @@ def process_translation_exchange(
     )
     success_rows = _read_jsonl(
         bundle / SUCCESS_NAME,
-        allowed_keys={"target_id", "status", "text", "route", "attempt", "source_sha256", "context_sha256"},
+        allowed_keys={
+            "target_id", "status", "text", "route", "attempt",
+            "source_sha256", "context_sha256",
+        },
+        optional_keys={"content_provenance"},
     )
     failure_rows = _read_jsonl(
         bundle / FAILURE_NAME,
@@ -797,7 +900,7 @@ def process_translation_exchange(
                 result.status in {"translated", "reviewed", "accepted_unreviewed"}
                 and valid_success_text
             ):
-                success_by_id[result.segment_id] = {
+                success_row = {
                     "target_id": result.segment_id,
                     "status": "success",
                     "text": result.text,
@@ -806,6 +909,25 @@ def process_translation_exchange(
                     "source_sha256": request["source_sha256"],
                     "context_sha256": request["context_sha256"],
                 }
+                provenance = result.metadata.get("content_provenance")
+                if "content_source_policy" in manifest:
+                    if provenance is None:
+                        provenance = direct_model_provenance(
+                            manifest["content_source_policy"],
+                            model,
+                            route=route,
+                        )
+                    try:
+                        provenance = validate_output_provenance(
+                            provenance,
+                            policy=manifest["content_source_policy"],
+                            model=model,
+                            route=route,
+                        )
+                    except ValueError as exc:
+                        raise TranslationExchangeError(str(exc)) from None
+                    success_row["content_provenance"] = dict(provenance)
+                success_by_id[result.segment_id] = success_row
                 retained_failures.pop(result.segment_id, None)
                 run_success += 1
                 continue
