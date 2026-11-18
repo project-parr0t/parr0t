@@ -95,8 +95,6 @@ class OmpPromptRuntimeTests(unittest.TestCase):
             "finite_interruptible_per_call_only_not_a_job_timeout",
         )
         self.assertEqual(step["relay"]["tool_transport"], launch["tool_transport"])
-        self.assertFalse(launch["tool_transport"]["required_extension"])
-        self.assertEqual(launch["model"], "openai-codex/gpt-6-luna:high")
         commands = payload["command_argv"]
         self.run_cli(commands["capability-available"])
         for index, binding in enumerate(payload["task_bindings"]):

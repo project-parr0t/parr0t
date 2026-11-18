@@ -21,6 +21,7 @@ from game_l10n.data_plane_task import (
 from game_l10n.errors import ConfigurationError
 from game_l10n.inventory_constraints import observe_inventory_constraints
 from game_l10n.workspace import initialize_workspace, load_config
+from tests.execution_policy_fixture import approved_execution_policy
 
 
 class InventoryConstraintTests(unittest.TestCase):
@@ -129,6 +130,19 @@ class InventoryConstraintTests(unittest.TestCase):
         self.assertNotIn(self.row["id"], rendered)
         self.assertNotIn(self.row["source"], rendered)
         self.assertNotIn(str(self.work), rendered)
+
+    def test_hold_exposes_deterministic_repair_and_accepts_corrected_evidence(self) -> None:
+        pending = self._block()
+        self.assertFalse(pending["dispatch_allowed"])
+        self.assertTrue(pending["deterministic_repair_allowed"])
+        self.assertIn("verify_inventory", pending["repair_actions"])
+        for path in (self.primary, self.independent):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["segments"][0]["metadata"]["ui_max_chars"] = 100
+            self._write(path, payload)
+        self._verify()
+        self.assertIsNone(self._pending())
+        self.assertEqual(self._prepare()["status"], "ready")
 
     def test_inventory_diagnostic_codes_do_not_hide_a_proven_deterministic_constraint(self) -> None:
         self._prepare()
@@ -286,7 +300,8 @@ class InventoryConstraintTests(unittest.TestCase):
             "inventory_reconciler": ["native-sol", "native-luna"]
         }
         self._save_config()
-        self._prepare()
+        with patch("game_l10n.native_runtime.active_execution_environment_policy", return_value=approved_execution_policy()):
+            self._prepare()
         self._seal(codes=["provider_error"])
         receipt_path = self.output / "receipt.json"
         receipt = json.loads(receipt_path.read_text())

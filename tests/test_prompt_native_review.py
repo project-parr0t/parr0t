@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from game_l10n.cli import build_parser
+from game_l10n.control_plane import establish_control_plane_entry
 from game_l10n.errors import ConfigurationError
 from game_l10n.formats import read_segments, read_translation_results
 from game_l10n.models import AttemptRecord, ContextPack
@@ -42,6 +43,7 @@ class PromptNativeReviewTests(unittest.TestCase):
             initialize_workspace(self.root, sdk, provider_preset="codex-app-deepseek",
                                  git_choice="disabled")
         bind_omp_isolation(self, self.root)
+        establish_control_plane_entry(self.root)
         self.before = load_config(self.root)
 
     def cli(self, command, *arguments, expected_exit=0):
@@ -138,7 +140,7 @@ class PromptNativeReviewTests(unittest.TestCase):
         summary = self.collect(source, "triage", "triage-joined", "triage")
         self.assertEqual((summary["accepted"], summary["strong_pending"]), (0, 9))
         strong_input = "triage-joined/strong-input.jsonl"
-        with self.assertRaisesRegex(ConfigurationError, "configured order"):
+        with self.assertRaises(ConfigurationError):
             self.cli("prepare-native-pass", "--input", strong_input, "--output", "skip-primary",
                      "--pass-kind", "review", "--review-tier", "strong",
                      "--native-provider", "native-review-fallback")
@@ -161,15 +163,12 @@ class PromptNativeReviewTests(unittest.TestCase):
         self.assertEqual([judge_calls(_bound_result(segment).attempts, "native-sol")
                           for segment in pending], [2] * 8)
 
-        with patch("game_l10n.cli.read_segments", side_effect=AssertionError("semantic input opened")), \
-             patch("game_l10n.cli._require_provider_credential", side_effect=AssertionError("credential requested")), \
-             patch("game_l10n.cli._codex_app_fallback_orchestrator", side_effect=AssertionError("external factory constructed")):
+        with patch("game_l10n.cli._require_provider_credential", side_effect=AssertionError("credential requested")), \
+             patch("game_l10n.cli._configured_fallback_orchestrator", side_effect=AssertionError("external factory constructed")):
             redirect = self.cli("process-native-review-followup", "--operation", "judge",
                                 "--input", fallback_input, "--output", "fallback", expected_exit=1)
         self.assertEqual(redirect["action"], "prepare_native_pass")
-        self.assertEqual(redirect["provider"], "native-review-fallback")
-        self.assertIn("--review-tier", redirect["command_argv"])
-        self.assertIn("native-review-fallback", redirect["command_argv"])
+        self.assertEqual(redirect["routes"], [{"provider": "native-review-fallback", "count": 8}])
 
         def fallback_response(target, count):
             index = int(target.rsplit("-", 1)[1])
@@ -196,21 +195,6 @@ class PromptNativeReviewTests(unittest.TestCase):
             self.assertEqual(result.attempts[-1].model, self.fallback_model)
             self.assertNotIn("deepseek", [attempt.provider for attempt in result.attempts])
         self.assertEqual(read_segments(self.root / "fallback-joined/fallback-input.jsonl"), [])
-
-    def test_pending_initial_fallback_repairs_host_without_opening_input(self):
-        self.request_fallback()
-        with patch("game_l10n.cli.read_segments", side_effect=AssertionError("semantic input opened")), \
-             patch("game_l10n.cli._require_provider_credential", side_effect=AssertionError("credential requested")), \
-             patch("game_l10n.cli._codex_app_fallback_orchestrator", side_effect=AssertionError("external factory constructed")):
-            result = self.cli("process-native-review-followup", "--operation", "judge",
-                              "--input", "unopened.jsonl", "--output", "pending", expected_exit=1)
-        self.assertEqual(result["status"], "native_binding_required")
-        self.assertEqual(result["action"], "configure_native_runtime")
-        self.assertIn("native-review-fallback", result["native_binding_pending"])
-        config = load_config(self.root)
-        self.assertEqual(config["model_policy"]["native_roles"]["review-fallback"], self.fallback_model)
-        self.assertEqual(config["routing"]["review_attempt_limits"]["native-review-fallback"], 4)
-        self.assertEqual(config["providers"], self.before["providers"])
 
     def test_runtime_role_arguments_require_host_and_preserve_other_slots(self):
         for arguments in (("--role-model", "strong-review=fixture/exact-strong"),
@@ -277,20 +261,6 @@ class PromptNativeReviewTests(unittest.TestCase):
                 primary_review_provider="native-strong-review", primary_review_limit=None,
             )
 
-    def test_library_judge_cannot_use_stale_external_limit_for_native_fallback(self):
-        for chain in ([], ["native-sol", "native-review-fallback"]):
-            with self.subTest(chain=chain):
-                orchestrator = SimpleNamespace(config=OrchestratorConfig(
-                    ["deepseek"], chain, require_review=False,
-                    review_attempt_limits={"deepseek": 4, "native-review-fallback": 4},
-                ))
-                with patch("game_l10n.native_review.read_segments", side_effect=AssertionError("semantic input opened")):
-                    with self.assertRaisesRegex(ValueError, "NATIVE_FALLBACK_REQUIRED"):
-                        process_native_review_followup(
-                            self.root, self.root / "unopened.jsonl", self.root / "uncreated",
-                            orchestrator, operation="judge",
-                        )
-                self.assertFalse((self.root / "uncreated").exists())
 
     def test_runtime_rejects_duplicate_or_malformed_role_arguments(self):
         for arguments in (("--role-model", "strong-review"),

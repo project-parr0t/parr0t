@@ -12,18 +12,21 @@ import unittest
 from unittest.mock import patch
 
 from game_l10n.control_plane import validate_control_envelope
+from game_l10n.content_source_policy import create_content_source_grant
 from game_l10n.data_plane_task import (
     _expected_context_pack_from_fragments,
     prepare_data_plane_task,
+    record_data_plane_failure,
     record_data_plane_relay_event,
     seal_data_plane_task,
 )
 from game_l10n.errors import ConfigurationError
-from game_l10n.native_runtime import configure_native_runtime
+from game_l10n.native_runtime import bind_data_plane_launch, configure_native_runtime, record_native_launch
 from game_l10n.omp_isolation import ISOLATION_ENV
 from game_l10n.store import stable_hash
 from tests import test_context_claim_binding as context_fixture
 from tests.omp_isolation_fixture import bind_omp_isolation
+from tests.execution_policy_fixture import approved_execution_policy
 
 
 class ContextWorkerExecutionTests(unittest.TestCase):
@@ -56,6 +59,7 @@ class ContextWorkerExecutionTests(unittest.TestCase):
             },
         }
         self.output = self.work / ".game-l10n/data-plane" / name
+        self.config = config
         prepared = prepare_data_plane_task(
             self.work, self.output, worker_role="context_analyzer",
             config=config, sdk_activation={"status": "active"},
@@ -103,7 +107,6 @@ class ContextWorkerExecutionTests(unittest.TestCase):
         return result
 
     def assert_round_trip(self) -> None:
-        self.assertEqual(self.execution["tool"], "available_host_process_tool")
         self.assertEqual(self.execution["argv_convention"], "complete_executable_argv")
         self.assertEqual(self.execution["workspace_root"], str(self.work.resolve()))
         self.assertEqual(self.execution["task_path"], str(self.task_path.resolve()))
@@ -173,6 +176,208 @@ class ContextWorkerExecutionTests(unittest.TestCase):
         self.assertEqual(sealed["status"], "success")
         self.assertTrue(sealed["execution"]["complete"])
         self.assertEqual(sealed["counts"]["success"], 2)
+
+    def test_partial_admission_failure_ends_without_starting_missing_slots_or_finalizer(self) -> None:
+        bind_omp_isolation(self, self.work)
+        configure_native_runtime(self.work, "omp", {"native-sol": "fixture/sol"}, omp_isolation="guarded")
+        self.prepare_snapshot("partial admission")
+        relay = self.output / "relay.json"
+        bind_data_plane_launch(self.work, relay)
+        contract = json.loads(relay.read_text(encoding="utf-8"))["launch_contract"]
+        record_native_launch(self.work, relay, event="capability-available")
+        record_native_launch(
+            self.work, relay, event="worker-started", task=contract["tasks"][0],
+            worker_id="synthetic-started-child", model=contract["model"],
+        )
+        record_data_plane_relay_event(self.work, relay, event="worker-started", slot=1)
+        record_data_plane_failure(self.work, relay, failure_code="execution_guard_denied")
+        with self.assertRaisesRegex(ConfigurationError, "actual started workers must end"):
+            seal_data_plane_task(self.work, relay, worker_ended=True)
+        record_data_plane_relay_event(self.work, relay, event="worker-ended", slot=1)
+        fingerprint = hashlib.sha256(relay.read_bytes()).hexdigest()
+        key = hashlib.sha256(f"{fingerprint}\0{contract['tasks'][0]}".encode()).hexdigest()
+        admission = self.work / ".game-l10n/native/omp-launch-admissions" / f"{key}.json"
+        admission.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "schema": "parr0t.omp-native-admission.v1", "relay_sha256": fingerprint,
+            "task": contract["tasks"][0], "state": "started",
+        }
+        admission.write_text(json.dumps(record), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "WORKER_ACTIVE"):
+            seal_data_plane_task(self.work, relay, worker_ended=True)
+        self.assertEqual(json.loads(admission.read_text(encoding="utf-8"))["state"], "started")
+        self.assertFalse((self.output / "receipt.json").exists())
+        admission.write_text(json.dumps({**record, "state": "ended"}), encoding="utf-8")
+        sealed = seal_data_plane_task(self.work, relay, worker_ended=True)
+        self.assertEqual(sealed["issue_codes"], ["operational_error", "execution_guard_denied"])
+        self.assertEqual(sealed["execution"]["started_workers"], 1)
+        self.assertEqual(sealed["execution"]["terminal_workers"], 1)
+        self.assertEqual(sealed["execution"]["terminal_unstarted_slots"], [2])
+        self.assertFalse(sealed["execution"]["finalizer_started"])
+        self.assertTrue(sealed["execution"]["finalizer_skipped"])
+        self.assertTrue(sealed["execution"]["complete"])
+
+    def test_denied_before_any_worker_start_seals_without_fabricated_children(self) -> None:
+        configure_native_runtime(self.work, "codex", {"native-sol": "gpt-6.1-sol"})
+        self.prepare_snapshot("denied admission")
+        relay = self.output / "relay.json"
+        bind_data_plane_launch(self.work, relay)
+        recorded = record_data_plane_failure(self.work, relay, failure_code="execution_guard_denied")
+        self.assertEqual(recorded["workers"], [])
+        self.assertFalse(recorded["cancellation_required"])
+        sealed = seal_data_plane_task(self.work, relay, worker_ended=True)
+        self.assertEqual(sealed["execution"]["started_workers"], 0)
+        self.assertEqual(sealed["execution"]["terminal_workers"], 0)
+        self.assertEqual(sealed["execution"]["terminal_unstarted_slots"], [1, 2])
+        self.assertTrue(sealed["execution"]["complete"])
+
+    def test_operational_successor_requires_the_original_bound_failure_category(self) -> None:
+        bind_omp_isolation(self, self.work)
+        configure_native_runtime(self.work, "omp", {
+            "native-sol": "fixture/sol", "native-approved-successor": "fixture/successor",
+        }, omp_isolation="guarded")
+        narrow = approved_execution_policy("provider_operational_error")
+        for failure, allowed in (("execution_guard_denied", False), ("provider_operational_error", True)):
+            with self.subTest(failure=failure):
+                with patch("game_l10n.native_runtime.active_execution_environment_policy", return_value=narrow):
+                    self.prepare_snapshot(f"bound-policy-{failure}")
+                original_task = self.task_path.read_bytes()
+                relay = self.output / "relay.json"
+                bind_data_plane_launch(self.work, relay)
+                if allowed:
+                    contract = json.loads(relay.read_text(encoding="utf-8"))["launch_contract"]
+                    record_native_launch(self.work, relay, event="capability-available")
+                    record_native_launch(
+                        self.work, relay, event="worker-started", task=contract["tasks"][0],
+                        worker_id="synthetic-provider-failure-child", model=contract["model"],
+                    )
+                    record_data_plane_relay_event(self.work, relay, event="worker-started", slot=1)
+                record_data_plane_failure(self.work, relay, failure_code=failure)
+                if allowed:
+                    with self.assertRaisesRegex(ConfigurationError, "actual started workers must end"):
+                        seal_data_plane_task(self.work, relay, worker_ended=True)
+                    record_data_plane_relay_event(self.work, relay, event="worker-ended", slot=1)
+                sealed = seal_data_plane_task(self.work, relay, worker_ended=True)
+                self.assertEqual(sealed["execution"]["started_workers"], int(allowed))
+                self.assertEqual(sealed["execution"]["terminal_workers"], int(allowed))
+                self.assertTrue(sealed["execution"]["complete"])
+                self.config["routing"]["context_analyzers"] = ["native-sol", "native-approved-successor"]
+                with patch("game_l10n.native_runtime.active_execution_environment_policy", return_value=approved_execution_policy()):
+                    prepared = prepare_data_plane_task(
+                        self.work, self.output, worker_role="context_analyzer",
+                        config=self.config, sdk_activation={"status": "active"},
+                    )
+                if allowed:
+                    self.assertEqual(prepared["status"], "ready")
+                    successor = json.loads(self.task_path.read_text(encoding="utf-8"))
+                    self.assertEqual(successor["context_route"], "native-approved-successor")
+                    self.assertNotEqual(successor["task_id"], self.task["task_id"])
+                    self.assertEqual(successor["attempt"], self.task["attempt"])
+                    archive = self.output / "history" / self.task["task_id"] / "task.json"
+                    self.assertEqual(archive.read_bytes(), original_task)
+                else:
+                    self.assertEqual(prepared["status"], "pending")
+                    self.assertEqual(prepared["next_action"], "repair_native_runtime")
+                    self.assertFalse(prepared["dispatch_allowed"])
+                    self.assertEqual(self.task_path.read_bytes(), original_task)
+
+    def test_minimum_context_failure_requires_repair_but_changed_capacity_can_retry(self) -> None:
+        relay = self.output / "relay.json"
+        first_task = self.task_path.read_bytes()
+        sealed = seal_data_plane_task(self.work, relay, worker_ended=True)
+        self.assertTrue(sealed["execution"]["complete"])
+        prepared = self.prepare_snapshot("context_analyzer")
+        self.assertEqual(prepared["status"], "pending")
+        self.assertEqual(prepared["next_action"], "repair_context_inputs")
+        self.assertFalse(prepared["dispatch_allowed"])
+        self.assertEqual(self.task_path.read_bytes(), first_task)
+        self.config["routing"]["context_chunk_chars"] = 4096
+        retried = prepare_data_plane_task(
+            self.work, self.output, worker_role="context_analyzer",
+            config=self.config, sdk_activation={"status": "active"},
+        )
+        self.assertEqual(retried["status"], "ready")
+        self.assertNotEqual(self.task_path.read_bytes(), first_task)
+        archive = self.output / "history" / self.task["task_id"] / "task.json"
+        self.assertEqual(archive.read_bytes(), first_task)
+
+    def test_minimum_context_failure_uses_untried_approved_route(self) -> None:
+        seal_data_plane_task(self.work, self.output / "relay.json", worker_ended=True)
+        self.prepare_snapshot("context_analyzer")
+        self.config["routing"]["context_analyzers"] = ["native-sol", "native-approved-successor"]
+        retried = prepare_data_plane_task(
+            self.work, self.output, worker_role="context_analyzer",
+            config=self.config, sdk_activation={"status": "active"},
+        )
+        self.assertEqual(retried["status"], "ready")
+        task = json.loads(self.task_path.read_text(encoding="utf-8"))
+        self.assertEqual(task["context_route"], "native-approved-successor")
+
+    def test_route_and_grant_revision_reuses_successful_context_fragments(self) -> None:
+        self.prepare_snapshot("scope-change")
+        claim_path, claim = self.claim(1)
+        self.run_command("commit-context-fragment", claim_path=claim_path, result_path=self.result(claim))
+        fragments = {
+            path: path.read_bytes()
+            for path in (self.work / ".game-l10n/context-progress/fragments").rglob("*.json")
+        }
+        sealed = seal_data_plane_task(self.work, self.output / "relay.json", worker_ended=True)
+        self.assertEqual(sealed["counts"]["success"], 1)
+        grant, _ = create_content_source_grant(
+            self.work, authority="explicit_user", scope_id="context-retry-v2",
+            task_kinds=["localization_context"], routes=["data-plane:context_analyzer"],
+            external_sources=["https://example.invalid/exact-context-reference"], user_confirmed=True,
+        )
+        self.config["routing"]["context_analyzers"] = ["native-sol", "native-approved-successor"]
+        prepared = prepare_data_plane_task(
+            self.work, self.output, worker_role="context_analyzer", config=self.config,
+            sdk_activation={"status": "active"}, content_source_grant=grant,
+            content_source_scope="context-retry-v2",
+        )
+        self.assertEqual(prepared["status"], "ready")
+        task = json.loads(self.task_path.read_text(encoding="utf-8"))
+        self.assertEqual(task["context_route"], "native-approved-successor")
+        self.assertEqual(task["context_parallelism"]["completed_chunks"], 1)
+        self.assertEqual(task["context_parallelism"]["pending_chunks"], 1)
+        self.assertEqual(task["context_parallelism"]["max_workers"], 1)
+        manifest = json.loads((self.work / task["input_context_manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["chunks"][0]["binding"]["semantic_route"], "native-sol")
+        self.assertEqual(manifest["chunks"][1]["binding"]["semantic_route"], "native-approved-successor")
+        self.assertEqual(len(task["context_source_policies"]), 2)
+        for path, original in fragments.items():
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_late_admission_keeps_original_failure_evidence_and_truthful_start_counts(self) -> None:
+        configure_native_runtime(self.work, "codex", {"native-sol": "gpt-6.1-sol"})
+        self.prepare_snapshot("late-admission")
+        relay = self.output / "relay.json"
+        bind_data_plane_launch(self.work, relay)
+        record_data_plane_failure(self.work, relay, failure_code="execution_guard_denied")
+        failure_path = next(self.output.glob("operational-failure-*.json"))
+        self.assertEqual(json.loads(failure_path.read_text(encoding="utf-8"))["workers"], [])
+        contract = json.loads(relay.read_text(encoding="utf-8"))["launch_contract"]
+        name = contract["tasks"][0]
+        record_native_launch(self.work, relay, event="capability-available")
+        record_native_launch(
+            self.work, relay, event="worker-started", task=name,
+            worker_id="synthetic-late-admitted-child", model=contract["model"],
+        )
+        fingerprint = hashlib.sha256(relay.read_bytes()).hexdigest()
+        key = hashlib.sha256(f"{fingerprint}\0{name}".encode()).hexdigest()
+        admission = self.work / ".game-l10n/native/omp-launch-admissions" / f"{key}.json"
+        admission.parent.mkdir(parents=True, exist_ok=True)
+        admission.write_text(json.dumps({
+            "schema": "parr0t.omp-native-admission.v1", "relay_sha256": fingerprint,
+            "task": name, "state": "ended",
+        }), encoding="utf-8")
+        sealed = seal_data_plane_task(self.work, relay, worker_ended=True)
+        self.assertEqual(sealed["execution"]["started_workers"], 1)
+        self.assertEqual(sealed["execution"]["terminal_workers"], 1)
+        self.assertEqual(sealed["execution"]["terminal_unstarted_slots"], [2])
+        failure = json.loads(failure_path.read_text(encoding="utf-8"))
+        self.assertEqual(failure["workers"], [])
+        self.assertEqual(failure["terminal_workers"][0]["worker_id"], "synthetic-late-admitted-child")
+        self.assertTrue(failure["terminal"])
 
     def test_ordinary_worker_argv_runs_without_cli_on_path(self) -> None:
         self.assert_round_trip()

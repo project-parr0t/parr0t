@@ -1,6 +1,7 @@
-"""Consume host-confirmed, operation-bound framework-mode approvals.
+"""Consume root-host, operation-bound framework-mode approvals.
 
-The host boundary owns interactive consent and root identity. These records are
+The host boundary binds an explicit user-request assertion and root identity;
+it does not require a second interactive dialog. These records are
 not a sandbox against arbitrary native code running as the same OS user.
 """
 from __future__ import annotations

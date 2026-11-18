@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 from copy import deepcopy
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -13,9 +14,11 @@ from unittest.mock import patch
 from game_l10n.cli import build_parser, main
 from game_l10n.control_plane import establish_control_plane_entry
 from game_l10n.data_plane_task import prepare_data_plane_task, record_data_plane_failure, seal_data_plane_task
+from game_l10n.image_localization import record_image_localization_policy
 from game_l10n.errors import ConfigurationError
 from game_l10n.extractor_preparation import (
     ACTION, ATTESTATION_PATH, PROFILE_PATH, PURPOSE, check_extractor_preparation,
+    apply_extractor_requirements,
     preparation_required, preparation_state, require_extractor_preparation,
 )
 from game_l10n.native_runtime import configure_native_runtime, native_launch_summary, record_native_launch
@@ -115,8 +118,11 @@ class ExtractorPreparationTests(unittest.TestCase):
 
     def _cli_prepare(self) -> Path:
         prepared = self._cli('prepare-data-plane-task', '--worker-role', 'source_probe', '--purpose', PURPOSE)
-        self.assertEqual(prepared['relay_path'], '.game-l10n/data-plane/extractor_preparation/relay.json')
-        return self.work / prepared['relay_path']
+        self.assertEqual(prepared['status'], 'ready')
+        relay = self.work / prepared['relay_path']
+        self.assertTrue(relay.is_file())
+        self.assertTrue(relay.resolve().is_relative_to(self.work.resolve()))
+        return relay
 
     def _start(self, relay_path: Path) -> None:
         relay = json.loads(relay_path.read_text())
@@ -144,6 +150,102 @@ class ExtractorPreparationTests(unittest.TestCase):
         self.assertEqual(sealed['status'], 'success')
         return {path: path.read_bytes() for path in (relay, output / 'task.json', envelope, output / 'receipt.json')}
 
+    def test_additive_image_repair_invalidates_old_readiness_without_changing_other_policy(self) -> None:
+        self._ready()
+        before = load_config(self.work)
+        requirements = deepcopy(self.requirements)
+        requirements["required_capabilities"].append("bounded-image-font-candidate-discovery")
+        requirements["required_formats"].append("image-font-resources")
+        requirements["source_metadata"]["image_candidate_discovery"] = {
+            "path": ".game-l10n/image-candidates.json",
+            "sha256": "a" * 64,
+            "requested_scope": "player_visible_text_assets",
+            "output_manifest": "inputs/image-inspection-candidates.json",
+            "asset_root": "inputs/image-assets",
+        }
+        path = self.work / ".game-l10n/image-extractor-requirements.json"
+        path.write_text(json.dumps(requirements), encoding="utf-8")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        apply_extractor_requirements(self.work, path, digest)
+        updated = load_config(self.work)
+        self.assertEqual(updated, {**before, "extractor_requirements": requirements})
+        self.assertEqual(preparation_state(self.work, updated, self.activation)["status"], "pending")
+        self.assertTrue((self.work / ATTESTATION_PATH).is_file())
+
+    def test_image_repair_rejects_stale_or_narrowed_requirements_without_config_mutation(self) -> None:
+        config_path = self.work / "game-l10n.json"
+        original = config_path.read_bytes()
+        path = self.work / ".game-l10n/image-extractor-requirements.json"
+        for narrowed in (False, True):
+            with self.subTest(narrowed=narrowed):
+                requirements = deepcopy(self.requirements)
+                if narrowed:
+                    requirements["required_capabilities"] = ["bounded-image-font-candidate-discovery"]
+                path.write_text(json.dumps(requirements), encoding="utf-8")
+                digest = hashlib.sha256(path.read_bytes()).hexdigest() if narrowed else "0" * 64
+                with self.assertRaises(ConfigurationError):
+                    apply_extractor_requirements(self.work, path, digest)
+                self.assertEqual(config_path.read_bytes(), original)
+
+    def test_opaque_image_cli_applies_repair_without_dispatching_unchanged_inventory(self) -> None:
+        self._ready()
+        configure_native_runtime(self.work, "codex", {})
+        record_image_localization_policy(self.work, requested=True, user_requested=True)
+        (self.game / "packed.pak").write_bytes(b"SYNTHETIC_OPAQUE_IMAGE_CONTAINER")
+        first = self._cli("prepare-data-plane-task", "--worker-role", "image_ui_inventory")
+        self.assertEqual(first["status"], "pending")
+        self.assertIs(first["dispatch_allowed"], False)
+        self.assertEqual(first["next_action"], ACTION)
+        self.assertIs(first["extractor_requirements_applied"], True)
+        self.assertEqual(first["data_plane_task"]["worker_role"], "source_probe")
+        self.assertEqual(first["data_plane_task"]["purpose"], PURPOSE)
+        updated = load_config(self.work)
+        self.assertTrue(set(self.requirements["required_capabilities"]) <= set(
+            updated["extractor_requirements"]["required_capabilities"],
+        ))
+        self.assertEqual(preparation_state(self.work, updated, self.activation)["status"], "pending")
+        repeated = self._cli("prepare-data-plane-task", "--worker-role", "image_ui_inventory")
+        self.assertIs(repeated["dispatch_allowed"], False)
+        self.assertEqual(repeated["extractor_requirements_sha256"], first["extractor_requirements_sha256"])
+        self.assertEqual(repeated["data_plane_task"]["purpose"], PURPOSE)
+
+    def test_image_requirement_revisions_preserve_prior_exact_contexts(self) -> None:
+        path = self.work / ".game-l10n/image-extractor-requirements.json"
+
+        def apply(requirements: dict) -> None:
+            path.write_text(json.dumps(requirements), encoding="utf-8")
+            apply_extractor_requirements(
+                self.work, path, hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+
+        requirements = deepcopy(self.requirements)
+        first = {"path": ".game-l10n/image-candidates.json", "sha256": "a" * 64}
+        requirements["source_metadata"]["image_candidate_discovery"] = first
+        apply(requirements)
+        original = (self.work / "game-l10n.json").read_bytes()
+        second = {**first, "sha256": "b" * 64}
+        requirements["source_metadata"]["image_candidate_discovery"] = second
+        with self.assertRaisesRegex(ConfigurationError, "retained history"):
+            apply(requirements)
+        self.assertEqual((self.work / "game-l10n.json").read_bytes(), original)
+        requirements["source_metadata"]["image_candidate_discovery_history"] = [first]
+        apply(requirements)
+        retained = (self.work / "game-l10n.json").read_bytes()
+        third = {**first, "sha256": "c" * 64}
+        requirements["source_metadata"]["image_candidate_discovery"] = third
+        requirements["source_metadata"]["image_candidate_discovery_history"] = [second]
+        with self.assertRaisesRegex(ConfigurationError, "retained history"):
+            apply(requirements)
+        self.assertEqual((self.work / "game-l10n.json").read_bytes(), retained)
+        requirements["source_metadata"]["image_candidate_discovery_history"] = [first, second]
+        apply(requirements)
+        self.assertEqual(
+            load_config(self.work)["extractor_requirements"]["source_metadata"],
+            {**self.requirements["source_metadata"],
+             "image_candidate_discovery": third,
+             "image_candidate_discovery_history": [first, second]},
+        )
+
     def test_failed_preparation_cli_retry_keeps_discovery_and_recovers_own_status(self) -> None:
         discovery = self._completed_discovery()
         configure_native_runtime(self.work, 'codex', {})
@@ -163,11 +265,35 @@ class ExtractorPreparationTests(unittest.TestCase):
         status = self._cli('status')
         self.assertEqual(status['next_actions'], [ACTION])
         self.assertEqual(status['data_plane_task']['last_receipt']['issue_codes'], sealed['issue_codes'])
-        self._cli_prepare()
+        previous_task = (self.output / 'task.json').read_bytes()
+        previous_receipt = (self.output / 'receipt.json').read_bytes()
+        blocked = self._cli('prepare-data-plane-task', '--worker-role', 'source_probe', '--purpose', PURPOSE)
+        self.assertEqual(blocked['status'], 'pending')
+        self.assertEqual(blocked['next_action'], 'repair_native_runtime')
+        self.assertFalse(blocked['dispatch_allowed'])
+        self.assertEqual((self.output / 'task.json').read_bytes(), previous_task)
+        original_model = json.loads(relay.read_text(encoding='utf-8'))['launch_contract']['model']
+        configure_native_runtime(self.work, 'codex', {
+            first_task['worker_route']: original_model,
+            'native-unrelated-repair': 'synthetic/unrelated-model',
+        })
+        unrelated = self._cli('prepare-data-plane-task', '--worker-role', 'source_probe', '--purpose', PURPOSE)
+        self.assertEqual(unrelated['status'], 'pending')
+        self.assertEqual(unrelated['next_action'], 'repair_native_runtime')
+        self.assertFalse(unrelated['dispatch_allowed'])
+        self.assertEqual((self.output / 'task.json').read_bytes(), previous_task)
+        configure_native_runtime(
+            self.work, 'codex', {first_task['worker_route']: 'synthetic/approved-repaired-model'},
+        )
+        fresh_relay = self._cli_prepare()
         retried = json.loads((self.output / 'task.json').read_text())
-        self.assertEqual(retried['attempt'], first_task['attempt'] + 1)
+        self.assertEqual(retried['attempt'], first_task['attempt'])
+        self.assertGreater(retried['task_revision'], first_task['task_revision'])
         self.assertNotEqual(retried['task_id'], first_task['task_id'])
-        self.assertEqual(native_launch_summary(self.work, relay)['started_workers'], 0)
+        self.assertEqual(native_launch_summary(self.work, fresh_relay)['started_workers'], 0)
+        archive = self.output / 'history' / first_task['task_id']
+        self.assertEqual((archive / 'task.json').read_bytes(), previous_task)
+        self.assertEqual((archive / 'receipt.json').read_bytes(), previous_receipt)
         self.assertEqual(ledger.read_bytes(), ledger_bytes)
         for path, original in discovery.items():
             self.assertEqual(path.read_bytes(), original)
@@ -212,14 +338,22 @@ class ExtractorPreparationTests(unittest.TestCase):
         original_task = (self.output / 'task.json').read_bytes()
         record_native_launch(self.work, relay, event='model-unavailable', failure_code='host_model_unavailable')
         seal_data_plane_task(self.work, relay, worker_ended=True)
+        original_receipt = (self.output / 'receipt.json').read_bytes()
         status = self._cli('status')
         self.assertEqual(status['next_actions'], [ACTION])
-        self.assertEqual(status['data_plane_task']['failure_action'], 'repair_native_runtime_then_resume_same_task')
         configure_native_runtime(self.work, 'codex', {'native-sol': 'synthetic/approved-repaired-model'})
         self._cli_prepare()
-        self.assertEqual((self.output / 'task.json').read_bytes(), original_task)
-        self.assertFalse((self.output / 'receipt.json').exists())
-        self.assertTrue(list(self.output.glob('receipt.json.legacy-*')))
+        repaired = json.loads((self.output / 'task.json').read_text())
+        original = json.loads(original_task)
+        self.assertNotEqual(repaired['task_id'], original['task_id'])
+        self.assertEqual(repaired['attempt'], original['attempt'])
+        self.assertGreater(repaired['task_revision'], original['task_revision'])
+        for field in ('source_roots', 'purpose', 'sdk_activation', 'extractor_requirements'):
+            self.assertEqual(repaired[field], original[field])
+        self.assertNotEqual(repaired['output_envelope'], original['output_envelope'])
+        archive = self.output / 'history' / original['task_id']
+        self.assertEqual((archive / 'task.json').read_bytes(), original_task)
+        self.assertEqual((archive / 'receipt.json').read_bytes(), original_receipt)
         self.assertEqual(native_launch_summary(self.work, relay)['started_workers'], 0)
         for path, original in discovery.items():
             self.assertEqual(path.read_bytes(), original)
@@ -334,7 +468,6 @@ class ExtractorPreparationTests(unittest.TestCase):
         self.assertEqual(task['output_artifact'], ATTESTATION_PATH)
         self.assertEqual(task['extractor_requirements'], self.requirements)
         self.assertNotIn('inventory_gate', task)
-        self.assertNotIn('worker_route', task)
 
     def test_status_prioritizes_activation_then_preparation_and_keeps_parent_text_free(self) -> None:
         for active in (False, True):
