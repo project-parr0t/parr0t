@@ -15,6 +15,8 @@ python scripts/update_branches.py --repo <repository> --main-ref origin/main --s
 ```
 
 Default planning includes the inventoried origin SDK refs. Repeat `--branch <local-sdk-branch>` for selected local targets. Network failures do not authorize using guessed refs or creating a replacement SDK.
+Explicit `--branch` targets may also name Core mirrors or topic branches. They receive the same pinned-tree, complete-validation, clean-worktree, and compare-and-swap protections. Default discovery remains SDK-only. Core-equivalent or addition-only topics can merge the intended Core; conflicting Core customizations remain held for explicit reconciliation. An ancestor-only mirror fast-forwards without a redundant merge commit.
+
 
 SDK branches declare Python validation dependencies in `requirements.txt`, `requirements-*.txt`, or `*-requirements.txt`, including under `profiles/`. Such a branch requires `--provision-dependencies`; ambient packages never satisfy its evidence because a different version can appear compatible. The exact files install into a content-addressed directory below the stable external cache. Before installation, the checker reuses an exact validated environment from the current run state or stable cache. Its pip download cache is also confined there, never to the host user's ambient pip cache. A new installation is an explicit network/package-install action. Provisioning never writes into the repository, user Python installation, or another SDK's environment. Evidence includes every installed dependency byte; later mutation is a hold. An installation that exits with an actual package failure is cached for the same dependency and Python identity; use `--force` only after its cause changes. Timeout interruptions are not permanent dependency failures; historical timeout-only failure markers do not block another attempt or invalidate a completed dependency environment.
 
@@ -56,13 +58,13 @@ After an applied merge, the source tree is exactly the validated tree. Do not re
 
 ## Explicit local application
 
-An agent may run `--apply` only after the user requests the local SDK merge/update action and its named targets. Implementation or inspection authorization alone does not authorize applying the current plan. No push, tag, release, or remote write is included.
+An agent may run `--apply` only after the user requests the local branch merge/update action and its named targets. Implementation or inspection authorization alone does not authorize applying the current plan. No push, tag, release, or remote write is included.
 
 ```text
 python scripts/update_branches.py --repo <repository> --main-ref origin/main --state-dir <external-run-state> --branch <local-sdk-branch> --apply
 ```
 
-`--apply` requires explicit local `sdk-*` names. It computes a fresh plan, validates immutable inputs, and accepts only `update_ready` rows. Remote-tracking refs are never update destinations. An unoccupied ref advances through a compare-and-swap transaction. A target already checked out in exactly one clean linked worktree advances there with an exact fast-forward to the preconstructed merge commit; the updater rechecks its branch, old tip, operation state, cleanliness, resulting tree, and final cleanliness. A dirty worktree or operation in progress is held. There is no automatic checkout, stash, reset, rebase, conflict resolution, deletion, or force push.
+`--apply` requires explicit local branch names. It computes a fresh plan, validates immutable inputs, and accepts only `update_ready` rows. Remote-tracking refs are never update destinations. An unoccupied ref advances through a compare-and-swap transaction. A target in one clean linked worktree advances there through an exact fast-forward. Dirty worktrees, changed refs, incomplete proof, and conflicts remain held; no automatic stash, reset, rebase, conflict resolution, deletion, or force push occurs.
 
 Construct a merge commit with the original SDK and intended main as parents, preserve the configured signing requirement, and record `Parr0t-Core`, `Parr0t-Validated-Tree`, and `Parr0t-Validation-Key` trailers. Then either atomically verify the expected main ref and compare-and-swap an unoccupied SDK ref, or fast-forward its exact clean linked worktree. A signing, ref, cleanliness, or fast-forward failure must never trigger an unsigned fallback, manual merge, or overwrite of a newer tip. Other targets may continue independently. A rejected update may leave an unreachable commit; do not delete repository objects as cleanup.
 

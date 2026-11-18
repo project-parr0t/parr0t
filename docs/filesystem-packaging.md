@@ -4,7 +4,7 @@
 
 ## Build
 
-Keep the completed payload, package spec, checkpoint, and ZIP in the private game workspace. A minimal spec is:
+Keep the completed payload, package spec, checkpoint, and ZIP in the private game workspace. Distribution requires a full release checkpoint; a local-only package may use a local integrity checkpoint when `required_for_distribution` is false. Either mode still validates package ownership, payload hashes, source lineage, and per-target integrity. A minimal spec is:
 
 ```json
 {
@@ -20,6 +20,23 @@ Keep the completed payload, package spec, checkpoint, and ZIP in the private gam
   "custom_errors": []
 }
 ```
+
+For a local-only integrity package, set workspace configuration `release_checkpoint.required_for_distribution` to `false`. Instead of `checkpoint_file`, the package spec may supply this exact generation request:
+
+```json
+{
+  "local_checkpoint": {
+    "inventory": "inventory.json",
+    "results": "translation-results.json",
+    "ownership": {
+      "owner": "Authorized owner",
+      "license": "License identifier"
+    }
+  }
+}
+```
+
+`inventory` and `results` name existing paths within the workspace; `ownership` requires both explicit nonempty `owner` and `license`. The packager validates the inventory and results, derives and validates the local integrity checkpoint, then binds it into the private generated package spec. Do not supply both `local_checkpoint` and `checkpoint_file`. This mode is not publication-ready; it does not waive payload and result integrity checks.
 
 Build and verify with:
 

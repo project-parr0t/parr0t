@@ -25,7 +25,7 @@ class ReviewPolicyTests(unittest.TestCase):
             registry=ProviderRegistry(providers),
             config=OrchestratorConfig(
                 [translator.name], [sol.name, fallback.name],
-                review_attempt_limits={fallback.name: 3} if configured else {},
+                review_attempt_limits={sol.name: 2, **({fallback.name: 3} if configured else {})},
                 review_max_rounds=10, grace_retries=8, retry_refusals_once=True,
                 rewriter_chain=[editor.name], use_style_memory=False,
                 defer_fallbacks_until_primary_complete=deferred, preserve_source_on_failure=True,
@@ -34,7 +34,7 @@ class ReviewPolicyTests(unittest.TestCase):
         )
         return orchestrator, providers
 
-    def test_sol_cap_and_explicit_fallback_total_in_single_and_deferred_paths(self):
+    def test_explicit_primary_and_fallback_total_in_single_and_deferred_paths(self):
         for deferred in (False, True):
             with self.subTest(deferred=deferred), tempfile.TemporaryDirectory() as directory:
                 orchestrator, providers = self.orchestrator(Path(directory), deferred=deferred)
@@ -45,26 +45,20 @@ class ReviewPolicyTests(unittest.TestCase):
                 self.assertEqual(providers["fallback"].call_count, 3)
                 self.assertEqual(providers["translator"].call_count, 1)
 
-    def test_missing_policy_stays_pending_and_resume_does_not_repeat_primary(self):
+    def test_default_fallback_policy_runs_without_human_count_and_success_is_reused(self):
         for deferred in (False, True):
             with self.subTest(deferred=deferred), tempfile.TemporaryDirectory() as directory:
                 orchestrator, providers = self.orchestrator(Path(directory), deferred=deferred, configured=False)
                 segment = Segment("fixture", "Source")
                 run = lambda: orchestrator.translate_many([segment])[0] if deferred else orchestrator.translate_one(segment)
-                pending = run()
-                self.assertEqual(pending.status, "failed")
-                self.assertEqual(pending.text, "\ub300\uc0c1")
-                self.assertEqual(pending.metadata["review_policy_required"], "fallback")
-                self.assertNotIn("All review routes were exhausted", pending.errors)
-                self.assertEqual(providers["fallback"].call_count, 0)
-                orchestrator.config.review_attempt_limits["fallback"] = 3
                 result = run()
+                self.assertEqual(run().status, "reviewed")
                 self.assertEqual(result.status, "reviewed")
                 self.assertEqual(providers["openai-sol"].call_count, 2)
                 self.assertEqual(providers["translator"].call_count, 1)
                 self.assertEqual(providers["fallback"].call_count, 3)
 
-    def test_confirmation_shares_the_sol_call_budget(self):
+    def test_confirmation_shares_the_explicit_route_call_budget(self):
         with tempfile.TemporaryDirectory() as directory:
             orchestrator, providers = self.orchestrator(Path(directory), rewrite=True)
             result = orchestrator.translate_one(Segment("fixture", "Source"))
@@ -99,11 +93,11 @@ class ReviewPolicyTests(unittest.TestCase):
             self.assertEqual(updated["routing"]["review_attempt_limits"]["fallback"], 4)
             self.assertEqual(updated["project"]["style_guide"], "FIXTURE_STYLE")
             self.assertEqual(updated["providers"][-1]["model"], "EXACT_FIXTURE_MODEL")
-            self.assertEqual(review_policy_status(updated)["missing_fallback_providers"], [])
+            self.assertNotIn("fallback", review_policy_status(updated)["defaulted_fallback_providers"])
             self.assertEqual(result["review_limits"], settings)
             self.assertEqual({key: updated["routing"][key] for key in settings}, settings)
 
-    def test_native_failed_only_chain_stops_after_two_and_preserves_count(self):
+    def test_native_failed_only_chain_preserves_explicit_two_call_policy(self):
         from game_l10n.native_pass import native_control_step, prepare_native_tasks
         from game_l10n.native_review import _bound_result, collect_native_review
         from game_l10n.formats import read_segments
@@ -111,11 +105,15 @@ class ReviewPolicyTests(unittest.TestCase):
         from tests import write_semantic_result_rows
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "game-l10n.json").write_text(json.dumps({
+                "routing": {"reviewers": ["native-sol"], "review_attempt_limits": {"native-sol": 2}},
+            }), encoding="utf-8")
             segments = [review_segment(name) for name in ("a", "b")]
             source = root / "source.jsonl"
             source.write_text("".join(json.dumps(asdict(segment)) + "\n" for segment in segments), encoding="utf-8")
             segments = read_segments(source)
-            prepare_native_tasks(root, source, segments, root / "tasks", pass_kind="review", max_records=2, min_records=1)
+            prepare_native_tasks(root, source, segments, root / "tasks", pass_kind="review", max_records=2, min_records=1,
+                                 route_binding={"provider": "native-sol", "model": "fixture-review-exact", "attempt": 1})
             manifest_path = root / "tasks" / "manifest.json"
             results = root / "results"
             for _ in range(2):
@@ -191,13 +189,83 @@ class ReviewPolicyTests(unittest.TestCase):
         from game_l10n.models import AttemptRecord, TranslationResult
         with tempfile.TemporaryDirectory() as directory:
             orchestrator, providers = self.orchestrator(Path(directory))
-            result = TranslationResult("fixture", "Source", "\ub300\uc0c1", attempts=[
-                AttemptRecord("review", "fallback", "error", ordinal=2, candidate_generation=1),
-            ])
-            verdict = orchestrator._judge_with_refusal_retry(result, providers["fallback"], Segment("fixture", "Source"), "\ub300\uc0c1", [])
+            from game_l10n.store import stable_hash
+            provider = providers["fallback"]
+            fingerprint = {**provider.fingerprint(), "model": "fixture/exact-fallback"}
+            result = TranslationResult("fixture", "Source")
+            orchestrator._set_candidate(result, "\ub300\uc0c1")
+            result.attempts.append(AttemptRecord(
+                "review", "fallback", "error", ordinal=2,
+                model=fingerprint["model"], candidate_generation=result.candidate_generation,
+                provider_fingerprint=stable_hash(fingerprint), operational=False, retryable=True,
+            ))
+            with patch.object(provider, "fingerprint", return_value=fingerprint):
+                verdict = orchestrator._judge_with_refusal_retry(
+                    result, provider, Segment("fixture", "Source"), result.text, [],
+                )
             self.assertIsNone(verdict)
-            self.assertEqual(providers["fallback"].call_count, 1)
-            self.assertEqual(judge_calls(result.attempts, "fallback"), 3)
+            self.assertEqual(provider.call_count, 1)
+            self.assertEqual([attempt.ordinal for attempt in result.attempts], [2, 3])
+            self.assertTrue(all(attempt.model == fingerprint["model"] for attempt in result.attempts))
+            self.assertTrue(all(attempt.provider_fingerprint == stable_hash(fingerprint) for attempt in result.attempts))
+            self.assertEqual(judge_calls(result.attempts, "fallback", model=fingerprint["model"]), 3)
+
+    def test_model_identity_never_creates_a_cap_or_combines_distinct_routes(self):
+        from game_l10n.models import AttemptRecord
+        from game_l10n.review_policy import review_call_limit, validate_review_settings
+        self.assertEqual(review_call_limit("custom-sol", ["custom-sol"], {"custom-sol": 9},
+                                          model="fixture/gpt-6.1-sol:high"), 9)
+        self.assertIsNone(review_call_limit("native-sol", ["native-sol"], {}))
+        self.assertEqual(review_call_limit("fallback", ["primary", "fallback"], {}), 3)
+        self.assertEqual(review_call_limit("fallback", ["primary", "fallback"], {"fallback": 7}, tier_limit=5), 5)
+        attempts = [AttemptRecord("review", "native-sol", "error", model="one/gpt-6.1-sol:high", ordinal=2),
+                    AttemptRecord("review", "other-sol", "error", model="two/gpt-6.1-sol:high", ordinal=8)]
+        self.assertEqual(judge_calls(attempts, "native-sol", model="one/gpt-6.1-sol:high"), 2)
+        validate_review_settings({"review_max_workers": 128})
+
+    def test_model_cutover_does_not_charge_a_known_different_model(self):
+        from game_l10n.models import AttemptRecord
+        attempts = [
+            AttemptRecord("review", "native-review", "error", model="fixture/old:high", ordinal=7),
+            AttemptRecord("review", "native-review", "error", model="fixture/new:high", ordinal=1),
+            AttemptRecord("review-confirm", "other-role", "error", model="fixture/new:high", ordinal=2),
+        ]
+        self.assertEqual(judge_calls(attempts, "native-review", model="fixture/new:high"), 2)
+        self.assertEqual(judge_calls(attempts, "native-review", model="fixture/old:high"), 7)
+        attempts.append(AttemptRecord("review", "native-review", "error", ordinal=3))
+        self.assertEqual(judge_calls(attempts, "native-review", model="fixture/new:high"), 3)
+        self.assertEqual(judge_calls(attempts, "native-review"), 7)
+
+    def test_confirmed_operational_failures_do_not_spend_semantic_review_calls(self):
+        from game_l10n.models import AttemptRecord
+        model = "fixture/exact-review"
+        attempts = [
+            AttemptRecord("review", "denied-adapter", "error", model=model, ordinal=99, operational=True),
+            AttemptRecord("review-triage", "denied-adapter", "error", model=model, ordinal=99, operational=True),
+        ]
+        self.assertEqual(judge_calls(attempts, "healthy-adapter", model=model), 0)
+        self.assertEqual(judge_calls(attempts, "healthy-adapter", model=model, stage_prefix="review-triage"), 0)
+        attempts.append(AttemptRecord("review", "healthy-adapter", "error", model=model, ordinal=1, operational=False))
+        self.assertEqual(judge_calls(attempts, "healthy-adapter", model=model), 1)
+        attempts.append(AttemptRecord("review-confirm", "legacy-adapter", "error", model=model, ordinal=2))
+        self.assertEqual(judge_calls(attempts, "healthy-adapter", model=model), 2)
+
+    def test_review_physical_ordinals_subtract_only_distinct_known_operational_events(self):
+        from game_l10n.models import AttemptRecord
+        model = "fixture/exact-review"
+        attempts = [
+            AttemptRecord("review", "route", "error", model=model, ordinal=1, operational=True),
+            AttemptRecord("review", "route", "error", model=model, ordinal=1, operational=True),
+            AttemptRecord("review", "route", "approved", model=model, ordinal=2, operational=False),
+        ]
+        self.assertEqual(judge_calls(attempts, "route", model=model), 1)
+        attempts.append(AttemptRecord("review-confirm", "route", "error", model=model, ordinal=3))
+        self.assertEqual(judge_calls(attempts, "route", model=model), 2)
+        attempts.extend([
+            AttemptRecord("review", "route", "error", model=model, ordinal=4, operational=True),
+            AttemptRecord("review-confirm", "route", "approved", model=model, ordinal=7, operational=False),
+        ])
+        self.assertEqual(judge_calls(attempts, "route", model=model), 5)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from unittest.mock import patch
 from game_l10n.coverage import completion_attestation
 from game_l10n.errors import ProviderError, ProviderFailure
 from game_l10n.models import (
+    AttemptRecord,
     ContextPack,
     GlossaryEntry,
     ProjectContext,
@@ -22,6 +23,89 @@ from game_l10n.store import stable_hash
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_repaired_transport_does_not_hide_an_unknown_prefix_before_operational_counter(self):
+        class Repairable(ScriptedProvider):
+            revision = 0
+            def fingerprint(self):
+                return {**super().fingerprint(), "revision": self.revision, "model": "fixture/exact"}
+        def unavailable(**_):
+            raise ProviderFailure("authentication_error", retryable=False)
+        with tempfile.TemporaryDirectory() as directory:
+            provider = Repairable("route", unavailable)
+            orchestrator = LocalizationOrchestrator(
+                registry=ProviderRegistry({"route": provider}),
+                config=OrchestratorConfig(["route"], [], require_review=False, translator_retries={"route": 2}),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            segment = Segment("one", "SOURCE")
+            prior = orchestrator.translate_one(segment)
+            prior.attempts[0].ordinal = 99
+            provider.revision = 1
+            status = orchestrator.continuation_status(segment, prior)
+            self.assertFalse(status["eligible"])
+            self.assertEqual(status["issue_code"], "historical_failure_evidence_unknown")
+            self.assertEqual(provider.call_count, 1)
+
+    def test_compact_translation_ordinal_spends_the_captured_semantic_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            provider = ScriptedProvider("route", lambda **_: {"status": "refused", "text": ""})
+            registry = ProviderRegistry({"route": provider})
+            segment = Segment("one", "SOURCE")
+            first = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(["route"], [], require_review=False, translator_retries={"route": 1}),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            prior = first.translate_one(segment)
+            prior.attempts = [prior.attempts[-1]]
+            self.assertEqual(prior.attempts[0].ordinal, 2)
+            resumed = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(["route"], [], require_review=False, translator_retries={"route": 2}),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            result = resumed.continue_many([segment], [prior])[0]
+            self.assertEqual(provider.call_count, 3)
+            self.assertEqual([item.ordinal for item in result.attempts if item.provider == "route"], [2, 3])
+            self.assertFalse(resumed.continuation_status(segment, result)["eligible"])
+
+    def test_semantic_counter_keeps_compact_gaps_without_charging_known_operational_events(self):
+        operational = AttemptRecord("review", "route", "error", ordinal=1, operational=True)
+        semantic = AttemptRecord("review", "route", "error", ordinal=2, operational=False)
+        used = LocalizationOrchestrator._semantic_attempts_used
+        self.assertEqual(used([semantic]), 2)
+        self.assertEqual(used([operational, semantic]), 1)
+        operational.ordinal = 99
+        self.assertEqual(used([operational]), 0)
+
+    def test_request_capacity_failure_exposes_actionable_repair_not_budget_exhaustion(self) -> None:
+        def oversized(**_):
+            raise ProviderFailure("input_capacity_exceeded", retryable=False)
+        with tempfile.TemporaryDirectory() as directory:
+            provider = ScriptedProvider("configured", oversized)
+            orchestrator = LocalizationOrchestrator(
+                registry=ProviderRegistry({provider.name: provider}),
+                config=OrchestratorConfig([provider.name], [], require_review=False),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            result = orchestrator.translate_one(Segment("line", "SOURCE"))
+            self.assertEqual(provider.call_count, 1)
+            self.assertEqual(result.attempts[-1].issue_code, "input_capacity_exceeded")
+            self.assertFalse(result.metadata["capacity_repair"]["user_budget_exhausted"])
+            self.assertEqual(result.metadata["capacity_repair"]["action"],
+                             "compact_focused_context_or_configure_larger_input_capacity")
+
+    def test_empty_parallel_inventory_does_not_create_an_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            provider = ScriptedProvider("configured", lambda **_: self.fail("No targets"))
+            orchestrator = LocalizationOrchestrator(
+                registry=ProviderRegistry({provider.name: provider}),
+                config=OrchestratorConfig([provider.name], [], require_review=False,
+                                          max_workers=128, use_style_memory=False),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            self.assertEqual(orchestrator.translate_many([]), [])
+
     @staticmethod
     def _optional_empty_segment() -> Segment:
         source = "OPTIONAL_ARTICLE"
@@ -1633,6 +1717,407 @@ class OrchestratorTests(unittest.TestCase):
         self.assertNotIn("previous_attempt_validation_failures", rewrites[2][1])
         self.assertNotIn("correction target. If permitted", rewrites[1][0])
         self.assertIn("correction target. If permitted", rewrites[2][0])
+
+    def test_continuation_does_not_replay_unchanged_operational_chain(self) -> None:
+        def unavailable(**_):
+            raise ProviderFailure("provider_error", retryable=True, usage={"input_tokens": 3})
+
+        with tempfile.TemporaryDirectory() as directory:
+            providers = [ScriptedProvider(name, unavailable) for name in ("first", "second")]
+            orchestrator = LocalizationOrchestrator(
+                registry=ProviderRegistry({p.name: p for p in providers}),
+                config=OrchestratorConfig(
+                    ["first", "second"], [], require_review=False,
+                    translator_retries={"first": 4, "second": 4},
+                ),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            segment = Segment("one", "SOURCE")
+            initial = orchestrator.translate_one(segment)
+            snapshot = initial.to_dict()
+            with patch.object(orchestrator.audit, "append", side_effect=AssertionError("Pure status wrote audit")):
+                status = orchestrator.continuation_status(segment, initial)
+            self.assertFalse(status["eligible"])
+            self.assertEqual(status["next_action"], "repair")
+            self.assertEqual(status["issue_code"], "operational_route_unchanged")
+            self.assertEqual(initial.to_dict(), snapshot)
+            resumed = orchestrator.continue_many([segment], [initial])[0]
+            repeated = orchestrator.continue_many([segment], {segment.id: resumed})[0]
+            self.assertEqual([p.call_count for p in providers], [1, 1])
+            self.assertEqual(repeated.attempts, initial.attempts)
+            self.assertEqual(initial.to_dict(), snapshot)
+            self.assertEqual(repeated.status, "failed")
+
+    def test_continuation_uses_new_route_and_locks_successful_peers(self) -> None:
+        def first_handler(*, user, **_):
+            if json.loads(user)["translation_target"]["id"] == "done":
+                return {"status": "success", "text": "TARGET_DONE"}
+            raise ProviderFailure("timeout", retryable=True)
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = ScriptedProvider("first", first_handler)
+            successor = ScriptedProvider(
+                "new-approved", lambda **_: {"status": "success", "text": "TARGET_NEW"},
+            )
+            registry = ProviderRegistry({p.name: p for p in (first, successor)})
+            segments = [Segment("done", "SOURCE_DONE"), Segment("pending", "SOURCE_PENDING")]
+            initial = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(["first"], [], require_review=False),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            ).translate_many(segments)
+            orchestrator = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(["first", "new-approved"], [], require_review=False),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            status = orchestrator.continuation_status(segments[1], initial[1])
+            self.assertTrue(status["eligible"])
+            self.assertEqual(status["route_binding"]["provider"], "new-approved")
+            results = orchestrator.continue_many(segments, initial)
+            self.assertIs(results[0], initial[0])
+            self.assertEqual(results[0].to_dict(), initial[0].to_dict())
+            self.assertEqual(results[1].attempts[0], initial[1].attempts[0])
+            self.assertEqual((first.call_count, successor.call_count), (2, 1))
+            self.assertEqual(results[1].translator, "new-approved")
+            self.assertEqual(results[1].status, "translated")
+
+    def test_continuation_carries_ordinals_when_explicit_semantic_budget_increases(self) -> None:
+        replies = iter([
+            {"status": "refused", "text": ""},
+            {"status": "refused", "text": ""},
+            {"status": "success", "text": "TARGET"},
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            provider = ScriptedProvider("route", lambda **_: next(replies))
+            registry = ProviderRegistry({"route": provider})
+            segment = Segment("one", "SOURCE")
+            initial_orchestrator = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(
+                    ["route"], [], require_review=False, translator_retries={"route": 1},
+                ),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            initial = initial_orchestrator.translate_one(segment)
+            self.assertFalse(initial_orchestrator.continuation_status(segment, initial)["eligible"])
+            orchestrator = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(
+                    ["route"], [], require_review=False, translator_retries={"route": 2},
+                ),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            status = orchestrator.continuation_status(segment, initial)
+            self.assertEqual(status["route_binding"]["ordinal"], 3)
+            result = orchestrator.continue_many([segment], [initial])[0]
+            self.assertEqual([a.ordinal for a in result.attempts], [1, 2, 3])
+            self.assertEqual(provider.call_count, 3)
+            self.assertEqual(result.status, "translated")
+
+    def test_continuation_requires_captured_repair_not_elapsed_time(self) -> None:
+        class ConfiguredProvider(ScriptedProvider):
+            endpoint = "before"
+
+            def fingerprint(self):
+                return {**super().fingerprint(), "model": "exact-model", "endpoint": self.endpoint}
+
+        with tempfile.TemporaryDirectory() as directory:
+            def handler(**_):
+                if provider.endpoint == "before":
+                    raise ProviderFailure("authentication_error", retryable=False)
+                return {"status": "success", "text": "TARGET"}
+
+            provider = ConfiguredProvider("route", handler)
+            orchestrator = LocalizationOrchestrator(
+                registry=ProviderRegistry({"route": provider}),
+                config=OrchestratorConfig(
+                    ["route"], [], require_review=False, translator_retries={"route": 0},
+                ),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            segment = Segment("one", "SOURCE")
+            initial = orchestrator.translate_one(segment)
+            self.assertFalse(orchestrator.continuation_status(segment, initial)["eligible"])
+            provider.endpoint = "after"
+            self.assertTrue(orchestrator.continuation_status(segment, initial)["eligible"])
+            result = orchestrator.continue_many([segment], [initial])[0]
+            self.assertEqual([a.ordinal for a in result.attempts], [1, 2])
+            self.assertEqual(result.attempts[0].model, "exact-model")
+            self.assertNotEqual(
+                result.attempts[0].provider_fingerprint, result.attempts[1].provider_fingerprint,
+            )
+            self.assertEqual(result.status, "translated")
+
+    def test_unknown_legacy_evidence_holds_only_affected_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            provider = ScriptedProvider("route", lambda **_: {"status": "success", "text": "TARGET"})
+            orchestrator = LocalizationOrchestrator(
+                registry=ProviderRegistry({"route": provider}),
+                config=OrchestratorConfig(["route"], [], require_review=False),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            segments = [Segment("old", "SOURCE_OLD"), Segment("fresh", "SOURCE_FRESH")]
+            old = TranslationResult(
+                "old", "SOURCE_OLD",
+                attempts=[AttemptRecord("translate", "route", "error", issue_code="timeout")],
+            )
+            result = orchestrator.continue_many(segments, [old])
+            self.assertEqual(provider.call_count, 1)
+            self.assertEqual([r.status for r in result], ["failed", "translated"])
+            self.assertEqual(
+                result[0].metadata["continuation"]["issue_code"], "historical_failure_evidence_unknown",
+            )
+            self.assertIsNone(result[0].attempts[0].operational)
+
+    def test_continuation_resumes_rewrite_then_confirmation_without_retranslation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            translator = ScriptedProvider("translator", lambda **_: {"status": "success", "text": "DRAFT"})
+            judge = ScriptedProvider(
+                "judge", lambda **_: {"verdict": "rewrite", "issues": ["voice"]},
+            )
+            def unavailable(**_):
+                raise ProviderFailure("provider_error", retryable=True)
+            failed_rewriter = ScriptedProvider("old-rewriter", unavailable)
+            new_rewriter = ScriptedProvider(
+                "new-rewriter", lambda **_: {"status": "success", "text": "REVISED"},
+            )
+            registry = ProviderRegistry({p.name: p for p in (
+                translator, judge, failed_rewriter, new_rewriter,
+            )})
+            segment = Segment("one", "SOURCE")
+            initial = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(
+                    ["translator"], ["judge"], rewriter_chain=["old-rewriter"],
+                ),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            ).translate_one(segment)
+            self.assertEqual(initial.status, "failed")
+            self.assertEqual(initial.text, "DRAFT")
+            judge.handler = lambda **_: {"verdict": "ok", "issues": []}
+            orchestrator = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(
+                    ["translator"], ["judge"], rewriter_chain=["old-rewriter", "new-rewriter"],
+                ),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            status = orchestrator.continuation_status(segment, initial)
+            self.assertEqual(status["next_action"], "review-rewrite")
+            self.assertEqual(status["route_binding"]["provider"], "new-rewriter")
+            result = orchestrator.continue_many([segment], [initial])[0]
+            self.assertEqual(result.status, "reviewed")
+            self.assertEqual(result.text, "REVISED")
+            self.assertEqual(result.candidate_generation, 2)
+            self.assertEqual((translator.call_count, failed_rewriter.call_count), (1, 1))
+            self.assertEqual((new_rewriter.call_count, judge.call_count), (1, 2))
+            self.assertEqual(
+                [a.ordinal for a in result.attempts if a.provider == "judge"], [1, 2],
+            )
+            self.assertEqual(result.attempts[-1].stage, "review-confirm")
+
+    def test_metadata_only_continuation_status_never_creates_runtime_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            provider = ScriptedProvider("route", lambda **_: self.fail("Metadata evaluation called provider"))
+            root = Path(directory) / "read-only-status"
+            with patch("game_l10n.orchestrator.require_localization_mode", side_effect=AssertionError("Status read execution mode")):
+                orchestrator = LocalizationOrchestrator(
+                    registry=ProviderRegistry({"route": provider}),
+                    config=OrchestratorConfig(["route"], [], require_review=False),
+                    project=ProjectContext("TEST", "src", "dst"), work_dir=root,
+                    metadata_only=True,
+                )
+                prior = TranslationResult("one", "SOURCE")
+                snapshot = prior.to_dict()
+                status = orchestrator.continuation_status(Segment("one", "SOURCE"), prior)
+                self.assertTrue(status["eligible"])
+                self.assertEqual(prior.to_dict(), snapshot)
+                self.assertIsNone(orchestrator.store)
+                self.assertIsNone(orchestrator.audit)
+                self.assertFalse(root.exists())
+                for execute in (
+                    lambda: orchestrator.translate_one(Segment("one", "SOURCE")),
+                    lambda: orchestrator.translate_many([]),
+                    lambda: orchestrator.review_existing_one(Segment("one", "SOURCE"), "TARGET"),
+                    lambda: orchestrator.review_existing_many([], {}),
+                    lambda: orchestrator.continue_many([], []),
+                ):
+                    with self.assertRaisesRegex(ValueError, "E_METADATA_ONLY_EXECUTION_FORBIDDEN"):
+                        execute()
+            self.assertEqual(provider.call_count, 0)
+
+    def test_continuation_honors_authoritative_execution_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            provider = ScriptedProvider("route", lambda **_: self.fail("Stopped work called provider"))
+            orchestrator = LocalizationOrchestrator(
+                registry=ProviderRegistry({"route": provider}),
+                config=OrchestratorConfig(["route"], [], require_review=False),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            with patch("game_l10n.orchestrator.require_localization_mode", side_effect=ValueError("USER_STOP")):
+                with self.assertRaisesRegex(ValueError, "USER_STOP"):
+                    orchestrator.continue_many([Segment("one", "SOURCE")], [])
+            self.assertEqual(provider.call_count, 0)
+
+    def test_new_exact_model_can_continue_without_resetting_old_model_budget(self) -> None:
+        class SelectedModelProvider(ScriptedProvider):
+            model = "original-exact-model"
+
+            def fingerprint(self):
+                return {**super().fingerprint(), "model": self.model, "effort": "high"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            provider = SelectedModelProvider(
+                "route", lambda **_: {"status": "refused", "text": ""},
+            )
+            orchestrator = LocalizationOrchestrator(
+                registry=ProviderRegistry({"route": provider}),
+                config=OrchestratorConfig(
+                    ["route"], [], require_review=False, translator_retries={"route": 0},
+                ),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            segment = Segment("one", "SOURCE")
+            initial = orchestrator.translate_one(segment)
+            self.assertFalse(orchestrator.continuation_status(segment, initial)["eligible"])
+            provider.model = "new-approved-exact-model"
+            provider.handler = lambda **_: {"status": "success", "text": "TARGET"}
+            status = orchestrator.continuation_status(segment, initial)
+            self.assertTrue(status["eligible"])
+            self.assertEqual(status["route_binding"]["model"], "new-approved-exact-model")
+            result = orchestrator.continue_many([segment], [initial])[0]
+            self.assertEqual(
+                [(a.model, a.ordinal) for a in result.attempts],
+                [("original-exact-model", 1), ("new-approved-exact-model", 1)],
+            )
+
+    def test_semantic_budget_stays_consumed_after_transport_config_changes(self) -> None:
+        class ConfiguredProvider(ScriptedProvider):
+            endpoint = "before"
+
+            def fingerprint(self):
+                return {**super().fingerprint(), "model": "exact", "endpoint": self.endpoint}
+
+        with tempfile.TemporaryDirectory() as directory:
+            provider = ConfiguredProvider("route", lambda **_: {"status": "refused", "text": ""})
+            orchestrator = LocalizationOrchestrator(
+                registry=ProviderRegistry({"route": provider}),
+                config=OrchestratorConfig(
+                    ["route"], [], require_review=False, translator_retries={"route": 0},
+                ),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            segment = Segment("one", "SOURCE")
+            initial = orchestrator.translate_one(segment)
+            provider.endpoint = "after"
+            self.assertFalse(orchestrator.continuation_status(segment, initial)["eligible"])
+            resumed = orchestrator.continue_many([segment], [initial])[0]
+            self.assertEqual(provider.call_count, 1)
+            self.assertEqual(resumed.attempts, initial.attempts)
+
+    def test_review_successor_with_same_model_keeps_distinct_provider_budget(self) -> None:
+        class ExactModelProvider(ScriptedProvider):
+            def fingerprint(self):
+                return {**super().fingerprint(), "model": "same-exact-model"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            translator = ScriptedProvider("translator", lambda **_: {"status": "success", "text": "DRAFT"})
+            first = ExactModelProvider("first-review", lambda **_: {"verdict": "refused", "issues": []})
+            second = ExactModelProvider("second-review", lambda **_: {"verdict": "ok", "issues": []})
+            result = LocalizationOrchestrator(
+                registry=ProviderRegistry({p.name: p for p in (translator, first, second)}),
+                config=OrchestratorConfig(
+                    ["translator"], ["first-review", "second-review"],
+                    review_attempt_limits={"first-review": 1, "second-review": 1},
+                ),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            ).translate_one(Segment("one", "SOURCE"))
+            self.assertEqual(result.status, "reviewed")
+            self.assertEqual((first.call_count, second.call_count), (1, 1))
+            self.assertEqual(result.reviewer, "second-review")
+            self.assertEqual([a.ordinal for a in result.attempts[1:]], [1, 1])
+
+    def test_attempt_evidence_roundtrips_and_legacy_fields_remain_unknown(self) -> None:
+        legacy = LocalizationOrchestrator._result_from_state({
+            "segment_id": "one", "source": "SOURCE",
+            "attempts": [{"stage": "translate", "provider": "route", "status": "error"}],
+        })
+        self.assertIsNone(legacy.attempts[0].operational)
+        self.assertIsNone(legacy.attempts[0].retryable)
+        self.assertEqual(legacy.attempts[0].provider_fingerprint, "")
+        current = TranslationResult(
+            "one", "SOURCE", attempts=[AttemptRecord(
+                "translate", "route", "error", operational=True,
+                provider_fingerprint=stable_hash({"model": "exact"}), retryable=False,
+            )],
+        )
+        decoded = LocalizationOrchestrator._result_from_state(current.to_dict())
+        self.assertEqual(decoded.to_dict(), current.to_dict())
+
+    def test_continuation_does_not_accept_rejected_legacy_review_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            translator = ScriptedProvider(
+                "translator", lambda **_: {"status": "success", "text": "DRAFT {name}"},
+            )
+            reviewer = ScriptedProvider("reviewer", lambda **_: {
+                "decision": "approved", "text": "INVALID", "meaning_preserved": True,
+                "issues": [],
+            })
+            orchestrator = LocalizationOrchestrator(
+                registry=ProviderRegistry({p.name: p for p in (translator, reviewer)}),
+                config=OrchestratorConfig(["translator"], ["reviewer"]),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            segment = Segment("one", "SOURCE {name}")
+            initial = orchestrator.translate_one(segment)
+            self.assertEqual(initial.status, "failed")
+            status = orchestrator.continuation_status(segment, initial)
+            self.assertFalse(status["eligible"])
+            self.assertEqual(status["next_action"], "repair")
+            result = orchestrator.continue_many([segment], [initial])[0]
+            self.assertEqual(result.status, "failed")
+            self.assertEqual((translator.call_count, reviewer.call_count), (1, 1))
+
+    def test_new_triager_can_resolve_operationally_unresolved_triage(self) -> None:
+        def unavailable(**_):
+            raise ProviderFailure("timeout", retryable=True)
+
+        with tempfile.TemporaryDirectory() as directory:
+            translator = ScriptedProvider("translator", lambda **_: {"status": "success", "text": "DRAFT"})
+            old_triager = ScriptedProvider("old-triager", unavailable)
+            strong = ScriptedProvider("strong", unavailable)
+            new_triager = ScriptedProvider(
+                "new-triager", lambda **_: {"verdict": "ok", "issues": []},
+            )
+            registry = ProviderRegistry({p.name: p for p in (
+                translator, old_triager, strong, new_triager,
+            )})
+            segment = Segment("one", "SOURCE")
+            initial = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(
+                    ["translator"], ["strong"], review_triager_chain=["old-triager"],
+                    strong_review_sample_percent=0, strong_review_high_risk_categories=[],
+                ),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            ).translate_one(segment)
+            orchestrator = LocalizationOrchestrator(
+                registry=registry,
+                config=OrchestratorConfig(
+                    ["translator"], ["strong"],
+                    review_triager_chain=["old-triager", "new-triager"],
+                    strong_review_sample_percent=0, strong_review_high_risk_categories=[],
+                ),
+                project=ProjectContext("TEST", "src", "dst"), work_dir=Path(directory),
+            )
+            status = orchestrator.continuation_status(segment, initial)
+            self.assertEqual(status["next_action"], "review-triage")
+            self.assertEqual(status["route_binding"]["provider"], "new-triager")
+            result = orchestrator.continue_many([segment], [initial])[0]
+            self.assertEqual(result.status, "reviewed")
+            self.assertEqual(result.reviewer, "new-triager")
+            self.assertEqual((translator.call_count, old_triager.call_count, strong.call_count), (1, 1, 1))
 
 if __name__ == "__main__":
     unittest.main()

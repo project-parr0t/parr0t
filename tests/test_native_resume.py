@@ -33,7 +33,10 @@ class NativeResumeTests(unittest.TestCase):
         native_pass.prepare_native_tasks(
             root, source, segments, tasks, pass_kind="review" if review else "translation",
             max_records=records if review else 2, max_workers=1,
-            route_binding={"provider": "native-sol" if review else "native-luna", "attempt": 1},
+            route_binding={
+                "provider": "native-sol" if review else "native-luna", "attempt": 1,
+                "model": "fixture/review" if review else "fixture/translation",
+            },
         )
         manifest_path = tasks / "manifest.json"
         if version == 6:
@@ -175,6 +178,11 @@ class NativeResumeTests(unittest.TestCase):
             self.assertEqual(historical["selected"]["state"], "complete")
             unknown = self._read_only(root, manifest_path=Path("unbound/manifest.json"))
             self.assertEqual(unknown["issue_codes"], ["E_NATIVE_RESUME_MANIFEST_NOT_FOUND"])
+            broken = root / "broken/manifest.json"
+            broken.parent.mkdir()
+            broken.write_text("{invalid selected manifest", encoding="utf-8")
+            invalid = self._read_only(root, manifest_path=broken)
+            self.assertEqual(invalid["issue_codes"], ["E_NATIVE_RESUME_MANIFEST_INVALID"])
 
     def test_tampered_digest_and_exact_bindings_fail_categorically(self) -> None:
         mutations = {
@@ -261,6 +269,36 @@ class NativeResumeTests(unittest.TestCase):
                 if json.loads(relay.read_text())["manifest"] == "job/tasks/manifest.json":
                     relay.unlink()
             self.assertEqual(self._read_only(root)["issue_codes"], ["E_NATIVE_RESUME_RESULTS_MISSING"])
+
+    def test_selected_lineage_ignores_unrelated_corrupt_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selected, _ = self._prepare(root, name="selected")
+            unrelated, _ = self._prepare(root, name="unrelated")
+            unrelated_relay = next(
+                path for path in (root / ".game-l10n/native/relay").glob("*-wave-*.json")
+                if json.loads(path.read_text(encoding="utf-8"))["manifest"] == "unrelated/tasks/manifest.json"
+            )
+            unrelated.write_bytes(b"\xffPRIVATE_SOURCE_SENTINEL")
+            unrelated_relay.write_bytes(b"\xffPRIVATE_SOURCE_SENTINEL")
+            corrupt_chain = root / ".game-l10n/native/review-splits/unrelated-corrupt/chain.json"
+            corrupt_chain.parent.mkdir(parents=True)
+            corrupt_chain.write_bytes(b"\xffPRIVATE_SOURCE_SENTINEL")
+            status = self._read_only(root, manifest_path=selected)
+            self.assertEqual(status["status"], "ready")
+            self.assertEqual(status["selected"]["manifest"], "selected/tasks/manifest.json")
+            self.assertEqual(status["issue_codes"], [])
+            self.assertNotIn("PRIVATE_SOURCE_SENTINEL", json.dumps(status))
+
+    def test_selected_corrupt_lineage_is_still_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selected, _ = self._prepare(root, name="selected")
+            relay = next((root / ".game-l10n/native/relay").glob("*-wave-*.json"))
+            relay.write_bytes(b"\xffPRIVATE_SOURCE_SENTINEL")
+            status = self._read_only(root, manifest_path=selected)
+            self.assertEqual(status["status"], "invalid")
+            self.assertNotIn("PRIVATE_SOURCE_SENTINEL", json.dumps(status))
 
     def test_malformed_non_utf8_and_unreadable_metadata_never_leak(self) -> None:
         for contents in (b"{PRIVATE_SOURCE_SENTINEL", b"\xffPRIVATE_SOURCE_SENTINEL"):

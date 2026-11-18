@@ -4,9 +4,10 @@ import { createHash, randomBytes } from "node:crypto";
 import { accessSync, constants, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import guard from "../src/game_l10n/templates/omp-isolation-guard.mjs";
 import prompt from "../src/game_l10n/templates/omp-prompt-isolation.mjs";
+import { hasFrameworkExposure } from "../src/game_l10n/templates/framework-mode-approval.mjs";
 
 const temporary = [];
 const envNames = ["PARR0T_OMP_GUARD_SESSION", "PARR0T_OMP_GUARD_WORKSPACE", "PARR0T_OMP_PROMPT_WORKSPACE", "PARR0T_OMP_CONTROL_DIRECTORY"];
@@ -43,7 +44,7 @@ function host(factory, workspace, kind = "main", depth = 0, id = "SyntheticRoot"
   const processes = [];
   factory({
     registerFlag() {}, getFlag() { return workspace; },
-    zod: { string: schema, array: schema, object: schema },
+    zod: { string: schema, boolean: schema, array: schema, object: schema },
     on(name, handler) { handlers.set(name, handler); },
     registerTool(tool) { tools.set(tool.name, tool); },
     async exec(...args) { processes.push(args); throw new Error("Agent runner must never receive approval proof"); },
@@ -59,7 +60,7 @@ function host(factory, workspace, kind = "main", depth = 0, id = "SyntheticRoot"
     ctx, tools, confirmations, processes,
     emit: (name, event = {}) => handlers.get(name)?.(event, ctx),
     call: (toolName, input) => handlers.get("tool_call")({ toolName, input }, ctx),
-    approve: (params = { mode: "analysis" }, signal) => tools.get("parr0t_framework_mode").execute("synthetic-call", params, signal, undefined, ctx),
+    approve: (params = { mode: "analysis" }, signal) => tools.get("parr0t_framework_mode").execute("synthetic-call", { user_requested: true, ...params }, signal, undefined, ctx),
   };
 }
 async function fixture(factory) {
@@ -113,7 +114,7 @@ function stageApproval(workspace, overrides = {}) {
 
 for (const [label, factory] of [["guarded", guard], ["prompt", prompt]]) {
   describe(`${label} explicit root lifecycle approval`, () => {
-    test("flag-only native calls deny unchanged; confirmed root consumes an exact one-shot approval", async () => {
+    test("flag-only native calls deny unchanged; explicit root request consumes an exact one-shot approval without a second dialog", async () => {
       const { workspace, root } = await fixture(factory);
       const initial = snapshot(workspace);
       const unapproved = native(workspace, ["--mode", "analysis", "--user-requested"]);
@@ -121,14 +122,11 @@ for (const [label, factory] of [["guarded", guard], ["prompt", prompt]]) {
       expect(snapshot(workspace)).toEqual(initial);
       const log = path.join(workspace, "synthetic-source.log");
       writeFileSync(log, "Synthetic diagnostic bytes, not a real session log.\n");
-      expect((await root.call("parr0t_framework_mode", { mode: "analysis", logs: ["synthetic-source.log"] }))?.block).not.toBe(true);
+      expect((await root.call("parr0t_framework_mode", { mode: "analysis", user_requested: true, logs: ["synthetic-source.log"] }))?.block).not.toBe(true);
       const result = await root.approve({ mode: "analysis", logs: ["synthetic-source.log"] });
       expect(result.isError).toBe(false);
       expect(root.processes).toHaveLength(0);
-      expect(root.confirmations).toHaveLength(1);
-      expect(root.confirmations[0][1]).toContain(`Workspace: ${JSON.stringify(workspace)}`);
-      expect(root.confirmations[0][1]).toContain("Mode: analysis");
-      expect(root.confirmations[0][1]).toContain(JSON.stringify([log]));
+      expect(root.confirmations).toHaveLength(0);
       const lifecycle = JSON.parse(readFileSync(path.join(workspace, ".game-l10n/framework-session.json"), "utf8"));
       expect(lifecycle.mode).toBe("analysis");
       expect(lifecycle.logs).toHaveLength(1);
@@ -164,8 +162,7 @@ for (const [label, factory] of [["guarded", guard], ["prompt", prompt]]) {
         schema: "parr0t.framework-session.v1", mode: "shutdown", revision: 2,
         instructions_active: false, user_requested: true, logs: [],
       });
-      expect(root.confirmations).toHaveLength(2);
-      expect(root.confirmations[1][1]).toContain("Mode: shutdown");
+      expect(root.confirmations).toHaveLength(0);
       expect(root.processes).toHaveLength(0);
     });
 
@@ -217,22 +214,91 @@ for (const [label, factory] of [["guarded", guard], ["prompt", prompt]]) {
       }
     });
 
-    test("cancelled, unavailable and noninteractive UI make zero writes and never invoke an agent runner", async () => {
+    test("explicit root requests work without interactive UI and preserve an actual cancellation", async () => {
       const { workspace, root } = await fixture(factory);
+      root.ctx.hasUI = false;
+      root.ctx.ui = { confirm: async () => { throw new Error("a second dialog is forbidden"); } };
       const initial = snapshot(workspace);
-      for (const ui of [undefined, {}, { confirm: async () => false }, { confirm: async () => undefined },
-        { confirm: async () => "yes" }, { confirm: async () => 1 }, { confirm: async () => { throw new Error("synthetic UI closed"); } }]) {
-        root.ctx.ui = ui;
-        await expect(root.approve()).rejects.toThrow();
+      const cancelled = new AbortController();
+      cancelled.abort();
+      await expect(root.approve({ mode: "pause" }, cancelled.signal)).rejects.toThrow("cancelled");
+      expect(snapshot(workspace)).toEqual(initial);
+      for (const value of [undefined, false, 1, "true"]) {
+        const request = { mode: "analysis", user_requested: value };
+        expect((await root.call("parr0t_framework_mode", request)).block).toBe(true);
+        await expect(root.approve(request)).rejects.toThrow("explicit user_requested");
         expect(snapshot(workspace)).toEqual(initial);
       }
-      root.ctx.ui = { confirm: async () => { throw new Error("noninteractive confirmation must not be called"); } };
-      for (const hasUI of [false, undefined]) {
-        root.ctx.hasUI = hasUI;
-        await expect(root.approve()).rejects.toThrow("confirmation unavailable");
-        expect(snapshot(workspace)).toEqual(initial);
-      }
+      expect((await root.approve({ mode: "shutdown" })).isError).toBe(false);
       expect(root.processes).toHaveLength(0);
+      expect(root.confirmations).toHaveLength(0);
+    });
+
+    test("clean lifecycle resumes in-session but successful root history access requires canonical fresh recovery", async () => {
+      const { workspace, root } = await fixture(factory);
+      const statePath = path.join(workspace, ".game-l10n/control-plane-state.json");
+      for (const mode of ["pause", "analysis", "shutdown", "localization"]) {
+        expect((await root.approve({ mode })).isError).toBe(false);
+      }
+      expect(JSON.parse(readFileSync(statePath, "utf8")).generation).toBe(7);
+      expect(JSON.parse(readFileSync(statePath, "utf8")).status).toBe("ready");
+      await root.emit("tool_result", { toolName: "read", input: { path: "history://synthetic" }, isError: true });
+      expect(JSON.parse(readFileSync(statePath, "utf8")).status).toBe("ready");
+      await root.emit("tool_result", { toolName: "read", input: { path: "history://synthetic" }, isError: false });
+      expect(JSON.parse(readFileSync(statePath, "utf8")).issue_code).toBe("control_plane_leak");
+      expect((await root.approve({ mode: "localization" })).isError).toBe(true);
+      expect(JSON.parse(readFileSync(statePath, "utf8")).status).toBe("rotation_required");
+      expect(root.confirmations).toHaveLength(0);
+    });
+
+    test("successful private file-URL reads prevent clean resume while failed reads leave it available", async () => {
+      const { workspace, root } = await fixture(factory);
+      expect((await root.approve({ mode: "analysis" })).isError).toBe(false);
+      const privateTask = path.join(workspace, ".game-l10n/data-plane/private # \uD55C\uAE00/task.json");
+      writeJson(privateTask, { synthetic_private_source: "private fixture, not real game data" });
+      const uri = pathToFileURL(privateTask).href;
+      const statePath = path.join(workspace, ".game-l10n/control-plane-state.json");
+      await root.emit("tool_result", { toolName: "read", input: { path: uri }, isError: true });
+      expect(JSON.parse(readFileSync(statePath, "utf8")).status).toBe("ready");
+      expect(JSON.parse(readFileSync(fileURLToPath(uri), "utf8"))).toEqual({
+        synthetic_private_source: "private fixture, not real game data",
+      });
+      await root.emit("tool_result", { toolName: "read", input: { path: `${uri}:1-2` }, isError: false });
+      const exposed = JSON.parse(readFileSync(statePath, "utf8"));
+      expect(exposed.status).toBe("rotation_required");
+      expect(exposed.issue_code).toBe("control_plane_leak");
+      expect(exposed.incident_code).toBe("parent_opened_data_plane");
+      expect((await root.approve({ mode: "localization" })).isError).toBe(true);
+      expect(JSON.parse(readFileSync(statePath, "utf8"))).toEqual(exposed);
+      expect(root.confirmations).toHaveLength(0);
+    });
+
+    test("recursive private search results quarantine the root, but zero matches and metadata-only hits do not", async () => {
+      const { workspace, root } = await fixture(factory);
+      expect((await root.approve({ mode: "analysis" })).isError).toBe(false);
+      const searchPath = path.join(workspace, ".game-l10n/data-plane");
+      const privateFile = path.join(searchPath, "search-fixture/task.json");
+      writeJson(privateFile, { synthetic_source: "recursive source fixture" });
+      const statePath = path.join(workspace, ".game-l10n/control-plane-state.json");
+      const zero = { toolName: "grep", input: { path: ".game-l10n/data-plane", pattern: "absent" },
+        isError: false, details: { searchPath, cwd: workspace, matchCount: 0, files: [] } };
+      await root.emit("tool_result", zero);
+      await root.emit("tool_result", { ...zero, toolName: "glob",
+        details: { files: [privateFile] } });
+      await root.emit("tool_result", { ...zero,
+        details: { searchPath, cwd: workspace, matchCount: 1, files: ["relay.json"] } });
+      expect(JSON.parse(readFileSync(statePath, "utf8")).status).toBe("ready");
+      const directoryResult = { ...zero,
+        details: { searchPath, cwd: workspace, matchCount: 1, files: ["search-fixture/task.json"] } };
+      expect(hasFrameworkExposure(directoryResult, root.ctx, workspace)).toBe(true);
+      expect(hasFrameworkExposure({ ...directoryResult, details: { matchCount: 1 } }, root.ctx, workspace)).toBe(true);
+      expect(readFileSync(privateFile, "utf8")).toContain("recursive source fixture");
+      const broadResult = { ...directoryResult, input: { path: ".", pattern: "recursive source fixture" },
+        details: { searchPath: workspace, cwd: workspace, matchCount: 1,
+          fileMatches: [{ path: ".game-l10n/data-plane/search-fixture/task.json", count: 1 }] } };
+      await root.emit("tool_result", broadResult);
+      expect(JSON.parse(readFileSync(statePath, "utf8")).status).toBe("rotation_required");
+      expect((await root.approve({ mode: "localization" })).isError).toBe(true);
     });
 
     test("missing host authority, child roles and spoofed consent deny hooks and direct execute", async () => {
@@ -253,13 +319,13 @@ for (const [label, factory] of [["guarded", guard], ["prompt", prompt]]) {
         await expect(root.approve()).rejects.toThrow("root");
       }
       root.ctx.sessionManager = originalManager;
-      for (const extra of [{ user_requested: true }, { root: true }, { approval: { id: "a".repeat(32), token: "b".repeat(64) } },
+      for (const extra of [{ root: true }, { approval: { id: "a".repeat(32), token: "b".repeat(64) } },
         { confirmed: true }, { runner: "forged" }, { contracts_read: true }, { text_free_confirmed: true }]) {
         const request = { mode: "analysis", ...extra };
         expect((await root.call("functions.parr0t_framework_mode", request)).block).toBe(true);
         await expect(root.approve(request)).rejects.toThrow("invalid lifecycle request");
       }
-      for (const request of [{ mode: "localization" }, { mode: "shutdown", logs: ["synthetic-source.log"] }]) {
+      for (const request of [{ mode: "unknown" }, { mode: "shutdown", logs: ["synthetic-source.log"] }]) {
         expect((await root.call("parr0t_framework_mode", request)).block).toBe(true);
         await expect(root.approve(request)).rejects.toThrow("invalid lifecycle request");
       }
@@ -268,30 +334,6 @@ for (const [label, factory] of [["guarded", guard], ["prompt", prompt]]) {
       expect(snapshot(workspace)).toEqual(initial);
     });
 
-    test("revision changes while awaiting consent deny without staging approval", async () => {
-      const { workspace, root } = await fixture(factory);
-      let expected;
-      root.ctx.ui.confirm = async () => {
-        writeJson(path.join(workspace, ".game-l10n/framework-session.json"), {
-          schema: "parr0t.framework-session.v1", mode: "shutdown", revision: 1,
-          instructions_active: false, user_requested: true, logs: [],
-        });
-        expected = snapshot(workspace);
-        return true;
-      };
-      await expect(root.approve()).rejects.toThrow("changed during confirmation");
-      expect(snapshot(workspace)).toEqual(expected);
-      expect(existsSync(path.join(workspace, ".game-l10n/framework-approvals"))).toBe(false);
-    });
-
-    test("host identity changes while awaiting consent deny without staging approval", async () => {
-      const { workspace, root } = await fixture(factory);
-      root.ctx.ui.confirm = async () => { root.ctx.agent.id = "ChangedRoot"; return true; };
-      const initial = snapshot(workspace);
-      await expect(root.approve()).rejects.toThrow("changed during confirmation");
-      expect(snapshot(workspace)).toEqual(initial);
-      expect(existsSync(path.join(workspace, ".game-l10n/framework-approvals"))).toBe(false);
-    });
 
     test("all roles deny lifecycle and approval writes, edits, aliases, renames and nested wrappers", async () => {
       const { workspace, root } = await fixture(factory);
@@ -315,6 +357,7 @@ for (const [label, factory] of [["guarded", guard], ["prompt", prompt]]) {
         ["write", { path: "xd://write", content: JSON.stringify({ path: state, content: "forged" }) }],
         ["write", { path: "xd://edit", content: `*** Begin Patch\n[${state}#ABCD]\nREM\n*** End Patch` }],
         ["write", { path: "xd://parr0t_framework_mode", content: JSON.stringify({ mode: "analysis", user_requested: true }) }],
+        ["write", { path: "xd://write", content: JSON.stringify({ path: "xd://parr0t_framework_mode", content: JSON.stringify({ mode: "analysis", user_requested: true }) }) }],
         ["ast_edit", { paths: [".game-l10n/*"], ops: [] }],
         ["ast_edit", { paths: ["synthetic-metadata-alias/*"], ops: [] }],
         ["multi_tool_use.parallel", { tool_uses: [{ recipient_name: "functions.write", parameters: { path: approval, content: "forged" } }] }],
@@ -322,7 +365,10 @@ for (const [label, factory] of [["guarded", guard], ["prompt", prompt]]) {
       ];
       for (const agent of [{ kind: "main", depth: 0 }, { kind: "sub", depth: 1 }, { kind: "sub", depth: 2 }, { kind: "sub", depth: 3, name: "DiagnosticReview" }]) {
         Object.assign(root.ctx.agent, agent);
-        for (const [tool, input] of calls) expect((await root.call(tool, input)).block).toBe(true);
+        for (const [tool, input] of calls) {
+          const decision = await root.call(tool, input);
+          expect(decision?.block, `${label} ${agent.kind}/${agent.depth}: ${tool} ${JSON.stringify(input)}`).toBe(true);
+        }
       }
       expect(root.confirmations).toHaveLength(0);
       expect(root.processes).toHaveLength(0);

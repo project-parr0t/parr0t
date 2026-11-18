@@ -23,6 +23,7 @@ from game_l10n.errors import ConfigurationError
 from game_l10n.failure_queue import load_failure_queue, update_failure_queue
 from game_l10n.models import AttemptRecord, FailureCode, Segment, TranslationResult
 from game_l10n.store import stable_hash
+from game_l10n.workspace import initialize_workspace
 
 
 DEFAULT_LANGUAGE_BINDING = {
@@ -121,6 +122,86 @@ class DisplayScopeContractTests(unittest.TestCase):
 
 
 class CoverageTests(unittest.TestCase):
+    def test_primary_only_assurance_is_effective_without_independent_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "primary.json"
+            write_inventory(source, "synthetic", [{"id": "one", "source": "SOURCE"}])
+            inventory = require_inventory_attestation(
+                root, source, config={"coverage": {"require_independent_inventory": False}},
+            )
+            self.assertFalse(inventory["static_complete"])
+            self.assertFalse(inventory["independent_verified"])
+            self.assertTrue(inventory["assurance_complete"])
+            segment = Segment("one", "SOURCE")
+            result = TranslationResult(
+                segment_id="one", source="SOURCE", text="TARGET", status="accepted_unreviewed",
+            )
+            state = completion_attestation(
+                [segment], [result], inventory_segments=[segment], inventory=inventory,
+                runtime={}, review_required=False,
+            )
+            self.assertTrue(state["assurance_completion"])
+            self.assertFalse(state["static_completion"])
+            self.assertEqual(state["source_inventory"]["assurance_mode"], "primary_only")
+            persisted = json.loads((root / ".game-l10n/inventory-attestation.json").read_text(encoding="utf-8"))
+            self.assertEqual(persisted, inventory)
+            (root / "game-l10n.json").write_text(json.dumps({
+                "coverage": {"require_independent_inventory": False},
+            }), encoding="utf-8")
+            report = root / "runtime.json"
+            report.write_text(json.dumps({
+                "schema": "parr0t.runtime-coverage.v1",
+                "inventory_fingerprint": inventory["primary_fingerprint"],
+                "observation_method": "synthetic-observation",
+                "observed_target_ids": ["one"],
+            }), encoding="utf-8")
+            runtime = record_runtime_coverage(root, report)
+            self.assertTrue(runtime["runtime_complete"])
+            reloaded = json.loads((root / ".game-l10n/inventory-attestation.json").read_text(encoding="utf-8"))
+            self.assertFalse(reloaded["static_complete"])
+            self.assertFalse(reloaded["independent_verified"])
+
+    def test_primary_only_rejects_incomplete_and_visible_exclusions_before_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "primary.json"
+            for complete, exclusions in (
+                (False, []),
+                (True, [{"reason_code": "not-examined", "affects_user_visible_text": True}]),
+            ):
+                with self.subTest(complete=complete, exclusions=exclusions):
+                    write_inventory(
+                        source, "synthetic", [{"id": "one", "source": "SOURCE"}],
+                        declared_complete=complete, exclusions=exclusions,
+                    )
+                    with self.assertRaises(ConfigurationError):
+                        require_inventory_attestation(
+                            root, source, config={"coverage": {"require_independent_inventory": False}},
+                        )
+                    self.assertFalse((root / ".game-l10n/inventory-attestation.json").exists())
+
+    def test_explicit_incomplete_artifact_keeps_blocking_hold_and_integrity_truth(self) -> None:
+        segment = Segment("one", "SOURCE", metadata={"blocking_on_failure": True})
+        result = TranslationResult(
+            segment_id="one", source="SOURCE", text="SOURCE", status="source_preserved",
+        )
+        inventory = {
+            "status": "static_verified", "static_complete": True,
+            "primary_segments": 1, "primary_fingerprint": "synthetic",
+        }
+        arguments = dict(inventory_segments=[segment], inventory=inventory, runtime={}, review_required=True)
+        ordinary = completion_attestation([segment], [result], **arguments)
+        explicit = completion_attestation([segment], [result], **arguments, allow_incomplete_artifact=True)
+        self.assertFalse(ordinary["incomplete_artifact_authorized"])
+        self.assertTrue(explicit["incomplete_artifact_authorized"])
+        self.assertFalse(explicit["target_completion"])
+        self.assertFalse(explicit["static_completion"])
+        self.assertEqual(explicit["artifact_assurance"], "explicit_incomplete")
+        result.resolution_code = FailureCode.INTEGRITY_INVALID.value
+        denied = completion_attestation([segment], [result], **arguments, allow_incomplete_artifact=True)
+        self.assertFalse(denied["incomplete_artifact_authorized"])
+
     @staticmethod
     def _static_scope(*, unused: int = 1) -> dict:
         return {
@@ -954,7 +1035,7 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(state["pending_count"], 0)
         self.assertEqual(state["terminal_count"], 1)
         self.assertFalse(
-            loaded["terminal_entries"][0]["retryable_on_user_resume"]
+            loaded["terminal_entries"][0]["retryable"]
         )
 
     def test_integrity_source_preservation_keeps_terminal_provenance(self) -> None:
@@ -1085,6 +1166,10 @@ class CoverageTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            sdk = root / "sdk"
+            sdk.mkdir()
+            root = root / "work"
+            initialize_workspace(root, sdk, git_choice="disabled")
             destination = root / "patch.json"
             summary, exit_code = _finalize_translation_results(
                 work_dir=root,
@@ -1128,6 +1213,10 @@ class CoverageTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            sdk = root / "sdk"
+            sdk.mkdir()
+            root = root / "work"
+            initialize_workspace(root, sdk, git_choice="disabled")
             destination = root / "patch.json"
             summary, exit_code = _finalize_translation_results(
                 work_dir=root,

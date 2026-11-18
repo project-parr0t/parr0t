@@ -47,6 +47,7 @@ class FailureCode(str, Enum):
     CONSTRAINT_UNSATISFIABLE = "constraint_unsatisfiable"
     MEANING_NOT_PRESERVED = "meaning_not_preserved"
     BUDGET_EXHAUSTED = "budget_exhausted"
+    INPUT_CAPACITY_EXCEEDED = "input_capacity_exceeded"
     BUDGET_ACCOUNTING_UNCERTAIN = "budget_accounting_uncertain"
     USER_ACCEPTED_AFTER_REVIEW_REFUSAL = "user_accepted_after_review_refusal"
     SOURCE_PRESERVED = "source_preserved"
@@ -210,6 +211,9 @@ class AttemptRecord:
     issue_code: str = ""
     candidate_generation: int = 0
     usage: dict[str, int] = field(default_factory=dict)
+    operational: bool | None = None
+    provider_fingerprint: str = ""
+    retryable: bool | None = None
 
 
 @dataclass(slots=True)

@@ -435,6 +435,11 @@ class ContentSourcePolicyTests(unittest.TestCase):
                     work / "retry",
                     content_policy=manifest["content_source_policy"],
                     primary_lineage=lineage,
+                    route_plan=[{
+                        "provider": "native-luna",
+                        "model": "provider/exact-model",
+                        "max_retries": 1,
+                    }],
                 )
 
     def test_fallback_bundles_inherit_denied_and_granted_retry_policy(self) -> None:
@@ -528,8 +533,13 @@ class ContentSourcePolicyTests(unittest.TestCase):
                     }
                 ],
             )
+            route_plan = [{
+                "provider": "native-luna",
+                "model": "provider/exact-model",
+                "max_retries": 1,
+            }]
             start_native_translation_retries(
-                work, source, [segment], results, state_dir
+                work, source, [segment], results, state_dir, route_plan=route_plan,
             )
             state_path = state_dir / "retry-state.json"
             state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -555,7 +565,7 @@ class ContentSourcePolicyTests(unittest.TestCase):
                 ValueError, "E_CONTENT_SOURCE_POLICY_IMMUTABLE"
             ):
                 start_native_translation_retries(
-                    work, source, [segment], results, state_dir
+                    work, source, [segment], results, state_dir, route_plan=route_plan,
                 )
 
     def test_inventory_local_inspection_remains_nonsemantic(self) -> None:
@@ -569,6 +579,47 @@ class ContentSourcePolicyTests(unittest.TestCase):
             self.assertFalse(policy["semantic_content_generation"])
             self.assertFalse(policy["direct_model_provenance_required"])
             self.assertFalse(policy["content_network_access"])
+
+
+    def test_exact_scope_reuse_and_versioned_additions_preserve_old_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            path, grant = create_content_source_grant(
+                work, authority="explicit_user", scope_id="workflow-v1",
+                task_kinds=["review"], routes=["exact-review-route"],
+                external_sources=["https://example.invalid/v1"], user_confirmed=True,
+            )
+            original = content_source_policy(
+                work, task_kind="review", route="exact-review-route", scope_id="workflow-v1",
+            )
+            self.assertEqual(original["grant_id"], grant["grant_id"])
+            (path.parent / "unrelated.json").write_text("{", encoding="utf-8")
+            self.assertEqual(
+                content_source_policy(work, task_kind="review", route="exact-review-route",
+                                      scope_id="workflow-v1"),
+                original,
+            )
+            extension, _ = create_content_source_grant(
+                work, authority="explicit_user", scope_id="workflow-v2",
+                task_kinds=["review", "rewrite"], routes=["exact-review-route"],
+                external_sources=["https://example.invalid/v1", "https://example.invalid/v2"],
+                user_confirmed=True,
+            )
+            updated = content_source_policy(
+                work, task_kind="rewrite", route="exact-review-route",
+                scope_id="workflow-v2", grant_path=extension,
+            )
+            self.assertEqual(len(updated["allowed_external_sources"]), 2)
+            self.assertEqual(
+                content_source_policy(work, task_kind="review", route="exact-review-route",
+                                      scope_id="workflow-v1", grant_path=path),
+                original,
+            )
+            with self.assertRaisesRegex(ValueError, "SCOPE_MISMATCH"):
+                content_source_policy(
+                    work, task_kind="rewrite", route="exact-review-route",
+                    scope_id="workflow-v1", grant_path=path,
+                )
 
 
 if __name__ == "__main__":

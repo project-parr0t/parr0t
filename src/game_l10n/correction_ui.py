@@ -20,15 +20,16 @@ from urllib.parse import parse_qs, urlparse
 from .corrections import CORRECTION_REQUEST_SCHEMA, CorrectionError, apply_user_corrections
 from .formats import read_existing_translations, read_segments
 from .models import Segment
-from .release_checkpoint import canonical_checkpoint_bytes
+from .release_checkpoint import CHECKPOINT_SCHEMA, canonical_checkpoint_bytes
 from .store import stable_hash
 from .validators import validate_integrity
 
 
 STATE_SCHEMA = "parr0t.user-interpretation-store/v1"
 TASK_SCHEMA = "parr0t.user-interpretation-task/v1"
+BATCH_SCHEMA = "parr0t.user-interpretation-batches/v1"
 PROPOSALS_SCHEMA = "parr0t.user-interpretation-proposals/v1"
-MAX_FOCUSED_TARGETS = 32
+DEFAULT_AGENT_TASK_SIZE = 32
 MAX_SEARCH_RESULTS = 100
 MAX_QUERY_CHARS = 4096
 MAX_SEARCH_CANDIDATES = 2048
@@ -38,6 +39,12 @@ ROUTES = {"direct", "agent"}
 
 class CorrectionUIError(CorrectionError):
     pass
+
+
+def _positive_task_size(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise CorrectionUIError("Agent task size must be a positive integer")
+    return value
 
 
 def _normalize(value: str) -> str:
@@ -166,11 +173,17 @@ class CorrectionWorkspace:
         corrected_output_path: Path,
         agent_task_path: Path,
         expected_inventory_fingerprint: str,
+        agent_task_size: int = DEFAULT_AGENT_TASK_SIZE,
     ) -> "CorrectionWorkspace":
+        agent_task_size = _positive_task_size(agent_task_size)
         source_path = source_path.resolve()
         checkpoint_path = checkpoint_path.resolve()
         base_results_path = base_results_path.resolve() if base_results_path else None
         checkpoint, checkpoint_bytes = canonical_checkpoint_bytes(checkpoint_path)
+        if checkpoint["schema"] != CHECKPOINT_SCHEMA:
+            raise CorrectionUIError(
+                "Dependency-based corrections require a full release checkpoint; local integrity records contain no dependency evidence"
+            )
         if checkpoint["source_inventory"]["fingerprint"] != expected_inventory_fingerprint:
             raise CorrectionUIError("Release checkpoint does not match the verified source inventory")
         binding = {
@@ -197,6 +210,51 @@ class CorrectionWorkspace:
                 raise CorrectionUIError(
                     "Correction state is bound to different artifacts; choose a new --state file"
                 )
+            legacy = instance._metadata_value("last_agent_task")
+            if legacy is not None:
+                old_task = json.loads(agent_task_path.read_text(encoding="utf-8"))
+                if (
+                    not isinstance(legacy, dict) or not isinstance(old_task, dict)
+                    or old_task.get("schema") != TASK_SCHEMA
+                    or old_task.get("task_id") != legacy.get("task_id")
+                    or old_task.get("task_id") != stable_hash({
+                        key: value for key, value in old_task.items() if key != "task_id"
+                    })
+                ):
+                    raise CorrectionUIError("Previously exported task binding is unavailable")
+                records = {record["id"]: record for record in old_task["records"]}
+                old_bindings = legacy.get("bindings", {})
+                if set(records) != set(old_bindings):
+                    raise CorrectionUIError("Previously exported task scope changed")
+                migrated_bindings = {}
+                decided = []
+                for target_id, previous in old_bindings.items():
+                    record = records[target_id]
+                    if (
+                        previous.get("source_sha256") != record["source_sha256"]
+                        or previous.get("context_sha256") != record["context_sha256"]
+                    ):
+                        raise CorrectionUIError("Previously exported task scope changed")
+                    migrated_bindings[target_id] = {
+                        **previous, "interpretation_sha256": stable_hash(record["user_interpretation"]),
+                    }
+                    annotation = instance.get_record(target_id)["annotation"] or {}
+                    if annotation.get("status") in {"proposal_ready", "approved", "reviewed_unchanged"}:
+                        decided.append(target_id)
+                registry = instance._metadata_value("agent_tasks", {})
+                registry[legacy["task_id"]] = {"bindings": migrated_bindings, "decided_ids": decided}
+                with closing(instance._connect()) as db:
+                    for key, value in (
+                        ("agent_tasks", registry),
+                        ("active_agent_tasks", [legacy["task_id"]]),
+                    ):
+                        db.execute(
+                            "INSERT INTO metadata(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (key, json.dumps(value, ensure_ascii=False)),
+                        )
+                    db.execute("DELETE FROM metadata WHERE key='last_agent_task'")
+                    db.commit()
+            instance._set_metadata("agent_task_size", agent_task_size)
             return instance
 
         segments = read_segments(source_path)
@@ -278,6 +336,10 @@ class CorrectionWorkspace:
                                 "INSERT OR IGNORE INTO reverse_dependencies(dependency_id, target_id) VALUES (?, ?)",
                                 (dependency, segment.id),
                             )
+                db.execute(
+                    "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                    ("agent_task_size", json.dumps(agent_task_size)),
+                )
                 db.commit()
             temporary.replace(instance.path)
         finally:
@@ -411,14 +473,22 @@ class CorrectionWorkspace:
         ids = list(dict.fromkeys(target_ids))
         if not ids:
             return []
-        placeholders = ",".join("?" for _ in ids)
+        rows = []
         with self._lock, closing(self._connect()) as db:
-            return db.execute(
-                f"""SELECT {self._select_clause()} FROM records r
-                LEFT JOIN annotations a ON a.target_id = r.target_id
-                WHERE r.target_id IN ({placeholders}) ORDER BY r.ordinal""",
-                ids,
-            ).fetchall()
+            limit = db.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+            if limit < 1:
+                raise CorrectionUIError("SQLite cannot bind correction target IDs")
+            for start in range(0, len(ids), limit):
+                batch = ids[start:start + limit]
+                placeholders = ",".join("?" for _ in batch)
+                rows.extend(db.execute(
+                    f"""SELECT {self._select_clause()} FROM records r
+                    LEFT JOIN annotations a ON a.target_id = r.target_id
+                    WHERE r.target_id IN ({placeholders})""",
+                    batch,
+                ).fetchall())
+        rows.sort(key=lambda row: row["ordinal"])
+        return rows
 
     def get_record(self, target_id: str) -> dict[str, Any]:
         rows = self._fetch_rows([target_id])
@@ -441,7 +511,7 @@ class CorrectionWorkspace:
             "flags": counts,
             "applied": bool(self._metadata_value("applied_output_sha256", "")),
             "search_modes": ["exact", "character", "vector"],
-            "max_focused_targets": MAX_FOCUSED_TARGETS,
+            "agent_task_size": self._metadata_value("agent_task_size", DEFAULT_AGENT_TASK_SIZE),
         }
 
     def search(self, query: str, *, mode: str, limit: int = 20) -> list[dict[str, Any]]:
@@ -649,6 +719,11 @@ class CorrectionWorkspace:
             )
 
     def export_agent_task(self) -> dict[str, Any]:
+        with self._lock:
+            return self._export_agent_task()
+
+    def _export_agent_task(self) -> dict[str, Any]:
+        task_size = _positive_task_size(self._metadata_value("agent_task_size", DEFAULT_AGENT_TASK_SIZE))
         with self._lock, closing(self._connect()) as db:
             selected = [
                 row[0]
@@ -674,80 +749,110 @@ class CorrectionWorkspace:
                     if dependent not in closure:
                         closure.add(dependent)
                         pending.append(dependent)
-                        if len(closure) > MAX_FOCUSED_TARGETS:
-                            raise CorrectionUIError(
-                                "Focused correction exceeds 32 targets after dependency closure"
-                            )
-        rows = self._fetch_rows(closure)
+            ordered_ids = [
+                row[0] for row in db.execute("SELECT target_id FROM records ORDER BY ordinal")
+                if row[0] in closure
+            ]
         selected_set = set(selected)
-        records = []
-        task_bindings: dict[str, dict[str, str]] = {}
-        for row in rows:
-            payload = self._row_payload(row)
-            context = {
-                "speaker": payload["speaker"],
-                "scene": payload["scene"],
-                "previous": payload["previous"],
-                "next": payload["next"],
-                "metadata": payload["metadata"],
-            }
-            context_sha256 = stable_hash(context)
-            source_sha256 = _sha256_text(payload["source"])
-            task_bindings[payload["id"]] = {
-                "source_sha256": source_sha256,
-                "context_sha256": context_sha256,
-            }
-            annotation = payload["annotation"] if payload["id"] in selected_set else None
-            records.append(
-                {
+        output = Path(self._metadata_value("agent_task_path"))
+        state_binding = self._metadata_value("binding_sha256")
+        tasks = []
+        bindings_by_task = {}
+        known_tasks = self._metadata_value("agent_tasks", {})
+        if not isinstance(known_tasks, dict):
+            raise CorrectionUIError("Bound agent task registry is invalid")
+        for start in range(0, len(ordered_ids), task_size):
+            rows = self._fetch_rows(ordered_ids[start:start + task_size])
+            records = []
+            task_bindings = {}
+            for row in rows:
+                payload = self._row_payload(row)
+                context = {
+                    "speaker": payload["speaker"], "scene": payload["scene"],
+                    "previous": payload["previous"], "next": payload["next"],
+                    "metadata": payload["metadata"],
+                }
+                context_sha256 = stable_hash(context)
+                source_sha256 = _sha256_text(payload["source"])
+                annotation = payload["annotation"]
+                interpretation = {
+                    "kind": annotation["flag_kind"] if annotation else "dependency",
+                    "note": annotation["note"] if annotation else "",
+                    "reference": annotation["reference"] if annotation else "",
+                }
+                task_bindings[payload["id"]] = {
+                    "source_sha256": source_sha256, "context_sha256": context_sha256,
+                    "interpretation_sha256": stable_hash(interpretation),
+                }
+                records.append({
                     "id": payload["id"],
                     "relation": "flagged" if payload["id"] in selected_set else "dependent",
-                    "source": payload["source"],
-                    "current_target": payload["target"],
-                    "context": context,
-                    "source_sha256": source_sha256,
-                    "context_sha256": context_sha256,
-                    "user_interpretation": {
-                        "kind": annotation["flag_kind"] if annotation else "dependency",
-                        "note": annotation["note"] if annotation else "",
-                        "reference": annotation["reference"] if annotation else "",
-                    },
-                }
-            )
-        task_core = {
-            "schema": TASK_SCHEMA,
-            "state_binding_sha256": self._metadata_value("binding_sha256"),
-            "selected_ids": selected,
-            "records": records,
+                    "source": payload["source"], "current_target": payload["target"],
+                    "context": context, "source_sha256": source_sha256,
+                    "context_sha256": context_sha256, "dependencies": payload["dependencies"],
+                    "user_interpretation": interpretation,
+                })
+            task_core = {
+                "schema": TASK_SCHEMA, "state_binding_sha256": state_binding,
+                "selected_ids": [record["id"] for record in records if record["id"] in selected_set],
+                "records": records,
+            }
+            task_id = stable_hash(task_core)
+            task = {**task_core, "task_id": task_id}
+            task_path = output.parent / f"{output.stem}-tasks" / f"{task_id}.json"
+            if task_path.exists():
+                if json.loads(task_path.read_text(encoding="utf-8")) != task:
+                    raise CorrectionUIError("Bound agent task content changed")
+            else:
+                _atomic_json(task_path, task)
+            tasks.append({
+                "task_id": task_id, "path": str(task_path.resolve()),
+                "record_count": len(records), "sha256": _sha256_bytes(task_path.read_bytes()),
+            })
+            previous = known_tasks.get(task_id)
+            if previous is not None and previous.get("bindings") != task_bindings:
+                raise CorrectionUIError("Bound agent task scope changed")
+            bindings_by_task[task_id] = previous or {"bindings": task_bindings, "decided_ids": []}
+        manifest_core = {
+            "schema": BATCH_SCHEMA, "state_binding_sha256": state_binding,
+            "task_size": task_size, "selected_count": len(selected),
+            "closure_count": len(closure), "tasks": tasks,
         }
-        task_id = stable_hash(task_core)
-        task = {**task_core, "task_id": task_id}
-        output = Path(self._metadata_value("agent_task_path"))
-        _atomic_json(output, task)
-        self._set_metadata("last_agent_task", {"task_id": task_id, "bindings": task_bindings})
+        batch_id = stable_hash(manifest_core)
+        _atomic_json(output, {**manifest_core, "batch_id": batch_id})
+        known_tasks.update(bindings_by_task)
+        self._set_metadata("agent_tasks", known_tasks)
+        self._set_metadata("active_agent_tasks", list(bindings_by_task))
         return {
-            "schema": TASK_SCHEMA,
-            "status": "ready",
-            "task_id": task_id,
-            "selected_count": len(selected),
-            "closure_count": len(records),
-            "output": str(output),
-            "output_sha256": _sha256_bytes(output.read_bytes()),
+            "schema": BATCH_SCHEMA, "status": "ready", "batch_id": batch_id,
+            "task_count": len(tasks), "task_size": task_size,
+            "pending_count": sum(
+                len(set(task["bindings"]) - set(task.get("decided_ids", [])))
+                for task in bindings_by_task.values()
+            ),
+            "selected_count": len(selected), "closure_count": len(closure),
+            "output": str(output), "output_sha256": _sha256_bytes(output.read_bytes()),
         }
 
     def import_agent_proposals(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            return self._import_agent_proposals(payload)
+
+    def _import_agent_proposals(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, dict) or set(payload) != {"schema", "task_id", "proposals"}:
             raise CorrectionUIError("Agent proposal fields must be schema, task_id, and proposals")
         if payload["schema"] != PROPOSALS_SCHEMA:
             raise CorrectionUIError("Agent proposal schema is unsupported")
-        task = self._metadata_value("last_agent_task")
-        if not isinstance(task, dict) or payload["task_id"] != task.get("task_id"):
-            raise CorrectionUIError("Agent proposals do not match the latest focused task")
+        tasks = self._metadata_value("agent_tasks", {})
+        task = tasks.get(payload["task_id"]) if isinstance(tasks, dict) else None
+        if not isinstance(task, dict):
+            raise CorrectionUIError("Agent proposals do not match a bound task")
         proposals = payload["proposals"]
-        if not isinstance(proposals, list) or not proposals or len(proposals) > MAX_FOCUSED_TARGETS:
-            raise CorrectionUIError("Agent proposals must contain 1-32 records")
+        if not isinstance(proposals, list) or not proposals:
+            raise CorrectionUIError("Agent proposals must contain at least one bound record")
         bindings = task.get("bindings", {})
         seen: set[str] = set()
+        updates = []
         for proposal in proposals:
             if not isinstance(proposal, dict) or set(proposal) != {
                 "id", "decision", "target", "source_sha256", "context_sha256"
@@ -775,34 +880,54 @@ class CorrectionWorkspace:
                 raise CorrectionUIError("Unchanged proposal must preserve the current target")
             self._validate_replacement(record, target)
             annotation = record["annotation"] or {}
+            interpretation = {
+                "kind": annotation.get("flag_kind", "dependency"),
+                "note": annotation.get("note", ""),
+                "reference": annotation.get("reference", ""),
+            }
+            if stable_hash(interpretation) != bindings[target_id]["interpretation_sha256"]:
+                raise CorrectionUIError("User interpretation changed after the agent task was bound")
+            if annotation.get("status") in {"approved", "reviewed_unchanged"}:
+                if annotation.get("proposal") != target or annotation.get("proposal_decision") != decision:
+                    raise CorrectionUIError("User-approved proposal is retained; flag the target again to request a new proposal")
+                continue
             note = annotation.get("note", "")
             reference = annotation.get("reference", "")
             flag_kind = annotation.get("flag_kind", "dependency")
-            with self._lock, closing(self._connect()) as db:
-                db.execute(
-                    """INSERT INTO annotations(
-                        target_id, route, flag_kind, note, reference_text, replacement,
-                        proposal, proposal_decision, status, normalized_note, normalized_reference,
-                        note_length, reference_length, updated_at
-                    ) VALUES (?, 'agent', ?, ?, ?, '', ?, ?, 'proposal_ready', ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT(target_id) DO UPDATE SET proposal=excluded.proposal,
-                        proposal_decision=excluded.proposal_decision,
-                        status='proposal_ready', updated_at=CURRENT_TIMESTAMP""",
-                    (
-                        target_id,
-                        flag_kind,
-                        note,
-                        reference,
-                        target,
-                        decision,
-                        _normalize(note),
-                        _normalize(reference),
-                        len(_normalize(note)),
-                        len(_normalize(reference)),
-                    ),
-                )
-                db.commit()
-        return {"schema": PROPOSALS_SCHEMA, "status": "imported", "proposal_count": len(seen)}
+            updates.append((
+                target_id, flag_kind, note, reference, target, decision,
+                _normalize(note), _normalize(reference),
+                len(_normalize(note)), len(_normalize(reference)),
+            ))
+        task["decided_ids"] = sorted(set(task.get("decided_ids", [])) | seen)
+        with self._lock, closing(self._connect()) as db:
+            db.executemany(
+                """INSERT INTO annotations(
+                    target_id, route, flag_kind, note, reference_text, replacement,
+                    proposal, proposal_decision, status, normalized_note, normalized_reference,
+                    note_length, reference_length, updated_at
+                ) VALUES (?, 'agent', ?, ?, ?, '', ?, ?, 'proposal_ready', ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(target_id) DO UPDATE SET proposal=excluded.proposal,
+                    proposal_decision=excluded.proposal_decision,
+                    status='proposal_ready', updated_at=CURRENT_TIMESTAMP""",
+                updates,
+            )
+            db.execute(
+                "INSERT INTO metadata(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("agent_tasks", json.dumps(tasks, ensure_ascii=False)),
+            )
+            db.commit()
+        task_pending = len(set(bindings) - set(task["decided_ids"]))
+        active = self._metadata_value("active_agent_tasks", [])
+        pending = sum(
+            len(set(tasks[task_id]["bindings"]) - set(tasks[task_id].get("decided_ids", [])))
+            for task_id in active
+        )
+        return {
+            "schema": PROPOSALS_SCHEMA, "status": "pending" if pending else "imported",
+            "proposal_count": len(seen), "task_pending_count": task_pending,
+            "pending_count": pending,
+        }
 
     def approve_proposal(self, target_id: str, replacement: str = "") -> dict[str, Any]:
         record = self.get_record(target_id)
@@ -812,7 +937,7 @@ class CorrectionWorkspace:
         target = replacement if replacement.strip() else annotation["proposal"]
         self._validate_replacement(record, target)
         if replacement.strip():
-            decision = "replace"
+            decision = "unchanged" if target == record["target"] else "replace"
         else:
             decision = annotation["proposal_decision"]
         if decision == "unchanged" and target != record["target"]:
@@ -844,8 +969,6 @@ class CorrectionWorkspace:
             }
         if not rows:
             raise CorrectionUIError("No user-approved corrections are ready")
-        if len(rows) + len(reviewed_dependencies) > MAX_FOCUSED_TARGETS:
-            raise CorrectionUIError("Minimal correction apply is limited to 32 targets")
         request_path = Path(self._metadata_value("request_output_path"))
         output_path = Path(self._metadata_value("corrected_output_path"))
         if request_path.exists() or output_path.exists():
@@ -913,8 +1036,8 @@ async function load(id){current=await api('/api/record?id='+encodeURIComponent(i
 async function save(){if(!current)return;try{current=await api('/api/flag',{method:'POST',body:JSON.stringify({id:current.id,kind:$('kind').value,route:$('route').value,note:$('note').value,reference:$('reference').value,replacement:$('replacement').value})});showMessage('message','Saved.');await refreshStatus();await load(current.id)}catch(e){showMessage('message',e.message,true)}}
 async function clearFlag(){if(!current)return;try{await api('/api/flag',{method:'DELETE',body:JSON.stringify({id:current.id})});showMessage('message','Flag removed.');await refreshStatus();await load(current.id)}catch(e){showMessage('message',e.message,true)}}
 async function approve(){if(!current)return;try{await api('/api/approve',{method:'POST',body:JSON.stringify({id:current.id,replacement:$('replacement').value})});showMessage('message','Proposal approved as a user edit.');await refreshStatus();await load(current.id)}catch(e){showMessage('message',e.message,true)}}
-async function exportTask(){try{const s=await api('/api/export-agent',{method:'POST',body:'{}'});showMessage('jobMessage',`Saved a ${s.closure_count}-record agent task: ${s.output}`)}catch(e){showMessage('jobMessage',e.message,true)}}
-async function importTask(file){try{const payload=JSON.parse(await file.text());const s=await api('/api/proposals',{method:'POST',body:JSON.stringify(payload)});showMessage('jobMessage',`Imported ${s.proposal_count} proposals.`);await refreshStatus();if(current)await load(current.id)}catch(e){showMessage('jobMessage',e.message,true)}}
+async function exportTask(){try{const s=await api('/api/export-agent',{method:'POST',body:'{}'});showMessage('jobMessage',`Saved ${s.task_count} bounded agent tasks (${s.closure_count} records, ${s.pending_count} decisions pending): ${s.output}`)}catch(e){showMessage('jobMessage',e.message,true)}}
+async function importTask(file){try{const payload=JSON.parse(await file.text());const s=await api('/api/proposals',{method:'POST',body:JSON.stringify(payload)});showMessage('jobMessage',`Imported ${s.proposal_count} proposals; ${s.pending_count} bound records still pending.`);await refreshStatus();if(current)await load(current.id)}catch(e){showMessage('jobMessage',e.message,true)}}
 async function apply(){if(!confirm('Apply only approved edits to a new result file?'))return;try{const s=await api('/api/apply',{method:'POST',body:'{}'});showMessage('jobMessage',`Applied ${s.changed_count} edits: ${s.output}`);await refreshStatus()}catch(e){showMessage('jobMessage',e.message,true)}}
 $('search').onclick=search;$('query').onkeydown=e=>{if(e.key==='Enter')search()};$('save').onclick=save;$('clear').onclick=clearFlag;$('approve').onclick=approve;$('export').onclick=exportTask;$('import').onclick=()=>$('proposalFile').click();$('proposalFile').onchange=e=>e.target.files[0]&&importTask(e.target.files[0]);$('apply').onclick=apply;refreshStatus().catch(e=>showMessage('summary',e.message,true));
 </script></body></html>"""

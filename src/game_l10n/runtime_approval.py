@@ -17,7 +17,6 @@ from .workspace import load_config
 SCHEMA = "parr0t.runtime-approval/v1"
 ACTIONS = {"install", "update", "remove", "launch"}
 DEFAULT_TTL_MINUTES = 30
-MAX_TTL_MINUTES = 24 * 60
 
 
 def _utc_now() -> datetime:
@@ -118,22 +117,29 @@ def create_runtime_approval(
     target_path: Path,
     executable_path: Path | None = None,
     ttl_minutes: int = DEFAULT_TTL_MINUTES,
+    workflow_reuse: bool = False,
     user_confirmed: bool,
 ) -> tuple[Path, dict[str, Any]]:
-    """Record one explicit, short-lived user approval without performing the action."""
+    """Record explicit exact-action consent, optionally reusable until its expiry."""
     work_dir = work_dir.resolve()
     if not user_confirmed:
         raise RuntimeApprovalError("E_RUNTIME_USER_CONFIRMATION_REQUIRED")
     if action not in ACTIONS:
         raise RuntimeApprovalError("E_RUNTIME_ACTION_INVALID")
-    if ttl_minutes < 1 or ttl_minutes > MAX_TTL_MINUTES:
+    if isinstance(ttl_minutes, bool) or not isinstance(ttl_minutes, int) or ttl_minutes < 1:
         raise RuntimeApprovalError("E_RUNTIME_APPROVAL_TTL_INVALID")
+    if not isinstance(workflow_reuse, bool):
+        raise RuntimeApprovalError("E_RUNTIME_APPROVAL_REUSE_INVALID")
     artifact = artifact_path.resolve()
     if not is_within(artifact, work_dir):
         raise RuntimeApprovalError("E_RUNTIME_ARTIFACT_OUTSIDE_WORKSPACE")
     target = _normalize_target(work_dir, target_path)
     executable = _normalize_executable(action, target, executable_path)
     created = _utc_now()
+    try:
+        expires = created + timedelta(minutes=ttl_minutes)
+    except OverflowError as exc:
+        raise RuntimeApprovalError("E_RUNTIME_APPROVAL_TTL_INVALID") from exc
     approval_id = secrets.token_hex(16)
     payload: dict[str, Any] = {
         "schema": SCHEMA,
@@ -143,8 +149,8 @@ def create_runtime_approval(
         "target": str(target),
         "executable": str(executable) if executable else None,
         "created_at_utc": _timestamp(created),
-        "expires_at_utc": _timestamp(created + timedelta(minutes=ttl_minutes)),
-        "one_shot": True,
+        "expires_at_utc": _timestamp(expires),
+        "one_shot": not workflow_reuse,
         "consumed_at_utc": None,
         "authorization_source": "explicit_user_instruction",
     }
@@ -173,8 +179,8 @@ def require_runtime_approval(
     approval = approval_path.resolve()
     if not approval.is_file() or not is_within(approval, approval_root):
         raise RuntimeApprovalError("E_RUNTIME_APPROVAL_INVALID_PATH")
-    payload = json.loads(approval.read_text(encoding="utf-8"))
-    if payload.get("schema") != SCHEMA or payload.get("one_shot") is not True:
+    payload = json.loads(approval.read_text(encoding="utf-8-sig"))
+    if payload.get("schema") != SCHEMA or not isinstance(payload.get("one_shot"), bool):
         raise RuntimeApprovalError("E_RUNTIME_APPROVAL_SCHEMA")
     if payload.get("authorization_source") != "explicit_user_instruction":
         raise RuntimeApprovalError("E_RUNTIME_APPROVAL_SOURCE")
@@ -201,7 +207,7 @@ def require_runtime_approval(
     for field in ("path", "kind", "sha256", "fingerprint", "installer_sha256"):
         if recorded_artifact.get(field) != current_artifact.get(field):
             raise RuntimeApprovalError("E_RUNTIME_APPROVAL_ARTIFACT_MISMATCH")
-    if consume:
+    if consume and payload["one_shot"]:
         payload["consumed_at_utc"] = _timestamp(_utc_now())
         temporary = approval.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
