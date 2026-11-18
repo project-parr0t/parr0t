@@ -22,7 +22,7 @@ from .content_source_policy import (
 from .language_policy import DEFAULT_TARGET_LANGUAGE, language_policy_digest
 from .models import Segment
 from .native_followup import CANDIDATE_METADATA_KEY
-from .native_runtime import RUNTIME_ISSUES, launch_contract, native_launch_summary, native_runtime, _unstarted_launch_ledger, _relay_command_argv, _preserve_legacy_launch_fields
+from .native_runtime import RUNTIME_ISSUES, launch_contract, native_launch_summary, native_runtime, require_native_workers_ended, _unstarted_launch_ledger, _relay_command_argv, _relay_worker_dispatches, _preserve_legacy_launch_fields
 from .omp_isolation import ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
 from .store import stable_hash, stable_hash_sequence
 from .review_policy import judge_calls, review_call_limit, review_worker_limit
@@ -1992,6 +1992,10 @@ def _write_wave_relay_dispatch(
                 legacy_results_must_not_be_reexecuted=True,
                 zero_launch_tasks_action="seal_existing_results_without_dispatch",
             )
+        if "worker_prompt" in launch and "message_isolation" in launch and (previous is None or (isinstance(previous_launch, dict) and "worker_dispatches" in previous_launch)):
+            for binding, task in zip(bindings, tasks):
+                binding["task_sha256"] = task["sha256"]
+            launch["worker_dispatches"] = _relay_worker_dispatches(work_dir, path, unsigned, launch)
         if isinstance(previous_launch, dict):
             compatible = {**launch, "runtime_fingerprint": previous_launch.get("runtime_fingerprint")}
             if compatible == previous_launch:
@@ -2344,6 +2348,8 @@ def seal_native_wave_relay(
     if "command_argv" in payload and "launch_contract" in payload:
         if payload["command_argv"] != _relay_command_argv(work_dir, resolved, payload):
             raise ValueError("E_NATIVE_RELAY_INVALID: lifecycle commands changed")
+    if "launch_contract" in payload:
+        require_native_workers_ended(work_dir, resolved)
 
     if relay_ended and ended_tasks:
         raise ValueError(
@@ -2374,12 +2380,10 @@ def seal_native_wave_relay(
 
     bindings_by_name: dict[str, tuple[Path, Path, int]] = {}
     for binding in payload["task_bindings"]:
-        if not isinstance(binding, dict) or set(binding) != {
-            "task",
-            "result",
-            "records",
-            "estimated_material_tokens",
-        }:
+        if not isinstance(binding, dict) or set(binding) not in (
+            {"task", "result", "records", "estimated_material_tokens"},
+            {"task", "result", "records", "estimated_material_tokens", "task_sha256"},
+        ):
             raise ValueError("E_NATIVE_RELAY_INVALID: task binding is invalid")
         if (
             not isinstance(binding["task"], str)

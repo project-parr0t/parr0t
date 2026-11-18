@@ -13,16 +13,34 @@ import sys
 import time
 from uuid import uuid4
 
-from .control_plane import CONTROL_HANDOFF_PATH, control_plane_entry_state, control_plane_state
+from .control_plane import (
+    CONTROL_HANDOFF_PATH, _validated_control_plane_handoff,
+    control_plane_entry_state, control_plane_state,
+)
+from .framework_session import framework_session_state
+from .errors import ConfigurationError
+from .user_request import user_request_binding
 
 
-def _startup_prompt(workspace: Path, core: Path, mode: str = "rotation", *, guarded: bool = False) -> str:
+def _startup_prompt(
+    workspace: Path, core: Path, mode: str, request: dict, *, guarded: bool = False,
+) -> str:
     return (
         "Parr0t의 기존 게임 현지화 작업을 새 text-free 최상위 제어 세션으로 이어가라. "
         "이 세션은 이전 세션의 대화·요약·하위 에이전트 기록을 상속하거나 열람하지 않는다. "
         f"코어 위치: {core.as_posix()}. 외부 작업 폴더: {workspace.as_posix()}. "
         "먼저 코어 AGENTS.md, docs/agent-usage.md, docs/control-plane-contract.md 및 "
         "작업 폴더 AGENTS.md를 읽고 메타데이터 상태만 확인하라. "
+        "함께 첨부한 파일은 대화 요약이 아니라 최초 사용자 요청의 보존된 원문이다. "
+        f"요청 경로: {request['path']}, SHA-256: {request['sha256']}, 바이트 수: {request['bytes']}. "
+        "원문 전체의 모든 요구사항을 적용하되, 이후 명시적으로 기록된 사용자 정책·승인과 "
+        "완료 결과를 원문의 초기화 지시로 되돌리지 마라. 이미 초기화된 작업 폴더를 다시 초기화하지 마라. "
+        "이미지·폰트·기존 한국어 중단 조건·문맥·검수·모델 ID·호출 제한 등 원문의 요청을 "
+        "일반 재개 안내로 대체하거나 누락하지 마라. 미바인딩 모델은 정확한 요청을 pending으로 보존한다. "
+        "첨부된 최초 요청 외에 이전 대화·로그·요약을 원래 요청으로 대신 읽지 마라. "
+        "다음 정확한 코어 argv에 필요한 명령을 덧붙여 실행하라: "
+        f"{json.dumps([sys.executable, '-I', '-B', str(core / 'src/game_l10n/templates/native-python.py')], ensure_ascii=False)}. "
+        "user-request --workspace를 사용해 요청 바인딩을 검증한 뒤 상태에 맞는 진입 절차를 수행하라. "
         +
         (
             f"정식 인계 영수증 {CONTROL_HANDOFF_PATH}만 사용하여 새 세션 재개 절차를 수행하라. "
@@ -31,8 +49,8 @@ def _startup_prompt(workspace: Path, core: Path, mode: str = "rotation", *, guar
             "새 history-free 작업 세션이다. status의 entry gate가 pending이면 계약을 읽고 "
             "source-unopened 조건을 확인한 뒤 enter-control-plane을 수행하라. "
             "이미 ready이면 재진입하거나 resume-control-plane을 실행하지 마라. "
-            "메타데이터와 승인된 정책만 확인하고 기록된 사용자 작업 의도가 없으면 "
-            "현지화 작업을 시작하지 말고 사용자에게 현재 요청을 물어라. "
+            "최초 사용자 요청은 첨부된 검증 대상 원문으로 이미 전달되었다. "
+            "이를 누락된 요청으로 취급하거나 동일한 모델·호출 제한을 다시 묻지 마라. "
         )
         +
         "게임 폴더는 읽기 전용이며 최상위는 게임 내용·번역 가능성을 직접 조사하지 않는다. "
@@ -66,13 +84,34 @@ def _startup_prompt(workspace: Path, core: Path, mode: str = "rotation", *, guar
     )
 
 
+def _resolve_mode(workspace: Path, mode: str) -> str:
+    if mode not in {"auto", "rotation", "workspace"}:
+        raise ValueError("E_OMP_CONTROL_MODE_REQUIRED")
+    state = control_plane_state(workspace)
+    session = framework_session_state(workspace)
+    if mode == "auto":
+        mode = "rotation" if state["status"] == "rotation_required" else "workspace"
+    if mode == "workspace":
+        if state["status"] == "rotation_required" or session["mode"] != "localization":
+            raise ValueError("E_OMP_CONTROL_ROTATION_REQUIRED: use --mode rotation")
+    else:
+        if state["status"] != "rotation_required":
+            raise ValueError("E_OMP_CONTROL_ROTATION_REQUIRED")
+        receipt = _validated_control_plane_handoff(workspace, workspace / CONTROL_HANDOFF_PATH)
+        if (
+            receipt["incident_id"] != state["incident_id"]
+            or receipt["from_generation"] != state["generation"]
+            or receipt["issue_code"] != state["issue_code"]
+        ):
+            raise ValueError("E_OMP_CONTROL_HANDOFF_INVALID")
+    return mode
+
+
 def _plan_command(
-    workspace: Path, model: str, mode: str = "rotation", *, guarded: bool = False,
+    workspace: Path, model: str, mode: str = "auto", *, guarded: bool = False,
 ) -> tuple[list[str], Path, Path | None]:
     """Validate prerequisites and plan a fresh session without writing anything."""
     workspace = workspace.resolve()
-    if mode not in {"rotation", "workspace"}:
-        raise ValueError("E_OMP_CONTROL_MODE_REQUIRED")
     if not re.fullmatch(
         r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/+\-]*"
         r"(?:@[A-Za-z0-9][A-Za-z0-9._/\-]*)?(?::[A-Za-z0-9][A-Za-z0-9._\-]*)?", model
@@ -80,15 +119,8 @@ def _plan_command(
         raise ValueError("E_OMP_CONTROL_EXACT_MODEL_REQUIRED")
     if not (workspace / "game-l10n.json").is_file():
         raise ValueError("E_OMP_CONTROL_WORKSPACE_REQUIRED")
-    state = control_plane_state(workspace)
+    mode = _resolve_mode(workspace, mode)
     control_plane_entry_state(workspace)
-    if mode == "rotation":
-        if state["status"] != "rotation_required":
-            raise ValueError("E_OMP_CONTROL_ROTATION_REQUIRED")
-        if not (workspace / CONTROL_HANDOFF_PATH).is_file():
-            raise ValueError("E_OMP_CONTROL_HANDOFF_REQUIRED")
-    elif state["status"] == "rotation_required":
-        raise ValueError("E_OMP_CONTROL_ROTATION_REQUIRED: use --mode rotation")
     executable = shutil.which("omp")
     if executable is None:
         raise ValueError("E_OMP_CONTROL_EXECUTABLE_REQUIRED")
@@ -105,17 +137,20 @@ def _plan_command(
         "--session-dir", str(session_dir), "--no-prewalk", "--no-title",
     ]
     command.extend(["--trusted-extension", str(extension.resolve()), "--parr0t-workspace", str(workspace)])
-    command.append(_startup_prompt(workspace, core, mode, guarded=guarded))
+    request = user_request_binding(workspace)
+    command.append(_startup_prompt(workspace, core, mode, request, guarded=guarded))
+    command.append("@" + str(workspace / request["path"]))
     return command, launch_dir, guard
 
 
 def _launch(
     workspace: Path, model: str, startup_seconds: float = 45.0,
-    *, mode: str = "rotation", foreground: bool = False, guarded: bool = False,
+    *, mode: str = "auto", foreground: bool = False, guarded: bool = False,
 ) -> dict:
     workspace = workspace.resolve()
     if os.name != "nt" and not foreground:
         raise ValueError("E_OMP_CONTROL_TERMINAL_REQUIRED: use --foreground")
+    mode = _resolve_mode(workspace, mode)
     command, launch_dir, guard = _plan_command(workspace, model, mode, guarded=guarded)
     session_dir = launch_dir / "sessions"
     session_dir.mkdir(parents=True)
@@ -124,6 +159,7 @@ def _launch(
         "model": model, "session_directory": str(session_dir),
         "handoff_receipt": CONTROL_HANDOFF_PATH if mode == "rotation" else None,
         "mode": mode, "omp_isolation": "guarded" if guarded else "prompt", "process_id": None,
+        "user_request": user_request_binding(workspace),
     }
     record_path = launch_dir / "launch.json"
     record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
@@ -189,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--model", required=True, help="Exact approved provider/model identifier")
-    parser.add_argument("--mode", choices=("rotation", "workspace"), default="rotation")
+    parser.add_argument("--mode", choices=("auto", "rotation", "workspace"), default="auto")
     parser.add_argument("--foreground", action="store_true", help="Use the current terminal")
     parser.add_argument("--guarded", action="store_true", help="Require the OMP execution guard and registration proof")
     parser.add_argument("--print-command", action="store_true", help="Print JSON argv without launching")
@@ -202,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
         result = _launch(
             args.workspace, args.model, mode=args.mode, foreground=args.foreground, guarded=args.guarded,
         )
-    except (OSError, ValueError) as error:
+    except (ConfigurationError, OSError, ValueError) as error:
         issue = str(error).split(":", 1)[0]
         if not re.fullmatch(r"E_[A-Z_]+", issue):
             issue = "E_OMP_CONTROL_START_FAILED"
