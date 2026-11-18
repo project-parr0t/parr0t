@@ -16,6 +16,7 @@ from .formats import read_segments
 from .models import Segment
 from .privacy import is_within
 from .store import stable_hash, stable_hash_sequence
+from .validators import validate_integrity
 
 
 RETRY_SCHEMA = "parr0t.native-translation-retry.v1"
@@ -181,11 +182,9 @@ def _validate_result_rows(
             raise NativeTranslationRetryError(
                 "Native semantic result provider does not match the bound route"
             )
-        valid_success_text = isinstance(text, str) and (
-            bool(text.strip())
-            or (not segment.source.strip() and text == segment.source)
-        )
-        if status == "success" and valid_success_text:
+        if status == "success" and isinstance(text, str) and (
+            bool(text.strip()) or not validate_integrity(segment, text, [])
+        ):
             row["candidate_generation"] = 1
             row["candidate_digest"] = stable_hash(text)
             if content_policy is not None:

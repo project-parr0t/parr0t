@@ -55,11 +55,12 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
   async function flushContextEnds(current, ctx) {
     if (!current.relay.execution_plan?.tracking_required) return;
     const keys = Object.keys(current.dispatches).filter(key => key !== "finalizer");
-    let entries;
-    try { entries = keys.map(task => ({ task, ...recordFor(task, current) })); }
-    catch (error) { if (error.code === "ENOENT") return; throw error; }
-    if (entries.some(({ record }) => !record.worker_id || record.state === "reserved" || record.state === "failed")) return;
-    for (const { task, file, record } of entries) {
+    for (const task of keys) {
+      let entry;
+      try { entry = recordFor(task, current); }
+      catch (error) { if (error.code === "ENOENT") continue; throw error; }
+      const { file, record } = entry;
+      requireRecord(record, current, task);
       if (record.state !== "ending") continue;
       const slot = current.dispatches[task].slot;
       await command(current.relay.command_argv["relay-events"][`worker-ended:${slot}`], ctx);
