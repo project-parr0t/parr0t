@@ -53,9 +53,10 @@ def _startup_prompt(workspace: Path, core: Path, mode: str = "rotation", *, guar
             if guarded else
             "native-runtime --omp-isolation prompt로 다시 바인딩하고 기존 정확한 모델 매핑을 보존하라. "
             "릴레이/워커는 launch_contract에 따라 메시지 전송·대화 및 세션 기록 열람을 하지 않는다. "
-            "agent:// 메시지와 history:// 열람을 사용하지 마라. 일반 호스트 Python과 도구로 실행하라. "
-            "공식 런처의 프롬프트 도우미는 하위 프롬프트의 충돌하는 협업 안내와 호스트 메시지·기록 도구 호출만 제한한다. "
-            "일반 Python·프로세스 실행을 샌드박스화하지 않으며 실행 가드 등록을 기다리지 마라. "
+            "agent:// 메시지와 history:// 열람을 사용하지 마라. 하위 에이전트의 Python·프로세스 실행은 "
+            "공식 도우미의 parr0t_process에 실행 파일부터 시작하는 argv로 전달하라. "
+            "도우미는 마커가 빠진 하위 세션에도 메시지·기록 접근과 내장 bash/eval 브리지를 차단한다. "
+            "일반 네이티브 프로세스는 샌드박스화하지 않으며 실행 가드 등록을 기다리지 마라. "
         )
         +
         "최상위가 새 릴레이를 시작할 때 코어가 반환한 상대 릴레이 경로를 PARR0T_OMP_RELAY=경로 형식의 단독 줄로 전달하라. "
