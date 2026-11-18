@@ -118,6 +118,15 @@ Data-plane launch ledgers are keyed by the immutable task ID, so a completed att
 
 Every newly dispatched relay carries `launch_contract`. Before any worker starts, verify nested dispatch capability and record `record-native-launch --workspace <workspace> --relay <relay-path> --event capability-available`, then attempt the bound exact model. Missing nested dispatch records `capability-unavailable`. Only an observed execution-layer denial or model-availability result may record `model-unavailable`, using the bound command with `--failure-code host_dispatch_denied|host_model_not_found|host_model_unavailable`. The code is categorical evidence of the observed result, never a guess from an advertisement or allowlist. New contracts reject a model-unavailable event without it. Seal normally and return only the receipt path; never change models or fabricate per-target failures. Existing immutable contracts remain readable without rewriting started-worker evidence.
 
+Capability preflight belongs to the current relay's own callable tool namespace.
+On OMP, use the built-in `task` directly (or resolve its deferred `xd://task`
+device), not eval `agent()`/`workpool()` or an additional capability-test agent.
+Only core-bound workers may be started. A test child already occupies the worker
+depth; its inability to spawn another child says nothing about the relay's own
+dispatch capability. Never record `capability-unavailable` from a descendant's
+report. New launch contracts bind this rule in `relay_prompt`; historical
+contracts, launch evidence and completed results remain immutable.
+
 For each task in `unstarted_tasks`, pass `launch_contract.model` explicitly to the spawn call (`model` in Codex, each `tasks[].model` in OMP) with no inherited history. After a successful spawn, record `--event worker-started --task <exact-binding> --worker-id <returned-id> --model <requested-exact-id>`. Include `--observed-model <id>` when the host supplies model metadata. Ordinary data-plane tasks use `worker-0`; context tasks use the bound `worker-<slot>` and `finalizer` keys. Context start/end lifecycle commands still apply separately. Already recorded workers must not be spawned again.
 
 Launcher records bind the explicit request and any host-reported model, not a worker-authored `provider` label. When the host omits actual-model telemetry, its identity remains unobserved; do not invent it or scrape session logs. A mismatching reported model blocks import even if the output labels itself as the requested provider. Preserve/quarantine rejected output; never relabel it.

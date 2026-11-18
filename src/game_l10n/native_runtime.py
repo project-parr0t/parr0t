@@ -174,6 +174,17 @@ def launch_contract(work_dir: Path, route: str, tasks: list[str]) -> dict[str, A
         "host": runtime["host"], "runtime_fingerprint": runtime["fingerprint"],
         "route": route, "model": runtime["models"][route], "tasks": tasks,
         "history_mode": "none", "inherit_model_allowed": False,
+        "relay_prompt": (
+            "Check dispatch capability in this relay's own callable tool namespace. "
+            "For OMP, use the built-in task tool directly; a deferred task tool may be "
+            "resolved through xd://task. Do not use eval agent(), workpool(), a "
+            "model-bearing process, or an extra agent to test dispatch capability. "
+            "Start only the exact bound tasks, using the exact model and worker prompt. "
+            "A capability-test child would consume the worker depth and cannot establish "
+            "this relay's capability; its inability to spawn grandchildren is not evidence "
+            "that this relay cannot start workers. Record capability-unavailable only "
+            "from this relay's own dispatch surface, never a descendant's report."
+        ),
         "worker_prompt": (
             "You are the native worker selected for this binding, not the relay. "
             "For semantic work, this session is already the exact requested model: "
@@ -411,6 +422,7 @@ def _preserve_legacy_launch_fields(contract: dict | None, previous: dict | None)
         "cancellation_priority",
         "operational_failure_policy",
         "worker_prompt",
+        "relay_prompt",
     ):
         if field not in previous:
             contract.pop(field, None)

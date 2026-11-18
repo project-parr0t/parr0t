@@ -330,11 +330,13 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(relay.read_bytes(), originals[relay])
 
     def test_old_promptless_capability_unavailable_wave_resumes_same_runtime(self) -> None:
-        self._resume_legacy_unavailable_wave('capability-unavailable', ('worker_prompt',))
+        self._resume_legacy_unavailable_wave(
+            'capability-unavailable', ('worker_prompt', 'relay_prompt'),
+        )
 
     def test_old_policyless_model_unavailable_wave_resumes_same_runtime(self) -> None:
         self._resume_legacy_unavailable_wave('model-unavailable', (
-            'model_authorization', 'unavailability_evidence', 'worker_prompt',
+            'model_authorization', 'unavailability_evidence', 'worker_prompt', 'relay_prompt',
             'lifecycle_observation', 'cancellation_priority', 'operational_failure_policy',
         ))
 
