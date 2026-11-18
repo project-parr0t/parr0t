@@ -57,6 +57,7 @@ async function runIntegration() {
   const workspace = realpathSync(mkdtempSync(path.join(os.tmpdir(), "parr0t-real-host-synthetic-")));
   const assetRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), "parr0t-real-host-assets-")));
   const helperPath = fileURLToPath(new URL("../src/game_l10n/templates/omp-prompt-isolation.mjs", import.meta.url));
+  const bootstrapPath = fileURLToPath(new URL("../src/game_l10n/templates/omp-native-process.mjs", import.meta.url));
   const controlDirectory = path.join(workspace, ".game-l10n", "omp-control", "b".repeat(32));
   const originalControl = process.env.PARR0T_OMP_CONTROL_DIRECTORY;
   const originalWorkspace = process.env.PARR0T_OMP_PROMPT_WORKSPACE;
@@ -83,12 +84,13 @@ async function runIntegration() {
     const identity = { id, name: id, kind, depth, parentId };
     const eventBus = new EventBus();
     const runtime = new ExtensionRuntime();
-    runtime.flagValues.set("parr0t-workspace", workspace);
+    if (selectedHelper) runtime.flagValues.set("parr0t-workspace", workspace);
     const spawned = [];
     const dispatchedTasks = [];
-    const loaded = await loadExtensions([selectedHelper], workspace, eventBus, runtime);
-    assert.deepEqual(loaded.errors, [], "Actual helper file must load through the selected host");
-    assert.equal(loaded.extensions.length, 1);
+    const helperPaths = selectedHelper ? [bootstrapPath, selectedHelper] : [bootstrapPath];
+    const loaded = await loadExtensions(helperPaths, workspace, eventBus, runtime);
+    assert.deepEqual(loaded.errors, [], "Actual helper files must load through the selected host");
+    assert.equal(loaded.extensions.length, helperPaths.length);
     const consumer = await loadExtensionFromFactory(pi => {
       // A synthetic, model-free consumer of real host task dispatch. Its input
       // is exactly what ExtensionToolWrapper passes after extension rewriting.
@@ -146,13 +148,18 @@ async function runIntegration() {
       .map(entry => ({ name: entry.definition.name, description: entry.definition.description,
         parameters: entry.definition.parameters, sourceInfo: entry.sourceInfo }));
     runtime.getActiveTools = () => [...activeTools.keys()];
+    const unsubscribeTools = runner.onToolRegistered(entry => {
+      const tool = wrap(wrapRegisteredTool(entry, runner));
+      registeredTools.set(entry.definition.name, tool);
+      activeTools.set(entry.definition.name, tool);
+    });
     function registered(name) {
       const tool = activeTools.get(name);
       assert.ok(tool, `Selected host has no active wrapper for ${name}`);
       return tool;
     }
     const session = {
-      id, runner, manager, spawned, dispatchedTasks, context, registeredTools, activeTools,
+      id, runner, manager, spawned, dispatchedTasks, context, registeredTools, activeTools, unsubscribeTools,
       write: input => write.execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
       bash: input => bash.execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
       read: input => read.execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
@@ -178,6 +185,25 @@ async function runIntegration() {
   }
 
   try {
+    // Ordinary OMP starts without --trusted-extension or workspace flags must
+    // acquire the native tool without acquiring worker-isolation attestation.
+    const bootstrapRoot = await makeSession("BootstrapRoot", "main", 0, undefined, null);
+    await bootstrapRoot.runner.emit({ type: "session_start" });
+    const bootstrapChild = await makeSession("BootstrapChild", "sub", 1, bootstrapRoot.id, null);
+    await bootstrapChild.runner.emit({ type: "session_start" });
+    const literal = "agent://Main; history://not-a-route | %PATH%";
+    for (const session of [bootstrapRoot, bootstrapChild]) {
+      const result = await session.process({
+        argv: [process.env.PARR0T_OMP_PYTHON ?? "python", "-I", "-B", "-c",
+          "import json,sys; print(json.dumps(sys.argv[1]))", literal],
+      });
+      assert.equal(result.isError, false);
+      assert.equal(JSON.parse(result.details.stdout), literal);
+      assert.equal(session.activeTools.has("parr0t_framework_mode"), false);
+      await session.runner.emit({ type: "session_start" });
+      assert.equal(session.runner.getAllRegisteredTools().filter(tool => tool.definition.name === "parr0t_process").length, 1);
+    }
+    assert.equal(existsSync(path.join(controlDirectory, "ready.json")), false);
     const parent = await makeSession(MAIN_AGENT_ID, "main", 0);
     const relay = await makeSession("SyntheticRelay", "sub", 1, parent.id);
     const peer = await makeSession("SyntheticPeer", "sub", 1, parent.id);
@@ -187,6 +213,7 @@ async function runIntegration() {
     assert.equal(existsSync(readinessPath), false);
     parent.activeTools.set("parr0t_process", parent.registeredTools.get("parr0t_process"));
     await parent.runner.emit({ type: "session_start" });
+    assert.equal(parent.runner.getAllRegisteredTools().filter(tool => tool.definition.name === "parr0t_process").length, 1);
     const receiptText = readFileSync(readinessPath, "utf8");
     const receipt = JSON.parse(receiptText);
     assert.deepEqual(receipt, {
@@ -341,6 +368,7 @@ print(json.dumps(native_launch_summary(w,w/sys.argv[3])))
     const guardPath = fileURLToPath(new URL("../src/game_l10n/templates/omp-isolation-guard.mjs", import.meta.url));
     const guardedRoot = await makeSession("GuardedRoot", "main", 0, undefined, guardPath);
     await guardedRoot.runner.emit({ type: "session_start" });
+    assert.equal(guardedRoot.activeTools.has("parr0t_process"), false);
     const registrationPath = path.join(workspace, ".game-l10n/native/omp-isolation",
       `${createHash("sha256").update(guardedRoot.manager.getSessionId()).digest("hex")}.json`);
     const registration = JSON.parse(readFileSync(registrationPath, "utf8"));
@@ -395,6 +423,7 @@ print(json.dumps(native_launch_summary(w,w/sys.argv[3])))
     assert.deepEqual(observations, []);
   } finally {
     for (const session of sessions) {
+      session.unsubscribeTools();
       session.runner.clearManagedTimers();
       session.runner.disposeFileFallbacks();
       await session.manager.close();
