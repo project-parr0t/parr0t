@@ -37,6 +37,7 @@ from game_l10n.privacy import PrivacyViolation
 from game_l10n.providers import ProviderRegistry
 from game_l10n.formats import read_segments
 from game_l10n.store import stable_hash
+from game_l10n.user_request import record_user_request
 from game_l10n.tooling import cached_tool_state, record_verified_pack_artifact, run_cached_tool
 from game_l10n.workspace import (
     initialize_workspace,
@@ -2053,6 +2054,55 @@ class WorkspaceTests(unittest.TestCase):
             status["required_contracts"],
             ["docs/sdk-selection.md", "docs/sdk-branch-contract.md"],
         )
+
+    def test_preserved_request_does_not_skip_initial_inventory_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk, game, work = (root / name for name in ("sdk", "game", "work"))
+            game.mkdir()
+            for relative, content in {
+                "pyproject.toml": "[project]\nname='synthetic-sdk'\n",
+                "docs/fixture-sdk.md": "Synthetic format contract.\n",
+                "src/game_l10n/__init__.py": "",
+                "src/game_l10n/adapter.py": "SYNTHETIC_FORMAT = 1\n",
+            }.items():
+                path = sdk / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+            establish_control_plane_entry(work)
+            refresh_sdk_inventory(
+                work, runtime_root=sdk,
+                portable_branch="sdk-fixture-1.0", portable_commit="a" * 40,
+            )
+            record_sdk_evaluation(
+                work, "sdk-fixture-1.0", "compatible", "public_contract_match",
+                ["docs/fixture-sdk.md"], target_engine="fixture", target_version="1.0",
+            )
+            record_sdk_selection(
+                work, "reuse", "sdk-fixture-1.0",
+                target_engine="fixture", target_version="1.0",
+            )
+            record_sdk_activation(work, runtime_root=sdk)
+            request = work / "inputs/user-request.txt"
+            request.write_text("Produce the requested synthetic patch.", encoding="utf-8")
+            original = request.read_bytes()
+            record_user_request(work, request, user_requested=True, text_free_confirmed=True)
+
+            actions = []
+            for filename in (None, "primary-inventory.json", "independent-inventory.json"):
+                if filename is not None:
+                    (work / "inputs" / filename).write_text("{}", encoding="utf-8")
+                with redirect_stdout(output := StringIO()):
+                    self.assertEqual(cmd_status(SimpleNamespace(workspace=str(work))), 0)
+                actions.append(json.loads(output.getvalue())["next_actions"])
+
+            self.assertEqual(actions, [
+                ["unpack_and_extract_ordered_script"],
+                ["extract_independent_source_inventory"],
+                ["verify_independent_source_inventory"],
+            ])
+            self.assertEqual(request.read_bytes(), original)
 
     def test_status_holds_deficient_sdk_before_either_inventory_but_preserves_existing_pair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
