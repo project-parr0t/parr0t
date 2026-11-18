@@ -44,7 +44,19 @@ def contains_term(term: str, text: str, *, case_sensitive: bool = False) -> bool
     Boundaries apply only at alphabetic-letter edges, so CJK names followed by particles still match
     and a plain English plural ("Potions") still counts as the glossary term.
     """
-    return bool(_term_spans(term, text, case_sensitive=case_sensitive))
+    if not term:
+        return False
+    if not case_sensitive:
+        term, text = term.casefold(), text.casefold()
+    return re.search(_term_pattern(term), text) is not None
+
+
+def _term_pattern(term: str) -> str:
+    # Alphabetic letters only: digits ("HP100") and CJK particles still count as edges.
+    letter = f"[{_ALPHABETIC}]"
+    left = f"(?<!{letter})" if re.match(letter, term[0]) else ""
+    right = f"(?:e?s)?(?!{letter})" if re.match(letter, term[-1]) else ""
+    return left + re.escape(term) + right
 
 
 def _term_spans(
@@ -55,14 +67,7 @@ def _term_spans(
     original_text = text
     if not case_sensitive:
         term, text = term.casefold(), text.casefold()
-    # Alphabetic letters only: digits ("HP100") and CJK particles still count as edges.
-    letter = f"[{_ALPHABETIC}]"
-    left = f"(?<!{letter})" if re.match(letter, term[0]) else ""
-    right = f"(?:e?s)?(?!{letter})" if re.match(letter, term[-1]) else ""
-    spans = [
-        match.span()
-        for match in re.finditer(left + re.escape(term) + right, text)
-    ]
+    spans = [match.span() for match in re.finditer(_term_pattern(term), text)]
     if spans and len(text) != len(original_text):
         # Case folding can expand characters ("ß" -> "ss"). All glossary entries,
         # including case-sensitive ones, must share the original source coordinates.
@@ -216,11 +221,11 @@ def _markup_nesting_ok(text: str, paired: set[str]) -> bool:
 
 def protected_tokens(text: str, extra_patterns: list[str] | None = None) -> Counter[str]:
     # Defaults scan as one leftmost alternation, so nested matches ("$d" in "%1$d") never double-count.
-    tokens = [match.group(0) for match in _DEFAULT_PROTECTED_RE.finditer(text)]
-    for pattern in extra_patterns or []:
+    tokens = Counter(match.group(0) for match in _DEFAULT_PROTECTED_RE.finditer(text))
+    for pattern in extra_patterns or ():
         # Capturing groups describe a pattern, not the bytes protected by it.
-        tokens.extend(match.group(0) for match in re.finditer(pattern, text))
-    return Counter(tokens)
+        tokens.update(match.group(0) for match in re.finditer(pattern, text))
+    return tokens
 
 _PARENTHETICAL_MARKS = {"(": ")", "\uff08": "\uff09"}
 _PARENTHETICAL_CLOSE = set(_PARENTHETICAL_MARKS.values())

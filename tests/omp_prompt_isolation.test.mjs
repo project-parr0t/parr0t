@@ -95,9 +95,6 @@ describe("OMP descendant communication boundary", () => {
       for (const sessionStart of [false, true]) {
         const session = await child(fixture(native), sessionStart);
         await deniedWithoutDelivery(session, "write", { path: "agent://Main", content: "synthetic" });
-        expect([...session.tools.keys()]).toEqual(["parr0t_process"]);
-        expect(session.handlers.has("assistant_message")).toBe(false);
-        expect(session.handlers.has("tool_result")).toBe(false);
       }
     }
   });

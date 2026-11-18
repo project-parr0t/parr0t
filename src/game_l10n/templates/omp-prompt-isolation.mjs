@@ -1,5 +1,7 @@
 import { readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
+import registerFrameworkModeApproval, { checkFrameworkToolCall } from "./framework-mode-approval.mjs";
+import createNativeRelayLifecycle from "./native-relay-lifecycle.mjs";
 
 // Enforce child host-tool communication boundaries without an OS sandbox.
 // Native processes use the public exec API, never the embedded URL filesystem.
@@ -148,6 +150,11 @@ function bindTaskMarkers(name, input, marker) {
 export default function promptIsolation(pi) {
   pi.registerFlag("parr0t-workspace", { description: "Absolute Parr0t workspace for prompt child communication boundaries", type: "string" });
   let relay;
+  const lifecycle = createNativeRelayLifecycle({
+    workspace,
+    relayPath: () => relay,
+    executeCore: (argv, ctx) => pi.exec(argv[0], argv.slice(1), { cwd: workspace(ctx) }),
+  });
   const z = pi.zod;
   if (!z || typeof pi.exec !== "function") throw new Error("PARR0T_OMP_PROMPT_ISOLATION: native process API required");
   pi.registerTool({
@@ -159,7 +166,11 @@ export default function promptIsolation(pi) {
       if (!Array.isArray(params.argv) || !params.argv.length
           || params.argv.some(arg => typeof arg !== "string" || arg.includes("\0"))
           || !params.argv[0].trim()) throw new Error("PARR0T_OMP_PROMPT_ISOLATION: native argv required");
-      const result = await pi.exec(params.argv[0], params.argv.slice(1), { cwd: params.cwd ?? ctx.cwd, signal });
+      if (relay && ctx.agent?.kind === "sub" && ctx.agent.depth === 1) {
+        const decision = await lifecycle.tool_call({ toolName: "parr0t_process", input: params }, ctx);
+        if (decision?.block) throw new Error(decision.reason);
+      }
+      const result = await pi.exec(params.argv[0], params.argv.slice(1), { cwd: params.cwd ?? (relay ? workspace(ctx) : ctx.cwd), signal });
       return {
         content: [{ type: "text", text: result.stdout + result.stderr }],
         details: result,
@@ -172,10 +183,11 @@ export default function promptIsolation(pi) {
     return typeof configured === "string" && path.isAbsolute(configured)
       ? configured : process.env[WORKSPACE_ENV] ?? ctx.cwd;
   }
+  registerFrameworkModeApproval(pi, workspace);
   pi.on("session_start", (_event, ctx) => {
     if (ctx.agent?.kind === "main") process.env[WORKSPACE_ENV] = workspace(ctx);
   });
-  pi.on("before_agent_start", (event, ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     if (ctx.agent?.kind !== "sub") return;
     let bound;
     try { bound = boundRelay(event.prompt, workspace(ctx)); }
@@ -187,20 +199,28 @@ export default function promptIsolation(pi) {
       if (relay && relay !== bound) throw new Error("PARR0T_OMP_PROMPT_ISOLATION: child relay binding cannot change");
       relay = bound;
     }
+    await lifecycle.before_agent_start(event, ctx);
     const blocks = (Array.isArray(event.systemPrompt) ? event.systemPrompt : [event.systemPrompt ?? ""]).map(stripCollaboration);
     if (!blocks.includes(POLICY)) blocks.push(POLICY);
     return { systemPrompt: Array.isArray(event.systemPrompt) ? blocks : blocks.join("\n\n") };
   });
-  pi.on("tool_call", (event, ctx) => {
+  pi.on("tool_call", async (event, ctx) => {
+    try { checkFrameworkToolCall(event, ctx, realpathSync(workspace(ctx))); }
+    catch (error) { return { block: true, reason: error.message }; }
     if (ctx.agent?.kind !== "sub") return;
     try {
       if (deniedCall(event.toolName, event.input)) return { ...DENIAL };
       if (relay) {
         const marker = `PARR0T_OMP_RELAY=${path.relative(realpathSync(workspace(ctx)), relay).split(path.sep).join("/")}`;
         if (toolName(event.toolName) === "task" || WRAPPERS.has(toolName(event.toolName))) {
-          return { input: bindTaskMarkers(event.toolName, structuredClone(event.input), marker) };
+          const input = bindTaskMarkers(event.toolName, structuredClone(event.input), marker);
+          return await lifecycle.tool_call({ ...event, input }, ctx) ?? { input };
         }
       }
+      return await lifecycle.tool_call(event, ctx);
     } catch { return { ...DENIAL }; }
   });
+  pi.on("before_subagent_spawn", lifecycle.before_subagent_spawn);
+  pi.on("tool_result", lifecycle.tool_result);
+  pi.on("agent_end", lifecycle.agent_end);
 }
