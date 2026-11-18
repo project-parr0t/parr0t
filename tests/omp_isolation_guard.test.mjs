@@ -665,6 +665,7 @@ describe("file-backed OMP host/message isolation", () => {
       writeFileSync(path.join(path.dirname(guardPath), "framework-mode-approval.mjs"), readFileSync(path.join(path.dirname(template), "framework-mode-approval.mjs")));
       writeFileSync(path.join(packageRoot, "templates/native-relay-lifecycle.mjs"), readFileSync(path.join(path.dirname(template), "native-relay-lifecycle.mjs")));
       writeFileSync(path.join(packageRoot, "templates/omp-prompt-isolation.mjs"), readFileSync(path.join(path.dirname(template), "omp-prompt-isolation.mjs")));
+      writeFileSync(path.join(packageRoot, "templates/omp-native-process.mjs"), readFileSync(path.join(path.dirname(template), "omp-native-process.mjs")));
       writeFileSync(path.join(packageRoot, "templates/native-python.py"), readFileSync(path.join(path.dirname(template), "native-python.py")));
       writeFileSync(path.join(packageRoot, "__init__.py"), "");
       const cliPath = path.join(packageRoot, "cli.py");
@@ -783,6 +784,7 @@ describe("file-backed OMP host/message isolation", () => {
     writeFileSync(path.join(path.dirname(copied), "framework-mode-approval.mjs"), readFileSync(path.join(path.dirname(template), "framework-mode-approval.mjs")));
     writeFileSync(path.join(path.dirname(copied), "native-relay-lifecycle.mjs"), readFileSync(path.join(path.dirname(template), "native-relay-lifecycle.mjs")));
     writeFileSync(path.join(path.dirname(copied), "omp-prompt-isolation.mjs"), readFileSync(path.join(path.dirname(template), "omp-prompt-isolation.mjs")));
+    writeFileSync(path.join(path.dirname(copied), "omp-native-process.mjs"), readFileSync(path.join(path.dirname(template), "omp-native-process.mjs")));
     const loaded = (await import(pathToFileURL(copied).href)).default;
     const root = host(f.workspace, "main", 0, "Anything", loaded);
     await root.emit("session_start");
