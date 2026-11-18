@@ -108,6 +108,7 @@ class ReviewPolicyTests(unittest.TestCase):
         from game_l10n.native_review import _bound_result, collect_native_review
         from game_l10n.formats import read_segments
         from tests.test_native_pass import review_segment
+        from tests import write_semantic_result_rows
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             segments = [review_segment(name) for name in ("a", "b")]
@@ -123,8 +124,13 @@ class ReviewPolicyTests(unittest.TestCase):
                 for binding in relay["task_bindings"]:
                     ids = [json.loads(line)["target_id"] for line in (root / binding["task"]).read_text(encoding="utf-8").splitlines()]
                     destination = root / binding["result"]
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    destination.write_text("".join(json.dumps({"target_id": target, "status": "refused", "text": ""}) + "\n" for target in ids), encoding="utf-8")
+                    write_semantic_result_rows(
+                        destination,
+                        [
+                            {"target_id": target, "status": "refused", "text": ""}
+                            for target in ids
+                        ],
+                    )
             done = native_control_step(root, manifest_path, results)
             self.assertEqual(done["action"], "aggregate_completed_pass")
             self.assertEqual(done["review_split"]["semantic_passes"], 2)

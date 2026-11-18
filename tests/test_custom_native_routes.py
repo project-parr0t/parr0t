@@ -14,9 +14,14 @@ from game_l10n.errors import ConfigurationError
 from game_l10n.formats import read_segments, read_translation_results
 from game_l10n.models import Segment
 from game_l10n.native_pass import merge_native_pass, native_control_step, seal_native_wave_relay
-from game_l10n.native_runtime import configure_native_runtime, record_native_launch
+from game_l10n.native_runtime import (
+    configure_native_runtime,
+    native_runtime,
+    record_native_launch,
+)
 from tests.test_native_pass import review_segment
 from tests.omp_isolation_fixture import bind_omp_isolation
+from tests import write_semantic_result_rows
 
 
 class CustomNativeRouteTests(unittest.TestCase):
@@ -52,8 +57,7 @@ class CustomNativeRouteTests(unittest.TestCase):
 
     @staticmethod
     def write_rows(path, rows):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        write_semantic_result_rows(path, rows)
 
     def source(self, name, segments):
         path = self.root / name
@@ -124,7 +128,16 @@ class CustomNativeRouteTests(unittest.TestCase):
                 [(segment.id, "success" if segment.id == success else "refused",
                   "TARGET_" + segment.id.upper() if segment.id == success else "") for segment in pending],
                 provider=provider, attempt=attempt)
-            self.assertEqual(manifest["route_binding"], {"provider": provider, "attempt": attempt})
+            self.assertEqual(
+                manifest["route_binding"],
+                {
+                    "provider": provider,
+                    "model": native_runtime(self.root, required=True)["models"][
+                        provider
+                    ],
+                    "attempt": attempt,
+                },
+            )
             state = self.cli("advance-native-translation-retries", "--state", state["state"],
                              "--results", results)
         self.assertEqual((state["next_action"], state["candidate_count"], state["pending_count"]),

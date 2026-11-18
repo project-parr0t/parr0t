@@ -14,14 +14,11 @@ from game_l10n.native_translation_retry import (
     require_pre_fallback_retry_state,
     start_native_translation_retries,
 )
+from tests import write_semantic_result_rows
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
-        encoding="utf-8",
-    )
+    write_semantic_result_rows(path, rows)
 
 
 def _result(target_id: str, status: str, text: str = "", provider: str = "native-luna") -> dict:

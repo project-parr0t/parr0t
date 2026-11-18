@@ -23,6 +23,7 @@ from game_l10n.native_pass import (
 from game_l10n.native_followup import CANDIDATE_METADATA_KEY
 from game_l10n.store import stable_hash
 from tests.test_validators import optional_slot_fixture
+from tests import write_semantic_result_rows
 
 
 def review_segment(segment_id: str, source: str = "S", candidate: str = "T") -> Segment:
@@ -904,10 +905,7 @@ class NativePassTests(unittest.TestCase):
             self.assertFalse((root / ".game-l10n/native/shards").exists())
 
     def _write_rows(self, path: Path, rows: list[dict]) -> None:
-        path.write_text(
-            "".join(json.dumps(row) + "\n" for row in rows),
-            encoding="utf-8",
-        )
+        write_semantic_result_rows(path, rows)
 
     def test_exclusive_shards_merge_in_source_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1210,7 +1208,14 @@ class NativePassTests(unittest.TestCase):
         self.assertEqual(manifest["language_binding"]["target_language"], "ko")
         self.assertEqual(
             manifest["result_contract"]["canonical_fields"],
-            ["target_id", "status", "text", "provider", "issues"],
+            [
+                "target_id",
+                "status",
+                "text",
+                "provider",
+                "issues",
+                "content_provenance",
+            ],
         )
         self.assertFalse(
             manifest["result_contract"]["alternate_text_fields_allowed"]
