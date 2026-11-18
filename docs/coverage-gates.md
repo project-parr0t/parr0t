@@ -1,17 +1,17 @@
 # Coverage and completion gates
 
-Parr0t separates four claims that must not be collapsed into one “complete” result:
+Parr0t reports coverage and assurance honestly; a single “complete” label must not erase what was actually verified:
 
-1. **Static inventory coverage** — two independent extraction methods found the same ordered targets and neither excluded user-visible scope.
-2. **Result alignment** — the current result artifact has exactly one matching row for every target in its declared scope.
-3. **Semantic review coverage** — every non-preserved candidate, including reused and previously unflagged candidates, received a fresh independent low-cost triage or selected strong verdict for this context and candidate digest.
-4. **Runtime coverage** — an authorized or user-executed observation found no unmatched, untranslated, unvisited, or unobservable user-visible state.
+1. **Static inventory coverage** — in full-assurance mode, two independent extraction methods agree on ordered targets and user-visible scope. A configured lower-assurance mode reports its narrower evidence and never claims independent verification.
+2. **Result alignment** — the current result artifact has exactly one matching row for every target in its declared scope; partial artifacts retain explicit pending IDs.
+3. **Semantic review coverage** — each claimed reviewed candidate has current-generation verdict evidence bound to its context and candidate digest.
+4. **Runtime coverage** — an authorized or user-executed observation reports unmatched, untranslated, unvisited, and unobservable user-visible states.
 
-Only the fourth claim can establish runtime completeness. Static checks must report `REAL_RUNTIME_NOT_EXECUTED` when no runtime report exists. `manifest_missing_count=0` is never evidence that the running game has zero omissions.
+Only runtime evidence establishes runtime completeness. Static checks report `REAL_RUNTIME_NOT_EXECUTED` when no runtime report exists. `manifest_missing_count=0` never proves that the running game has no omissions. Lower assurance may establish a useful checkpoint but must not be labeled full assurance.
 
 ## Independent source inventories
 
-The selected engine SDK produces two JSON documents in the private workspace. They use different extraction methods but the same stable target-ID contract:
+Full-assurance inventory verification uses two independently implemented extraction methods with the same stable target-ID contract. When `coverage.require_independent_inventory` is false, report the selected lower assurance explicitly; do not claim independent coverage or silently weaken a requested full-assurance gate.
 
 ```json
 {
@@ -65,7 +65,7 @@ Startup determines missing inventories from the canonical primary/independent pa
 
 Inventory strings, including IDs, metadata values, and object keys, must contain valid Unicode scalar values in UTF-8 JSON. Malformed UTF-8 or unpaired surrogate escapes fail categorically with `E_INVENTORY_INVALID_UNICODE` before a new attestation or identity binding is written. No replacement, dropping, or lossy normalization is permitted. Valid supplementary characters, including JSON surrogate-pair escapes decoded to those characters, retain their exact content and fingerprint behavior.
 
-Every saved attestation also records a metadata-only reconciliation generation, gap vector, gap score, identity gate, and progress state. `incomplete` always has `continuation_required=true` and is never a terminal job result. `reconcile_inventory_identity_namespace` repairs aliases before ordinary content gaps. If a bounded repair reduces the gap score, run the next `inventory_reconciler` task from cached scans. An ID/order mismatch, local parser/layout error, or newly found target is not a user decision and must not end the job. Stop only when status proves an external missing input/capability, an applicable deterministic gate, or the configured unchanged-progress limit; preserve the checkpoint and exact remaining codes. A root call/token turn ceiling is not applicable unless the user explicitly requested its concrete value and the manifest records that approval.
+Every attestation records a metadata-only reconciliation generation, gaps, identity gate, and progress. `incomplete` requires continuation and is not a terminal success. Reconcile from cached scans; mismatch, parser/layout repair, and newly found targets are actionable work, not a user decision or semantic exhaustion. Continue eligible repair and independent work without whole-wave/no-progress barriers. Stop for an actual external blocker, deterministic gate, or user stop; retain the checkpoint and exact remaining codes.
 
 The metadata-only `agreed_target_count` counts active comparison keys whose source, UI/display contract and localization authority agree across both methods. A lower complete blocker score is improvement. At an equal score, an unchanged blocker vector may also report `improved` when this agreement count grows and neither active denominator shrinks; a remaining completeness declaration does not erase that progress. Raw-occurrence growth and fingerprint churn alone do not qualify. Identical input fingerprints report `unchanged`; other uncredited input changes report `changed`. None of these observations grants static completion, waives proof, changes retry routes or creates a job limit.
 
@@ -91,7 +91,7 @@ Pair verification reuses each document's validated active scope and a shared can
 
 ## Context execution gate
 
-The context state records a successful sealed context task. Provider refusal, capacity, timeout, malformed output, or another operational error produces a non-success receipt and status exposes a fresh bound `context_analyzer` attempt; an existing partial file never converts that failure into success. Each new task binds one configured native route. Its relay may run the configured ceiling of up to 32 core-bound workers on disjoint atomically claimed chunks, store slot-owned fragments, and invoke one fresh source-order finalizer; workers never share-write the context pack. Completed fragments remain cached and only unfinished claims retry. A receipt with measurable progress restores the configured base chunk ceiling; only a complete no-progress route cycle halves it toward the floor. Each attempt owns a generation-and-attempt-specific envelope, so stale output cannot be resealed. The top-level agent sees only receipt counts and must not substitute `analyze-context`, inspect private fragments, or read the source inventory. Only the core seal may write a successful context state after deterministic domain and evidence coverage passes. Context receipts and native-pass unchanged-observation limits are nonterminal here; only status may prove an external blocker.
+The context state records sealed successful work; refusal, capacity, timeout, malformed output, or operational error remains non-success. Each task binds a configured native route. Worker counts and chunk sizes use safe defaults but honor explicit bounds and available host/model capacity. Completed fragments remain reusable; continue unfinished claims and available independent work without requiring a whole no-progress route cycle. Stale output cannot be resealed, and only core sealing writes successful context state after evidence validation.
 
 ## Existing translation review
 
@@ -106,15 +106,18 @@ Correction and re-review may change target text only. They never rename a target
 
 ## Failure queue and held patches
 
-Retryable failures are saved as target IDs, categorical failure codes, and blocking state only. They contain no source or translation text. The queue is not retried automatically in a later turn. After the user explicitly asks to continue, run:
+Retryable failures remain private categorical queue entries. An authorized job may continue pending work under core-selected configured routes; operational/admission errors can advance only to an already-approved native successor using a fresh manifest. A real user pause or stop is respected, but a fresh human request is not a prerequisite for resuming authorized work.
 
 ```text
 game-l10n resume-failures --workspace <workspace> --input <primary.json> --output <results.json> --user-requested
 ```
+`--user-requested` asserts the existing user's authorization to continue; it is not a requirement for a new interactive confirmation.
 
-`failed` entries remain in the retryable queue. `source_preserved` and user-approved `accepted_unreviewed` entries are terminal unresolved outcomes and are recorded separately; they are not silently retried by `resume-failures`. A new user request may reopen them only through a new explicit correction or translation decision, never by pretending the exhausted route is still pending.
+`failed` entries remain retryable under configured policy. `source_preserved` and `accepted_unreviewed` remain visibly unresolved; reopening either requires an applicable explicit correction or translation decision, not pretending exhausted work is pending. Repair-needed or unattempted targets are not route exhaustion.
 
-An SDK marks a target `metadata.blocking_on_failure=true` when leaving that target untranslated would make the patch unusable or unsafe. If any retryable or terminal blocking target is unresolved, Parr0t writes a private held checkpoint, returns status `held`, and does not emit the requested patch artifact. Optional targets may preserve exact source after route exhaustion; they can be packaged, but both the failure queue and completion attestation keep them visibly terminal-unresolved rather than translated.
+Targets marked `metadata.blocking_on_failure=true` remain blocking when unresolved. By default, do not claim a complete patch while a blocking target is unresolved. When explicitly configured, `failure_queue.allow_incomplete_artifact` may produce a separately identified incomplete artifact; it must not be presented as full coverage or a complete patch. Optional targets may preserve exact source only after actual configured-route exhaustion and remain visibly unresolved.
+The legacy `hold_patch_when_blocking_target_fails` setting is not permission to publish incomplete output; use the separate `failure_queue.allow_incomplete_artifact` mode only when an honestly incomplete artifact is explicitly requested.
+When `required_for_distribution=false`, a locally integrity-verified checkpoint may complete without satisfying publication requirements. `assurance_completion` must match the actual assurance mode; a lower-assurance checkpoint cannot claim full independent coverage. Full publication remains subject to the requested full-assurance gates.
 
 ## Result-to-patch binding
 

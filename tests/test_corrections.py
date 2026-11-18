@@ -13,7 +13,7 @@ from game_l10n.corrections import (
 )
 from game_l10n.formats import write_results
 from game_l10n.models import AttemptRecord, Segment, TranslationResult
-from game_l10n.release_checkpoint import CHECKPOINT_SCHEMA
+from game_l10n.release_checkpoint import CHECKPOINT_SCHEMA, LOCAL_INTEGRITY_SCHEMA, validate_release_checkpoint
 from game_l10n.store import stable_hash
 
 
@@ -100,6 +100,44 @@ def _checkpoint(
 
 
 class CorrectionTests(unittest.TestCase):
+    def test_dependency_corrections_reject_valid_local_integrity_before_creating_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segment = Segment("synthetic-one", "SYNTHETIC SOURCE")
+            result = _result(segment.id, segment.source, "SYNTHETIC TARGET")
+            fingerprint = _digest("synthetic-inventory")
+            full = _checkpoint([segment], [result], fingerprint)
+            local = {
+                "schema": LOCAL_INTEGRITY_SCHEMA,
+                "patch_id": full["patch_id"], "release_id": full["release_id"],
+                "ownership": {"owner": "Synthetic owner", "license": "MIT"},
+                "source_inventory": full["source_inventory"],
+                "language": {"source": "en", "target": "ko"},
+                "entries": [{
+                    key: full["entries"][0][key] for key in (
+                        "id", "source_sha256", "target", "target_sha256", "status",
+                    )
+                } | {"integrity_evidence_sha256": _digest("synthetic-integrity-evidence")}],
+            }
+            self.assertEqual(validate_release_checkpoint(local), local)
+            checkpoint = root / "local-integrity.json"
+            checkpoint.write_text(json.dumps(local), encoding="utf-8")
+            checkpoint_bytes = checkpoint.read_bytes()
+            request = root / "request.json"
+            request.write_text(json.dumps({
+                "schema": CORRECTION_REQUEST_SCHEMA,
+                "changes": [{"id": segment.id, "target": "SYNTHETIC CORRECTION"}],
+            }), encoding="utf-8")
+            output = root / "corrected.json"
+            with self.assertRaisesRegex(CorrectionError, "require a full release checkpoint"):
+                apply_user_corrections(
+                    segments=[segment], base_results_path=None,
+                    checkpoint_path=checkpoint, request_path=request, output_path=output,
+                    expected_inventory_fingerprint=fingerprint,
+                )
+            self.assertFalse(output.exists())
+            self.assertEqual(checkpoint.read_bytes(), checkpoint_bytes)
+
     def test_exact_user_correction_changes_only_named_target_without_model_work(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

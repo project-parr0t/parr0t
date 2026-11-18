@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 const SCHEMA = "parr0t.omp-native-admission.v1";
@@ -18,6 +18,41 @@ function writeRecord(file, record) {
   const temporary = `${file}.${process.pid}.tmp`;
   writeFileSync(temporary, JSON.stringify(record), { mode: 0o600 });
   renameSync(temporary, file);
+}
+
+// Catalog metadata is resolution evidence, never a per-call model grant.
+export function publishHostModels(ctx, workspace) {
+  if (ctx.agent?.kind !== "main" || ctx.agent.depth !== 0) return;
+  const root = realpathSync(workspace);
+  const directory = path.join(root, ".game-l10n", "native");
+  const target = path.join(directory, "host-models.json");
+  try {
+    const session = ctx.sessionManager?.getSessionId?.();
+    const catalog = ctx.modelRegistry?.getAll?.();
+    if (typeof session !== "string" || !session.trim() || !Array.isArray(catalog)) throw new Error("metadata unavailable");
+    const models = [];
+    const seen = new Set();
+    for (const model of catalog) {
+      const provider = model?.provider;
+      const id = model?.id;
+      if (typeof provider !== "string" || !provider || typeof id !== "string" || !id) continue;
+      const selector = `${provider}/${id}`;
+      if (seen.has(selector)) continue;
+      seen.add(selector);
+      models.push({ provider, id, selector });
+    }
+    const record = { schema: "parr0t.native-host-models.v1", host: "omp",
+      session_id: session, process_id: process.pid, models };
+    if (typeof ctx.model?.provider === "string" && typeof ctx.model?.id === "string") {
+      record.current_model = `${ctx.model.provider}/${ctx.model.id}`;
+    }
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    if (realpathSync(directory) !== directory) return;
+    writeRecord(target, record);
+  } catch {
+    // A previous session's catalog must not masquerade as this host's metadata.
+    try { if (realpathSync(directory) === directory) rmSync(target, { force: true }); } catch {}
+  }
 }
 
 // Runs only in a trusted loaded host extension. It does not dispatch another

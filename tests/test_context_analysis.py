@@ -123,6 +123,15 @@ def successful_knowledge_context(**kwargs):
 
 
 class ContextAnalysisTests(unittest.TestCase):
+    def test_positive_context_capacity_is_not_arbitrarily_clamped(self) -> None:
+        analyzer = ContextAnalyzer(ProviderRegistry(), ["configured"], max_workers=257, max_chunk_chars=1_000_001)
+        self.assertEqual(analyzer.max_workers, 257)
+        self.assertEqual(analyzer.max_chunk_chars, 1_000_001)
+        for field in ("max_workers", "max_chunk_chars"):
+            for value in (0, -1, True):
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(ValueError, "positive integer"):
+                    ContextAnalyzer(ProviderRegistry(), ["configured"], **{field: value})
+
     @staticmethod
     def _context_free_ui_metadata(**extra):
         return {

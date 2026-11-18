@@ -1,10 +1,10 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import createLifecycle from "../src/game_l10n/templates/native-relay-lifecycle.mjs";
+import createLifecycle, { publishHostModels } from "../src/game_l10n/templates/native-relay-lifecycle.mjs";
 
 async function fixture(run) {
   const workspace = mkdtempSync(path.join(os.tmpdir(), "parr0t-lifecycle-state-"));
@@ -124,4 +124,38 @@ test("partial batch admission failure cannot strand a completed sibling", async 
     await finalizer.end({ willContinue: false, awaitingAsyncWork: false });
     assert.deepEqual(events, ["start:0", "end:0", "start:1", "end:1", "finalizer-start", "finalizer-end"]);
   });
+});
+
+test("public host catalog snapshot contains resolution metadata only and never grants authorization", () => {
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "parr0t-public-models-"));
+  try {
+    const model = { provider: "provider", id: "literal-model@upstream:high", apiKey: "PRIVATE_CREDENTIAL", headers: { authorization: "PRIVATE_HEADER" } };
+    const ctx = {
+      agent: { kind: "main", depth: 0 },
+      sessionManager: { getSessionId: () => "synthetic-main-session" },
+      modelRegistry: {
+        getAll: () => [model, model, { provider: "other", id: "literal-model@upstream:high" }],
+        getAvailable() { throw new Error("must not query credentials or availability"); },
+        getApiKey() { throw new Error("must not query credentials"); },
+      },
+      model,
+    };
+    publishHostModels(ctx, workspace);
+    const file = path.join(workspace, ".game-l10n/native/host-models.json");
+    const bytes = readFileSync(file, "utf8");
+    assert.deepEqual(JSON.parse(bytes), {
+      schema: "parr0t.native-host-models.v1", host: "omp",
+      session_id: "synthetic-main-session", process_id: process.pid,
+      models: [
+        { provider: "provider", id: model.id, selector: `provider/${model.id}` },
+        { provider: "other", id: model.id, selector: `other/${model.id}` },
+      ],
+      current_model: `provider/${model.id}`,
+    });
+    assert.ok(!bytes.includes("PRIVATE"));
+    publishHostModels({ ...ctx, agent: { kind: "sub", depth: 1 } }, workspace);
+    assert.equal(readFileSync(file, "utf8"), bytes);
+    publishHostModels({ ...ctx, modelRegistry: undefined }, workspace);
+    assert.equal(existsSync(file), false);
+  } finally { rmSync(workspace, { recursive: true, force: true }); }
 });

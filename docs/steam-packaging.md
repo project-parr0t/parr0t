@@ -42,7 +42,24 @@ Place the completed files under a payload directory in the external workspace. C
 }
 ```
 
-`patch_id` is the stable status/receipt identity. `release_id` changes when a new package replaces the previous release. `checkpoint_file` is required, is resolved beside or below the private spec, and must satisfy `docs/release-checkpoint.md` with matching patch/release IDs. The builder canonicalizes it and places it at ZIP root as `parr0t-release-checkpoint.json`; it is release metadata and is not copied into the game. `required_files` is optional and validates a manually selected game root. `source_bindings` is optional and binds supported original byte counts and hashes to registered custom errors; omission is equivalent to `[]` for v4 compatibility. `replace_files` is optional and is reserved for payload paths that must replace and later restore an original game file; omit `backup_path` to use the private `.parr0t/backups/<patch-id>/...` default. `custom_errors` is optional and uses the isolated `PARR0T-<SCOPE>-E###` namespace. Real identifiers and payload paths stay in the private workspace and generated ZIP; they must not be committed to Parr0t.
+`patch_id` is the stable status/receipt identity. `release_id` changes when a new package replaces the previous release. Published packages supply `checkpoint_file`, resolved beside or below the private spec, and must satisfy `docs/release-checkpoint.md` with matching patch/release IDs. Local-only packages instead may supply `local_checkpoint` when workspace configuration sets `release_checkpoint.required_for_distribution` to `false`; its generated checkpoint is canonicalized into the ZIP as `parr0t-release-checkpoint.json`. The checkpoint is package metadata and is not copied into the game. `required_files` is optional and validates a manually selected game root. `source_bindings` is optional and binds supported original byte counts and hashes to registered custom errors; omission is equivalent to `[]` for v4 compatibility. `replace_files` is optional and is reserved for payload paths that must replace and later restore an original game file; omit `backup_path` to use the private `.parr0t/backups/<patch-id>/...` default. `custom_errors` is optional and uses the isolated `PARR0T-<SCOPE>-E###` namespace. Real identifiers and payload paths stay in the private workspace and generated ZIP; they must not be committed to Parr0t.
+
+For local-only packaging, set workspace configuration `release_checkpoint.required_for_distribution` to `false` and omit `checkpoint_file`. The spec may instead contain:
+
+```json
+{
+  "local_checkpoint": {
+    "inventory": "inventory.json",
+    "results": "translation-results.json",
+    "ownership": {
+      "owner": "Authorized owner",
+      "license": "License identifier"
+    }
+  }
+}
+```
+
+The inventory/results paths must resolve to existing workspace files; ownership requires explicit nonempty values. The packager validates these inputs and generates the local integrity checkpoint and evidence into a private immutable spec. `local_checkpoint` and `checkpoint_file` are mutually exclusive. This local-only mode does not qualify the package for publication.
 
 ## Build and verify
 

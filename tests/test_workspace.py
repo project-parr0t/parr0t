@@ -20,6 +20,7 @@ from game_l10n.cli import (
     _completion_state_valid,
     _context_state_valid,
     _require_provider_credential,
+    build_parser,
     cmd_doctor,
     cmd_init,
     cmd_policy,
@@ -191,30 +192,26 @@ class WorkspaceTests(unittest.TestCase):
             )
         )
 
-    def test_cli_cannot_infer_the_initial_game_workspace_git_choice(self) -> None:
+    def test_cli_defaults_to_disabled_git_and_records_explicit_language(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sdk = root / "sdk"
             work = root / "work"
             sdk.mkdir()
-            args = SimpleNamespace(
-                workspace=str(work),
-                sdk_root=str(sdk),
-                game_root=[],
-                git_choice="disabled",
-                provider_preset="codex-app-deepseek",
-                user_confirmed_git_choice=False,
-            )
-            with self.assertRaisesRegex(
-                ConfigurationError, "explicit user confirmation"
-            ):
-                cmd_init(args)
-            args.user_confirmed_git_choice = True
+            args = build_parser().parse_args([
+                "init-workspace", str(work), "--sdk-root", str(sdk), "--target-language", "fr",
+            ])
             with redirect_stdout(StringIO()):
                 cmd_init(args)
-            self.assertEqual(
-                load_config(work)["repository"]["initial_choice"], "disabled"
-            )
+            config = load_config(work)
+            self.assertEqual(config["repository"]["initial_choice"], "disabled")
+            self.assertEqual(config["project"]["target_language"], "fr")
+            from game_l10n.language_policy import target_language_policy
+            policy = target_language_policy(work)
+            self.assertEqual(policy["target_language"], "fr")
+            self.assertEqual(policy["authorization"], "explicit_user_request")
+            self.assertFalse((work / ".git").exists())
+            self.assertNotIn("publish_approved", config["repository"])
 
             policy_work = root / "policy-work"
             initialize_workspace(policy_work, sdk)
@@ -229,7 +226,7 @@ class WorkspaceTests(unittest.TestCase):
             ):
                 cmd_policy(policy_args)
             self.assertEqual(
-                load_config(policy_work)["repository"]["initial_choice"], "pending"
+                load_config(policy_work)["repository"]["initial_choice"], "disabled"
             )
             policy_args.user_confirmed_git_choice = True
             with redirect_stdout(StringIO()):
@@ -237,6 +234,30 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(
                 load_config(policy_work)["repository"]["initial_choice"], "disabled"
             )
+
+    def test_cli_requires_confirmation_before_enabling_git(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            args = SimpleNamespace(
+                workspace=str(work),
+                sdk_root=str(sdk),
+                game_root=[],
+                git_choice="enabled",
+                provider_preset="codex-app-deepseek",
+                target_language="ko",
+                user_confirmed_git_choice=False,
+            )
+            with self.assertRaisesRegex(ConfigurationError, "explicit user confirmation"):
+                cmd_init(args)
+            self.assertFalse(work.exists())
+            args.user_confirmed_git_choice = True
+            with redirect_stdout(StringIO()):
+                cmd_init(args)
+            self.assertEqual(load_config(work)["repository"]["initial_choice"], "enabled")
+            self.assertFalse((work / ".git").exists())
 
     def test_portable_sdk_snapshot_activates_without_git(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -467,7 +488,7 @@ class WorkspaceTests(unittest.TestCase):
                 _context_state_valid(payload, context, None, "inventory-v1")
             )
 
-    def test_legacy_native_execution_defaults_upgrade_in_memory(self) -> None:
+    def test_execution_migration_preserves_selected_shards_and_removes_obsolete_quotas(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sdk = root / "sdk"
@@ -479,6 +500,8 @@ class WorkspaceTests(unittest.TestCase):
             execution = legacy["execution"]
             execution["native_shard_records"] = 32
             execution["native_shard_material_tokens"] = 12_000
+            execution["max_semantic_model_calls_per_task"] = 1
+            execution["bulk_budget_gate_records"] = 4096
             for key in (
                 "native_shard_policy_version",
                 "native_shard_min_records",
@@ -489,12 +512,10 @@ class WorkspaceTests(unittest.TestCase):
                 "max_root_model_calls_per_turn",
                 "max_root_input_tokens_per_turn",
                 "max_root_progress_messages_per_wave",
-                "max_worker_model_calls_per_task",
-                "max_semantic_model_calls_per_task",
+                "native_review_split_max_depth",
                 "per_record_semantic_call_loop_allowed",
                 "detail_contract_schema",
                 "free_form_execution_contract_allowed",
-                "bulk_budget_gate_records",
                 "bulk_max_elapsed_minutes",
                 "bulk_max_input_tokens",
                 "bulk_max_provider_cost_usd",
@@ -510,22 +531,16 @@ class WorkspaceTests(unittest.TestCase):
             )
             upgraded = load_config(work)["execution"]
 
-        self.assertEqual(upgraded["native_shard_policy_version"], 5)
-        self.assertEqual(upgraded["native_shard_records"], 64)
-        self.assertEqual(upgraded["native_shard_min_records"], 8)
-        self.assertEqual(upgraded["native_shard_material_tokens"], 8_000)
-        self.assertEqual(upgraded["native_review_shard_records"], 2048)
-        self.assertEqual(upgraded["native_review_shard_material_tokens"], 262_144)
+        self.assertEqual(upgraded["native_shard_records"], 32)
+        self.assertEqual(upgraded["native_shard_material_tokens"], 12_000)
         self.assertFalse(upgraded["model_controller_allowed"])
         self.assertFalse(upgraded["worker_delegation_allowed"])
-        self.assertEqual(upgraded["control_turn_budget_policy_version"], 2)
         self.assertFalse(upgraded["control_turn_budget_user_approved"])
         self.assertIsNone(upgraded["max_root_model_calls_per_wave"])
         self.assertIsNone(upgraded["max_root_model_calls_per_turn"])
         self.assertIsNone(upgraded["max_root_input_tokens_per_turn"])
-        self.assertEqual(upgraded["max_semantic_model_calls_per_task"], 1)
-        self.assertFalse(upgraded["per_record_semantic_call_loop_allowed"])
-        self.assertEqual(upgraded["bulk_budget_gate_records"], 4096)
+        self.assertNotIn("max_semantic_model_calls_per_task", upgraded)
+        self.assertNotIn("bulk_budget_gate_records", upgraded)
 
     def test_legacy_framework_turn_limits_are_not_treated_as_user_approval(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -559,29 +574,6 @@ class WorkspaceTests(unittest.TestCase):
             upgraded["budget_exhaustion_action"],
             "continue_until_terminal_or_actionable_blocker",
         )
-
-    def test_legacy_workspace_gains_selective_review_defaults_in_memory(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            sdk = root / "sdk"
-            work = root / "work"
-            sdk.mkdir()
-            initialize_workspace(work, sdk, git_choice="disabled")
-            config_path = work / "game-l10n.json"
-            legacy = json.loads(config_path.read_text(encoding="utf-8"))
-            legacy["routing"].pop("review_triagers")
-            legacy["routing"].pop("strong_review_sample_percent")
-            legacy["routing"].pop("strong_review_high_risk_categories")
-            config_path.write_text(
-                json.dumps(legacy, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-
-            routing = load_config(work)["routing"]
-
-        self.assertEqual(routing["review_triagers"], ["native-luna"])
-        self.assertEqual(routing["strong_review_sample_percent"], 5.0)
-        self.assertIn("wordplay", routing["strong_review_high_risk_categories"])
 
     def test_explicit_user_control_turn_budget_survives_config_loading(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -628,332 +620,236 @@ class WorkspaceTests(unittest.TestCase):
         }
         self.assertFalse(_completion_state_valid(state))
 
-    def test_api_provider_preset_is_ready_after_keys_are_supplied(self) -> None:
+    def test_workspace_defaults_preserve_isolation_without_whole_job_quotas(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sdk = root / "sdk"
             work = root / "work"
             sdk.mkdir()
-            initialize_workspace(
-                work,
-                sdk,
-                git_choice="disabled",
-                provider_preset="openai-deepseek",
-            )
+            initialize_workspace(work, sdk)
             config = load_config(work)
-            generated_agents = (work / "AGENTS.md").read_text(encoding="utf-8")
-            control_state = json.loads(
-                (work / ".game-l10n" / "control-plane-state.json").read_text(
-                    encoding="utf-8"
-                )
-            )
             entry_state = control_plane_entry_state(work)
-            legacy_config = json.loads(json.dumps(config))
-            next(
-                item for item in legacy_config["providers"] if item["name"] == "deepseek"
-            ).pop("task_max_input_chars")
-            legacy_deepseek = ProviderRegistry.from_config(legacy_config, work).get("deepseek")
-            legacy_input_caps = legacy_deepseek.fingerprint()["task_max_input_chars"]
+            control_state = json.loads(
+                (work / ".game-l10n" / "control-plane-state.json").read_text(encoding="utf-8")
+            )
 
-        providers = {item["name"]: item for item in config["providers"]}
-        self.assertEqual(config["provider_preset"], "openai-deepseek")
-        self.assertEqual(config["execution_mode"], "api")
-        self.assertFalse(config["provider_policy"]["key_presence_selects_mode"])
-        self.assertEqual(config["project"]["context_mode"], "auto")
-        self.assertEqual(providers["openai-luna"]["model"], "gpt-6-luna")
-        self.assertEqual(providers["deepseek"]["model"], "deepseek-flash")
-        self.assertNotIn("temperature", providers["deepseek"])
-        self.assertEqual(providers["deepseek"]["thinking"], "disabled")
-        self.assertEqual(providers["deepseek"]["reasoning_effort"], "none")
-        self.assertEqual(providers["deepseek"]["review_verdict_format"], "plain")
-        self.assertEqual(
-            providers["deepseek"]["task_max_input_chars"],
-            {
-                "game_translation": 24000,
-                "game_translation_review_judge": 24000,
-                "game_translation_review_rewrite": 24000,
-            },
-        )
-        self.assertEqual(legacy_input_caps, providers["deepseek"]["task_max_input_chars"])
-        self.assertEqual(providers["openai-sol"]["model"], "gpt-6.1-sol")
-        self.assertEqual(providers["openai-luna"]["reasoning_effort"], "none")
-        self.assertEqual(
-            providers["openai-luna"]["task_max_output_tokens"][
-                "game_translation_review_judge"
-            ],
-            256,
-        )
-        self.assertEqual(providers["openai-sol"]["reasoning_effort"], "low")
-        self.assertEqual(
-            config["routing"]["translators"],
-            ["openai-luna", "openai-sol", "deepseek"],
-        )
-        self.assertEqual(
-            config["routing"]["translator_retries"],
-            {"openai-luna": 5, "openai-sol": 3},
-        )
-        self.assertEqual(config["routing"]["review_triagers"], ["openai-luna"])
-        self.assertEqual(config["routing"]["reviewers"], ["openai-sol", "deepseek"])
-        self.assertEqual(config["routing"]["rewriters"], ["deepseek", "openai-sol"])
-        self.assertEqual(config["routing"]["review_max_rounds"], 2)
-        self.assertEqual(config["routing"]["strong_review_sample_percent"], 5.0)
-        self.assertEqual(
-            providers["openai-sol"]["task_max_output_tokens"][
-                "game_translation_review_judge"
-            ],
-            512,
-        )
-        self.assertEqual(config["routing"]["grace_retries"], 3)
-        self.assertEqual(config["routing"]["review_refusal_policy"], "fallback")
-        self.assertTrue(config["routing"]["defer_fallbacks_until_primary_complete"])
-        self.assertTrue(config["routing"]["preserve_source_on_failure"])
-        self.assertEqual(config["execution"]["scope_mode"], "minimum_requested_artifact")
-        self.assertEqual(config["execution"]["validation_profile"], "proportional")
-        self.assertEqual(config["execution"]["same_failure_limit"], 2)
-        self.assertFalse(config["execution"]["delegate_simple_tasks"])
-        self.assertEqual(config["execution"]["native_shard_policy_version"], 5)
-        self.assertEqual(config["execution"]["native_shard_records"], 64)
-        self.assertEqual(config["execution"]["native_shard_min_records"], 8)
-        self.assertEqual(config["execution"]["native_shard_material_tokens"], 8000)
-        self.assertEqual(config["execution"]["native_review_shard_records"], 2048)
-        self.assertEqual(config["execution"]["native_review_shard_min_records"], 64)
-        self.assertEqual(
-            config["execution"]["native_review_shard_material_tokens"], 262144
-        )
-        self.assertEqual(config["execution"]["large_inventory_threshold_records"], 10000)
-        self.assertEqual(config["execution"]["startup_full_inventory_scan_limit"], 2)
-        self.assertFalse(config["execution"]["startup_per_record_artifacts_allowed"])
-        self.assertEqual(config["execution"]["native_worker_history"], "none")
-        self.assertFalse(config["execution"]["native_worker_reuse"])
-        self.assertEqual(config["execution"]["native_agent_max_depth"], 1)
-        self.assertFalse(config["execution"]["model_controller_allowed"])
-        self.assertFalse(config["execution"]["worker_delegation_allowed"])
-        self.assertEqual(config["execution"]["max_semantic_model_calls_per_task"], 1)
-        self.assertFalse(
-            config["execution"]["per_record_semantic_call_loop_allowed"]
-        )
-        self.assertEqual(
-            config["execution"]["detail_contract_schema"],
-            "parr0t.detail-contract.v1",
-        )
-        self.assertFalse(config["execution"]["free_form_execution_contract_allowed"])
-        self.assertEqual(config["execution"]["bulk_budget_gate_records"], 4096)
-        self.assertEqual(config["execution"]["control_turn_budget_policy_version"], 2)
-        self.assertFalse(config["execution"]["control_turn_budget_user_approved"])
-        self.assertIsNone(config["execution"]["max_root_model_calls_per_wave"])
-        self.assertIsNone(config["execution"]["max_root_model_calls_per_turn"])
-        self.assertIsNone(config["execution"]["max_root_input_tokens_per_turn"])
-        self.assertEqual(
-            config["execution"]["budget_exhaustion_action"],
-            "continue_until_terminal_or_actionable_blocker",
-        )
-        self.assertEqual(config["execution"]["residual_direct_records"], 32)
-        self.assertFalse(config["execution"]["job_local_controller_allowed"])
-        self.assertFalse(config["execution"]["automatic_capacity_restart_allowed"])
-        self.assertEqual(config["execution"]["max_unchanged_progress_observations"], 1)
-        self.assertEqual(config["execution"]["max_control_actions_without_progress"], 2)
-        self.assertTrue(config["execution"]["aggregate_once_per_wave"])
-        self.assertEqual(
-            config["execution"]["progress_report_mode"],
-            "completion_checkpoint_or_blocker_only",
-        )
-        self.assertEqual(
-            config["control_plane"]["envelope_schema"],
-            "parr0t.control-envelope.v2",
-        )
+        execution = config["execution"]
+        self.assertEqual(config["repository"]["initial_choice"], "disabled")
+        self.assertNotIn("publish_approved", config["repository"])
+        self.assertEqual(execution["native_review_shard_records"], 256)
+        self.assertEqual(execution["native_review_shard_material_tokens"], 65_536)
+        self.assertEqual(execution["native_review_split_max_depth"], 11)
+        for key in ("bulk_max_elapsed_minutes", "bulk_max_input_tokens", "bulk_max_provider_cost_usd"):
+            self.assertIsNone(execution[key])
+        self.assertEqual(execution["native_worker_history"], "none")
+        self.assertFalse(execution["native_worker_reuse"])
+        self.assertFalse(execution["model_controller_allowed"])
+        self.assertFalse(execution["worker_delegation_allowed"])
         self.assertTrue(config["control_plane"]["metadata_only_for_all_data_plane_stages"])
         self.assertTrue(config["control_plane"]["reject_free_form_worker_returns"])
         self.assertTrue(config["control_plane"]["rotate_after_leak"])
-        self.assertEqual(
-            config["control_plane"]["observation_policy_schema"],
-            "parr0t.control-observation-policy.v1",
-        )
-        self.assertEqual(
-            config["control_plane"]["root_observation_sources"],
-            [
-                "core_cli_metadata",
-                "sealed_relay_receipt",
-                "validated_control_envelope",
-            ],
-        )
-        self.assertEqual(
-            config["control_plane"]["root_forbidden_observation_sources"],
-            [
-                "agent_tree",
-                "chat_transcript",
-                "codex_session_log",
-                "nested_worker_output",
-                "nested_worker_status",
-                "semantic_worker_log",
-            ],
-        )
-        self.assertTrue(config["control_plane"]["direct_relay_wait_only"])
-        self.assertEqual(
-            config["control_plane"]["usage_telemetry_sources"],
-            ["core_usage_ledger", "sealed_relay_receipt"],
-        )
-        self.assertEqual(
-            config["control_plane"]["forbidden_observation_action"],
-            "record_leak_and_rotate",
-        )
         self.assertEqual(control_state["status"], "ready")
-        self.assertEqual(control_state["generation"], 1)
         self.assertEqual(entry_state["status"], "pending")
         self.assertEqual(entry_state["issue_code"], "control_plane_entry_required")
         self.assertTrue(config["coverage"]["require_independent_inventory"])
         self.assertTrue(config["coverage"]["separate_static_and_runtime_completion"])
-        self.assertTrue(config["failure_queue"]["resume_only_after_user_request"])
-        self.assertTrue(config["failure_queue"]["hold_patch_when_blocking_target_fails"])
-        self.assertTrue(config["release_checkpoint"]["required_for_distribution"])
+        self.assertTrue(config["failure_queue"]["automatic_resume"])
+        self.assertFalse(config["failure_queue"]["allow_incomplete_artifact"])
+        self.assertFalse(config["release_checkpoint"]["required_for_distribution"])
         self.assertTrue(config["release_checkpoint"]["reuse_verified_unchanged_targets"])
-        self.assertTrue(config["release_checkpoint"]["selective_user_corrections"])
-        self.assertEqual(
-            config["release_checkpoint"]["locale_fallback"],
-            "best_effort_declared",
-        )
         self.assertTrue(config["instance_release"]["dormant_until_user_publication_command"])
         self.assertTrue(config["instance_release"]["gate_required_before_external_publication"])
-        self.assertTrue(config["instance_release"]["package_validation_is_not_release_readiness"])
-        self.assertEqual(config["instance_release"]["metadata_file"], "parr0t-instance-release.json")
         self.assertEqual(config["runtime"]["default_policy"], "deny")
         self.assertTrue(config["runtime"]["separate_install_and_launch"])
-        self.assertTrue(config["runtime"]["user_executes_by_default"])
-        self.assertNotIn("publish_approved", config["repository"])
-        self.assertLessEqual(len(generated_agents.split()), 1000)
-        self.assertEqual(config["sdk_selection"]["status"], "pending")
 
-    def test_default_provider_preset_is_locked_codex_app(self) -> None:
+    def test_selected_positive_worker_and_shard_settings_survive_loading(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sdk = root / "sdk"
             work = root / "work"
             sdk.mkdir()
-            initialize_workspace(work, sdk, git_choice="disabled")
-            config = load_config(work)
+            initialize_workspace(work, sdk)
+            config_path = work / "game-l10n.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            selected = {
+                "native_shard_records": 512,
+                "native_shard_min_records": 128,
+                "native_shard_material_tokens": 131_072,
+                "native_review_shard_records": 1024,
+                "native_review_shard_min_records": 128,
+                "native_review_shard_material_tokens": 262_144,
+                "native_review_split_max_depth": 14,
+                "native_review_split_max_record_amplification": 4,
+            }
+            config["execution"].update(selected)
+            config["routing"].update(max_workers=96, context_max_workers=80)
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            loaded = load_config(work)
 
-        self.assertEqual(config["provider_preset"], "codex-app-deepseek")
-        self.assertEqual(config["execution_mode"], "codex_app_native")
-        self.assertEqual([item["name"] for item in config["providers"]], ["deepseek"])
+        for key, value in selected.items():
+            self.assertEqual(loaded["execution"][key], value, key)
+        self.assertEqual(loaded["routing"]["max_workers"], 96)
+        self.assertEqual(loaded["routing"]["context_max_workers"], 80)
 
-    def test_known_legacy_presets_receive_pre_fallback_retry_defaults(self) -> None:
-        cases = (
-            (
-                "codex-app-deepseek",
-                ["native-luna", "deepseek"],
-                ["native-luna", "native-sol", "deepseek"],
-                {"native-luna": 5, "native-sol": 3},
-            ),
-            (
-                "openai-deepseek",
-                ["openai-luna", "deepseek"],
-                ["openai-luna", "openai-sol", "deepseek"],
-                {"openai-luna": 5, "openai-sol": 3},
-            ),
-        )
-        for preset, legacy, expected, retries in cases:
+    def test_omitted_context_concurrency_uses_selected_worker_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            initialize_workspace(work, sdk)
+            config_path = work / "game-l10n.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["routing"]["max_workers"] = 96
+            config["routing"].pop("context_max_workers")
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            routing = load_config(work)["routing"]
+
+        self.assertEqual(routing["max_workers"], 96)
+        self.assertEqual(routing["context_max_workers"], 96)
+
+    def test_bulk_budget_dimensions_are_independently_optional(self) -> None:
+        dimensions = {
+            "bulk_max_elapsed_minutes": 15,
+            "bulk_max_input_tokens": 100_000,
+            "bulk_max_provider_cost_usd": 1.25,
+        }
+        for selected, limit in dimensions.items():
+            with self.subTest(dimension=selected), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                sdk = root / "sdk"
+                work = root / "work"
+                sdk.mkdir()
+                initialize_workspace(work, sdk)
+                config_path = work / "game-l10n.json"
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                config["execution"]["bulk_budget_user_approved"] = True
+                config["execution"][selected] = limit
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                execution = load_config(work)["execution"]
+
+            self.assertEqual(execution[selected], limit)
+            for omitted in dimensions.keys() - {selected}:
+                self.assertIsNone(execution[omitted])
+
+    def test_selected_native_topology_and_retry_limits_are_not_preset_frozen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            initialize_workspace(work, sdk)
+            config_path = work / "game-l10n.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["providers"] = [{
+                "name": "chosen-fallback",
+                "type": "compatible_chat",
+                "model": "explicit-external-model",
+                "base_url": "https://fixture.invalid",
+                "api_key_env": "FIXTURE_API_KEY",
+                "allowed_roles": ["translation_fallback", "judge_fallback", "selective_rewrite"],
+            }]
+            selected = {
+                "context_analyzers": ["native-selected-context"],
+                "translators": ["native-selected-translation", "chosen-fallback"],
+                "translator_retries": {"native-selected-translation": 7, "chosen-fallback": 1},
+                "review_triagers": ["native-selected-triage"],
+                "reviewers": ["native-sol", "chosen-fallback"],
+                "rewriters": ["native-selected-rewrite", "chosen-fallback"],
+                "review_attempt_limits": {"native-sol": 9, "chosen-fallback": 6},
+                "review_max_rounds": 12,
+                "defer_fallbacks_until_primary_complete": False,
+            }
+            config["routing"].update(selected)
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            loaded = load_config(work)
+
+        self.assertEqual(loaded["providers"], config["providers"])
+        for key, value in selected.items():
+            self.assertEqual(loaded["routing"][key], value, key)
+        self.assertEqual(loaded["execution_mode"], "codex_app_native")
+        self.assertFalse(loaded["native_workflow"]["child_model_cli_allowed"])
+        self.assertFalse(loaded["native_workflow"]["external_provider_primary_allowed"])
+
+    def test_native_role_selection_does_not_require_legacy_route_aliases(self) -> None:
+        from game_l10n.model_policy import apply_native_role_models
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            initialize_workspace(work, sdk)
+            config_path = work / "game-l10n.json"
+            config = apply_native_role_models(
+                json.loads(config_path.read_text(encoding="utf-8")),
+                {
+                    "translation": "chosen-translation-model",
+                    "triage": "chosen-triage-model",
+                    "strong-review": "chosen-review-model",
+                    "review-fallback": "chosen-fallback-model",
+                    "context": "chosen-context-model",
+                    "rewrite": "chosen-rewrite-model",
+                },
+            )
+            config["providers"] = []
+            config["routing"]["translators"] = ["native-translation"]
+            config["routing"]["translator_retries"] = {"native-translation": 4}
+            config["routing"]["context_analyzers"] = ["native-context"]
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            loaded = load_config(work)
+
+        self.assertEqual(loaded["model_policy"], config["model_policy"])
+        self.assertEqual(loaded["providers"], [])
+        for key in ("translators", "review_triagers", "reviewers", "rewriters", "context_analyzers"):
+            self.assertEqual(loaded["routing"][key], config["routing"][key])
+            self.assertNotIn("native-luna", loaded["routing"][key])
+            self.assertNotIn("native-sol", loaded["routing"][key])
+
+    def test_missing_retry_defaults_do_not_insert_unselected_routes(self) -> None:
+        for preset, primary in (
+            ("codex-app-deepseek", "native-luna"),
+            ("openai-deepseek", "openai-luna"),
+        ):
             with self.subTest(preset=preset), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 sdk = root / "sdk"
                 work = root / "work"
                 sdk.mkdir()
-                initialize_workspace(
-                    work,
-                    sdk,
-                    git_choice="disabled",
-                    provider_preset=preset,
-                )
+                initialize_workspace(work, sdk, provider_preset=preset)
                 config_path = work / "game-l10n.json"
                 config = json.loads(config_path.read_text(encoding="utf-8"))
-                config["routing"]["translators"] = legacy
+                config["routing"]["translators"] = [primary, "deepseek"]
                 config["routing"].pop("translator_retries")
-                config_path.write_text(
-                    json.dumps(config, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-
+                config_path.write_text(json.dumps(config), encoding="utf-8")
                 loaded = load_config(work)
 
-            self.assertEqual(loaded["routing"]["translators"], expected)
-            self.assertEqual(loaded["routing"]["translator_retries"], retries)
+            self.assertEqual(loaded["routing"]["translators"], [primary, "deepseek"])
 
-    def test_custom_provider_routing_is_not_rewritten_with_retry_defaults(self) -> None:
+    def test_failure_continuation_migration_preserves_explicit_pause_and_output_hold(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sdk = root / "sdk"
             work = root / "work"
             sdk.mkdir()
-            initialize_workspace(
-                work,
-                sdk,
-                git_choice="disabled",
-                provider_preset="custom",
-            )
+            initialize_workspace(work, sdk)
             config_path = work / "game-l10n.json"
             config = json.loads(config_path.read_text(encoding="utf-8"))
-            config["routing"].pop("translator_retries")
-            config_path.write_text(
-                json.dumps(config, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
+            config["failure_queue"] = {
+                "resume_only_after_user_request": True,
+                "hold_patch_when_blocking_target_fails": True,
+            }
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            migrated = load_config(work)["failure_queue"]
+            self.assertTrue(migrated["automatic_resume"])
+            self.assertFalse(migrated["allow_incomplete_artifact"])
 
-            loaded = load_config(work)
-
-        self.assertEqual(loaded["routing"]["translators"], ["translator-primary"])
-        self.assertNotIn("translator_retries", loaded["routing"])
-
-    def test_codex_app_preset_locks_native_workers_and_scopes_key_to_fallback(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ,
-            {
-                "OPENAI_API_KEY": "fixture-openai-key",
-                "DEEPSEEK_API_KEY": "fixture-deepseek-key",
-            },
-        ):
-            root = Path(directory)
-            sdk = root / "sdk"
-            work = root / "work"
-            sdk.mkdir()
-            initialize_workspace(
-                work,
-                sdk,
-                git_choice="disabled",
-                provider_preset="codex-app-deepseek",
-            )
-            config = load_config(work)
-            mode_lock = json.loads(
-                (work / ".game-l10n" / "provider-mode.json").read_text(encoding="utf-8")
-            )
-
-        self.assertEqual(config["provider_preset"], "codex-app-deepseek")
-        self.assertEqual(config["execution_mode"], "codex_app_native")
-        self.assertEqual(mode_lock["provider_preset"], "codex-app-deepseek")
-        self.assertEqual(mode_lock["execution_mode"], "codex_app_native")
-        self.assertEqual(
-            config["native_workflow"]["launcher"],
-            "collaboration",
-        )
-        self.assertFalse(config["native_workflow"]["child_model_cli_allowed"])
-        self.assertFalse(config["native_workflow"]["external_provider_primary_allowed"])
-        self.assertEqual([item["name"] for item in config["providers"]], ["deepseek"])
-        self.assertEqual(
-            set(config["providers"][0]["allowed_roles"]),
-            {"translation_fallback", "selective_rewrite", "judge_fallback"},
-        )
-        self.assertEqual(
-            config["routing"]["context_analyzers"],
-            ["native-sol", "native-luna"],
-        )
-        self.assertEqual(
-            config["routing"]["translators"],
-            ["native-luna", "native-sol", "deepseek"],
-        )
-        self.assertEqual(
-            config["routing"]["translator_retries"],
-            {"native-luna": 5, "native-sol": 3},
-        )
-        self.assertEqual(config["routing"]["review_triagers"], ["native-luna"])
-        self.assertEqual(config["routing"]["reviewers"], ["native-sol", "deepseek"])
-        self.assertEqual(config["routing"]["rewriters"], ["deepseek"])
+            config["failure_queue"] = {
+                "automatic_resume": False,
+                "allow_incomplete_artifact": False,
+            }
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            self.assertEqual(load_config(work)["failure_queue"], config["failure_queue"])
 
     def test_codex_app_mode_lock_rejects_agent_switch_to_custom(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1986,12 +1882,6 @@ class WorkspaceTests(unittest.TestCase):
                 cmd_status(SimpleNamespace(workspace=str(work)))
             second = json.loads(second_output.getvalue())
 
-            update_repository_policy(work, initial_choice="disabled")
-            third_output = StringIO()
-            with redirect_stdout(third_output):
-                cmd_status(SimpleNamespace(workspace=str(work)))
-            third = json.loads(third_output.getvalue())
-
         self.assertEqual(first["next_actions"], ["establish_text_free_control_plane"])
         self.assertEqual(first["contract_base"], str(sdk.resolve()))
         self.assertEqual(
@@ -2009,19 +1899,18 @@ class WorkspaceTests(unittest.TestCase):
             first["contract_set"]["reload_policy"],
             "digest_change_or_new_control_generation_only",
         )
-        self.assertEqual(second["next_actions"], ["ask_user_for_initial_git_choice"])
         self.assertEqual(
-            third["next_actions"],
+            second["next_actions"],
             ["record_target_identity_evaluate_and_select_sdk"],
         )
         self.assertEqual(
-            third["required_contracts"],
+            second["required_contracts"],
             ["docs/sdk-selection.md", "docs/sdk-branch-contract.md"],
         )
-        self.assertEqual(third["data_plane_task"]["worker_role"], "source_probe")
-        self.assertEqual(third["data_plane_task"]["stage"], "discovery")
+        self.assertEqual(second["data_plane_task"]["worker_role"], "source_probe")
+        self.assertEqual(second["data_plane_task"]["stage"], "discovery")
         self.assertEqual(
-            third["data_plane_task"]["dispatch"], "fresh_isolated_relay_only"
+            second["data_plane_task"]["dispatch"], "fresh_isolated_relay_only"
         )
 
     def test_status_requires_sdk_activation_after_selection(self) -> None:
@@ -2366,17 +2255,19 @@ class WorkspaceTests(unittest.TestCase):
                 first_exit = cmd_status(SimpleNamespace(workspace=str(work)))
             first = json.loads(first_output.getvalue())
 
-            update_repository_policy(work, initial_choice="disabled")
+            missing_game.mkdir()
             second_output = StringIO()
             with redirect_stdout(second_output):
                 second_exit = cmd_status(SimpleNamespace(workspace=str(work)))
             second = json.loads(second_output.getvalue())
 
-        self.assertEqual(first_exit, 0)
-        self.assertEqual(first["next_actions"], ["ask_user_for_initial_git_choice"])
-        self.assertEqual(second_exit, 1)
-        self.assertEqual(second["next_actions"], ["fix_missing_game_root"])
-        self.assertEqual(second["required_contracts"], [])
+        self.assertEqual(first_exit, 1)
+        self.assertEqual(first["next_actions"], ["fix_missing_game_root"])
+        self.assertEqual(first["required_contracts"], [])
+        self.assertEqual(second_exit, 0)
+        self.assertEqual(
+            second["next_actions"], ["record_target_identity_evaluate_and_select_sdk"]
+        )
 
     def test_status_reports_only_rotation_action_after_control_plane_leak(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2641,6 +2532,107 @@ class WorkspaceTests(unittest.TestCase):
             stale_status["next_actions"], ["reconcile_stale_failure_queue"]
         )
         self.assertEqual(stale_status["state_issue_codes"], ["FAILURE_QUEUE_STALE"])
+
+
+class SemanticResultFixtureTests(unittest.TestCase):
+    def test_unbound_fixture_demands_route_and_exact_model(self) -> None:
+        from tests import semantic_result_rows
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory) / "result.jsonl"
+            rows = [{"target_id": "a", "status": "success", "text": "T"}]
+            with self.assertRaisesRegex(ValueError, "explicit route"):
+                semantic_result_rows(result, rows)
+            with self.assertRaisesRegex(ValueError, "exact model"):
+                semantic_result_rows(result, rows, route="native-selected")
+            bound = semantic_result_rows(
+                result, rows, route="native-selected", model="selected-exact-model"
+            )
+
+        self.assertNotIn("provider", rows[0])
+        self.assertEqual(bound[0]["provider"], "native-selected")
+        self.assertEqual(bound[0]["content_provenance"]["model"], "selected-exact-model")
+        self.assertEqual(bound[0]["content_provenance"]["route"], "native-selected")
+
+    def test_runtime_binding_supplies_only_its_actual_exact_model(self) -> None:
+        from game_l10n.native_runtime import configure_native_runtime
+        from tests import semantic_result_rows
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            configure_native_runtime(root, "codex", {"native-selected": "selected-exact-model"})
+            rows = [{
+                "target_id": "a", "status": "success", "text": "T",
+                "provider": "native-selected",
+            }]
+            bound = semantic_result_rows(root / "results" / "result.jsonl", rows)
+            with self.assertRaisesRegex(ValueError, "exact model"):
+                semantic_result_rows(
+                    root / "results" / "result.jsonl",
+                    [{**rows[0], "provider": "native-sol"}],
+                )
+
+        self.assertEqual(bound[0]["content_provenance"]["model"], "selected-exact-model")
+
+    def test_configured_provider_supplies_model_not_provider_alias(self) -> None:
+        from tests import semantic_result_rows
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            work = root / "work"
+            sdk.mkdir()
+            initialize_workspace(work, sdk, provider_preset="openai-deepseek")
+            config_path = work / "game-l10n.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            next(
+                provider for provider in config["providers"] if provider["name"] == "deepseek"
+            )["model"] = "selected-provider-model"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            rows = [{
+                "target_id": "a", "status": "success", "text": "T", "provider": "deepseek",
+            }]
+            bound = semantic_result_rows(work / "results" / "result.jsonl", rows)
+
+        self.assertEqual(bound[0]["content_provenance"]["model"], "selected-provider-model")
+        self.assertEqual(bound[0]["content_provenance"]["route"], "deepseek")
+
+    def test_manifest_binding_is_used_without_repairing_wrong_result_provider(self) -> None:
+        from game_l10n.models import Segment
+        from game_l10n.native_pass import prepare_native_tasks
+        from tests import semantic_result_rows
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text("fixture", encoding="utf-8")
+            prepare_native_tasks(
+                root, source, [Segment("a", "S")], root / "tasks",
+                route_binding={
+                    "provider": "native-selected", "model": "selected-exact-model", "attempt": 1,
+                },
+            )
+            rows = [{
+                "target_id": "a", "status": "success", "text": "T",
+                "provider": "native-wrong-provider",
+            }]
+            bound = semantic_result_rows(root / "results" / "task-0001.jsonl", rows)
+
+        self.assertEqual(bound[0]["provider"], "native-wrong-provider")
+        self.assertEqual(bound[0]["content_provenance"]["route"], "native-selected")
+        self.assertEqual(bound[0]["content_provenance"]["model"], "selected-exact-model")
+
+    def test_control_errors_do_not_receive_fabricated_semantic_provenance(self) -> None:
+        from tests import semantic_result_rows
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory) / "result.jsonl"
+            rows = [{
+                "target_id": "a", "status": "error", "text": "", "provider": "native-control",
+            }]
+            bound = semantic_result_rows(result, rows)
+        self.assertEqual(bound, rows)
+        self.assertNotIn("content_provenance", bound[0])
 
 
 if __name__ == "__main__":

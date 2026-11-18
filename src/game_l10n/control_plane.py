@@ -46,7 +46,9 @@ def review_control_contract() -> dict[str, Any]:
         "semantic_access_allowed": False,
         "free_form_planning_allowed": False,
         "ad_hoc_contracts_allowed": False,
-        "autonomous_resume_allowed": False,
+        "recoverable_failure_continuation_allowed": True,
+        "user_pause_or_stop_resume_requires_explicit_request": True,
+        "changed_scope_requires_new_user_approval": True,
         "autonomous_sdk_or_tool_changes_allowed": False,
         "model_choice_allowed": False,
         "batch_shape_change_allowed": False,
@@ -67,10 +69,11 @@ def review_control_contract() -> dict[str, Any]:
             "record_aggregate_usage",
             "checkpoint_and_stop",
         ],
-        "resume_requirements": [
-            "explicit_user_approval",
-            "complete_budget_contract",
+        "recoverable_continuation_requirements": [
+            "original_scope_authorization",
             "regenerated_validated_manifest",
+            "respect_user_pause_or_stop",
+            "honest_optional_budget_accounting",
         ],
         "unknown_state_action": "checkpoint_and_stop",
         "next_action_source": "validated_status_or_manifest_only",
@@ -271,6 +274,8 @@ VALIDATION_ISSUE_CODES = {
 ISSUE_CODES_BY_STAGE = {
     "discovery": COMMON_ISSUE_CODES | DISCOVERY_ISSUE_CODES,
     "inventory": COMMON_ISSUE_CODES | INVENTORY_ISSUE_CODES,
+    "image_inventory": COMMON_ISSUE_CODES | INVENTORY_ISSUE_CODES | {"image_scope_unexamined"},
+    "image_localization": COMMON_ISSUE_CODES | TRANSLATION_ISSUE_CODES,
     "context": COMMON_ISSUE_CODES | ROUTING_ISSUE_CODES | CONTEXT_ISSUE_CODES,
     "translation": COMMON_ISSUE_CODES | ROUTING_ISSUE_CODES | TRANSLATION_ISSUE_CODES,
     # Detailed review findings (meaning, voice, omission, tone, and similar
@@ -475,6 +480,8 @@ def public_control_plane_state(state: dict[str, Any]) -> dict[str, Any]:
         "generation": state["generation"],
         "issue_code": state["issue_code"],
         "incident_code": state["incident_code"],
+        "same_session_resume_allowed": state["status"] == "ready" or state["issue_code"] == "framework_suspended",
+        "fresh_recovery_required": state["status"] == "rotation_required" and state["issue_code"] != "framework_suspended",
     }
     if "exposure_acceptance" in state:
         public["boundary_mode"] = "user_accepted_exposure"
@@ -500,19 +507,38 @@ def require_control_plane_ready(work_dir: Path) -> dict[str, Any]:
 def record_control_plane_leak(work_dir: Path, incident_code: str) -> dict[str, Any]:
     if incident_code not in LEAK_INCIDENT_CODES:
         raise ConfigurationError("E_CONTROL_PLANE_LEAK: unsupported incident code")
-    return _record_control_plane_incident(work_dir, incident_code, "control_plane_leak")
+    from .framework_session import _framework_session_lock
+
+    with _framework_session_lock(work_dir):
+        return _record_control_plane_incident(work_dir, incident_code, "control_plane_leak")
 
 
-def suspend_control_plane(work_dir: Path) -> dict[str, Any]:
-    """Invalidate localization admission without claiming an actual text leak."""
-    return _record_control_plane_incident(work_dir, "framework_suspended", "framework_suspended")
+def suspend_control_plane(work_dir: Path, *, source_exposed: bool = False) -> dict[str, Any]:
+    """Keep a clean controller reusable; actual diagnostic exposure still rotates."""
+    if source_exposed:
+        return record_control_plane_leak(work_dir, "parent_opened_data_plane")
+    return control_plane_state(work_dir)
+
+
+def resume_clean_control_plane(work_dir: Path) -> dict[str, Any]:
+    """Resume only a clean controller, including historical clean suspensions."""
+    state = control_plane_state(work_dir)
+    if state["status"] == "rotation_required":
+        if state["issue_code"] != "framework_suspended":
+            raise ConfigurationError(
+                "E_CONTROL_PLANE_ROTATION_REQUIRED: source/history exposure requires canonical fresh recovery"
+            )
+        state = {**initial_control_plane_state(), "generation": state["generation"]}
+        _atomic_json(work_dir / CONTROL_STATE_PATH, state)
+        (work_dir / CONTROL_HANDOFF_PATH).unlink(missing_ok=True)
+    return state
 
 
 def _record_control_plane_incident(
     work_dir: Path, incident_code: str, issue_code: str,
 ) -> dict[str, Any]:
     state = control_plane_state(work_dir)
-    if state["status"] == "rotation_required":
+    if state["status"] == "rotation_required" and state["issue_code"] != "framework_suspended":
         # Recovery after an interrupted leak record: replace a missing or prior-incident receipt.
         try:
             receipt = _validated_control_plane_handoff(work_dir, work_dir / CONTROL_HANDOFF_PATH)
@@ -799,8 +825,8 @@ def _acknowledge_control_plane_rotation_locked(
 
 
 def _validate_target_ids(value: Any) -> list[str]:
-    if not isinstance(value, list) or len(value) > 2000:
-        raise ConfigurationError("E_CONTROL_ENVELOPE_INVALID: target_ids must be a bounded list")
+    if not isinstance(value, list):
+        raise ConfigurationError("E_CONTROL_ENVELOPE_INVALID: target_ids must be a list")
     for target_id in value:
         if (
             not isinstance(target_id, str)

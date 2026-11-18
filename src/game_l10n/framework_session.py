@@ -8,7 +8,9 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .control_plane import _atomic_json, suspend_control_plane
+from .control_plane import (
+    _atomic_json, _record_control_plane_incident, resume_clean_control_plane, suspend_control_plane,
+)
 from .errors import ConfigurationError
 from .framework_approval import consume_framework_approval, require_framework_approval_proof
 from .store import exclusive_file_lock
@@ -45,7 +47,7 @@ def framework_session_state(work_dir: Path) -> dict[str, Any]:
         not isinstance(state, dict) or set(state) != fields
         or state.get("schema") != FRAMEWORK_SESSION_SCHEMA
         or not isinstance(state.get("mode"), str)
-        or state["mode"] not in {"localization", "analysis", "shutdown"}
+        or state["mode"] not in {"localization", "pause", "analysis", "shutdown"}
         or type(state.get("revision")) is not int or state["revision"] < 1
         or state.get("instructions_active") is not (state["mode"] == "localization")
         or state.get("user_requested") is not True
@@ -111,8 +113,8 @@ def change_framework_mode(
     if user_requested is not True:
         raise ConfigurationError("E_FRAMEWORK_USER_REQUEST_REQUIRED: explicit user request required")
     require_framework_approval_proof(approval)
-    if not isinstance(mode, str) or mode not in {"analysis", "shutdown"}:
-        raise ConfigurationError("E_FRAMEWORK_MODE_INVALID: select analysis or shutdown")
+    if not isinstance(mode, str) or mode not in {"localization", "pause", "analysis", "shutdown"}:
+        raise ConfigurationError("E_FRAMEWORK_MODE_INVALID: select localization, pause, analysis or shutdown")
     if mode != "analysis" and logs:
         raise ConfigurationError("E_FRAMEWORK_ANALYSIS_REQUIRED: log access requires analysis mode")
     if not (work_dir / "game-l10n.json").is_file():
@@ -122,9 +124,11 @@ def change_framework_mode(
         consume_framework_approval(
             work_dir, mode, revision=previous["revision"], logs=logs, approval=approval,
         )
+        if mode == "localization":
+            resume_clean_control_plane(work_dir)
         state = {
             "schema": FRAMEWORK_SESSION_SCHEMA, "mode": mode,
-            "revision": previous["revision"] + 1, "instructions_active": False,
+            "revision": previous["revision"] + 1, "instructions_active": mode == "localization",
             "user_requested": True, "logs": [],
         }
         # Suspend first, but do not hold the transaction lock while copying logs:
@@ -132,7 +136,10 @@ def change_framework_mode(
         _atomic_json(work_dir / FRAMEWORK_SESSION_PATH, state)
         control_issue = ""
         try:
-            suspend_control_plane(work_dir)
+            if logs:
+                _record_control_plane_incident(work_dir, "parent_opened_data_plane", "control_plane_leak")
+            else:
+                suspend_control_plane(work_dir)
         except (ConfigurationError, OSError, ValueError):
             control_issue = "control_state_repair_required"
     snapshots = {}

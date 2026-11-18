@@ -13,11 +13,11 @@ artifact_built
   -> runtime_validated
 ```
 
-Each arrow into a real external effect performed by an agent or noninteractive script requires the user's explicit instruction for that action. `install`, `update`, `remove`, and `launch` are four different automation permissions. Installation does not imply launch; launch does not imply cleanup, log deletion, save changes, another launch, or any patch mutation. This record is not a player-facing license prompt: a player running the packaged interactive menu authorizes Install or Restore through its final target/action confirmation.
+Each arrow into a real external effect performed by an agent or noninteractive script requires the user's explicit instruction for that action. `install`, `update`, `remove`, and `launch` are four different automation permissions. Installation does not imply launch; launch does not imply cleanup, log deletion, save changes, or patch mutation. Repeated exact actions are permitted only when explicitly included in bounded workflow reuse. This record is not a player-facing license prompt: a player running the packaged interactive menu authorizes Install or Restore through its final target/action confirmation.
 
 ## Approval record
 
-After the user requests one exact action, the agent records it without executing anything:
+After the user requests an exact action, optionally including bounded repeated use, the agent records it without executing anything:
 
 ```text
 game-l10n approve-runtime --workspace <external-workspace> --action <install|update|remove|launch> --artifact <artifact-inside-workspace> --target <configured-game-root> --user-confirmed
@@ -31,10 +31,10 @@ The record is bound to:
 - the exact artifact path and content digest;
 - the exact configured game root;
 - the exact executable for launch;
-- a short expiry, 30 minutes by default;
-- one use.
+- an explicit expiry, 30 minutes by default (`--ttl-minutes <positive-minutes>` may record a suitable approved duration without an arbitrary one-day maximum);
+- one use by default, or repeated exact use only with explicit user authorization recorded through `--workflow-reuse`.
 
-A changed build, different path, different action, different executable, expiry, or prior use invalidates the record. The matching SDK operation consumes it immediately before the external effect. If the operation fails after consumption, report the failure and wait for a new user instruction instead of minting another approval automatically.
+A changed build, different path, different action, different executable, expiry, or consumed one-shot record invalidates the approval. The matching SDK operation validates it immediately before the external effect and consumes one-shot approvals. A failed action does not justify broadening or minting consent: an unchanged, unexpired reusable record can authorize the requested retry; a consumed one-shot record needs new explicit authorization.
 
 ## Steam packages
 
@@ -45,12 +45,14 @@ powershell -File <extracted-package>/Install-Translation-Patch.ps1 -Mode Install
 powershell -File <extracted-package>/Install-Translation-Patch.ps1 -Mode Restore -GameRoot <configured-game-root> -ApprovalFile <approval-json>
 ```
 
-The installer recomputes its manifest/payload fingerprint, checks the exact target, action, expiry, and one-shot state, consumes the record, and only then mutates receipt-owned paths. Its agent-harness approval JSON stays in the private workspace and is never included in the player ZIP. See `docs/installer-contract.md`.
+The installer recomputes its manifest/payload fingerprint, checks the exact target, action, expiry, and use policy, consumes a one-shot record, and only then mutates receipt-owned paths. A reusable record remains limited to its exact approved action and unchanged artifact. Its agent-harness approval JSON stays in the private workspace and is never included in the player ZIP. See `docs/installer-contract.md`.
+
+Approval JSON accepts UTF-8 with or without a BOM, including consumed receipts rewritten by Windows PowerShell.
 
 ## Engine SDK contract
 
 An engine branch that adds real install or launch behavior must call `require_runtime_approval(..., consume=True)` immediately before the write or process start. It must not provide a second unguarded path, invoke the installer or executable directly, or translate another approval type into the requested action. Offline builders and validators remain inside the external workspace and do not need runtime approval.
 
-The default runtime-validation handoff is still user execution: give the user the recoverable artifact and request only the resulting metadata or logs. An agent may run the real game only after a separate launch instruction and exact launch approval.
+The default runtime-validation handoff is still user execution: give the user the recoverable artifact and request only authorized metadata or diagnostic evidence. An agent may run the real game only after an explicit launch instruction and exact launch approval. Source/log exposure still follows control-plane recovery rules.
 
-This SDK guard cannot cryptographically prove that a chat message came from a human, and a shell-capable agent could bypass any library by issuing operating-system commands directly. Repository and workspace `AGENTS.md` therefore prohibit direct copies, installers, process launches, or cleanup outside this guard. A host-level confirmation dialog remains the strongest boundary when the agent platform provides one.
+This SDK guard cannot cryptographically prove that a chat message came from a human, and a shell-capable agent could bypass a library through operating-system commands. Repository and workspace instructions therefore prohibit direct copies, installers, process launches, or cleanup outside the guard. Optional host confirmation can add assurance; an explicit current user request and bound approval do not require a second mandatory interactive dialog. Framework lifecycle consent never grants game installation or execution permission.

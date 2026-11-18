@@ -9,6 +9,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
+from tests.execution_policy_fixture import approved_execution_policy
 
 from game_l10n.cli import build_parser, main
 from game_l10n.control_plane import (
@@ -498,13 +499,14 @@ class ControlPlaneContractTests(unittest.TestCase):
             output = root / ".game-l10n" / "data-plane" / "inventory_reconciler"
 
             def prepare():
-                prepared = prepare_data_plane_task(
-                    root,
-                    output,
-                    worker_role="inventory_reconciler",
-                    config=config,
-                    sdk_activation={},
-                )
+                with patch("game_l10n.native_runtime.active_execution_environment_policy", return_value=approved_execution_policy()):
+                    prepared = prepare_data_plane_task(
+                        root,
+                        output,
+                        worker_role="inventory_reconciler",
+                        config=config,
+                        sdk_activation={},
+                    )
                 if prepared["status"] != "ready":
                     return prepared, None, None
                 relay = root / prepared["relay_path"]
@@ -1342,9 +1344,12 @@ class ControlPlaneContractTests(unittest.TestCase):
                 self.assertEqual(
                     sealed["issue_codes"], ["relay_execution_incomplete"]
                 )
-                self.assertEqual(
-                    sealed["execution"]["unstarted_slots"], [1]
-                )
+                execution = sealed["execution"]
+                self.assertEqual(execution["unstarted_slots"], [])
+                self.assertEqual(execution["terminal_unstarted_slots"], [1])
+                self.assertEqual(execution["started_workers"], 0)
+                self.assertTrue(execution["finalizer_skipped"])
+                self.assertTrue(execution["complete"])
             receipt_path = output / "receipt.json"
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             receipt["counts"] = {
@@ -1477,7 +1482,9 @@ class ControlPlaneContractTests(unittest.TestCase):
         self.assertFalse(contract["semantic_access_allowed"])
         self.assertFalse(contract["free_form_planning_allowed"])
         self.assertFalse(contract["ad_hoc_contracts_allowed"])
-        self.assertFalse(contract["autonomous_resume_allowed"])
+        self.assertTrue(contract["recoverable_failure_continuation_allowed"])
+        self.assertTrue(contract["user_pause_or_stop_resume_requires_explicit_request"])
+        self.assertTrue(contract["changed_scope_requires_new_user_approval"])
         self.assertFalse(contract["autonomous_sdk_or_tool_changes_allowed"])
         self.assertTrue(contract["status_action_match_required"])
         self.assertTrue(contract["native_step_command_required"])
@@ -1490,11 +1497,12 @@ class ControlPlaneContractTests(unittest.TestCase):
             ["read_status", "record_aggregate_usage", "checkpoint_and_stop"],
         )
         self.assertEqual(
-            contract["resume_requirements"],
+            contract["recoverable_continuation_requirements"],
             [
-                "explicit_user_approval",
-                "complete_budget_contract",
+                "original_scope_authorization",
                 "regenerated_validated_manifest",
+                "respect_user_pause_or_stop",
+                "honest_optional_budget_accounting",
             ],
         )
         self.assertEqual(contract["unknown_state_action"], "checkpoint_and_stop")
@@ -1632,6 +1640,51 @@ class ControlPlaneContractTests(unittest.TestCase):
         self.assertNotIn("source", result)
         self.assertNotIn("reason", result)
         self.assertNotIn("text", result)
+
+    def test_large_envelopes_preserve_every_target_and_still_validate_opaque_unique_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = self._valid_translation_envelope(root)
+            targets = [f"fixture-{index}" for index in range(2001)]
+            payload["target_ids"] = targets
+            payload["counts"] = {"total": len(targets), "success": 0, "fallback_required": len(targets)}
+            payload["queue_transitions"][0]["count"] = len(targets)
+            envelope = self._write_envelope(root, payload)
+            result = validate_control_envelope(root, envelope)
+            self.assertEqual(result["target_ids"], [control_target_id(target) for target in targets])
+            self.assertEqual(result["counts"]["total"], len(targets))
+            for invalid in ("not-a-list", [*targets, targets[-1]], [*targets, 1], [*targets, "not opaque"], [*targets, ""]):
+                with self.subTest(invalid_tail=invalid[-1]):
+                    payload["target_ids"] = invalid
+                    envelope = self._write_envelope(root, payload)
+                    with self.assertRaisesRegex(ConfigurationError, "target_ids"):
+                        validate_control_envelope(root, envelope)
+
+    def test_image_stage_envelopes_validate_categorical_results_without_losing_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for role, stage, issues in (
+                ("image_ui_inventory", "image_inventory", []),
+                ("image_ui_inventory", "image_inventory", ["image_scope_unexamined"]),
+                ("image_localizer", "image_localization", []),
+                ("image_localizer", "image_localization", ["placeholder_mismatch"]),
+            ):
+                with self.subTest(role=role, issues=issues):
+                    payload = self._valid_translation_envelope(root)
+                    payload.update({
+                        "worker_role": role, "stage": stage,
+                        "status": "partial" if issues else "success",
+                        "issue_codes": issues, "queue_transitions": [],
+                    })
+                    payload["counts"] = {"total": 1, "success": 0 if issues else 1}
+                    envelope = self._write_envelope(root, payload)
+                    result = validate_control_envelope(root, envelope, expected_role=role, expected_stage=stage)
+                    self.assertEqual(result["status"], payload["status"])
+                    self.assertEqual(result["issue_codes"], issues)
+                    payload["issue_codes"] = ["private_image_error_prose"]
+                    envelope = self._write_envelope(root, payload)
+                    with self.assertRaisesRegex(ConfigurationError, "issue_codes"):
+                        validate_control_envelope(root, envelope)
 
     def test_envelope_rejects_artifact_names_that_carry_free_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

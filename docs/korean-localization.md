@@ -5,9 +5,9 @@ This document adds Korean-specific translation and review rules without changing
 ## Authority and names
 
 1. Reuse an applicable official Korean localization before project glossaries, domain convention, or literal translation. Bind ambiguous forms by concept or exact target IDs; never repair a homonym, numeric name, model number, or substring globally.
-2. A title, organization, person, product, place, substance, or fictional term is an identity, not ordinary prose. Reuse an authorized Korean form when one exists. Otherwise follow the declared identity or transliteration policy: preserve the source form when authority requires it, or derive one consistent Korean form without ad hoc literal translation. Do not mix that form with the source form or append a parenthetical duplicate unless the source or an applicable authoritative glossary contains it.
-3. Transliteration must be consistent for the same identity. Distinct identities that share spelling may use different Korean forms only with scoped evidence.
-4. Prefer established Korean professional terminology when it preserves the source concept. Do not force a native-Korean paraphrase over a standard loanword or technical term, and do not preserve an unfamiliar literal calque when a well-established Korean term exists. Deliberate source verbosity, wordplay, and characterization remain semantic evidence and must not be shortened automatically.
+2. A title, organization, person, product, place, substance, or fictional term is an identity, not ordinary prose. Reuse an authorized Korean form when one exists. Otherwise follow the user's explicit identity/transliteration instructions or the declared policy, preserving source identity and consistency. Do not mix forms or append a parenthetical duplicate unless requested by the user, supported by source context, or authorized by an applicable glossary.
+3. Transliteration must be consistent for the same identity. Distinct identities that share spelling may use different Korean forms with scoped evidence or explicit user direction.
+4. Prefer established Korean professional terminology when it preserves the source concept and does not conflict with explicit user terminology/style direction. Do not force a native-Korean paraphrase over a standard loanword or technical term, and do not preserve an unfamiliar literal calque when a well-established Korean term exists unless faithful rendering or user direction calls for it. Deliberate source verbosity, wordplay, and characterization remain semantic evidence and must not be shortened automatically.
 
 ## Voice, register, and UI style
 
@@ -31,7 +31,7 @@ Apply `docs/dialogue-localization.md` first. Korean speech level is speaker- and
 
 1. Replace source-language sentence punctuation with the established Korean project style unless punctuation is an immutable token, markup, identifier, deliberate voice cue, or authoritative name component.
 2. Chinese full-width stops, commas, colons, brackets, and quotation marks are review defects when they leak into ordinary Korean prose without an evidenced stylistic purpose.
-3. Preserve meaningful pauses, interruptions, ellipses, emphasis, and line breaks, but render them consistently with the project's Korean typography. Do not add explanatory parentheses, translator notes, bilingual glosses, or unsupported quotation marks.
+3. Preserve meaningful pauses, interruptions, ellipses, emphasis, and line breaks, rendering them consistently with project typography while following explicit user style instructions where compatible with the source. Do not add unsupported explanatory parentheses, translator notes, bilingual glosses, or quotation marks; source- or user-authorized additions remain permitted.
 4. Check spacing around Korean particles, counters, units, Latin abbreviations, and inline markup in the final composed value rather than judging isolated fragments only.
 
 ## Korean review checklist
