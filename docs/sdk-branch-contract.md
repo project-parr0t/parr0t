@@ -43,6 +43,23 @@ An engine SDK branch owns:
 
 After its deterministic pack and round-trip verification succeeds, an engine branch records the artifact through the core `record_verified_pack_artifact` API. This binds the engine output to the exact completed translation result without routing engine logic into `main`. An unverified output, a generic pass-through copy, or a pack built from another result must not create core pack state.
 
+## Display eligibility before semantic work
+
+Every SDK separates its private raw-occurrence census from its active translation inventory. A string, a source-language match, an engine/resource container, two equal inventories, or an evidence digest alone is not a display-use proof. This separation is mandatory; the additional reachability pruning in `docs/engine-static-scope.md` is optional.
+
+The SDK must derive each active target from a supported display-bearing format role or a source-bound consumer/dependency trace. Account separately for display targets, actual unresolved display dependencies, proven non-display occurrences, and raw unclassified occurrences. Resolve unsupported roles from cached structural evidence through the isolated SDK preparation/reconciliation workflow, not a human per-string whitelist or a semantic context pass over every raw literal. An unresolved actual display consumer keeps affected scope pending; it must not disappear behind a complete claim.
+
+Control keys, indices, script operands and shared control storage are not active replacement targets. Preserve their bytes and use distinct display-only projections when the same value also reaches a display. `display_projection_required=true` is a repair requirement, not permission to translate control storage. New inventories emit the existing `coverage.display_scope` and source-bound per-target evidence; no parallel eligibility schema is needed.
+
+Context is evidence for already eligible targets, not an inventory filter. Attach only the relevant speaker, branch, state, composition and explicitly bound semantic facts. Keep full command trees, editor records, unrelated notes, diagnostics and parse/provenance caches outside model inputs. Useful annotations may be retained when bound to the target; do not indiscriminately remove all notes or classify their wording in the text-free parent.
+
+Primary and independent methods independently discover supported physical target locations and their eligibility. They may share lossless format readers, public role specifications and identity normalization, but not a discovered segment list, copied classifications, or counterpart output. Two traversals of one already selected list do not establish independent extraction.
+
+SDK acceptance fixtures must exercise the actual extractor-to-consumer boundary: visible text survives; control/editor/unused records do not become targets; unsupported actual display dependencies remain pending; relevant context survives without unrelated records; excluded source bytes remain unchanged on apply/repack; and an omission in one discovery method produces an inventory disagreement. Use synthetic format fixtures, not source-text assertions, output echoes, or mere equal counts. A core test pass, a clean privacy scan and an `up_to_date` branch state do not establish these engine-specific properties.
+
+Existing checkpoint-bound raw history is never silently deleted to fix eligibility. Use the bound scope-correction contract for retired occurrences and regenerate affected context/review bindings without renaming successful historical identities.
+
+
 ## Selection before implementation
 
 The agent must complete `docs/sdk-selection.md` before it writes provisional format tooling. A compatible SDK branch with the same engine/version identity is reused directly. A partial same-identity match is extended with the smallest missing capability. A different identity with reusable implementation is recorded as a reference and selected through `derive-new`; it is not extended. A new private adapter without a reference is allowed only after every inventoried candidate is evaluated as incompatible. Neither the current checkout nor the absence of a local branch is evidence that no reusable SDK exists.

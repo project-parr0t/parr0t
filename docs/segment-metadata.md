@@ -25,6 +25,11 @@ All fields are optional and belong in `Segment.metadata`. Emit them only from st
 
 These localization-authority fields are defined in `docs/localization-authority.md`. Both independent inventories must agree on them. They bind semantic interpretation and therefore cannot be inferred from a candidate or changed during correction.
 
+For an inventory declaring `coverage.display_scope`, an active row cannot have a control-storage `storage_role`, even with `display_projection_required=true`. Keep that occurrence in raw/history accounting and bind a separate display-only projection. Segment consumers validate the declared active scope before forming context neighbors or dispatching semantic work; historical retired rows remain available only through the bound scope-correction evidence.
+
+The SDK must keep semantic context distinct from parse evidence. Attach relevant target-bound facts, not wholesale command lists, editor metadata or raw string tables. `context_preflight` only decides whether an already eligible target needs semantic context; it cannot turn an internal or unclassified occurrence into a translation target.
+
+
 ## Context preflight authority
 
 UI includes buttons, labels, values, status text, and composed fragments. UI is not automatically context-free. Dynamic state, quest/tutorial linkage, terminology, speaker or target linkage, logic/storage use, ambiguity, strong-review signals, and unresolved composition dependencies always remain in semantic context analysis.

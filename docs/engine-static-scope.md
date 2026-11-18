@@ -1,6 +1,6 @@
 # Engine static display-scope contract
 
-An engine SDK may build a smaller translation inventory when its public data format exposes stable runtime roots, display bindings, and control-flow references. This is an optional engine capability, not a generic text heuristic. Raw literal discovery is a candidate collection step, not proof that every literal is displayed. Without display-scope evidence, retain uncertain display candidates rather than declaring them internal or demanding translation of every raw string.
+Separating raw occurrences from eligible display targets is mandatory for every SDK, as specified in `docs/sdk-branch-contract.md`. An SDK may additionally build a smaller translation inventory when its public format exposes stable runtime roots, display bindings and control-flow references. This additional reachability pruning is optional, not a generic text heuristic. Raw literal discovery is not proof of display use. Retain actual uncertain display dependencies, but do not promote every unclassified raw string into that category.
 
 ## Claims
 
@@ -16,6 +16,13 @@ Only `proven_unused` display candidates may be absent under this reachability cl
 
 Core-bound new inventory tasks also use `coverage.display_scope` (`parr0t.display-scope.v1`) to separate raw occurrence accounting from translation candidates. It records raw occurrences, display candidates, control-only and unclassified occurrences, plus a nonempty evidence fingerprint. Every included segment supplies `metadata.display_scope_evidence` with kind `positive_display_binding` or `possible_display_dependency` and its evidence fingerprint. The core checks schema, non-negative counts, candidate/segment equality, and evidence presence; these checks do not establish SDK correctness, engine reachability, physical provenance, or runtime completeness. SDKs own those claims and must retain uncertain actual display candidates. Legacy snapshots may omit this declaration.
 New-contract scope evidence additionally binds each target's UTF-8 source digest and a stable `display_binding_id`; control-valued storage needs an explicit display projection. Unclassified raw occurrences remain outside translation scope until the SDK establishes a possible display dependency. This is not permission to exclude uncertain actual display candidates or to infer visibility from module names or raw-string presence.
+
+Eligibility is decided before inventory materialization, context chunking, translation and review. Supported display fields and consumer traces establish candidates; editor/control/diagnostic storage does not become eligible from its language, container membership, a caller's arbitrary label or a matching hash. Retain unclassified occurrences in the private census and resolve their roles locally from cached format evidence. An actual unresolved display consumer remains an explicit pending dependency, not a silently excluded target.
+
+Only eligible rows are semantic inputs. Preserve full parse/command evidence privately and attach only target-bound speaker, branch, state, composition and other relevant facts. Never pass the entire census to context analysis to discover which rows should have been filtered.
+
+Each independent method discovers target locations and eligibility from source independently. Shared format primitives are allowed; emitting the same discovered segment list twice with different method labels is not independent extraction. Engine fixtures must show both exclusion and visible-text preservation, byte-safe application and detection of a one-method omission.
+
 
 ## Inventory binding
 
