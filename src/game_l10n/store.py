@@ -52,19 +52,13 @@ def stable_hash_sequence(values: Iterable[Any]) -> str:
 
     digest = hashlib.sha256()
     digest.update(b"[")
+    encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     first = True
     for value in values:
         if not first:
             digest.update(b",")
         first = False
-        digest.update(
-            json.dumps(
-                value,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        )
+        digest.update(encoder.encode(value).encode("utf-8"))
     digest.update(b"]")
     return digest.hexdigest()
 

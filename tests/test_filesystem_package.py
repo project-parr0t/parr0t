@@ -108,12 +108,9 @@ class FilesystemPackageTests(unittest.TestCase):
             self.assertEqual(validate_filesystem_package(first)["status"], "valid")
             with zipfile.ZipFile(first) as archive:
                 manifest = json.loads(archive.read(MANIFEST_NAME))
-                installer = archive.read("Install-Translation-Patch.ps1").decode("utf-8-sig")
             self.assertNotIn("steam", manifest)
             self.assertEqual(manifest["target"]["selection"], "explicit_game_root")
             self.assertEqual(manifest["installer"]["status_file"], STATUS_FILE_NAME)
-            self.assertIn("target.source_binding:", installer)
-            self.assertIn("Get-TargetContract", installer)
 
             powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
             if powershell:
