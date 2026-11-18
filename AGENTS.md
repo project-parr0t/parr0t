@@ -30,6 +30,7 @@ Parr0t is engine-neutral. Keep game/credential/title/job data in external worksp
 15. **Start large jobs linearly.** At 10,000+ records: scan once/method, cache evidence, repair gaps. Display scope needs render/dependency evidence. Reconcile comparison keys before canonical expansion; no per-record startup artifacts.
 16. **Use the branch updater.** Run `scripts/update_branches.py`; never manually merge a hold. Fix its cause and replan.
 17. **Never solicit limits.** No whole-job usage ceiling applies unless the user selected it and the manifest records it. Time/token/cost dimensions are independently optional. Capacity and provider errors must not be mislabeled as a user budget.
+18. **Limit framework-version compatibility to checkpoints.** Resume from validated checkpoint/repository data using the current Core and the current selected SDK implementation. Never retain, restore, alias, execute, or add a compatibility branch for an obsolete Parr0t runtime, path, launcher, or tool transport. Historical execution bindings are immutable evidence, not executable plans: verify actual worker termination, close the old attempt honestly, preserve completed artifacts/identities, and regenerate fresh manifests and argv with the current code. Engine/version support and real-game runtime approval remain separate contracts.
 
 ## Standard job sequence
 
