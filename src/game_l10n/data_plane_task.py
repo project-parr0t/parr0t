@@ -63,10 +63,10 @@ from .inventory_constraints import (
 )
 from .language_policy import language_binding
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext, Segment
-from .native_runtime import RUNTIME_ISSUES, native_launch_summary, native_runtime
+from .native_runtime import RUNTIME_ISSUES, native_launch_summary, native_runtime, require_native_workers_ended
 from .omp_isolation import ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
 from .privacy import is_within
-from .store import stable_hash
+from .store import exclusive_file_lock, stable_hash
 
 
 DATA_PLANE_TASK_SCHEMA = "parr0t.data-plane-task.v1"
@@ -2974,6 +2974,14 @@ def record_data_plane_failure(
         "cancellation_owner": "actual_host_relay_owner",
     }
 def record_data_plane_relay_event(
+    work_dir: Path, relay_path: Path, *, event: str, slot: int | None = None,
+) -> dict[str, Any]:
+    require_control_plane_ready(work_dir)
+    with exclusive_file_lock(work_dir / ".game-l10n/data-plane-relay-events.lock", issue_code="E_DATA_PLANE_RELAY_BUSY", blocking=True):
+        return _record_data_plane_relay_event(work_dir, relay_path, event=event, slot=slot)
+
+
+def _record_data_plane_relay_event(
     work_dir: Path,
     relay_path: Path,
     *,
@@ -3505,6 +3513,8 @@ def seal_data_plane_task(
     """Seal one data-plane task, including a worker ending without valid output."""
 
     relay, task = _load_bound_data_plane_relay(work_dir, relay_path)
+    if "launch_contract" in relay:
+        require_native_workers_ended(work_dir, relay_path)
     execution = _relay_execution_summary(work_dir, relay)
     operational_failure_path = _operational_failure_path(
         relay_path, str(task["task_id"])

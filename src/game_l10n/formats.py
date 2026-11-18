@@ -52,6 +52,7 @@ def read_segments(path: Path) -> list[Segment]:
 
     segments: list[Segment] = []
     seen: set[str] = set()
+    known = {"id", "source", "speaker", "scene", "previous", "next", "metadata"}
     for index, row in enumerate(rows(), start=1):
         if not isinstance(row, dict):
             raise ValueError(f"Row {index} must be an object")
@@ -62,7 +63,6 @@ def read_segments(path: Path) -> list[Segment]:
         if segment_id in seen:
             raise ValueError(f"Duplicate segment id: {segment_id}")
         seen.add(segment_id)
-        known = {"id", "source", "speaker", "scene", "previous", "next", "metadata"}
         metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
         metadata = {**metadata, **{key: value for key, value in row.items() if key not in known}}
         segments.append(
@@ -83,7 +83,8 @@ def read_segments(path: Path) -> list[Segment]:
             previous = segments[index - 1].source
         if not following and index + 1 < len(segments):
             following = segments[index + 1].source
-        segments[index] = replace(segment, previous=previous, next=following)
+        if previous != segment.previous or following != segment.next:
+            segments[index] = replace(segment, previous=previous, next=following)
     return segments
 
 
