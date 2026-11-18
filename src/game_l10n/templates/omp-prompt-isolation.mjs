@@ -1,5 +1,6 @@
 import { readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
+import registerFrameworkModeApproval, { checkFrameworkToolCall } from "./framework-mode-approval.mjs";
 
 // Enforce child host-tool communication boundaries without an OS sandbox.
 // Native processes use the public exec API, never the embedded URL filesystem.
@@ -172,6 +173,7 @@ export default function promptIsolation(pi) {
     return typeof configured === "string" && path.isAbsolute(configured)
       ? configured : process.env[WORKSPACE_ENV] ?? ctx.cwd;
   }
+  registerFrameworkModeApproval(pi, workspace);
   pi.on("session_start", (_event, ctx) => {
     if (ctx.agent?.kind === "main") process.env[WORKSPACE_ENV] = workspace(ctx);
   });
@@ -192,6 +194,8 @@ export default function promptIsolation(pi) {
     return { systemPrompt: Array.isArray(event.systemPrompt) ? blocks : blocks.join("\n\n") };
   });
   pi.on("tool_call", (event, ctx) => {
+    try { checkFrameworkToolCall(event, ctx, realpathSync(workspace(ctx))); }
+    catch (error) { return { block: true, reason: error.message }; }
     if (ctx.agent?.kind !== "sub") return;
     try {
       if (deniedCall(event.toolName, event.input)) return { ...DENIAL };

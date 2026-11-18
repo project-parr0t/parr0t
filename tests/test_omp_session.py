@@ -13,6 +13,7 @@ from game_l10n.errors import ConfigurationError
 from game_l10n.control_plane import suspend_control_plane, control_plane_state
 from game_l10n.framework_session import change_framework_mode, framework_session_state
 from game_l10n.user_request import record_user_request, user_request_binding, USER_REQUEST_PATH
+from tests.framework_approval_fixture import issue_approval
 
 
 class OmpSessionTests(unittest.TestCase):
@@ -311,7 +312,10 @@ class OmpSessionTests(unittest.TestCase):
     def test_auto_restart_selects_canonical_recovery_without_reactivating_caller(self):
         for mode in ("analysis", "shutdown"):
             with self.subTest(mode=mode):
-                change_framework_mode(self.workspace, mode, user_requested=True)
+                change_framework_mode(
+                    self.workspace, mode, user_requested=True,
+                    approval=issue_approval(self.workspace, mode),
+                )
                 lifecycle = framework_session_state(self.workspace)
                 control = control_plane_state(self.workspace)
                 with self.assertRaisesRegex(ValueError, "ROTATION_REQUIRED"):
@@ -329,7 +333,10 @@ class OmpSessionTests(unittest.TestCase):
                 self.assertEqual(user_request_binding(self.workspace), self.request)
 
     def test_auto_restart_rejects_stale_handoff_before_spawn(self):
-        change_framework_mode(self.workspace, "analysis", user_requested=True)
+        change_framework_mode(
+            self.workspace, "analysis", user_requested=True,
+            approval=issue_approval(self.workspace, "analysis"),
+        )
         path = self.workspace / omp_session.CONTROL_HANDOFF_PATH
         receipt = json.loads(path.read_text(encoding="utf-8"))
         receipt["from_generation"] += 1

@@ -28,7 +28,7 @@ For a new job:
 
 For an existing job, start with status and reuse valid checkpoints. Do not repeat work with unchanged fingerprints.
 
-Continuation, shutdown/analysis, and approved log diagnosis: `control-plane-contract.md`.
+Continuation/diagnosis: `control-plane-contract.md`. Analysis/shutdown requires the main host's `parr0t_framework_mode` and interactive user approval. Flags and children cannot authorize changes; exposure/recovery gates remain.
 
 ## State machine
 

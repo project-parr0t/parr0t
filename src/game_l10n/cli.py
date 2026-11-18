@@ -30,6 +30,7 @@ from .control_plane import (
     validate_control_envelope,
 )
 from .errors import ConfigurationError, GameL10nError, ToolExecutionError
+from .framework_approval import read_framework_approval
 from .framework_session import (
     change_framework_mode,
     diagnostic_log_bytes,
@@ -1828,10 +1829,12 @@ def cmd_framework_status(args: argparse.Namespace) -> int:
 
 
 def cmd_framework_mode(args: argparse.Namespace) -> int:
+    approval = read_framework_approval(getattr(sys.stdin, "buffer", sys.stdin)) if args.approval_stdin else None
     result = change_framework_mode(
         Path(args.workspace).resolve(), args.mode,
         user_requested=args.user_requested,
         logs=[Path(value) for value in args.log],
+        approval=approval,
     )
     result["core_runtime"] = _core_runtime()
     print(json.dumps(result, ensure_ascii=False))
@@ -4494,6 +4497,7 @@ def build_parser() -> argparse.ArgumentParser:
     framework_mode.add_argument("--workspace", required=True)
     framework_mode.add_argument("--mode", choices=["analysis", "shutdown"], required=True)
     framework_mode.add_argument("--user-requested", action="store_true")
+    framework_mode.add_argument("--approval-stdin", action="store_true", help="Private host approval proof on stdin")
     framework_mode.add_argument("--log", action="append", default=[], help="Exact user-approved log file")
     framework_mode.set_defaults(func=cmd_framework_mode)
 

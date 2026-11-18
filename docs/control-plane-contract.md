@@ -400,28 +400,27 @@ This is an admission exception, not retroactive isolation or permission for new 
 
 ## Framework shutdown and private diagnostic analysis
 
-A contaminated session can stop being a localization controller without pretending to become text-free. On the user's explicit request, enter one of these modes:
+Framework mode changes belong only to the top-level controller, identified by the host as `main` at depth zero. Disposable relays, semantic workers and diagnostic descendants cannot change modes. A model's claim that the user requested analysis is not authority: `--user-requested` alone is rejected before lifecycle, control or log-grant mutation. Neither an execution failure nor a missing SDK authorizes a transition.
+
+On an explicit user request, invoke `parr0t_framework_mode` from the main host session with `mode: "analysis"` or `mode: "shutdown"`. For analysis, supply only the exact approved `logs`; omit logs for code-only diagnosis. The host displays the resolved workspace, requested mode and selected log paths, then requires affirmative interactive user confirmation. Cancellation, missing main identity or a noninteractive/unavailable confirmation surface denies the request without mutation. Prompt entry never implies approval.
+
+Only after confirmation does the host issue a random, short-lived, single-use approval bound to the workspace, actual main/session identity, current lifecycle revision, mode and ordered log paths. The secret proof reaches core through private stdin, never command arguments, environment variables or model-visible output. Core verifies and consumes it under the lifecycle lock before mutation. Changed scope, stale revision, expiry, wrong token and replay fail closed. Replacing analysis log grants or switching to shutdown requires fresh approval too.
+
+The internal CLI transport is `framework-mode --user-requested --approval-stdin`, not a public approval issuer. Do not create approval records or proofs manually, infer consent from persisted `user_requested: true`, or edit lifecycle/approval metadata through agent tools. Both OMP helpers protect those host-tool write paths and reject child invocation even at direct tool execution. Hosts without trusted confirmation integration cannot authorize mode changes.
 
 ```text
-game-l10n framework-mode --workspace <workspace> --mode shutdown --user-requested
-game-l10n framework-mode --workspace <workspace> --mode analysis --user-requested \
-  --log <exact-user-approved-log-path>
 game-l10n framework-status --workspace <workspace>
 ```
 
-`framework-mode`, `framework-status`, and every `status` branch report `core_runtime` with the actual CLI module, Python executable, and `cli_argv`. Append the intended verb and arguments to that array and execute it directly, without shell interpolation. The prefix uses the adjacent packaged `native-python.py` under `-I -B`, so a stale editable installation, current-directory package, or `PYTHONPATH` cannot silently select another core. Reporting or using this prefix does not authorize a mode change or localization recovery.
+`framework-mode`, `framework-status`, and every `status` branch report `core_runtime` with the actual CLI module, Python executable, and `cli_argv`. Append read-only status/diagnostic commands to that array without shell interpolation; mode mutation additionally requires the host approval above. The prefix uses the adjacent packaged `native-python.py` under `-I -B`, so stale imports cannot silently select another core. Selecting a core or reading prompt instructions grants no consent.
 
-If the installed CLI does not recognize `framework-mode`, invoke the selected full core checkout explicitly rather than retrying the unchanged installation or starting a replacement session:
+The approval is a supported CLI/host-tool boundary, not an OS sandbox or a cryptographic attestation against arbitrary native code running as the same OS user. Direct filesystem tampering with trusted host records requires OS-level separation to prevent. Do not claim otherwise. Changing helper files cannot hot-upgrade a loaded host; reload the trusted helper before using the new confirmation tool.
 
-```text
-python -I -B <core>/src/game_l10n/templates/native-python.py framework-mode --workspace <workspace> --mode analysis --user-requested
-```
-
-Omit `--log` when no exact logs were approved. Preserve the old checkout, provider policy, and checkpoints; do not change the global Python installation merely to enter diagnostics. An explicit core entry selects code but does not load or hot-upgrade the current OMP host's isolation guard.
+Preserve the old checkout, provider policy and checkpoints; do not change global Python installations or automatically launch a replacement session to obtain approval.
 
 Shutdown withdraws localization instructions and admits no diagnostic logs. Analysis does the same withdrawal and authorizes only the exact selected logs. `--log` is repeatable; omitted logs means no log-read grant. Selection can use workspace-relative or absolute paths, including an explicitly selected host log outside the workspace; it is not permission to discover other sessions, traverse agent trees, scan log directories, or read unrelated private artifacts. Never infer consent from contamination alone: record contamination, then honor the user's requested shutdown or analysis scope. No new OMP session is started.
 
-The core atomically writes `.game-l10n/framework-session.json` (`parr0t.framework-session.v1`) before touching control metadata or opening logs. Missing lifecycle state retains the existing localization default. An inactive state has `instructions_active: false`; normal CLI operations, native admission, and workspace-bound direct translation/review reject new work with `E_FRAMEWORK_INACTIVE`. `status` reports `framework_shutdown` or `analyze_framework_logs`, not an unfinished translation action. It does not require healthy game configuration or control-plane metadata. An unreadable selected log leaves localization disabled and grants no partial log access.
+After consuming valid approval, the core atomically writes `.game-l10n/framework-session.json` (`parr0t.framework-session.v1`) before touching control metadata or opening logs. Missing lifecycle state retains the existing localization default. An inactive state has `instructions_active: false`; normal CLI operations, native admission, and workspace-bound direct translation/review reject new work with `E_FRAMEWORK_INACTIVE`. `status` reports `framework_shutdown` or `analyze_framework_logs`, not an unfinished translation action. It does not require healthy game configuration or control-plane metadata. An unreadable selected log leaves localization disabled and grants no partial log access.
 
 Only a genuinely absent metadata entry receives a legacy initial state. Existing directories, dangling symlinks/junctions, denied lookups, and entries that disappear after lookup fail closed in the control-state, entry-gate, and lifecycle readers. The OMP lifecycle guard follows the same distinction; an `ENOENT` from following an existing link must never reactivate localization. These checks detect malformed metadata, not adversarial filesystem tampering or an OS sandbox boundary.
 

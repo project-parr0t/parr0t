@@ -10,6 +10,7 @@ from game_l10n.errors import ConfigurationError
 from game_l10n.control_plane import control_plane_state
 from game_l10n.framework_session import change_framework_mode, framework_session_state
 from game_l10n.user_request import USER_REQUEST_PATH, record_user_request, user_request_binding
+from tests.framework_approval_fixture import issue_approval
 
 
 class UserRequestTests(unittest.TestCase):
@@ -63,7 +64,10 @@ class UserRequestTests(unittest.TestCase):
         self.assertFalse((self.workspace / USER_REQUEST_PATH).exists())
 
     def test_recording_during_analysis_does_not_reactivate_or_echo_request(self):
-        change_framework_mode(self.workspace, "analysis", user_requested=True)
+        change_framework_mode(
+            self.workspace, "analysis", user_requested=True,
+            approval=issue_approval(self.workspace, "analysis"),
+        )
         lifecycle = framework_session_state(self.workspace)
         control = control_plane_state(self.workspace)
         output = io.StringIO()

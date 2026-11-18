@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { accessSync, appendFileSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import registerFrameworkModeApproval, { checkFrameworkToolCall } from "./framework-mode-approval.mjs";
 
 const TEMPLATE = fileURLToPath(import.meta.url);
 const GUARD_SHA256 = createHash("sha256").update(readFileSync(TEMPLATE)).digest("hex");
@@ -360,6 +361,10 @@ export default function isolationGuard(pi) {
   let relay;
   let childRole;
   let announcedMode;
+  registerFrameworkModeApproval(pi, () => {
+    if (!ready || fatal) fail("guard startup failed");
+    return workspace;
+  });
   function requireAnalysis(state) {
     if (state.mode !== "analysis") fail("diagnostic collaboration requires analysis mode", "framework_inactive");
   }
@@ -555,6 +560,8 @@ export default function isolationGuard(pi) {
     } catch (error) { return deny(ctx, "task", error); }
   });
   pi.on("tool_call", (event, ctx) => {
+    try { checkFrameworkToolCall(event, ctx, workspace ?? ctx.cwd); }
+    catch (error) { return { block: true, reason: error.message }; }
     try {
       if (!ready || fatal) fail("guard startup failed");
       const state = frameworkState(workspace);
