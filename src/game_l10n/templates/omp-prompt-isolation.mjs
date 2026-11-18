@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import registerFrameworkModeApproval, { checkFrameworkToolCall, recordFrameworkExposure } from "./framework-mode-approval.mjs";
 import createNativeRelayLifecycle, { publishHostModels } from "./native-relay-lifecycle.mjs";
+import { registerNativeProcess } from "./omp-native-process.mjs";
 
 // Enforce child host-tool communication boundaries without an OS sandbox.
 // Native processes use the public exec API, never the embedded URL filesystem.
@@ -169,28 +170,14 @@ export default function promptIsolation(pi) {
     relayPath: () => relay,
     executeCore: (argv, ctx) => pi.exec(argv[0], argv.slice(1), { cwd: workspace(ctx) }),
   });
-  const z = pi.zod;
-  if (!z || typeof pi.exec !== "function") throw new Error("PARR0T_OMP_PROMPT_ISOLATION: native process API required");
-  pi.registerTool({
-    name: "parr0t_process",
-    label: "Parr0t Native Process",
-    description: "Execute native argv (executable first), including ordinary Python, without OMP virtual-URL or IRC routing. No shell interpolation, implicit timeout, execution guard registration, or OS sandbox.",
-    parameters: z.object({ argv: z.array(z.string()).min(1), cwd: z.string().optional() }),
-    async execute(_id, params, signal, _onUpdate, ctx) {
-      if (!Array.isArray(params.argv) || !params.argv.length
-          || params.argv.some(arg => typeof arg !== "string" || arg.includes("\0"))
-          || !params.argv[0].trim()) throw new Error("PARR0T_OMP_PROMPT_ISOLATION: native argv required");
+  registerNativeProcess(pi, {
+    async beforeExecute(params, ctx) {
       if (relay && ctx.agent?.kind === "sub" && ctx.agent.depth === 1) {
         const decision = await lifecycle.tool_call({ toolName: "parr0t_process", input: params }, ctx);
         if (decision?.block) throw new Error(decision.reason);
       }
-      const result = await pi.exec(params.argv[0], params.argv.slice(1), { cwd: params.cwd ?? (relay ? workspace(ctx) : ctx.cwd), signal });
-      return {
-        content: [{ type: "text", text: result.stdout + result.stderr }],
-        details: result,
-        isError: result.code !== 0 || result.killed,
-      };
     },
+    defaultCwd: ctx => relay ? workspace(ctx) : ctx.cwd,
   });
   function workspace(ctx) {
     const configured = pi.getFlag("parr0t-workspace");
