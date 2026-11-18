@@ -4,7 +4,7 @@ A successful review retry counts toward semantic completion only when its approv
 
 The framework reviews by **role**, not by vendor or model name. Translation, compact judging, selective rewriting, and fallback judging may each use a different API, native App agent, command adapter, local model, or compatible endpoint.
 
-Review starts only after the translation barrier. A configured translation retry is still translation, not review: lock every successful candidate, retry only failed targets on the same route, advance only the remainder to the secondary translator, and use the external fallback only after that route's retry budget. The recommended preset is Luna first attempt plus five retries, Sol first attempt plus three retries, then DeepSeek. None of these stages authorizes the top-level control plane to read or judge text.
+Review follows the configured route pipeline; retries remain failed-only and successes are locked. Preset examples describe safe defaults, not fixed provider topology. Explicit route/model selections and configured retry counts remain authoritative; only missing settings receive documented defaults. Review remains isolated from the top-level control plane.
 
 ## Cost-aware quality flow
 
@@ -39,19 +39,20 @@ Only an independently `reviewed` result may enter `approved_same_speaker_style_a
 
 For native App review, compact output alone is not enough: each bounded review task runs in a fresh no-history worker and that worker ends after the task. Reusing a judge session for later tasks replays prior candidates and tool output, increases input superlinearly, and risks cross-target contamination without improving the current target's evidence.
 
-Prepare Codex App native judging with `prepare-native-pass --pass-kind review --review-tier triage` for the complete Luna pass, then `--review-tier strong` only for the selected Sol subset. Other execution modes follow their configured reviewer routes. The manifest binds the expected native provider and rejects a result from another model. The public limits of 2,048 candidates and 262,144 estimated material tokens are structural hard ceilings, not initial packing targets or whole-job usage ceilings. A new v7 review task starts at no more than 256 candidates and 65,536 estimated material tokens. The judge loads shared rules/context once and produces all bound `ok | rewrite | refused | error` verdicts in one semantic response. It must not create or submit one prompt per candidate.
+Native review uses `prepare-native-pass --pass-kind review --review-tier triage|strong` with core-bound routes and task manifests. Packing values are configurable safe defaults, not universal hard ceilings; honor positive explicit bounds and host/model capacity. Each worker returns ordered categorical verdicts for its bound task in one semantic call.
 
-Within that fresh worker, one semantic call covers the whole bound task and the worker ends. If a batch refusal, error, malformed response, or target failure remains, the deterministic core imports and locks successful verdicts, then emits a child manifest containing only failed targets at half the previous task bounds. Neither the root nor the relay inspects text, chooses target membership, or reopens successful rows. Existing v7 manifests retain their serialized 11-level compatibility ceiling, but the current deterministic core stops at depth 3 or before cumulative record attempts would exceed 2.0 times the original review set. Cumulative usage survives the chain. A one-record failed subset, a one-record task bound, or a failure remaining at a depth/amplification limit proceeds to the configured review fallback; it does not justify another ad hoc split loop.
+Core imports valid results independently, locks successes, and retains missing or failed targets for continuation. Failed-subset manifests preserve provider/attempt bindings and cumulative usage. Review splitting follows the manifest's serialized depth and configurable optimization policy; do not impose hidden depth or amplification clamps. Repair-needed or not-yet-attempted targets are not semantic exhaustion.
 
-The worker reads only its bound v7 task payload plus the referenced focused context. It must not reopen the complete ordered source or prior result set for every batch. The full artifacts remain framework validation inputs; repeating them in each worker turns a linear pass into superlinear input cost without improving verdict evidence.
+Workers consume only their bound payload and focused context, not the complete source or prior result set.
 
-This is selective **strong** review, not selective review coverage. Every new or reused candidate receives a fresh triage verdict through the configured route. Prior approval never exempts a candidate. An unselected candidate counts as reviewed only when a current-generation `review-triage` approval and candidate digest both match; selected candidates require a current strong approval. With no `review_triagers` route, Parr0t retains the legacy behavior and sends every candidate through `reviewers`.
+Every current candidate requires current-generation review evidence: triage for unselected candidates and strong approval for selected ones. With no `review_triagers` route, all candidates go through `reviewers`.
 
-`routing.review_max_rounds` is the legacy judge/rewrite-cycle bound for routes without an explicit call cap. Explicit route/tier caps also bound their correction cycles. Sol strong review has an independent ceiling of **two judge attempts per target, including the first attempt**, error/refusal retries, split attempts, and post-rewrite confirmation. Approved targets remain locked. Attempt history and cumulative ordinal summaries survive split collection and resume; changing a limit does not invalidate successful candidates or reset counters. Operational/native admission errors do not prove a request reached the provider; dispatch counts are not measured provider usage.
+`routing.review_max_rounds` and route/tier call limits are configured policy with safe defaults. User-selected limits replace model-name caps; preserve explicit existing values, including a configured Sol limit, and do not add a Sol-specific ceiling. Operational/native admission errors do not prove a provider attempt; dispatch counts are not measured usage.
 
-Fallback review has no invented call-count default. `routing.review_attempt_limits` maps each configured fallback provider name to the positive total number of judge attempts explicitly requested by the user. Explicit initial user/template model and count selections take precedence over preset defaults: retain exact IDs and ask only for missing values. Missing configuration produces `E_REVIEW_FALLBACK_POLICY_REQUIRED` / `user_configuration_required`, preserves the candidate and pending queue, makes no fallback request, and cannot justify `source_preserved` or route exhaustion. An unbound host or incompatible authorized transport likewise preserves the exact requested model/count pending; it is not a failed/refused request or evidence of exhaustion. Translation retries and complete triage coverage are separate policies.
 
-Pre-v7 worker-owned review contracts cannot enforce the new per-target cap and are held as `E_NATIVE_REVIEW_CALL_POLICY_REQUIRED` before dispatch. Keep their imported successes and original artifacts; aggregate those normally and prepare only still-pending targets under the current v7 contract. Never reset history, overwrite success, or dispatch an old multi-call worker to bypass the cap.
+Legacy manifests retain their original serialized contract and successes; continue pending targets under the current contract without resetting history or overwriting results.
+
+Fallback routes default to three total judge attempts per target when no route-specific count is configured. `routing.review_attempt_limits` records explicit totals. Preserve explicit initial user/template model and count selections; a missing host binding or incompatible authorized transport leaves the exact request pending, not semantic failure or route exhaustion. Translation retries and triage coverage are separate policies.
 
 Inspect or record an explicitly selected fallback model and its per-target total call count without changing provider mode or permissions:
 
@@ -60,24 +61,15 @@ game-l10n review-policy --workspace <workspace>
 game-l10n review-policy --workspace <workspace> --fallback-model <exact-requested-model> --max-calls <user-total> --user-requested
 ```
 
-`review-policy` binds both the selected model and call count; it is not merely a check against the default DeepSeek model. A matching existing fallback-review route may be retained; if several routes use that model, specify `--fallback-provider <configured-provider-name>`. On the current native preset/host, an explicitly requested authorized native fallback may instead bind `native-review-fallback`, recorded as the `review-fallback` native-role override. Presets supply model defaults, not immutable model choices: this explicitly recorded native-role override is the narrow topology exception. It does not switch provider mode or convert the request to an API call. If the native host is not bound, or the model is incompatible with the selected host/authorized transport, retain the exact requested model/count pending rather than substituting a model, sending a native request to DeepSeek, or declaring failure/refusal/exhaustion. A Sol route cannot exceed two calls. Preserve unspecified roles/routes, endpoints and credentials, translator retries, existing per-target counters/limits, started-worker evidence, and completed results.
+`review-policy` binds an explicitly selected model and count to a configured fallback route (or to the selected native review-fallback role) without changing provider mode or permissions. Presets supply defaults, not immutable topology. Missing host binding or incompatible transport preserves the exact request pending; advertised availability is not permission. A selection never implicitly changes API/native execution.
 
-Record explicit native-host role selections before dispatch with `native-runtime --workspace <workspace> --host <current-native-host> --role-model review-fallback=<exact-requested-model> --user-requested-models`, using the already chosen `codex` or `omp` host. The same repeatable flag maps `translation` → `native-translation`, `triage` → `native-triage`, `strong-review` → `native-strong-review`, and `context` → `native-context`; omit unselected roles. The existing `--model route=exact-id` route syntax remains supported. A model selection grants no new provider role, endpoint, credential, or transport permission; never implicitly swap API/native execution.
+Record only tier values supplied by the user or starting template. Omitted values retain safe defaults. Positive worker counts and task sizes are bounded by actual host/model capacity and resource-safe scheduling, not arbitrary universal caps. User call limits replace model-name caps; existing selected limits remain unchanged.
 
-Exact user/template model choices are already approved by Parr0t across SDKs, independently of provider catalogs or advertised model lists. `review-policy` reports `model_authorizations` separately from `native_binding_pending`: a missing runtime binding is not missing model approval. Do not invent another approval list or leave a supplied model/count pending merely because it is absent from an advertisement. Actual execution-layer denial remains an operational result and never consumes an unstarted semantic attempt or establishes route exhaustion.
-
-Optional user-selected tier settings are `routing.triage_max_calls`, `routing.strong_max_calls`, `routing.review_max_workers`, `routing.triage_max_workers`, and `routing.strong_max_workers`. Omitted values retain the current policy. Calls must be positive integers; worker caps are integers from 1 through the transport's structural ceiling of 64. Strong review uses the minimum of its explicit route cap, tier cap, and Sol's two-call cap when applicable. A tier cap does not invent missing fallback authorization or its count. Each phase uses the minimum of requested workers, the overall review cap, its tier cap, and the existing host/model ceiling; translation/context concurrency is unchanged.
-
-Record only values explicitly supplied by the user or starting template:
-
-```sh
-game-l10n review-policy --workspace <workspace> --triage-max-calls <user-total> --strong-max-calls <user-total> --review-max-workers <user-limit> --triage-max-workers <user-limit> --strong-max-workers <user-limit> --user-requested
-```
-
-This command can also include the exact fallback model/count flags above; it validates the entire request before one atomic configuration write. It never requests a whole-job usage ceiling or grants extra provider/model permissions.
+The command validates supplied model/count/tier settings before writing configuration; it does not require a whole-job usage ceiling or grant provider/model permissions.
 
 
-After a complete review pass, freeze the flagged target set. If no more than `execution.residual_direct_records` remain, process them as one cached residual task through its isolated relay and one fresh no-history semantic worker, then aggregate once. The residual size does not waive the relay boundary. Do not create a new controller, ownership/lease layer, proof bundle, or supplemental context workflow for the tail, and never reopen already approved candidates. A capacity failure preserves the exact residual task for resumption instead of restarting the control turn.
+
+After the complete review pass, continue any remaining eligible review work through the core-selected route. Residual task sizing follows configured safe defaults and explicit bounds; it never reopens approved candidates. Packaging and deterministic finalization do not spawn another reviewer unless candidate text changes.
 
 Once the final verdict is imported, review is over. Package construction, README/release metadata, and deterministic integrity checks must not spawn another reviewer or request semantic reassurance. A finalization defect reopens only the exact failed deterministic gate unless it changes candidate text.
 
@@ -116,7 +108,7 @@ Reference cues are advisory evidence, not a license to invent. Context analysis 
 
 - `review_triagers` provide complete low-cost verdict coverage. A non-`ok` outcome routes the target to strong review; it never drops the target.
 - `reviewers` are selective strong judges. Refusal or operational failure advances to the next strong judge.
-- `review_attempt_limits` values are user decisions, not recommended defaults; the example's `3` is illustrative. A successful verdict stops early. Counters include prior judge attempts and confirmations, not only the latest invocation. Never copy an example count into a real job without the user's choice.
+- Explicit `review_attempt_limits` values take precedence; an unspecified fallback route uses the documented default of three total attempts per target. The configuration example is illustrative, not a request to overwrite explicit settings. A successful verdict stops early; counters include prior attempts and confirmations.
 - `rewriters` are correction editors. They are called only for `rewrite` verdicts and tried in order.
 - An empty `rewriters` list reuses the active judge as the rewriter for compatibility.
 - Translation and review chains remain independent. Do not use the top-level orchestrator as the semantic judge.
@@ -138,7 +130,7 @@ Choose limits with representative evaluations. Reasoning models may need a large
 
 ## Recommended and alternative deployments
 
-The recommended hybrid deployment uses native Codex App Luna translation workers, fresh Luna triage workers, selective native Sol strong judges, and a compatible API for refused translations, selective rewrites, and strong-judge fallback. Sol is retained for the cases where its quality has the highest value instead of paying its cost on every ordinary candidate. The roles remain provider-neutral.
+The recommended hybrid deployment uses native Codex App Luna translation and triage defaults, selective native Sol strong-review defaults, and a compatible API for eligible translation fallback, selective rewrites, and judge fallback. These names and routes are defaults; roles remain provider-neutral and explicit workspace selections take precedence.
 
 Supported alternatives include:
 

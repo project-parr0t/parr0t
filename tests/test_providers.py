@@ -16,6 +16,14 @@ from game_l10n.provider_policy import CONTROL_OBSERVATION_POLICY
 
 
 class ProviderTimingTests(unittest.TestCase):
+    def test_model_bindings_read_only_declared_models_without_resolving_routes(self):
+        registry = ProviderRegistry({
+            "bound": CommandProvider("bound", ["not-executed"], model="fixture/exact"),
+            "unbound": CommandProvider("unbound", ["not-executed"]),
+        })
+        with patch.object(registry, "get", side_effect=AssertionError("Do not resolve a route")):
+            self.assertEqual(registry.model_bindings(), {"bound": "fixture/exact"})
+
     def test_provider_defaults_and_config_do_not_invent_timeouts(self) -> None:
         entries = [
             {"type": "openai_responses", "name": "responses", "model": "fixture"},
@@ -316,7 +324,7 @@ class CompatibleProviderTests(unittest.TestCase):
         self.assertEqual(result["_usage"]["cached_input_tokens"], 80)
         self.assertEqual(result["_usage"]["cache_miss_input_tokens"], 40)
 
-    def test_task_input_budget_blocks_oversized_request_before_network(self) -> None:
+    def test_task_input_capacity_blocks_oversized_request_before_network(self) -> None:
         provider = CompatibleChatProvider(
             "deepseek",
             "fixture-model",
@@ -328,7 +336,7 @@ class CompatibleProviderTests(unittest.TestCase):
         with patch.dict(os.environ, {"FIXTURE_API_KEY": "fixture-key"}), patch(
             "game_l10n.providers._post_json"
         ) as post:
-            with self.assertRaisesRegex(ProviderFailure, "budget_exhausted") as raised:
+            with self.assertRaisesRegex(ProviderFailure, "input_capacity_exceeded") as raised:
                 provider.generate_json(
                     system="Translate.",
                     user=json.dumps({"translation_target": {"source": "X" * 200}}),
@@ -338,6 +346,17 @@ class CompatibleProviderTests(unittest.TestCase):
 
         self.assertFalse(raised.exception.retryable)
         post.assert_not_called()
+
+    def test_capacity_compaction_preserves_all_json_values(self) -> None:
+        provider = CompatibleChatProvider(
+            "configured", "exact-model", api_key_env="", base_url="https://fixture.invalid",
+            max_input_chars=80,
+        )
+        material = {"translation_target": {"source": "Synthetic source"}}
+        formatted = json.dumps(material, indent=20)
+        compact = provider._prepare_input("", formatted, "game_translation")
+        self.assertLessEqual(len(compact), 80)
+        self.assertEqual(json.loads(compact), material)
 
     def test_plain_review_verdict_accepts_effect_quality_codes(self) -> None:
         def fake_post(_url, _headers, _payload, _timeout):
@@ -719,6 +738,16 @@ class ProviderProtocolTests(unittest.TestCase):
 
 
 class CommandProviderProtocolTests(unittest.TestCase):
+    def test_command_model_is_explicit_in_fingerprint_and_request(self) -> None:
+        model = "configured/provider-model@upstream:high"
+        provider = CommandProvider("adapter", ["fixture-command"], model=model)
+        completed = subprocess.CompletedProcess([], 0, stdout='{"status":"success"}', stderr="")
+        with patch("game_l10n.providers.subprocess.run", return_value=completed) as run:
+            provider.generate_json(system="fixture", user="fixture", schema={}, schema_name="fixture")
+        self.assertEqual(provider.fingerprint()["model"], model)
+        self.assertEqual(json.loads(run.call_args.kwargs["input"])["model"], model)
+        self.assertNotIn("model", CommandProvider("adapter", ["fixture-command"]).fingerprint())
+
     def test_command_transport_preserves_inert_input_and_direct_arguments(self) -> None:
         command = ["fixture-command", "--mode", "", "fixture argument"]
         provider = CommandProvider("fixture", command, cwd="fixture-directory")

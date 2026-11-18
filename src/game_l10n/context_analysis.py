@@ -1178,6 +1178,10 @@ class ContextAnalyzer:
     ):
         if not provider_chain:
             raise ValueError("context analyzer provider chain is empty")
+        if type(max_chunk_chars) is not int or max_chunk_chars < 1:
+            raise ValueError("context chunk size must be a positive integer")
+        if type(max_workers) is not int or max_workers < 1:
+            raise ValueError("context worker count must be a positive integer")
         if context_mode not in SUPPORTED_CONTEXT_MODES:
             raise ValueError(
                 f"unsupported context mode {context_mode!r}; expected one of "
@@ -1186,7 +1190,7 @@ class ContextAnalyzer:
         self.registry = registry
         self.provider_chain = provider_chain
         self.max_chunk_chars = max_chunk_chars
-        self.max_workers = max(1, int(max_workers))
+        self.max_workers = max_workers
         self.context_mode = context_mode
         self.project = project
         self.glossary = tuple(glossary)

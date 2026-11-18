@@ -74,6 +74,32 @@ def _result_manifest(path: Path, rows: list[dict]) -> dict | None:
     return None
 
 
+def _semantic_fixture_bindings(path: Path) -> tuple[Path, dict[str, str]]:
+    from game_l10n.model_policy import native_role_bindings
+    from game_l10n.native_runtime import RUNTIME_PATH, native_runtime
+
+    for ancestor in path.resolve().parents:
+        if not (
+            (ancestor / "game-l10n.json").is_file()
+            or (ancestor / RUNTIME_PATH).is_file()
+        ):
+            continue
+        models: dict[str, str] = {}
+        if (ancestor / "game-l10n.json").is_file():
+            config = json.loads((ancestor / "game-l10n.json").read_text(encoding="utf-8"))
+            models.update({
+                provider["name"]: provider["model"]
+                for provider in config.get("providers", [])
+                if isinstance(provider.get("model"), str) and provider["model"]
+            })
+            models.update(native_role_bindings(config))
+        runtime = native_runtime(ancestor)
+        if runtime is not None:
+            models.update(runtime["models"])
+        return ancestor, models
+    return path.parent, {}
+
+
 def semantic_result_rows(
     path: Path,
     rows: list[dict],
@@ -101,46 +127,34 @@ def semantic_result_rows(
     ]
     if not provenance_rows:
         return copied
-    manifest = manifest or _result_manifest(path, copied)
+    manifest = manifest if manifest is not None else _result_manifest(path, copied)
     if manifest is not None:
         from game_l10n.native_pass import _bound_manifest_content_source_policy
         policy = _bound_manifest_content_source_policy(manifest)
-        route_binding = manifest.get("route_binding") or {}
-        bound_route = route_binding.get("provider") or route or (
-            "native-luna"
-            if manifest.get("pass_kind", "translation") == "translation"
-            else "native-sol"
-        )
-        bound_model = route_binding.get("model") or model or bound_route
     else:
-        bound_route = route or next(
-            (
-                str(row["provider"])
-                for row in copied
-                if isinstance(row.get("provider"), str)
-                and row["provider"] != "native-control"
-            ),
-            "native-luna" if task_kind == "translation" else "native-sol",
-        )
-        bound_model = model or bound_route
+        policy = None
+    if manifest is not None and not isinstance(policy, dict):
+        return copied
+    work_dir, configured_models = _semantic_fixture_bindings(path)
+    if manifest is None:
         policy = content_source_policy(
-            path.parent,
+            work_dir,
             task_kind=task_kind,
             route=f"native-pass:{'review' if task_kind in {'triage', 'strong_review'} else task_kind}",
         )
-    if not isinstance(policy, dict):
-        return copied
+    route_binding = (manifest or {}).get("route_binding") or {}
     for row in provenance_rows:
-        row_route = (
-            str(row.get("provider") or bound_route)
-            if manifest is None
-            else str(bound_route)
-        )
-        row_model = (
-            str(model or row_route)
-            if manifest is None
-            else str(bound_model)
-        )
+        row_route = route_binding.get("provider") or route or row.get("provider")
+        if not isinstance(row_route, str) or not row_route or row_route == "native-control":
+            raise ValueError(
+                "Semantic result fixture requires an explicit route or manifest route binding"
+            )
+        row_model = route_binding.get("model") or model or configured_models.get(row_route)
+        if not isinstance(row_model, str) or not row_model:
+            raise ValueError(
+                f"Semantic result fixture route {row_route!r} requires an exact model "
+                "from its manifest, runtime, configuration, or explicit model= binding"
+            )
         row.setdefault("provider", row_route)
         row["content_provenance"] = direct_model_provenance(
             policy, row_model, route=row_route

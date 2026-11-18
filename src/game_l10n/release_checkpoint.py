@@ -4,16 +4,18 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .errors import GameL10nError
 
 
 CHECKPOINT_NAME = "parr0t-release-checkpoint.json"
 CHECKPOINT_SCHEMA = "parr0t.release-checkpoint/v1"
+LOCAL_INTEGRITY_SCHEMA = "parr0t.local-release-integrity/v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _STATUS = {"reviewed", "accepted_unreviewed", "source_preserved"}
+_LOCAL_STATUS = _STATUS | {"unreviewed"}
 _FALLBACK_MODES = {"fallback_locale", "placeholder", "source_text", "none"}
 
 
@@ -98,6 +100,11 @@ def validate_release_checkpoint(
 ) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ReleaseCheckpointError("Release checkpoint must be a JSON object")
+    if payload.get("schema") == LOCAL_INTEGRITY_SCHEMA:
+        return _validate_local_integrity(
+            payload, expected_patch_id=expected_patch_id,
+            expected_release_id=expected_release_id,
+        )
     _required_keys(
         payload,
         {
@@ -258,6 +265,208 @@ def validate_release_checkpoint(
 
     _validate_locale_fallback(payload["locale_fallback"])
     return payload
+
+
+def _validate_local_integrity(
+    payload: dict[str, Any], *,
+    expected_patch_id: str | None, expected_release_id: str | None,
+) -> dict[str, Any]:
+    """Local delivery retains integrity without claiming future-update readiness."""
+    from .language_policy import normalize_language_tag
+
+    _required_keys(payload, {
+        "schema", "patch_id", "release_id", "ownership", "source_inventory",
+        "language", "entries",
+    } | ({"integrity_evidence"} if "integrity_evidence" in payload else set()), scope="local_integrity")
+    for key, expected in (("patch_id", expected_patch_id), ("release_id", expected_release_id)):
+        actual = _text(payload[key], field=key)
+        if expected is not None and expected != actual:
+            raise ReleaseCheckpointError(f"Local integrity {key} does not match package")
+    ownership = payload["ownership"]
+    if not isinstance(ownership, dict):
+        raise ReleaseCheckpointError("ownership must be an object")
+    _required_keys(ownership, {"owner", "license"}, scope="ownership")
+    for key in ("owner", "license"):
+        _text(ownership[key], field=f"ownership.{key}")
+    language = payload["language"]
+    if not isinstance(language, dict):
+        raise ReleaseCheckpointError("language must be an object")
+    _required_keys(language, {"source", "target"}, scope="language")
+    for key in ("source", "target"):
+        try:
+            canonical = normalize_language_tag(language[key], field=key)
+        except GameL10nError as exc:
+            raise ReleaseCheckpointError("language tags must be valid") from exc
+        if canonical != language[key]:
+            raise ReleaseCheckpointError("language tags must be canonical")
+    inventory = payload["source_inventory"]
+    if not isinstance(inventory, dict):
+        raise ReleaseCheckpointError("source_inventory must be an object")
+    _required_keys(inventory, {"method", "fingerprint", "target_count"}, scope="source_inventory")
+    _text(inventory["method"], field="source_inventory.method")
+    _digest(inventory["fingerprint"], field="source_inventory.fingerprint")
+    count = inventory["target_count"]
+    entries = payload["entries"]
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1 or not isinstance(entries, list) or len(entries) != count:
+        raise ReleaseCheckpointError("entries must match positive source_inventory.target_count")
+    ids = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ReleaseCheckpointError("local entries must be objects")
+        _required_keys(entry, {
+            "id", "source_sha256", "target", "target_sha256", "status",
+            "integrity_evidence_sha256",
+        }, scope="local entry")
+        target_id = _text(entry["id"], field="entry.id")
+        if target_id in ids:
+            raise ReleaseCheckpointError("local entry IDs must be unique")
+        ids.add(target_id)
+        source_digest = _digest(entry["source_sha256"], field="entry.source_sha256")
+        target_digest = _digest(entry["target_sha256"], field="entry.target_sha256")
+        _digest(entry["integrity_evidence_sha256"], field="entry.integrity_evidence_sha256")
+        if not isinstance(entry["target"], str) or hashlib.sha256(entry["target"].encode("utf-8")).hexdigest() != target_digest:
+            raise ReleaseCheckpointError("local entry target digest mismatch")
+        if entry["status"] not in _LOCAL_STATUS:
+            raise ReleaseCheckpointError("local entry status is unsupported")
+        if entry["status"] == "source_preserved" and source_digest != target_digest:
+            raise ReleaseCheckpointError("source_preserved local target must match source")
+    if "integrity_evidence" in payload:
+        evidence = payload["integrity_evidence"]
+        if not isinstance(evidence, dict) or set(evidence) != ids:
+            raise ReleaseCheckpointError("local integrity evidence must match exact target IDs")
+        for entry in entries:
+            proof = evidence[entry["id"]]
+            if (
+                not isinstance(proof, dict)
+                or proof.get("source_sha256") != entry["source_sha256"]
+                or proof.get("target_sha256") != entry["target_sha256"]
+                or _evidence_digest(proof) != entry["integrity_evidence_sha256"]
+            ):
+                raise ReleaseCheckpointError("local integrity evidence binding mismatch")
+    return payload
+
+
+def _evidence_digest(payload: dict[str, Any]) -> str:
+    data = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def generate_local_release_integrity(
+    work_dir: Path, inventory_path: Path, results: Iterable[Any], *,
+    patch_id: str, release_id: str, owner: str, license_name: str,
+    source_language: str, target_language: str,
+    review_required: bool = True, allow_incomplete_artifact: bool = False,
+    glossary: Iterable[Any] = (), extra_patterns: list[str] | None = None,
+    max_length_ratio: float = 4.0,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Generate a self-contained local checkpoint from actual validated results."""
+    from .coverage import _inventory_document, completion_attestation, inventory_fingerprint, require_inventory_attestation
+    from .language_policy import language_binding, normalize_language_tag
+    from .models import FailureCode, Segment, TranslationResult
+    from .store import stable_hash
+    from . import validators
+
+    if not isinstance(review_required, bool) or not isinstance(allow_incomplete_artifact, bool):
+        raise ReleaseCheckpointError("review and incomplete artifact options must be boolean")
+    _text(owner, field="ownership.owner")
+    _text(license_name, field="ownership.license")
+    config = json.loads((work_dir / "game-l10n.json").read_text(encoding="utf-8"))
+    binding = language_binding(work_dir, config)
+    source_language = normalize_language_tag(source_language, field="source_language")
+    target_language = normalize_language_tag(target_language, field="target_language")
+    if source_language != binding["source_language"] or target_language != binding["target_language"]:
+        raise ReleaseCheckpointError("local release language does not match current source/target policy")
+    inventory = require_inventory_attestation(work_dir, inventory_path, config=config)
+    document = _inventory_document(inventory_path)
+    if inventory_fingerprint(document.payload) != inventory["primary_fingerprint"]:
+        raise ReleaseCheckpointError("inventory changed during local release generation")
+    segments = [
+        Segment(**{key: row[key] for key in (
+            "id", "source", "speaker", "scene", "previous", "next", "metadata",
+        ) if key in row})
+        for row in document.active_rows
+    ]
+    rows = list(results)
+    if (
+        not rows or any(not isinstance(row, TranslationResult) for row in rows)
+        or [row.segment_id for row in rows] != [segment.id for segment in segments]
+    ):
+        raise ReleaseCheckpointError("local results must match exact ordered active inventory")
+    for segment, row in zip(segments, rows):
+        if row.source != segment.source or row.status not in _STATUS | {"translated"}:
+            raise ReleaseCheckpointError("local result source or status is invalid")
+        if row.resolution_code == FailureCode.INTEGRITY_INVALID.value:
+            raise ReleaseCheckpointError("integrity-rejected results cannot be released")
+        if row.status == "source_preserved":
+            if row.text != segment.source:
+                raise ReleaseCheckpointError("source-preserved result changed its source")
+        elif row.candidate_digest != stable_hash(row.text):
+            raise ReleaseCheckpointError("local candidate digest does not match released text")
+        if row.status == "accepted_unreviewed" and row.acceptance_authority != "user_policy":
+            raise ReleaseCheckpointError("accepted-unreviewed result requires real user-policy authority")
+    completion = completion_attestation(
+        segments, rows, inventory_segments=segments, inventory=inventory, runtime={},
+        review_required=review_required, target_language=target_language, language_binding=binding,
+        allow_incomplete_artifact=allow_incomplete_artifact,
+    )
+    if (
+        completion["semantic_review"]["reviewed_count"] != sum(row.status == "reviewed" for row in rows)
+        or not completion["accounting_complete"]
+        or (not completion["target_completion"] and not completion["incomplete_artifact_authorized"])
+    ):
+        raise ReleaseCheckpointError("local results have not passed the selected review/incomplete policy")
+    glossary_rows = list(glossary)
+    glossary_digest = stable_hash([{
+        key: getattr(entry, key) for key in entry.__dataclass_fields__
+    } for entry in glossary_rows])
+    validator_digest = hashlib.sha256(Path(validators.__file__).read_bytes()).hexdigest()
+    evidence = {}
+    entries = []
+    for segment, row in zip(segments, rows):
+        issues = validators.validate_integrity(
+            segment, row.text, glossary_rows, extra_patterns=extra_patterns,
+            max_length_ratio=max_length_ratio,
+        )
+        if issues:
+            raise ReleaseCheckpointError("local result failed deterministic integrity validation")
+        source_digest = hashlib.sha256(segment.source.encode("utf-8")).hexdigest()
+        target_digest = hashlib.sha256(row.text.encode("utf-8")).hexdigest()
+        status = "unreviewed" if row.status == "translated" else row.status
+        proof = {
+            "schema": "parr0t.local-integrity-evidence.v1",
+            "source_sha256": source_digest, "target_sha256": target_digest,
+            "inventory_fingerprint": inventory["primary_fingerprint"],
+            "validator_source_sha256": validator_digest,
+            "protected_patterns": list(extra_patterns or []),
+            "max_length_ratio": max_length_ratio,
+            "glossary_digest": glossary_digest,
+            "status": status, "candidate_generation": row.candidate_generation,
+            "candidate_digest": row.candidate_digest,
+            "acceptance_authority": row.acceptance_authority,
+            "review_verdicts": [{
+                "stage": attempt.stage, "provider": attempt.provider, "model": attempt.model,
+                "status": attempt.status, "candidate_generation": attempt.candidate_generation,
+            } for attempt in row.attempts if attempt.status == "approved"],
+            "validation_issues": [],
+        }
+        evidence[segment.id] = proof
+        entries.append({
+            "id": segment.id, "source_sha256": source_digest, "target": row.text,
+            "target_sha256": target_digest, "status": status,
+            "integrity_evidence_sha256": _evidence_digest(proof),
+        })
+    checkpoint = {
+        "schema": LOCAL_INTEGRITY_SCHEMA, "patch_id": patch_id, "release_id": release_id,
+        "ownership": {"owner": owner, "license": license_name},
+        "source_inventory": {
+            "method": document.payload["method"], "fingerprint": inventory["primary_fingerprint"],
+            "target_count": len(segments),
+        },
+        "language": {"source": source_language, "target": target_language},
+        "entries": entries, "integrity_evidence": evidence,
+    }
+    validate_release_checkpoint(checkpoint, expected_patch_id=patch_id, expected_release_id=release_id)
+    return checkpoint, evidence
 
 
 def canonical_checkpoint_bytes(

@@ -86,9 +86,15 @@ class PromptModelPolicyTests(unittest.TestCase):
         for role, route in NATIVE_ROLE_ROUTES.items():
             with self.subTest(role=role):
                 self.assertEqual(launch_contract(self.work, route, ["fixture"])["model"], models[role])
-        self.assertEqual(after["routing"]["translator_retries"], {"native-translation": 5, "native-sol": 3})
+        expected_retries = dict(before["routing"]["translator_retries"])
+        expected_retries["native-translation"] = expected_retries.pop("native-luna")
+        self.assertEqual(after["routing"]["translator_retries"], expected_retries)
         self.assertEqual(after["routing"]["context_analyzers"], ["native-context", "native-luna"])
         self.assertEqual(after["providers"], before["providers"])
+        for role, previous in (("strong-review", "native-sol"), ("review-fallback", "deepseek")):
+            if previous in before["routing"]["review_attempt_limits"]:
+                self.assertEqual(after["routing"]["review_attempt_limits"][NATIVE_ROLE_ROUTES[role]],
+                                 before["routing"]["review_attempt_limits"][previous])
         self.assertEqual(after["model_policy"]["native_roles"], models)
 
     def test_partial_role_update_preserves_previous_user_choice_and_other_operator_bindings(self):
@@ -118,14 +124,70 @@ class PromptModelPolicyTests(unittest.TestCase):
         self.assertEqual((self.work / RUNTIME_PATH).read_bytes(), before)
         self.assertEqual(launch_contract(self.work, "native-translation", ["fixture"])["model"], "fixture/chosen")
 
-    def test_sol_limit_cannot_be_evaded_with_a_new_role_name(self):
+    def test_explicit_sol_review_limit_is_not_replaced_by_model_name_policy(self):
         self.bind()
-        before = self.path.read_bytes()
-        with self.assertRaisesRegex(ValueError, "SOL_REVIEW_CALL_LIMIT"):
-            configure_review_policy(self.work, model="fixture/gpt-6.1-sol:high", max_calls=3, user_requested=True)
-        self.assertEqual(self.path.read_bytes(), before)
-        result = configure_review_policy(self.work, model="fixture/gpt-6.1-sol:high", max_calls=2, user_requested=True)
-        self.assertEqual(result["review_attempt_limits"]["native-review-fallback"], 2)
+        result = configure_review_policy(self.work, model="fixture/gpt-6.1-sol:high", max_calls=7, user_requested=True)
+        self.assertEqual(result["review_attempt_limits"]["native-review-fallback"], 7)
+
+    def test_model_only_fallback_uses_documented_default_count(self):
+        self.bind()
+        result = configure_review_policy(self.work, model=self.model, user_requested=True)
+        self.assertEqual(result["review_attempt_limits"]["native-review-fallback"], 3)
+        configure_review_policy(self.work, model=self.model, max_calls=7, user_requested=True)
+        result = configure_review_policy(self.work, model=self.model, user_requested=True)
+        self.assertEqual(result["review_attempt_limits"]["native-review-fallback"], 7)
+
+    def test_rewrite_can_be_selected_without_unused_legacy_bindings(self):
+        config = load_config(self.work)
+        config["routing"]["rewriters"] = []
+        updated = apply_native_role_models(config, {"rewrite": "\uacf5\uae09\uc790/\ubaa8\ub378(\uc0c8\ub85c\uc6b4)+\ubc84\uc804@\uacbd\ub85c:high"})
+        self.assertEqual(updated["routing"]["rewriters"], ["native-rewrite"])
+        self.assertEqual(updated["providers"], config["providers"])
+
+    def test_presets_do_not_freeze_topology_counts_or_adapter_identity(self):
+        from game_l10n.provider_policy import validate_provider_policy
+        config = load_config(self.work)
+        config["providers"] = [
+            {"name": "explicit-fallback", "type": "compatible_chat", "model": "fixture/exact",
+             "api_key_env": "EXPLICIT_PROVIDER_TOKEN", "allowed_roles": ["translation_fallback", "judge_fallback"]},
+            {"name": "explicit-editor", "type": "compatible_chat", "model": "fixture/editor",
+             "api_key_env": "EDITOR_TOKEN", "allowed_roles": ["selective_rewrite"]},
+        ]
+        config["routing"].update(
+            translators=["native-translation", "explicit-fallback"],
+            translator_retries={"native-translation": 11},
+            context_analyzers=["native-context"], review_triagers=["native-triage"],
+            reviewers=["native-strong-review", "explicit-fallback"], rewriters=["explicit-editor"],
+            defer_fallbacks_until_primary_complete=False, review_refusal_policy="error",
+        )
+        validate_provider_policy(config)
+        config["providers"] = []
+        config["routing"].update(translators=["native-translation"], reviewers=["native-strong-review"],
+                                  rewriters=["native-rewrite"])
+        validate_provider_policy(config)
+        config["providers"] = [{"name": "external", "type": "compatible_chat", "model": "fixture/exact",
+                                "api_key_env": "EXPLICIT_PROVIDER_TOKEN", "allowed_roles": ["judge_fallback"]}]
+        config["routing"]["reviewers"] = ["external"]
+        with self.assertRaisesRegex(ConfigurationError, "external adapter cannot become"):
+            validate_provider_policy(config)
+        config["routing"]["reviewers"] = ["native-strong-review", "external"]
+        config["providers"][0]["allowed_roles"] = ["selective_rewrite"]
+        with self.assertRaisesRegex(ConfigurationError, "not authorized"):
+            validate_provider_policy(config)
+
+    def test_opaque_selector_validation_is_not_a_model_allowlist(self):
+        from game_l10n.model_policy import exact_native_model
+        for model in ("\uacf5\uae09\uc790/\ubaa8\ub378(\ud310)+\ubc84\uc804@\uacbd\ub85c:high", "vendor/model,name=v2", "vendor/model name"):
+            self.assertTrue(exact_native_model(model), model)
+        for model in ("/game/model", "C:/game/model", "vendor/../file", "vendor/*", "vendor/model\x00",
+                      "vendor/model\ninjected", "sol", "@task", "https://example.test/model"):
+            self.assertFalse(exact_native_model(model), repr(model))
+
+    def test_explicit_role_update_replaces_recorded_choice_coherently(self):
+        self.bind(role_models={"rewrite": "fixture/old-editor"}, user_requested_models=True)
+        self.bind(role_models={"rewrite": "fixture/new-editor"}, user_requested_models=True)
+        self.assertEqual(load_config(self.work)["model_policy"]["native_roles"]["rewrite"], "fixture/new-editor")
+        self.assertEqual(launch_contract(self.work, "native-rewrite", ["fixture"])["model"], "fixture/new-editor")
 
     def test_a_stale_native_binding_cannot_launch_the_wrong_requested_model(self):
         self.bind(role_models={"review-fallback": "fixture/old"}, user_requested_models=True)

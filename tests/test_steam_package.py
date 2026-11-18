@@ -711,6 +711,34 @@ class SteamPackageTests(unittest.TestCase):
             self.assertFalse((game / STATUS_FILE_NAME).exists())
             self.assertTrue((game / "fixture-game.exe").exists())
 
+            reusable_install, original_consent = create_runtime_approval(
+                work, action="install", artifact_path=second_package, target_path=game,
+                workflow_reuse=True, ttl_minutes=7 * 24 * 60, user_confirmed=True,
+            )
+            reusable_remove, _ = create_runtime_approval(
+                work, action="remove", artifact_path=second_package, target_path=game,
+                workflow_reuse=True, ttl_minutes=7 * 24 * 60, user_confirmed=True,
+            )
+            for _ in range(2):
+                installed = run(second, "Install", reusable_install)
+                self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+                wrong_action = run(second, "Restore", reusable_install)
+                self.assertNotEqual(wrong_action.returncode, 0)
+                self.assertTrue((game / target_relative).exists())
+                verified = run(second, "Verify")
+                self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+                restored = run(second, "Restore", reusable_remove)
+                self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
+                self.assertFalse((game / target_relative).exists())
+                recorded = json.loads(reusable_install.read_text(encoding="utf-8-sig"))
+                self.assertIsNone(recorded["consumed_at_utc"])
+                self.assertEqual(recorded["expires_at_utc"], original_consent["expires_at_utc"])
+            original_consent["expires_at_utc"] = "2000-01-01T00:00:00Z"
+            reusable_install.write_text(json.dumps(original_consent), encoding="utf-8")
+            expired = run(second, "Install", reusable_install)
+            self.assertNotEqual(expired.returncode, 0)
+            self.assertFalse((game / target_relative).exists())
+
 
 if __name__ == "__main__":
     unittest.main()

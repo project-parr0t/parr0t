@@ -31,22 +31,33 @@ from tests.omp_isolation_fixture import bind_omp_isolation
 from tests import write_semantic_result_rows
 
 
+APPROVED_EXECUTION_POLICY = {
+    "schema": "parr0t.execution-environment-policy.v1", "host": "omp",
+    "authorization": "user_requested",
+    "fallback_on": ["provider_operational_error", "execution_guard_denied"],
+    "fallback_strategy": "next_configured_native_route",
+    "preserve_successes": True, "preserve_isolation": True,
+    "silent_model_switch_allowed": False,
+}
+
+
 class NativeRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         bind_omp_isolation(self, self.root)
+        establish_control_plane_entry(self.root)
         self.segments = [Segment("a", "SOURCE A"), Segment("b", "SOURCE B")]
         self.source = self.root / "source.jsonl"
         self.write_rows(self.source, [asdict(row) for row in self.segments])
         self.tasks, self.results = self.root / "tasks", self.root / "results"
 
     @staticmethod
-    def write_rows(path: Path, rows: list[dict]) -> None:
-        write_semantic_result_rows(path, rows)
+    def write_rows(path: Path, rows: list[dict], *, model: str | None = None) -> None:
+        write_semantic_result_rows(path, rows, model=model)
 
-    def prepare_probe(self) -> tuple[dict, Path, Path]:
+    def prepare_probe(self, *, approved_recovery: bool = False) -> tuple[dict, Path, Path]:
         game = self.root / "game"
         game.mkdir()
         (self.root / "game-l10n.json").write_text("{}", encoding="utf-8")
@@ -55,13 +66,20 @@ class NativeRuntimeTests(unittest.TestCase):
         config = {"game_roots": [str(game)], "sdk_root": str(self.root / "sdk"),
                   "sdk_selection": {"inventory_fingerprint": "fixture-inventory"}}
         output = self.root / ".game-l10n/data-plane/source_probe"
-        prepared = prepare_data_plane_task(self.root, output, worker_role="source_probe", config=config)
+        with patch("game_l10n.native_runtime.active_execution_environment_policy",
+                   return_value=APPROVED_EXECUTION_POLICY if approved_recovery else None):
+            prepared = prepare_data_plane_task(self.root, output, worker_role="source_probe", config=config)
         relay = self.root / prepared["relay_path"]
         bind_data_plane_launch(self.root, relay)
         return config, output, relay
 
     def prepare(self, host: str = "omp") -> tuple[dict, Path, dict]:
-        configure_native_runtime(self.root, host, {})
+        previous = native_runtime(self.root)
+        model = ((previous or {}).get("models", {}).get("native-luna")
+                 if previous and previous["host"] == host else None)
+        configure_native_runtime(self.root, host, {
+            "native-luna": model or ("openai-codex/gpt-6-luna:high" if host == "omp" else "gpt-6-luna"),
+        })
         prepare_native_tasks(
             self.root, self.source, self.segments, self.tasks,
             max_records=1, max_workers=2,
@@ -70,6 +88,16 @@ class NativeRuntimeTests(unittest.TestCase):
         step = self.step()
         relay = self.root / step["relay"]["dispatch"]
         return step, relay, json.loads(relay.read_text(encoding="utf-8"))
+
+    def prepare_replacement(self, *, route: str = "native-recovery",
+                            model: str = "fixture/approved-successor") -> None:
+        configure_native_runtime(self.root, "omp", {route: model})
+        self.tasks, self.results = self.root / "replacement-tasks", self.root / "replacement-results"
+        prepare_native_tasks(
+            self.root, self.source, self.segments, self.tasks,
+            max_records=1, max_workers=2,
+            route_binding={"provider": route, "model": model, "attempt": 1},
+        )
 
     def step(self, **kwargs) -> dict:
         return native_control_step(
@@ -122,9 +150,11 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(dispatch["slot"], 0)
         for binding in (str(self.root), str(task), dispatch["task_sha256"], "PARR0T_OMP_TASK=worker-0"):
             self.assertIn(binding, dispatch["worker_prompt"])
+        self.assertIs(native_launch_summary(self.root, relay)["launch_observed"], False)
         preflight = self.invoke_argv(payload["command_argv"]["capability-available"])
         self.assertEqual(preflight["issue_codes"], [])
         self.assertEqual(preflight["launch_state"], "awaiting_worker_start")
+        self.assertIs(preflight["launch_observed"], True)
         self.assertEqual(native_launch_summary(self.root, relay)["issue_codes"], ["E_NATIVE_WORKER_NOT_STARTED"])
         sealed = self.invoke_argv(payload["command_argv"]["seal"])
         self.assertIn("E_NATIVE_WORKER_NOT_STARTED", sealed["issue_codes"])
@@ -141,6 +171,7 @@ class NativeRuntimeTests(unittest.TestCase):
         for state in ("reserved", "started", "ending"):
             with self.subTest(state=state):
                 admission.write_text(json.dumps({**record, "state": state}), encoding="utf-8")
+                self.assertIs(native_launch_summary(self.root, relay)["launch_observed"], True)
                 with self.assertRaisesRegex(ValueError, "E_NATIVE_WORKER_ACTIVE"):
                     seal_data_plane_task(self.root, relay, worker_ended=True)
                 self.assertFalse((output / "receipt.json").exists())
@@ -158,7 +189,7 @@ class NativeRuntimeTests(unittest.TestCase):
         payload = json.loads(relay.read_text(encoding="utf-8"))
         commands = payload["command_argv"]
         self.invoke_argv(commands["capability-available"])
-        with self.assertRaisesRegex(ConfigurationError, "no bound worker start"):
+        with self.assertRaisesRegex(ConfigurationError, "E_DATA_PLANE_FAILURE_INVALID"):
             record_data_plane_failure(
                 self.root, relay, failure_code="provider_operational_error"
             )
@@ -259,6 +290,122 @@ class NativeRuntimeTests(unittest.TestCase):
             _load_bound_data_plane_relay(self.root, relay)
         self.assertFalse((relay.parent / "receipt.json").exists())
 
+    def test_metadata_configuration_before_entry_does_not_authorize_execution(self) -> None:
+        from game_l10n.native_host import configure_native_host
+        from game_l10n.native_runtime import launch_contract
+        unentered = self.root / "unentered"
+        with patch.dict("os.environ", {"PARR0T_OMP_GUARD_SESSION": ""}):
+            configure_native_runtime(unentered, "omp", {"native-custom": "fixture/exact"},
+                                     omp_isolation="prompt")
+            configure_native_host(unentered, "fixture-host", "http://127.0.0.1:12345")
+            self.assertEqual(native_runtime(unentered)["models"], {"native-custom": "fixture/exact"})
+            contract = launch_contract(unentered, "native-custom", ["fixture-task"])
+            self.assertEqual(contract["model"], "fixture/exact")
+            with self.assertRaisesRegex(ConfigurationError, "^E_CONTROL_PLANE_ENTRY_REQUIRED"):
+                record_native_launch(unentered, unentered / ".game-l10n/relay.json", event="capability-available")
+
+    def test_a_single_custom_route_does_not_require_unused_legacy_slots(self) -> None:
+        configure_native_runtime(self.root, "omp", {"native-rewrite": "\uacf5\uae09\uc790/\ubaa8\ub378(\ud310)+\uc0c8\ubc84\uc804@\uacbd\ub85c:high"})
+        self.assertEqual(native_runtime(self.root)["models"], {
+            "native-rewrite": "\uacf5\uae09\uc790/\ubaa8\ub378(\ud310)+\uc0c8\ubc84\uc804@\uacbd\ub85c:high",
+        })
+        configure_native_runtime(self.root, "omp", {})
+        self.assertEqual(set(native_runtime(self.root)["models"]), {"native-rewrite"})
+
+    def test_host_metadata_resolves_one_exact_id_without_inventing_authorization(self) -> None:
+        from game_l10n.native_host import MODEL_SNAPSHOT_PATH, MODEL_SNAPSHOT_SCHEMA, host_model_snapshot
+        path = self.root / MODEL_SNAPSHOT_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        snapshot = {"schema": MODEL_SNAPSHOT_SCHEMA, "host": "omp", "session_id": "fixture-session",
+                    "process_id": 123, "models": [
+                        {"provider": "\uc2e4\uc81c\uacf5\uae09\uc790", "id": "\ubaa8\ub378(\ud310)+\uc0c8\ubc84\uc804:high",
+                         "selector": "\uc2e4\uc81c\uacf5\uae09\uc790/\ubaa8\ub378(\ud310)+\uc0c8\ubc84\uc804:high"},
+                    ]}
+        path.write_text(json.dumps(snapshot), encoding="utf-8")
+        configure_native_runtime(self.root, "omp", {"native-custom": "\ubaa8\ub378(\ud310)+\uc0c8\ubc84\uc804:high"})
+        self.assertEqual(native_runtime(self.root)["models"]["native-custom"], "\uc2e4\uc81c\uacf5\uae09\uc790/\ubaa8\ub378(\ud310)+\uc0c8\ubc84\uc804:high")
+        self.assertNotIn("authorization", host_model_snapshot(self.root))
+        snapshot["models"].append({"provider": "\uc2e4\uc81c\uacf5\uae09\uc790", "id": "opaque-base",
+                                   "selector": "\uc2e4\uc81c\uacf5\uae09\uc790/opaque-base"})
+        path.write_text(json.dumps(snapshot), encoding="utf-8")
+        configure_native_runtime(self.root, "omp", {"native-qualified": "opaque-base@explicit-route:high"})
+        self.assertEqual(native_runtime(self.root)["models"]["native-qualified"],
+                         "\uc2e4\uc81c\uacf5\uae09\uc790/opaque-base@explicit-route:high")
+        snapshot["models"].extend([
+            {"provider": "exact-provider", "id": "model:variant",
+             "selector": "exact-provider/model:variant"},
+            {"provider": "wrong-provider", "id": "model",
+             "selector": "wrong-provider/model"},
+        ])
+        path.write_text(json.dumps(snapshot), encoding="utf-8")
+        configure_native_runtime(self.root, "omp", {"native-routed": "model:variant@upstream:high"})
+        self.assertEqual(native_runtime(self.root)["models"]["native-routed"],
+                         "exact-provider/model:variant@upstream:high")
+        snapshot["models"].append({"provider": "\ub2e4\ub978\uacf5\uae09\uc790", "id": "\ubaa8\ub378(\ud310)+\uc0c8\ubc84\uc804:high",
+                                   "selector": "\ub2e4\ub978\uacf5\uae09\uc790/\ubaa8\ub378(\ud310)+\uc0c8\ubc84\uc804:high"})
+        path.write_text(json.dumps(snapshot), encoding="utf-8")
+        before = (self.root / ".game-l10n/native/runtime.json").read_bytes()
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_MODEL_AMBIGUOUS"):
+            configure_native_runtime(self.root, "omp", {"native-custom": "\ubaa8\ub378(\ud310)+\uc0c8\ubc84\uc804:high"})
+        self.assertEqual((self.root / ".game-l10n/native/runtime.json").read_bytes(), before)
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_MODEL_METADATA_REQUIRED"):
+            configure_native_runtime(self.root, "omp", {"native-custom": "\ubaa8\ub378(\ud310)"})
+        configure_native_runtime(self.root, "omp", {"native-custom": "\uba85\uc2dc\uacf5\uae09\uc790/\ubaa8\ub378@\uacbd\ub85c:high"})
+        self.assertEqual(native_runtime(self.root)["models"]["native-custom"], "\uba85\uc2dc\uacf5\uae09\uc790/\ubaa8\ub378@\uacbd\ub85c:high")
+
+    def test_nested_opaque_catalog_id_resolves_before_qualified_fallback(self) -> None:
+        from game_l10n.native_host import MODEL_SNAPSHOT_PATH, MODEL_SNAPSHOT_SCHEMA, resolve_native_model
+        path = self.root / MODEL_SNAPSHOT_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        snapshot = {
+            "schema": MODEL_SNAPSHOT_SCHEMA, "host": "omp",
+            "session_id": "fixture-session", "process_id": 123,
+            "models": [{"provider": "fixture", "id": "org/model", "selector": "fixture/org/model"}],
+        }
+        path.write_text(json.dumps(snapshot), encoding="utf-8")
+        for requested, expected in (
+            ("org/model", "fixture/org/model"),
+            ("org/model:high", "fixture/org/model:high"),
+            ("org/model@upstream:high", "fixture/org/model@upstream:high"),
+            ("fixture/org/model@upstream:high", "fixture/org/model@upstream:high"),
+            ("explicit/org/model@upstream:high", "explicit/org/model@upstream:high"),
+            ("org/model-extra@upstream:high", "org/model-extra@upstream:high"),
+        ):
+            with self.subTest(requested=requested):
+                self.assertEqual(resolve_native_model(self.root, "omp", requested), expected)
+        configure_native_runtime(self.root, "omp", {"native-nested": "org/model@upstream:high"})
+        self.assertEqual(native_runtime(self.root)["models"]["native-nested"], "fixture/org/model@upstream:high")
+        original = (self.root / ".game-l10n/native/runtime.json").read_bytes()
+        snapshot["models"].append({"provider": "other", "id": "org/model", "selector": "other/org/model"})
+        path.write_text(json.dumps(snapshot), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_MODEL_AMBIGUOUS"):
+            configure_native_runtime(self.root, "omp", {"native-nested": "org/model@upstream:high"})
+        self.assertEqual((self.root / ".game-l10n/native/runtime.json").read_bytes(), original)
+        self.assertEqual(resolve_native_model(self.root, "omp", "fixture/org/model@upstream:high"),
+                         "fixture/org/model@upstream:high")
+
+    def test_missing_host_metadata_never_guesses_a_provider_prefix(self) -> None:
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_MODEL_METADATA_REQUIRED"):
+            configure_native_runtime(self.root, "omp", {"native-custom": "gpt-6.1-sol"})
+        configure_native_runtime(self.root, "codex", {"native-custom": "gpt-6.1-sol"})
+        self.assertEqual(native_runtime(self.root)["models"]["native-custom"], "gpt-6.1-sol")
+
+    def test_execution_environment_policy_is_validated_without_affecting_bindings(self) -> None:
+        from game_l10n.native_runtime import active_execution_environment_policy
+        configure_native_runtime(self.root, "omp", {})
+        path = self.root / "execution-environment.json"
+        policy = {"schema": "parr0t.execution-environment-policy.v1", "host": "omp",
+                  "authorization": "user_requested", "fallback_on": ["provider_operational_error", "execution_guard_denied"],
+                  "fallback_strategy": "next_configured_native_route", "preserve_successes": True,
+                  "preserve_isolation": True, "silent_model_switch_allowed": False}
+        path.write_text(json.dumps(policy), encoding="utf-8")
+        with patch.dict("os.environ", {"PARR0T_EXECUTION_ENVIRONMENT_POLICY": str(path)}):
+            self.assertEqual(active_execution_environment_policy(self.root), policy)
+            policy["silent_model_switch_allowed"] = True
+            path.write_text(json.dumps(policy), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "E_EXECUTION_ENVIRONMENT_POLICY_INVALID"):
+                active_execution_environment_policy(self.root)
+
     def test_host_specific_exact_models_and_explicit_override(self) -> None:
         configure_native_runtime(self.root, "codex", {})
         self.assertEqual(native_runtime(self.root)["models"], {
@@ -266,7 +413,7 @@ class NativeRuntimeTests(unittest.TestCase):
         })
         configure_native_runtime(self.root, "omp", {"native-sol": "fixture/selected-sol"})
         self.assertEqual(native_runtime(self.root)["models"], {
-            "native-luna": "openai-codex/gpt-6-luna:high", "native-sol": "fixture/selected-sol",
+            "native-sol": "fixture/selected-sol",
         })
         configure_native_runtime(self.root, "omp", {})
         self.assertEqual(native_runtime(self.root)["models"]["native-sol"], "fixture/selected-sol")
@@ -277,7 +424,7 @@ class NativeRuntimeTests(unittest.TestCase):
     def test_fresh_omp_sol_wave_binds_exact_provider_path_and_effort(self) -> None:
         configure_native_runtime(self.root, "omp", {})
         self.assertEqual(native_runtime(self.root)["models"], {
-            "native-luna": "openai-codex/gpt-6-luna:high", "native-sol": "opencodex/gpt-6.1-sol:high",
+            "native-luna": "openai-codex/gpt-6-luna:high", "native-sol": "openai-codex/gpt-6.1-sol:high",
         })
         prepare_native_tasks(
             self.root, self.source, self.segments, self.tasks,
@@ -287,7 +434,7 @@ class NativeRuntimeTests(unittest.TestCase):
         step = self.step()
         relay = self.root / step["relay"]["dispatch"]
         contract = json.loads(relay.read_text(encoding="utf-8"))["launch_contract"]
-        self.assertEqual(contract["model"], "opencodex/gpt-6.1-sol:high")
+        self.assertEqual(contract["model"], "openai-codex/gpt-6.1-sol:high")
         self.assertEqual(contract["spawn_model_parameter"], "tasks[].model")
 
     def test_missing_runtime_does_not_create_a_controller_checkpoint(self) -> None:
@@ -301,34 +448,34 @@ class NativeRuntimeTests(unittest.TestCase):
         legacy = review_control_contract()
         legacy["allowed_actions"].remove("repair_native_runtime")
         with patch("game_l10n.native_pass.review_control_contract", return_value=legacy):
-            prepare_native_tasks(self.root, self.source, self.segments, self.tasks)
+            prepare_native_tasks(self.root, self.source, self.segments, self.tasks,
+                                 route_binding={"provider": "native-luna", "attempt": 1})
         before = (self.tasks / "manifest.json").read_bytes()
         configure_native_runtime(self.root, "omp", {})
         self.assertEqual(self.step()["action"], "dispatch_isolated_wave_relay")
         self.assertEqual((self.tasks / "manifest.json").read_bytes(), before)
 
-    def test_unavailable_relay_creates_no_fake_results_and_resumes_same_wave(self) -> None:
+    def test_unavailable_relay_preserves_evidence_and_uses_approved_fresh_route(self) -> None:
         _, relay, payload = self.prepare()
         self.assertEqual(payload["launch_contract"]["model"], "openai-codex/gpt-6-luna:high")
-        self.assertEqual(payload["launch_contract"]["spawn_model_parameter"], "tasks[].model")
         record_native_launch(self.root, relay, event="capability-unavailable")
         sealed = seal_native_wave_relay(self.root, relay, relay_ended=True)
         self.assertEqual(sealed["issue_codes"], ["E_NATIVE_DISPATCH_UNAVAILABLE"])
         self.assertEqual(sealed["ended_tasks_recorded"], 0)
         self.assertEqual(list(self.results.glob("*.jsonl")), [])
-        dispatch_bytes = relay.read_bytes()
+        original = relay.read_bytes()
         blocked = self.step()
         self.assertEqual(blocked["action"], "repair_native_runtime")
-        self.assertEqual(blocked["relay"]["dispatch"], relay.relative_to(self.root).as_posix())
-        self.assertEqual(blocked["relay"]["tasks"], 2)
-        self.assertEqual(blocked["runtime_repair"]["scope"], "host")
         self.assertFalse(blocked["runtime_repair"]["isolation_relaxation_allowed"])
-        self.assertEqual(relay.read_bytes(), dispatch_bytes)
-        record_native_launch(self.root, relay, event="capability-available")
-        resumed = self.step(resume_relay=True)
+        self.prepare_replacement()
+        resumed = self.step()
         self.assertEqual(resumed["action"], "dispatch_isolated_wave_relay")
-        self.assertEqual(resumed["wave"], 1)
-        self.assertEqual(resumed["route_binding"]["attempt"], 1)
+        replacement = self.root / resumed["relay"]["dispatch"]
+        self.assertNotEqual(replacement, relay)
+        self.assertEqual(json.loads(replacement.read_text())["launch_contract"]["model"], "fixture/approved-successor")
+        self.assertEqual(relay.read_bytes(), original)
+        self.assertEqual(list(self.results.glob("*.jsonl")), [])
+
 
     def _resume_legacy_unavailable_wave(self, event: str, missing_fields: tuple[str, ...]) -> None:
         from game_l10n.native_runtime import launch_contract
@@ -337,45 +484,35 @@ class NativeRuntimeTests(unittest.TestCase):
             contract = launch_contract(*args, **kwargs)
             for field in missing_fields:
                 contract.pop(field, None)
-            if 'model_authorization' in missing_fields:
-                contract['preflight'] = 'inspect_available_dispatch_tool_and_exact_model_before_starting_any_worker'
+            if "model_authorization" in missing_fields:
+                contract["preflight"] = "inspect_available_dispatch_tool_and_exact_model_before_starting_any_worker"
             return contract
 
-        with patch('game_l10n.native_runtime.launch_contract', side_effect=legacy_contract), \
-             patch('game_l10n.native_pass.launch_contract', side_effect=legacy_contract):
+        with patch("game_l10n.native_runtime.launch_contract", side_effect=legacy_contract), \
+             patch("game_l10n.native_pass.launch_contract", side_effect=legacy_contract):
             _, relay, payload = self.prepare()
             record_native_launch(self.root, relay, event=event)
             seal_native_wave_relay(self.root, relay, relay_ended=True)
-        ledger = relay.with_name(relay.stem + '-launch.json')
-        paths = [relay, ledger, self.tasks / 'manifest.json',
-                 *(self.root / binding['task'] for binding in payload['task_bindings'])]
+        paths = [relay, self.tasks / "manifest.json",
+                 *(self.root / binding["task"] for binding in payload["task_bindings"])]
         originals = {path: path.read_bytes() for path in paths}
-        runtime = native_runtime(self.root)
-        self.assertEqual(self.step()['action'], 'repair_native_runtime')
-        resumed = self.step(resume_relay=True)
-        self.assertEqual(resumed['action'], 'dispatch_isolated_wave_relay')
-        self.assertEqual(resumed['wave'], 1)
-        self.assertEqual(resumed['route_binding']['attempt'], 1)
-        self.assertEqual(native_runtime(self.root), runtime)
+        self.assertEqual(self.step()["action"], "repair_native_runtime")
+        self.prepare_replacement()
+        resumed = self.step()
+        self.assertEqual(resumed["action"], "dispatch_isolated_wave_relay")
+        self.assertNotEqual(self.root / resumed["relay"]["dispatch"], relay)
         for path, original in originals.items():
             self.assertEqual(path.read_bytes(), original)
         for field in missing_fields:
-            self.assertNotIn(field, json.loads(relay.read_text())['launch_contract'])
-        record_native_launch(self.root, relay, event='capability-available')
-        for binding, target in zip(payload['task_bindings'], ('a', 'b')):
-            record_native_launch(self.root, relay, event='worker-started', task=binding['task'],
-                                 worker_id='synthetic-legacy-' + target, model=payload['launch_contract']['model'])
-            self.write_rows(self.root / binding['result'], [self.row(target)])
-        seal_native_wave_relay(self.root, relay, relay_ended=True)
-        self.assertEqual(self.step()['action'], 'aggregate_completed_pass')
-        self.assertEqual(relay.read_bytes(), originals[relay])
+            self.assertNotIn(field, json.loads(relay.read_text())["launch_contract"])
 
-    def test_old_promptless_capability_unavailable_wave_resumes_same_runtime(self) -> None:
+
+    def test_old_promptless_denial_preserves_contract_and_uses_fresh_successor(self) -> None:
         self._resume_legacy_unavailable_wave(
             'capability-unavailable', ('worker_prompt', 'relay_prompt'),
         )
 
-    def test_old_policyless_model_unavailable_wave_resumes_same_runtime(self) -> None:
+    def test_old_policyless_denial_preserves_contract_and_uses_fresh_successor(self) -> None:
         self._resume_legacy_unavailable_wave('model-unavailable', (
             'model_authorization', 'unavailability_evidence', 'worker_prompt', 'relay_prompt',
             'lifecycle_observation', 'cancellation_priority', 'operational_failure_policy',
@@ -383,6 +520,8 @@ class NativeRuntimeTests(unittest.TestCase):
 
     def test_live_relay_wait_has_no_implicit_deadline(self) -> None:
         _, relay, _ = self.prepare()
+        record_native_launch(self.root, relay, event="capability-available")
+        self.assertIs(native_launch_summary(self.root, relay)["launch_observed"], True)
         for _ in range(5):
             waiting = self.step()
             self.assertEqual(waiting["action"], "wait_for_active_wave")
@@ -402,7 +541,7 @@ class NativeRuntimeTests(unittest.TestCase):
         relay = self.root / initial["relay"]["dispatch"]
         payload = json.loads(relay.read_text())
         first, second = payload["task_bindings"]
-        self.write_rows(self.root / first["result"], [self.row("a")])
+        self.write_rows(self.root / first["result"], [self.row("a")], model="gpt-6-luna")
         original = (self.root / first["result"]).read_bytes()
         for _ in range(3):
             native_control_step(self.root, self.tasks / "manifest.json", self.results,
@@ -415,10 +554,6 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(updated["launch_contract"]["tasks"], [second["task"]])
         self.assertTrue(updated["relay_contract"]["legacy_results_must_not_be_reexecuted"])
         self.assertEqual(native_launch_summary(self.root, relay)["legacy_unverified_results"], 1)
-        record_native_launch(self.root, relay, event="capability-unavailable")
-        seal_native_wave_relay(self.root, relay, relay_ended=True)
-        self.assertEqual(self.step()["action"], "repair_native_runtime")
-        self.assertEqual(self.step(resume_relay=True)["action"], "dispatch_isolated_wave_relay")
         record_native_launch(self.root, relay, event="capability-available")
         record_native_launch(self.root, relay, event="worker-started", task=second["task"],
                              worker_id="new-peer", model=updated["launch_contract"]["model"])
@@ -432,12 +567,13 @@ class NativeRuntimeTests(unittest.TestCase):
 
     def test_preserved_legacy_result_cannot_change_after_resume(self) -> None:
         prepare_native_tasks(self.root, self.source, self.segments, self.tasks,
-                             max_records=1, max_workers=2)
+                             max_records=1, max_workers=2,
+                             route_binding={"provider": "native-luna", "model": "gpt-6-luna", "attempt": 1})
         initial = native_control_step(self.root, self.tasks / "manifest.json", self.results,
                                       require_relay_receipt=True)
         relay = self.root / initial["relay"]["dispatch"]
         first = json.loads(relay.read_text())["task_bindings"][0]
-        self.write_rows(self.root / first["result"], [self.row("a")])
+        self.write_rows(self.root / first["result"], [self.row("a")], model="gpt-6-luna")
         configure_native_runtime(self.root, "codex", {})
         self.step(resume_relay=True)
         self.write_rows(self.root / first["result"], [self.row("a", status="refused")])
@@ -452,13 +588,15 @@ class NativeRuntimeTests(unittest.TestCase):
                                       require_relay_receipt=True)
         relay = self.root / initial["relay"]["dispatch"]
         binding = json.loads(relay.read_text())["task_bindings"][0]
-        self.write_rows(self.root / binding["result"], [self.row("a")])
+        self.write_rows(self.root / binding["result"], [self.row("a")], model="gpt-6-luna")
         configure_native_runtime(self.root, "codex", {})
         self.assertEqual(self.step(resume_relay=True)["action"], "dispatch_isolated_wave_relay")
         launch = native_launch_summary(self.root, relay)
         self.assertEqual(launch["expected_workers"], 0)
         self.assertEqual(launch["issue_codes"], [])
-        seal_native_wave_relay(self.root, relay, relay_ended=True)
+        sealed = seal_native_wave_relay(self.root, relay, relay_ended=True)
+        self.assertEqual(sealed["counts"], {"expected_tasks": 1, "ready_tasks": 1, "pending_tasks": 0})
+        self.assertEqual(sealed["issue_codes"], [])
         finished = self.step()
         self.assertEqual(finished["imported_wave"]["success"], 1)
         self.assertEqual(finished["imported_wave"]["failed"], 1)
@@ -499,19 +637,25 @@ class NativeRuntimeTests(unittest.TestCase):
             self.assertEqual(native_runtime(self.root)["models"]["native-sol"], "openai-codex/gpt-6.1-sol")
             self.assertEqual(native_launch_summary(self.root, relay)["started_workers"], 1)
 
-    def test_model_rebind_of_unstarted_wave_quarantines_unverified_output(self) -> None:
+    def test_changed_model_uses_new_manifest_without_importing_unverified_old_output(self) -> None:
         _, relay, payload = self.prepare()
         record_native_launch(self.root, relay, event="model-unavailable", failure_code="host_model_unavailable")
         seal_native_wave_relay(self.root, relay, relay_ended=True)
         binding = payload["task_bindings"][0]
-        self.write_rows(self.root / binding["result"], [self.row("a")])
-        configure_native_runtime(self.root, "omp", {"native-luna": "fixture/approved-new-model"})
-        step = self.step(resume_relay=True)
+        result = self.root / binding["result"]
+        self.write_rows(result, [self.row("a")])
+        original_result, original_relay = result.read_bytes(), relay.read_bytes()
+        self.prepare_replacement(route="native-luna", model="fixture/approved-new-model")
+        step = self.step()
         self.assertEqual(step["action"], "dispatch_isolated_wave_relay")
-        self.assertEqual(step["route_binding"]["attempt"], 1)
-        self.assertEqual(json.loads(relay.read_text())["launch_contract"]["model"], "fixture/approved-new-model")
-        self.assertFalse((self.root / binding["result"]).exists())
-        self.assertTrue(list(self.results.glob("*.unstarted-original-*")))
+        replacement = self.root / step["relay"]["dispatch"]
+        self.assertNotEqual(replacement, relay)
+        self.assertEqual(json.loads(replacement.read_text())["launch_contract"]["model"], "fixture/approved-new-model")
+        self.assertEqual(step["counts"]["imported_tasks"], 0)
+        self.assertEqual(list(self.results.glob("*.jsonl")), [])
+        self.assertEqual(result.read_bytes(), original_result)
+        self.assertEqual(relay.read_bytes(), original_relay)
+
 
     def test_model_rebind_cannot_relabel_an_already_started_worker(self) -> None:
         _, relay, payload = self.prepare()
@@ -525,17 +669,21 @@ class NativeRuntimeTests(unittest.TestCase):
             self.step(resume_relay=True)
         self.assertEqual(relay.read_bytes(), original)
 
-    def test_interrupted_unstarted_rebind_is_resumable_from_archived_evidence(self) -> None:
+    def test_interrupted_fresh_replacement_dispatch_is_resumable(self) -> None:
         _, relay, _ = self.prepare()
         record_native_launch(self.root, relay, event="model-unavailable", failure_code="host_model_unavailable")
         seal_native_wave_relay(self.root, relay, relay_ended=True)
-        configure_native_runtime(self.root, "omp", {"native-luna": "fixture/approved-new-model"})
+        original = relay.read_bytes()
+        self.prepare_replacement(route="native-luna", model="fixture/approved-new-model")
         with patch("game_l10n.native_pass._write_wave_relay_dispatch", side_effect=OSError("fixture interrupted write")):
             with self.assertRaises(OSError):
-                self.step(resume_relay=True)
-        resumed = self.step(resume_relay=True)
+                self.step()
+        resumed = self.step()
         self.assertEqual(resumed["action"], "dispatch_isolated_wave_relay")
-        self.assertEqual(json.loads(relay.read_text())["launch_contract"]["model"], "fixture/approved-new-model")
+        replacement = self.root / resumed["relay"]["dispatch"]
+        self.assertEqual(json.loads(replacement.read_text())["launch_contract"]["model"], "fixture/approved-new-model")
+        self.assertEqual(relay.read_bytes(), original)
+
 
     def test_partial_launch_preserves_success_and_only_starts_remaining_task(self) -> None:
         _, relay, payload = self.prepare()
@@ -584,22 +732,26 @@ class NativeRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "E_NATIVE_WORKER_NOT_STARTED"):
             import_native_wave(self.root, self.tasks / "manifest.json", self.results, 1)
 
-    def test_legacy_transport_errors_cannot_consume_another_provider_attempt(self) -> None:
+    def test_unattempted_transport_error_requires_repair_without_consuming_semantic_budget(self) -> None:
+        configure_native_runtime(self.root, "omp", {"native-luna": "fixture/luna"})
+        plan = [{"provider": "native-luna", "model": "fixture/luna", "max_retries": 2}]
         first = self.root / "first.jsonl"
         self.write_rows(first, [self.row("a"), self.row("b", status="refused")])
         state_dir = self.root / "retry"
-        start_native_translation_retries(self.root, self.source, self.segments, first, state_dir)
+        initial = start_native_translation_retries(self.root, self.source, self.segments, first, state_dir,
+                                                   route_plan=plan)
+        locked = (self.root / initial["successful_results"]).read_bytes()
         failed = self.root / "failed.jsonl"
         self.write_rows(failed, [self.row("b", status="error", provider="native-control")])
-        before = json.loads((state_dir / "retry-state.json").read_text())
         repaired = advance_native_translation_retries(self.root, state_dir, failed)
-        self.assertEqual(repaired["next_attempt"], before["next_attempt"])
-        self.assertEqual(repaired["next_provider"], before["next_provider"])
+        self.assertEqual(repaired["next_action"], "repair_native_runtime")
         self.assertEqual(repaired["candidate_count"], 1)
         self.assertFalse(repaired["provider_attempt_consumed"])
-        self.assertNotEqual(repaired["native_pass_output"], "retry/native-passes/run-0001")
-        self.write_rows(failed, [self.row("b")])
-        self.assertEqual(advance_native_translation_retries(self.root, state_dir, failed)["next_action"], "complete")
+        self.assertEqual(repaired["repair_needed_count"], 1)
+        self.assertEqual((self.root / repaired["successful_results"]).read_bytes(), locked)
+        with self.assertRaisesRegex(ValueError, "No native translation retry is pending"):
+            advance_native_translation_retries(self.root, state_dir, failed)
+
 
     def test_new_execution_cannot_import_another_runs_errors(self) -> None:
         options = {"max_records": 1, "max_workers": 2,
@@ -627,7 +779,7 @@ class NativeRuntimeTests(unittest.TestCase):
                 self.assertTrue(prepare_native_tasks(self.root, self.source, self.segments, tasks,
                                                      **{**options, "route_binding": route})["cached"])
 
-    def test_rebinding_same_directory_does_not_reuse_prior_route_receipts(self) -> None:
+    def test_changed_route_requires_new_namespace_without_reusing_prior_receipts(self) -> None:
         options = {"max_records": 1, "max_workers": 2,
                    "route_binding": {"provider": "native-luna", "attempt": 1}}
         prepare_native_tasks(self.root, self.source, self.segments, self.tasks, **options)
@@ -636,8 +788,11 @@ class NativeRuntimeTests(unittest.TestCase):
         native_control_step(self.root, self.tasks / "manifest.json", self.results, require_relay_receipt=True)
         original = {p.name: p.read_bytes() for p in self.results.glob("*.jsonl")}
         options["route_binding"] = {"provider": "native-sol", "attempt": 1}
-        prepare_native_tasks(self.root, self.source, self.segments, self.tasks, **options)
-        step = native_control_step(self.root, self.tasks / "manifest.json", self.root / "sol-results", require_relay_receipt=True)
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_TASK_MANIFEST_IMMUTABLE"):
+            prepare_native_tasks(self.root, self.source, self.segments, self.tasks, **options)
+        new_tasks = self.root / "sol-tasks"
+        prepare_native_tasks(self.root, self.source, self.segments, new_tasks, **options)
+        step = native_control_step(self.root, new_tasks / "manifest.json", self.root / "sol-results", require_relay_receipt=True)
         self.assertEqual(step["action"], "dispatch_isolated_wave_relay")
         self.assertEqual(step["counts"]["imported_tasks"], 0)
         self.assertEqual({p.name: p.read_bytes() for p in self.results.glob("*.jsonl")}, original)
@@ -682,29 +837,34 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(self.step()["action"], "aggregate_completed_pass")
         self.assertEqual(self.step()["counts"]["imported_tasks"], 2)
 
-    def test_mixed_transport_failure_does_not_replay_already_attempted_failures(self) -> None:
+    def test_repair_pending_targets_do_not_starve_independent_semantic_retry(self) -> None:
+        configure_native_runtime(self.root, "omp", {"native-luna": "fixture/luna"})
+        plan = [{"provider": "native-luna", "model": "fixture/luna", "max_retries": 2}]
         segments = [*self.segments, Segment("c", "SOURCE C")]
         self.write_rows(self.source, [asdict(row) for row in segments])
         first = self.root / "first.jsonl"
-        self.write_rows(first, [self.row("a"), self.row("b", status="refused"), self.row("c", status="error", provider="native-control")])
+        self.write_rows(first, [self.row("a"), self.row("b", status="refused"),
+                                self.row("c", status="error", provider="native-control")])
         state_dir = self.root / "retry"
-        state = start_native_translation_retries(self.root, self.source, segments, first, state_dir)
-        self.assertEqual(state["next_attempt"], 1)
+        state = start_native_translation_retries(self.root, self.source, segments, first, state_dir,
+                                                 route_plan=plan)
+        self.assertEqual(state["next_attempt"], 2)
         self.assertEqual(state["pending_count"], 1)
         self.assertEqual(state["deferred_failure_count"], 1)
         self.assertEqual(state["unresolved_count"], 2)
         pending = [json.loads(line)["id"] for line in (self.root / state["pending_input"]).read_text().splitlines()]
-        self.assertEqual(pending, ["c"])
+        self.assertEqual(pending, ["b"])
         retry = self.root / "recovered.jsonl"
-        self.write_rows(retry, [self.row("c")])
+        self.write_rows(retry, [self.row("b")])
         resumed = advance_native_translation_retries(self.root, state_dir, retry)
-        self.assertEqual(resumed["next_attempt"], 2)
+        self.assertEqual(resumed["next_action"], "repair_native_runtime")
         self.assertEqual(resumed["candidate_count"], 2)
         self.assertEqual(resumed["deferred_failure_count"], 0)
         pending = [json.loads(line)["id"] for line in (self.root / resumed["pending_input"]).read_text().splitlines()]
-        self.assertEqual(pending, ["b"])
+        self.assertEqual(pending, ["c"])
 
-    def test_discovery_transport_failure_reuses_same_task_and_attempt(self) -> None:
+
+    def test_discovery_denial_does_not_repeat_unchanged_task_without_runtime_repair(self) -> None:
         game = self.root / "game"
         game.mkdir()
         (self.root / "game-l10n.json").write_text("{}", encoding="utf-8")
@@ -721,7 +881,8 @@ class NativeRuntimeTests(unittest.TestCase):
         result = seal_data_plane_task(self.root, relay, worker_ended=True)
         self.assertEqual(result["issue_codes"], ["E_NATIVE_DISPATCH_UNAVAILABLE"])
         second = prepare_data_plane_task(self.root, output, worker_role="source_probe", config=config)
-        self.assertEqual(second["task_id"], first["task_id"])
+        self.assertEqual(second["next_action"], "repair_native_runtime")
+        self.assertFalse(second["dispatch_allowed"])
         self.assertEqual((output / "task.json").read_bytes(), original)
 
     def test_completed_data_plane_attempt_keeps_distinct_launch_evidence(self) -> None:
@@ -770,8 +931,8 @@ class NativeRuntimeTests(unittest.TestCase):
         second = prepare_data_plane_task(self.root, output, worker_role="source_probe", config=config)
         self.assertEqual(first["task_id"], second["task_id"])
 
-    def test_ended_unstarted_probe_rebind_keeps_task_and_invalidates_stale_receipt(self) -> None:
-        config, output, relay = self.prepare_probe()
+    def test_ended_unstarted_probe_uses_fresh_task_after_explicit_binding_change(self) -> None:
+        config, output, relay = self.prepare_probe(approved_recovery=True)
         original = (output / "task.json").read_bytes()
         payload = json.loads(relay.read_text())
         envelope = self.root / payload["expected_envelope"]
@@ -780,13 +941,20 @@ class NativeRuntimeTests(unittest.TestCase):
         seal_data_plane_task(self.root, relay, worker_ended=True)
         configure_native_runtime(self.root, "omp", {"native-sol": "fixture/approved-new-model"})
         prepared = prepare_data_plane_task(self.root, output, worker_role="source_probe", config=config)
-        self.assertEqual(prepared["task_id"], payload["task_id"])
+        self.assertNotEqual(prepared["task_id"], payload["task_id"])
         bind_data_plane_launch(self.root, relay)
-        self.assertEqual((output / "task.json").read_bytes(), original)
-        self.assertFalse((output / "receipt.json").exists())
-        self.assertFalse(envelope.exists())
-        self.assertTrue(list(output.glob("receipt.json.legacy-*")))
-        self.assertTrue(list(output.glob(envelope.name + ".legacy-*")))
+        replacement = json.loads(relay.read_text())
+        self.assertNotEqual(replacement["expected_envelope"], payload["expected_envelope"])
+        self.assertFalse((self.root / replacement["expected_envelope"]).exists())
+        self.assertNotEqual((output / "task.json").read_bytes(), original)
+        current_task = json.loads((output / "task.json").read_text())
+        self.assertEqual(current_task["attempt"], json.loads(original)["attempt"])
+        self.assertGreater(current_task["task_revision"], json.loads(original).get("task_revision", 0))
+        history = output / "history" / payload["task_id"]
+        self.assertEqual((history / "task.json").read_bytes(), original)
+        self.assertEqual(json.loads((history / "receipt.json").read_text())["task_id"], payload["task_id"])
+        receipt = json.loads((output / "receipt.json").read_text())
+        self.assertNotEqual(receipt["task_id"], prepared["task_id"])
         launch = native_launch_summary(self.root, relay)
         self.assertEqual(launch["model"], "fixture/approved-new-model")
         self.assertEqual(launch["started_workers"], 0)
@@ -819,7 +987,7 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(relay.read_bytes(), original)
 
     def test_interrupted_data_plane_rebind_recovers_archived_evidence(self) -> None:
-        _, output, relay = self.prepare_probe()
+        _, output, relay = self.prepare_probe(approved_recovery=True)
         record_native_launch(self.root, relay, event="model-unavailable", failure_code="host_model_unavailable")
         seal_data_plane_task(self.root, relay, worker_ended=True)
         configure_native_runtime(self.root, "omp", {"native-sol": "fixture/approved-new-model"})

@@ -15,11 +15,13 @@ from uuid import uuid4
 
 from .control_plane import (
     CONTROL_HANDOFF_PATH, _validated_control_plane_handoff,
-    control_plane_entry_state, control_plane_state,
+    control_plane_entry_state, control_plane_state, public_control_plane_state,
 )
 from .framework_session import framework_session_state
 from .errors import ConfigurationError
 from .user_request import user_request_binding
+from .model_policy import exact_native_model
+from .native_host import resolve_native_model
 
 
 def _startup_prompt(
@@ -73,6 +75,11 @@ def _startup_prompt(
             "릴레이/워커는 launch_contract에 따라 메시지 전송·대화 및 세션 기록 열람을 하지 않는다. "
             "agent:// 메시지와 history:// 열람을 사용하지 마라. 하위 에이전트의 Python·프로세스 실행은 "
             "공식 도우미의 parr0t_process에 실행 파일부터 시작하는 argv로 전달하라. "
+            "이 도구는 새로 실행된 현재 호스트 세션에 속한다. 호출자 세션의 도구 목록이나 "
+            "작업 폴더의 entry ready 상태를 이 호스트의 도우미 등록 증거로 취급하지 마라. "
+            "parr0t_process가 최상위 함수 목록에 없으면 먼저 read xd://parr0t_process로 "
+            "활성·마운트된 도구 장치를 확인한 뒤에만 등록 누락을 판단하라. "
+            "도구가 실제로 없으면 현재 프로세스·세션을 유지하고 차단을 보고하며 자동 재시작하지 마라. "
             "도우미는 마커가 빠진 하위 세션에도 메시지·기록 접근과 내장 bash/eval 브리지를 차단한다. "
             "일반 네이티브 프로세스는 샌드박스화하지 않으며 실행 가드 등록을 기다리지 마라. "
         )
@@ -89,6 +96,16 @@ def _resolve_mode(workspace: Path, mode: str) -> str:
         raise ValueError("E_OMP_CONTROL_MODE_REQUIRED")
     state = control_plane_state(workspace)
     session = framework_session_state(workspace)
+    public = public_control_plane_state(state)
+    if (
+        state["status"] != "rotation_required" and session["mode"] != "localization"
+    ) or (
+        state["status"] == "rotation_required" and public.get("same_session_resume_allowed")
+    ):
+        raise ValueError(
+            "E_OMP_CONTROL_CLEAN_RESUME_REQUIRED: explicitly resume the clean session "
+            "through the root framework-mode tool; no generation rotation is required"
+        )
     if mode == "auto":
         mode = "rotation" if state["status"] == "rotation_required" else "workspace"
     if mode == "workspace":
@@ -112,13 +129,11 @@ def _plan_command(
 ) -> tuple[list[str], Path, Path | None]:
     """Validate prerequisites and plan a fresh session without writing anything."""
     workspace = workspace.resolve()
-    if not re.fullmatch(
-        r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/+\-]*"
-        r"(?:@[A-Za-z0-9][A-Za-z0-9._/\-]*)?(?::[A-Za-z0-9][A-Za-z0-9._\-]*)?", model
-    ):
+    if not exact_native_model(model):
         raise ValueError("E_OMP_CONTROL_EXACT_MODEL_REQUIRED")
     if not (workspace / "game-l10n.json").is_file():
         raise ValueError("E_OMP_CONTROL_WORKSPACE_REQUIRED")
+    model = resolve_native_model(workspace, "omp", model)
     mode = _resolve_mode(workspace, mode)
     control_plane_entry_state(workspace)
     executable = shutil.which("omp")
@@ -143,6 +158,25 @@ def _plan_command(
     return command, launch_dir, guard
 
 
+def _read_registration(launch_dir: Path, digest: str, *, guarded: bool) -> dict | None:
+    try:
+        proof = json.loads((launch_dir / "ready.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (
+        isinstance(proof, dict)
+        and proof.get("schema") == "parr0t.omp-control-ready.v1"
+        and proof.get("launch_id") == launch_dir.name
+        and type(proof.get("process_id")) is int and proof["process_id"] > 0
+        and proof.get("guard_sha256" if guarded else "helper_sha256") == digest
+        and isinstance(proof.get("session_id"), str)
+        and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", proof["session_id"])
+        and (guarded or proof.get("process_tool") == "parr0t_process")
+    ):
+        return proof
+    return None
+
+
 def _launch(
     workspace: Path, model: str, startup_seconds: float = 45.0,
     *, mode: str = "auto", foreground: bool = False, guarded: bool = False,
@@ -156,7 +190,8 @@ def _launch(
     session_dir.mkdir(parents=True)
     record = {
         "schema": "parr0t.omp-control-launch.v1", "status": "starting",
-        "model": model, "session_directory": str(session_dir),
+        "model": command[command.index("--model") + 1], "requested_model": model,
+        "session_directory": str(session_dir),
         "handoff_receipt": CONTROL_HANDOFF_PATH if mode == "rotation" else None,
         "mode": mode, "omp_isolation": "guarded" if guarded else "prompt", "process_id": None,
         "user_request": user_request_binding(workspace),
@@ -169,8 +204,9 @@ def _launch(
     environment.pop("PARR0T_OMP_GUARD_WORKSPACE", None)
     environment.pop("PARR0T_OMP_CONTROL_DIRECTORY", None)
     environment.pop("PARR0T_OMP_PROMPT_WORKSPACE", None)
-    if guarded:
-        environment["PARR0T_OMP_CONTROL_DIRECTORY"] = str(launch_dir)
+    environment["PARR0T_OMP_CONTROL_DIRECTORY"] = str(launch_dir)
+    extension = Path(command[command.index("--trusted-extension") + 1])
+    digest = sha256(extension.read_bytes()).hexdigest()
     process = subprocess.Popen(
         command, cwd=workspace, env=environment,
         creationflags=0 if foreground else subprocess.CREATE_NEW_CONSOLE, close_fds=True,
@@ -179,44 +215,31 @@ def _launch(
     record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     if foreground:
         record["exit_code"] = process.wait()
-        record["status"] = "exited"
-        record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-        return {**record, "launch_record": str(record_path)}
-    if guard is None:
-        # Process creation is observed; readiness and enforced isolation are not.
-        record["status"] = "started"
-        record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-        return {**record, "launch_record": str(record_path)}
-    registration = launch_dir / "ready.json"
-    guard_digest = sha256(guard.read_bytes()).hexdigest()
-    deadline = time.monotonic() + startup_seconds
-    while time.monotonic() < deadline:
-        if registration.is_file():
-            try:
-                proof = json.loads(registration.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                proof = {}
-            if (
-                isinstance(proof, dict)
-                and proof.get("schema") == "parr0t.omp-control-ready.v1"
-                and proof.get("launch_id") == launch_dir.name
-                and type(proof.get("process_id")) is int and proof["process_id"] > 0
-                and proof.get("guard_sha256") == guard_digest
-                and isinstance(proof.get("session_id"), str)
-                and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", proof["session_id"])
-            ):
-                record["status"] = "guard_registered"
-                record["process_id"] = proof["process_id"]
-                record["session_id"] = proof["session_id"]
-                break
-        if process.poll() not in {None, 0}:
-            record["status"] = "startup_failed"
-            break
-        time.sleep(0.1)
+        proof = _read_registration(launch_dir, digest, guarded=guarded)
+        record["status"] = "startup_failed"
     else:
-        # This is a startup observation limit, not a worker or job deadline.
-        # Keep the process and its identity; never restart it automatically.
-        record["status"] = "startup_pending"
+        deadline = time.monotonic() + startup_seconds
+        while True:
+            proof = _read_registration(launch_dir, digest, guarded=guarded)
+            if proof is not None:
+                break
+            exit_code = process.poll()
+            if exit_code is not None:
+                record["status"] = "startup_failed"
+                record["exit_code"] = exit_code
+                break
+            if time.monotonic() >= deadline:
+                # This observation limit never restarts or replaces the live process.
+                record["status"] = "startup_pending"
+                break
+            time.sleep(0.1)
+    if proof is not None:
+        record["status"] = "guard_registered" if guarded else "helper_registered"
+        record["process_id"] = proof["process_id"]
+        record["session_id"] = proof["session_id"]
+        if foreground:
+            record["registration_status"] = record["status"]
+            record["status"] = "exited"
     record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     return {**record, "launch_record": str(record_path)}
 
@@ -246,8 +269,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     print(json.dumps(result, ensure_ascii=False))
     if args.foreground:
-        return result["exit_code"]
-    return 0 if result["status"] in {"started", "guard_registered"} else 1
+        if result["exit_code"] != 0:
+            return result["exit_code"]
+        return 0 if result["status"] == "exited" else 1
+    return 0 if result["status"] in {"helper_registered", "guard_registered"} else 1
 
 
 if __name__ == "__main__":

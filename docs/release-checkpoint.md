@@ -1,8 +1,28 @@
 # Release checkpoint contract
 
-Every Parr0t distribution contains `parr0t-release-checkpoint.json`. The file makes the released translation a machine-readable continuation point: when an agent later receives that release together with a readable game folder, it can recover verified unchanged targets without translating or reviewing them again. When a title-specific translation source repository is also supplied, it remains a separate build/apply input; use it instead of reconstructing equivalent title-specific work or copying it into the checkpoint repository.
+Every published distribution contains `parr0t-release-checkpoint.json`. It makes the released translation a machine-readable continuation point for verified unchanged targets. A local package or integrity handoff that is not intended for distribution may instead use the smaller `parr0t.local-release-integrity/v1` checkpoint: it binds ownership/license, language, source inventory, and per-target source/target digests and integrity evidence, without claiming future-update readiness. It must preserve whether results were reviewed; a result produced with review explicitly disabled is labeled unreviewed, not independently reviewed or user-accepted merely because it is included. `required_for_distribution: false` permits this local integrity checkpoint; it does not waive package ownership, payload hashes, source lineage, or integrity checks. When a title-specific translation source repository is also supplied, it remains a separate build/apply input; use it instead of reconstructing equivalent title-specific work or copying it into the checkpoint repository.
+Local entries use `reviewed`, `unreviewed`, `accepted_unreviewed`, or `source_preserved`. `unreviewed` is valid for a translated result only when review was explicitly disabled. `accepted_unreviewed` remains a separate user-authorized acceptance state; neither inclusion nor integrity validation implies acceptance or independent review.
 
-Each entry records one of three exact states: `reviewed`, user-authorized `accepted_unreviewed`, or `source_preserved`. A translated candidate that was shipped after review failure or review exhaustion must remain `accepted_unreviewed`; it must not be promoted to `reviewed`. A missing or deterministically unsafe candidate remains `source_preserved`. These states allow a later correction or resumed review to touch only the affected targets.
+## Local integrity checkpoint generation
+
+For a local-only filesystem or Steam package, set workspace configuration `release_checkpoint.required_for_distribution` to `false`. Omit `checkpoint_file`; provide this request in the package spec instead:
+
+```json
+"local_checkpoint": {
+  "inventory": "inventory.json",
+  "results": "translation-results.json",
+  "ownership": {
+    "owner": "Authorized owner",
+    "license": "License identifier"
+  }
+}
+```
+
+The inventory and results must be validated existing paths within the workspace. `owner` and `license` are explicit required values. The package command validates the selected inventory and ordered result/source/status bindings, generates local integrity evidence, embeds that evidence in the checkpoint, and persists the checkpoint with a derived immutable spec; per-target evidence hashes bind entries to the embedded evidence. Callers do not hand-author hashes or evidence. `local_checkpoint` and `checkpoint_file` cannot be combined, and local generation is rejected when distribution requires the full checkpoint. A translated result is labeled `unreviewed` only when `routing.require_review` is false. `accepted_unreviewed` requires actual user acceptance authority; generation does not create it.
+
+## Full release checkpoint
+
+Full release-checkpoint entries record one of three exact states: `reviewed`, user-authorized `accepted_unreviewed`, or `source_preserved`. A translated candidate that was shipped after review failure or review exhaustion must remain `accepted_unreviewed`; it must not be promoted to `reviewed`. A missing or deterministically unsafe candidate remains `source_preserved`. These states allow a later correction or resumed review to touch only the affected targets.
 
 The checkpoint is distribution data, not SDK data. It may contain only the target strings already shipped in the release; source text is represented by a digest and must not be duplicated in a separate field. A `source_preserved` target may necessarily equal its source, but remains explicitly marked unresolved. The file must not contain prompts, model output, provider explanations, credentials, logs, private workspace paths, or unpublished translation candidates.
 
@@ -18,7 +38,7 @@ The checkpoint binds one release to:
 - each stable target ID and its source, target, location, dependency, and review fingerprints;
 - the declared locale-fallback result.
 
-The package manifest records the checkpoint path, schema, byte count, and digest. Package validation rejects a missing, noncanonical, modified, or differently bound checkpoint.
+For published distributions, the package manifest records the checkpoint path, schema, byte count, and digest. Package validation rejects a missing, noncanonical, modified, or differently bound checkpoint. A local-only integrity checkpoint is validated against its local schema and matching patch/release identity; it is not evidence of update compatibility or publication readiness.
 
 ## Resume algorithm
 
@@ -40,7 +60,7 @@ When the user requests a wording or terminology change, resolve it to stable tar
 
 When the user supplies or approves the exact final target wording, use the deterministic `apply-user-correction` flow in `docs/minimal-corrections.md`. This is user-directed correction rather than model translation: do not re-run context analysis or semantic review for the named IDs. The command still verifies the released source/target bindings and all deterministic integrity constraints. If the reverse dependency closure contains unnamed IDs, stop and review only that closure before packaging.
 
-When the user requests tone, voice, nuance, or naturalness improvement without final wording, use the same document's bounded semantic route. Freeze no more than 32 directly affected and reverse-dependent IDs, reuse their existing target-scoped context, and perform at most one rewrite batch plus one focused review batch. This does not authorize a full-inventory review, new extraction, SDK work, branch maintenance, publication, installation, or launch.
+When the user requests tone, voice, nuance, or naturalness improvement without final wording, use a bounded semantic route sized to the user's explicit positive task bounds and available capacity. Reuse existing target-scoped context and perform the requested rewrite and review work without imposing an undocumented target-count, batch-count, or universal re-review cap. This does not authorize a full-inventory review, new extraction, SDK work, branch maintenance, publication, installation, or launch unless requested.
 
 Do not invalidate the full inventory merely because one entry changed. Expand the invalidation set only when evidence shows a wider dependency, a global glossary/voice/context policy changes, or stable mapping is ambiguous. If the user explicitly requests a complete re-review, `docs/coverage-gates.md` still requires a fresh verdict for every current target.
 

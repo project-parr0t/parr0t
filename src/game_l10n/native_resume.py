@@ -86,6 +86,7 @@ def _metadata(path: Path) -> dict[str, Any]:
 def _manifest(root: Path, relative: str) -> dict[str, Any]:
     path = _contained(root, relative)
     _require(path.name == "manifest.json", "MANIFEST_INVALID")
+    _require(path.exists(), "MANIFEST_NOT_FOUND")
     try:
         manifest = _load_task_manifest(root, path)
         _native_control_plan_fingerprint(manifest)
@@ -326,9 +327,40 @@ def native_resume_status(work_dir: Path, *, manifest_path: Path | None = None) -
         split_dir = _directory(root, ".game-l10n/native/review-splits")
         manifests: dict[str, dict] = {}
         bindings: dict[str, str] = {}
+        selected_prefixes: set[str] | None = None
+        selected_chain_directory: str | None = None
+        if selected_manifest is not None:
+            selected_prefixes = set()
+            relative = selected_manifest
+            ancestry: set[str] = set()
+            while True:
+                _require(relative not in ancestry, "SPLIT_INVALID")
+                ancestry.add(relative)
+                manifest = _manifest(root, relative)
+                manifests[relative] = manifest
+                plan = _native_control_plan_fingerprint(manifest)
+                selected_prefixes.add(plan[:24])
+                split = manifest.get("review_split") or {}
+                _require(isinstance(split, dict), "SPLIT_INVALID")
+                parent = split.get("parent_manifest")
+                if not parent:
+                    selected_chain_directory = plan[:24]
+                    break
+                _require(isinstance(parent, str), "SPLIT_INVALID")
+                relative = parent
+            chain_path = _contained(root, _relative(root, _review_split_chain_path(root, plan)))
+            if chain_path.is_file():
+                selected_chain = _chain(root, chain_path, manifests)
+                _require(selected_manifest in selected_chain["manifests"], "SPLIT_INVALID")
+                selected_prefixes.update(
+                    _native_control_plan_fingerprint(manifests[item])[:24]
+                    for item in selected_chain["manifests"]
+                )
         if relay_dir.exists():
             for path in sorted(relay_dir.iterdir()):
                 if not path.match("*-wave-*.json") or path.name.endswith(("-receipt.json", "-launch.json")):
+                    continue
+                if selected_prefixes is not None and path.name.split("-wave-", 1)[0] not in selected_prefixes:
                     continue
                 _contained(root, _relative(root, path))
                 relative, results = _relay(root, path, manifests)
@@ -337,6 +369,8 @@ def native_resume_status(work_dir: Path, *, manifest_path: Path | None = None) -
         chains = []
         if split_dir.exists():
             for directory in sorted(split_dir.iterdir()):
+                if selected_chain_directory is not None and directory.name != selected_chain_directory:
+                    continue
                 _contained(root, _relative(root, directory))
                 if not directory.is_dir():
                     continue
