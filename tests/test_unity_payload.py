@@ -130,7 +130,7 @@ class UnityPayloadTests(unittest.TestCase):
                 self.assertEqual(payload["literal_strings"], {"SOURCE_TEXT": "SOURCE_TEXT"})
                 self.assertEqual(
                     payload["string_tables"]["fixture_collection"]["1001"],
-                    {"text": "합성 대상", "is_smart": False},
+                    {"text": chr(0xAC00) * 4, "is_smart": False},
                 )
                 self.assertEqual(summary["segments"], 2)
                 self.assertEqual(summary["source_preserved"], 1)
