@@ -15,7 +15,10 @@ from game_l10n.control_plane import validate_control_envelope
 from game_l10n.data_plane_task import (
     _expected_context_pack_from_fragments,
     prepare_data_plane_task,
+    record_data_plane_relay_event,
+    seal_data_plane_task,
 )
+from game_l10n.errors import ConfigurationError
 from game_l10n.native_runtime import configure_native_runtime
 from game_l10n.omp_isolation import ISOLATION_ENV
 from game_l10n.store import stable_hash
@@ -143,6 +146,33 @@ class ContextWorkerExecutionTests(unittest.TestCase):
         finalized_bytes = (self.work / self.task["output_artifact"]).read_bytes()
         self.run_command("finalize-context-fragments")
         self.assertEqual((self.work / self.task["output_artifact"]).read_bytes(), finalized_bytes)
+
+    def test_completed_slot_does_not_wait_for_sibling_admission(self) -> None:
+        relay = self.output / "relay.json"
+        slots = json.loads(relay.read_text(encoding="utf-8"))["execution_plan"]["required_worker_slots"]
+        first, second = slots
+        record_data_plane_relay_event(self.work, relay, event="worker-started", slot=first)
+        path, claim = self.claim(first)
+        self.run_command("commit-context-fragment", claim_path=path, result_path=self.result(claim))
+        ended = record_data_plane_relay_event(self.work, relay, event="worker-ended", slot=first)
+        self.assertEqual(ended["execution"]["terminal_workers"], 1)
+        self.assertEqual(ended["execution"]["unstarted_slots"], [second])
+        with self.assertRaisesRegex(ConfigurationError, "finalizer requires"):
+            record_data_plane_relay_event(self.work, relay, event="finalizer-started")
+        with self.assertRaisesRegex(ConfigurationError, "EXECUTION_INCOMPLETE"):
+            seal_data_plane_task(self.work, relay)
+
+        record_data_plane_relay_event(self.work, relay, event="worker-started", slot=second)
+        path, claim = self.claim(second)
+        self.run_command("commit-context-fragment", claim_path=path, result_path=self.result(claim))
+        record_data_plane_relay_event(self.work, relay, event="worker-ended", slot=second)
+        record_data_plane_relay_event(self.work, relay, event="finalizer-started")
+        self.run_command("finalize-context-fragments")
+        record_data_plane_relay_event(self.work, relay, event="finalizer-ended")
+        sealed = seal_data_plane_task(self.work, relay)
+        self.assertEqual(sealed["status"], "success")
+        self.assertTrue(sealed["execution"]["complete"])
+        self.assertEqual(sealed["counts"]["success"], 2)
 
     def test_ordinary_worker_argv_runs_without_cli_on_path(self) -> None:
         self.assert_round_trip()
