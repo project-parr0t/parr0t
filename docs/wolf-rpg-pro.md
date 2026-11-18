@@ -61,7 +61,9 @@ python -m game_l10n.wolf apply-batches `
   --translated-json translations\wolf-json
 ```
 
-The importer accepts `reviewed`, explicitly user-authorized `accepted_unreviewed`, and exact `source_preserved` rows. Missing translation results preserve their source instead of invalidating the whole delivery. A candidate with a control-code or newline mismatch also preserves the source for that target; unknown IDs, changed sources, and invalid statuses still fail before any batch file is written. The returned counts distinguish applied unreviewed targets, missing translations, and structural rejections. A verified inventory fingerprint is mandatory, and any unresolved `metadata.blocking_on_failure=true` target holds import, application, and packing until a later user-requested resume resolves it.
+The importer accepts `reviewed`, explicitly user-authorized `accepted_unreviewed`, and exact `source_preserved` rows. Missing translation results preserve their source instead of invalidating the whole delivery. A candidate with a control-code or newline mismatch also preserves the source for that target; unknown IDs, changed sources, and invalid statuses still fail before any batch file is written. The returned counts distinguish applied unreviewed targets, missing translations, and structural rejections. A verified inventory fingerprint is mandatory.
+
+An unresolved `metadata.blocking_on_failure=true` target normally holds import, application, and packing until a later user-requested resume resolves it. Explicit user consent via `failure_queue.allow_incomplete_artifact=true` can instead authorize the exact safe incomplete result bound to the current Core completion attestation. Import checks the actual `--reviewed` path; application and packing revalidate that existing bound artifact without inventing a new result path. Consent alone does not bypass current inventory, full-scope alignment, target-language policy, artifact path/hash/size, or integrity checks. An alternate result file (even with identical bytes), stale artifact, or unapproved completion remains blocked. This authorization does not clear the failure queue or turn unresolved targets into completed translations, and it does not grant permission to execute external tools.
 
 ## Manual translator queue
 
@@ -119,7 +121,7 @@ python -m game_l10n.wolf pack-pro `
 
 Review the output before installing it. Keep a recoverable copy of the original archives and never copy packer binaries or game-derived data into this SDK repository.
 
-`pack-pro` rechecks the current inventory and blocking-failure gate before invoking the external packer. Runtime coverage remains a separate claim: packing and a clean static audit do not prove that every screen or state was observed in a real execution.
+`pack-pro` rechecks the current inventory and blocking-failure gate (including any artifact-bound incomplete authorization) before invoking the external packer. Runtime coverage remains a separate claim: packing and a clean static audit do not prove that every screen or state was observed in a real execution.
 
 ## Core update compatibility
 

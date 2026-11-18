@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ..coverage import require_inventory_attestation
+from ..tooling import require_incomplete_artifact
 
 
 SOURCE_TEXT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
@@ -294,7 +295,9 @@ def write_inventory_pair(
     return primary_path, independent_path
 
 
-def require_wolf_patch_gate(work_dir: Path, primary_path: Path) -> dict[str, Any]:
+def require_wolf_patch_gate(
+    work_dir: Path, primary_path: Path, *, result_path: Path | None = None,
+) -> dict[str, Any]:
     inventory = require_inventory_attestation(work_dir, primary_path)
     queue_path = work_dir / ".game-l10n" / "failure-queue.json"
     if not queue_path.is_file():
@@ -305,5 +308,5 @@ def require_wolf_patch_gate(work_dir: Path, primary_path: Path) -> dict[str, Any
     if queue.get("inventory_fingerprint") != inventory["primary_fingerprint"]:
         raise ValueError("Failure queue is stale for the verified WOLF inventory")
     if int(queue.get("blocking_count", 0)) > 0:
-        raise ValueError("WOLF patch output is held while a blocking translation target remains unresolved")
+        require_incomplete_artifact(work_dir, inventory, result_path=result_path)
     return inventory

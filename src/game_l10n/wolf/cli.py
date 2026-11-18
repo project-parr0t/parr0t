@@ -97,9 +97,10 @@ def cmd_prepare_batches(args: argparse.Namespace) -> int:
 def cmd_import_reviewed(args: argparse.Namespace) -> int:
     work_dir, _ = _workspace(args)
     primary = _work_path(work_dir, args.segments, must_exist=True)
-    require_wolf_patch_gate(work_dir, primary)
+    reviewed = _work_path(work_dir, args.reviewed, must_exist=True)
+    require_wolf_patch_gate(work_dir, primary, result_path=reviewed)
     result = import_reviewed_results(
-        _work_path(work_dir, args.reviewed, must_exist=True),
+        reviewed,
         _work_path(work_dir, args.batches, must_exist=True),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
