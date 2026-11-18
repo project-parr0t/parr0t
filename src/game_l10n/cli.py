@@ -4995,7 +4995,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sdk_activate.add_argument(
         "--reference-checkout",
-        help="Exact clean Git or content-bound reference runtime required only for derive-new",
+        help="Optional repository containing the selected derive-new reference commit; its HEAD is not executed",
     )
     sdk_activate.set_defaults(func=cmd_sdk_activate)
 
