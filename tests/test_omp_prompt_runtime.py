@@ -26,6 +26,7 @@ from game_l10n.workspace import (
     initialize_workspace, load_config, record_sdk_activation, record_sdk_evaluation, record_sdk_selection, refresh_sdk_inventory,
 )
 from tests.omp_isolation_fixture import install_omp_isolation
+from tests import write_semantic_result_rows
 
 
 class OmpPromptRuntimeTests(unittest.TestCase):
@@ -104,10 +105,12 @@ class OmpPromptRuntimeTests(unittest.TestCase):
             recorded = self.run_cli(start)
             self.assertEqual(recorded["started_workers"], index + 1)
             result = self.root / binding["result"]
-            result.parent.mkdir(parents=True, exist_ok=True)
-            result.write_text(json.dumps({"target_id": f"synthetic-{'ab'[index]}",
-                "status": "success", "text": "\ud569\uc131 \ub300\uc0c1", "provider": "native-luna", "issues": []}) + "\n",
-                encoding="utf-8")
+            write_semantic_result_rows(
+                result,
+                [{"target_id": f"synthetic-{'ab'[index]}",
+                  "status": "success", "text": "\ud569\uc131 \ub300\uc0c1",
+                  "provider": "native-luna", "issues": []}],
+            )
         self.run_cli(commands["seal"])
         completed = native_control_step(self.root, tasks / "manifest.json", results,
                                         require_runtime=True, require_relay_receipt=True)

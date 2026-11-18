@@ -7,6 +7,11 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
 
+from .content_source_policy import (
+    content_source_policy,
+    validate_content_source_policy,
+    validate_output_provenance,
+)
 from .formats import read_segments
 from .models import Segment
 from .privacy import is_within
@@ -101,9 +106,19 @@ def _validated_route_plan(route_plan: Iterable[dict[str, Any]]) -> list[dict[str
         not plan
         or len({item.get("provider") for item in plan}) != len(plan)
         or any(
-            set(item) != {"provider", "max_retries"}
+            set(item) not in (
+                {"provider", "max_retries"},
+                {"provider", "model", "max_retries"},
+            )
             or not isinstance(item["provider"], str)
             or not item["provider"]
+            or (
+                "model" in item
+                and (
+                    not isinstance(item["model"], str)
+                    or not item["model"]
+                )
+            )
             or not isinstance(item["max_retries"], int)
             or isinstance(item["max_retries"], bool)
             or item["max_retries"] < 0
@@ -113,6 +128,23 @@ def _validated_route_plan(route_plan: Iterable[dict[str, Any]]) -> list[dict[str
         raise NativeTranslationRetryError("Native translation retry route plan is invalid")
     return plan
 
+def _route_plans_match(
+    stored: list[dict[str, Any]], configured: list[dict[str, Any]]
+) -> bool:
+    if stored == configured:
+        return True
+    return (
+        all("model" not in item for item in stored)
+        and [
+            {
+                "provider": item["provider"],
+                "max_retries": item["max_retries"],
+            }
+            for item in configured
+        ]
+        == stored
+    )
+
 
 def _validate_result_rows(
     segments: list[Segment],
@@ -120,6 +152,8 @@ def _validate_result_rows(
     *,
     expected_provider: str | None = None,
     allow_legacy_native_provider: bool = False,
+    content_policy: dict[str, Any] | None = None,
+    expected_model: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[Segment]]:
     rows = _read_jsonl(results_path)
     if [row.get("target_id") for row in rows] != [segment.id for segment in segments]:
@@ -154,6 +188,13 @@ def _validate_result_rows(
         if status == "success" and valid_success_text:
             row["candidate_generation"] = 1
             row["candidate_digest"] = stable_hash(text)
+            if content_policy is not None:
+                row["content_provenance"] = validate_output_provenance(
+                    row.get("content_provenance"),
+                    policy=content_policy,
+                    model=expected_model or str(expected_provider),
+                    route=str(expected_provider),
+                )
             successes.append(row)
         elif status in {"refused", "error", "invalid"} and text == "":
             failures.append(segment)
@@ -198,13 +239,92 @@ def _load_state(work_dir: Path, state_dir: Path) -> dict[str, Any]:
         "pending_sha256",
         "final_results",
         "history",
+        "content_source_policy",
+        "state_fingerprint",
     }
-    if not isinstance(state, dict) or set(state) - {"deferred_failure_ids"} != required:
+    if (
+        not isinstance(state, dict)
+        or set(state) - {"deferred_failure_ids", "primary_lineage"} != required
+    ):
         raise NativeTranslationRetryError("Native translation retry state is malformed")
     deferred = state.get("deferred_failure_ids", [])
     if not isinstance(deferred, list) or not all(isinstance(item, str) for item in deferred) or len(set(deferred)) != len(deferred):
         raise NativeTranslationRetryError("Native translation retry deferred targets are invalid")
     plan = _validated_route_plan(state["route_plan"])
+    fingerprint_payload = dict(state)
+    state_fingerprint = fingerprint_payload.pop("state_fingerprint", None)
+    if state_fingerprint != stable_hash(fingerprint_payload):
+        raise NativeTranslationRetryError(
+            "E_CONTENT_SOURCE_POLICY_IMMUTABLE"
+        )
+    try:
+        validate_content_source_policy(state["content_source_policy"])
+    except ValueError as exc:
+        raise NativeTranslationRetryError(
+            "E_CONTENT_SOURCE_POLICY_IMMUTABLE"
+        ) from exc
+    lineage = state.get("primary_lineage")
+    if lineage is not None:
+        lineage_keys = {
+            "manifest",
+            "manifest_contract_fingerprint",
+            "source_fingerprint",
+            "execution_namespace",
+            "content_source_policy_digest",
+            "route_binding",
+            "primary_results_sha256",
+        }
+        binding = lineage.get("route_binding") if isinstance(lineage, dict) else None
+        if (
+            not isinstance(lineage, dict)
+            or set(lineage) != lineage_keys
+            or not isinstance(lineage.get("manifest"), str)
+            or not lineage["manifest"]
+            or lineage.get("source_fingerprint") != state["source_fingerprint"]
+            or lineage.get("content_source_policy_digest")
+            != state["content_source_policy"]["policy_digest"]
+            or not isinstance(binding, dict)
+            or set(binding) != {"provider", "model", "attempt"}
+            or binding.get("provider") != state["route_plan"][0]["provider"]
+            or binding.get("attempt") != 1
+            or (
+                "model" in state["route_plan"][0]
+                and binding.get("model") != state["route_plan"][0]["model"]
+            )
+            or not isinstance(binding.get("model"), str)
+            or not binding["model"]
+            or not isinstance(lineage.get("primary_results_sha256"), str)
+            or len(lineage["primary_results_sha256"]) != 64
+            or not isinstance(state.get("history"), list)
+            or not state["history"]
+        ):
+            raise NativeTranslationRetryError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
+        try:
+            from .native_pass import _load_task_manifest
+
+            manifest_path = (work_dir / lineage["manifest"]).resolve()
+            manifest = _load_task_manifest(work_dir, manifest_path)
+            namespace = manifest_path.parent.relative_to(work_dir).as_posix()
+        except (OSError, ValueError, KeyError, TypeError):
+            raise NativeTranslationRetryError(
+                "E_CONTENT_SOURCE_POLICY_IMMUTABLE"
+            ) from None
+        if (
+            manifest.get("pass_kind", "translation") != "translation"
+            or manifest.get("source_fingerprint") != state["source_fingerprint"]
+            or manifest.get("contract_fingerprint")
+            != lineage["manifest_contract_fingerprint"]
+            or manifest.get("execution_namespace") != namespace
+            or lineage.get("execution_namespace") != namespace
+            or manifest.get("content_source_policy")
+            != state["content_source_policy"]
+            or manifest.get("route_binding") != binding
+            or state["history"][0].get("result_sha256")
+            != lineage["primary_results_sha256"]
+        ):
+            raise NativeTranslationRetryError(
+                "E_CONTENT_SOURCE_POLICY_IMMUTABLE"
+            )
     if (
         state.get("schema") != RETRY_SCHEMA
         or not isinstance(state.get("route_index"), int)
@@ -245,6 +365,13 @@ def _state_summary(work_dir: Path, state_dir: Path, state: dict[str, Any]) -> di
         "candidate_count": candidate_count,
         "pending_input": state["pending_artifact"],
         "pre_fallback_results": state["final_results"],
+        "content_source_policy": state["content_source_policy"],
+        "route_plan": state["route_plan"],
+        **(
+            {"primary_lineage": state["primary_lineage"]}
+            if "primary_lineage" in state
+            else {}
+        ),
         "native_pass_output": _relative(work_dir, state_dir / "native-passes" / run_name),
         "native_pass_results": _relative(work_dir, state_dir / "native-passes" / (run_name + "-results")),
     }
@@ -290,6 +417,8 @@ def _write_stage(
             "final_results": _relative(work_dir, final_path),
         }
     )
+    state.pop("state_fingerprint", None)
+    state["state_fingerprint"] = stable_hash(state)
     _atomic_json(state_dir / STATE_NAME, state)
     return _state_summary(work_dir, state_dir, state)
 
@@ -302,6 +431,8 @@ def start_native_translation_retries(
     state_dir: Path,
     *,
     route_plan: Iterable[dict[str, Any]] = DEFAULT_ROUTE_PLAN,
+    content_policy: dict[str, Any] | None = None,
+    primary_lineage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     work_dir = work_dir.resolve()
     source_path = source_path.resolve()
@@ -315,14 +446,56 @@ def start_native_translation_retries(
     if not segments or len({segment.id for segment in segments}) != len(segments):
         raise NativeTranslationRetryError("Native retry source must contain unique targets")
     plan = _validated_route_plan(route_plan)
+    if content_policy is None:
+        content_policy = content_source_policy(
+            work_dir,
+            task_kind="translation",
+            route="native-pass:translation",
+        )
+    else:
+        content_policy = validate_content_source_policy(content_policy)
+        if (
+            content_policy["task_kind"] != "translation"
+            or content_policy["route"] != "native-pass:translation"
+        ):
+            raise NativeTranslationRetryError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
+    first_model = None
+    if primary_lineage is not None:
+        route_binding = primary_lineage.get("route_binding")
+        if (
+            not isinstance(route_binding, dict)
+            or route_binding.get("provider") != str(plan[0]["provider"])
+            or route_binding.get("attempt") != 1
+            or not isinstance(route_binding.get("model"), str)
+            or not route_binding["model"]
+            or (
+                "model" in plan[0]
+                and route_binding.get("model") != plan[0]["model"]
+            )
+            or primary_lineage.get("source_fingerprint")
+            != stable_hash_sequence(asdict(segment) for segment in segments)
+            or primary_lineage.get("content_source_policy_digest")
+            != content_policy["policy_digest"]
+        ):
+            raise NativeTranslationRetryError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
+        first_model = route_binding["model"]
+        primary_lineage = {
+            **primary_lineage,
+            "primary_results_sha256": _sha256(first_results),
+        }
+    first_model = str(
+        plan[0].get("model") or first_model or plan[0]["provider"]
+    )
     if state_dir.exists() and any(state_dir.iterdir()):
         state = _load_state(work_dir, state_dir)
         expected = stable_hash_sequence(asdict(segment) for segment in segments)
         if (
             state["source_fingerprint"] != expected
-            or state["route_plan"] != plan
+            or not _route_plans_match(state["route_plan"], plan)
             or not state["history"]
             or state["history"][0].get("result_sha256") != _sha256(first_results)
+            or state["content_source_policy"] != content_policy
+            or state.get("primary_lineage") != primary_lineage
         ):
             raise NativeTranslationRetryError("Existing native retry state is stale")
         return {**_state_summary(work_dir, state_dir, state), "cached": True}
@@ -331,6 +504,8 @@ def start_native_translation_retries(
         first_results,
         expected_provider=str(plan[0]["provider"]),
         allow_legacy_native_provider=True,
+        content_policy=content_policy,
+        expected_model=first_model,
     )
     candidates = {row["target_id"]: row for row in successes}
     next_provider, next_attempt, route_index, next_action = _next_route(
@@ -349,6 +524,7 @@ def start_native_translation_retries(
         "source": _relative(work_dir, source_path),
         "source_fingerprint": stable_hash_sequence(asdict(segment) for segment in segments),
         "route_plan": plan,
+        "content_source_policy": content_policy,
         "route_index": route_index,
         "last_provider": str(plan[0]["provider"]),
         "last_attempt": 1,
@@ -372,6 +548,11 @@ def start_native_translation_retries(
             }
         ],
         "deferred_failure_ids": deferred,
+        **(
+            {"primary_lineage": primary_lineage}
+            if primary_lineage is not None
+            else {}
+        ),
     }
     return {
         **_write_stage(work_dir, state_dir, segments, candidates, failures, state),
@@ -392,7 +573,9 @@ def advance_native_translation_retries(
                 "Native translation retry paths must stay inside the workspace"
             )
     state = _load_state(work_dir, state_dir)
-    if route_plan is not None and state["route_plan"] != _validated_route_plan(route_plan):
+    if route_plan is not None and not _route_plans_match(
+        state["route_plan"], _validated_route_plan(route_plan)
+    ):
         raise NativeTranslationRetryError("Configured native translation routes changed")
     if state["next_action"] != "native_retry":
         raise NativeTranslationRetryError("No native translation retry is pending")
@@ -420,10 +603,16 @@ def advance_native_translation_retries(
     pending_segments = [
         Segment(**row) for row in _read_jsonl(work_dir / state["pending_artifact"])
     ]
+    plan = _validated_route_plan(state["route_plan"])
+    current_route = plan[int(state["route_index"])]
     successes, failures = _validate_result_rows(
         pending_segments,
         attempt_results,
         expected_provider=str(state["next_provider"]),
+        content_policy=state["content_source_policy"],
+        expected_model=str(
+            current_route.get("model") or state["next_provider"]
+        ),
     )
     candidate_rows = _read_jsonl(work_dir / state["candidate_artifact"])
     candidates = {row["target_id"]: row for row in candidate_rows}
@@ -434,7 +623,6 @@ def advance_native_translation_retries(
 
     provider = state["next_provider"]
     attempt = state["next_attempt"]
-    plan = _validated_route_plan(state["route_plan"])
     route_index = int(state["route_index"])
     if provider != plan[route_index]["provider"]:
         raise NativeTranslationRetryError("Native translation retry route binding changed")
@@ -456,6 +644,7 @@ def advance_native_translation_retries(
         next_provider, next_attempt, next_route_index, next_action = _next_route(
             plan, route_index, attempt, len(failures)
         )
+    state.pop("state_fingerprint", None)
     state["deferred_failure_ids"] = [segment.id for segment in source_segments if segment.id in deferred_ids]
     state.update(
         {
@@ -503,6 +692,8 @@ def require_pre_fallback_retry_state(
     if (work_dir / state["final_results"]).resolve() != final_results.resolve():
         raise NativeTranslationRetryError("Native retry state targets another result set")
     plan = _validated_route_plan(state["route_plan"])
-    if plan != _validated_route_plan(route_plan):
-        raise NativeTranslationRetryError("Native retry route plan does not match configured routes")
+    if not _route_plans_match(plan, _validated_route_plan(route_plan)):
+        raise NativeTranslationRetryError(
+            "Native retry route plan does not match configured routes"
+        )
     return _state_summary(work_dir, state_dir, state)
