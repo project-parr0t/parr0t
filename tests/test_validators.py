@@ -208,6 +208,21 @@ class ValidatorTests(unittest.TestCase):
                 issues = validate_integrity(segment, "[item:1] [item:2]", [], extra_patterns=[pattern])
                 self.assertEqual([item.code for item in issues], ["protected-token-mismatch"])
 
+    def test_overlapping_custom_tokens_preserve_multiplicity_and_order(self) -> None:
+        source = "[item:1] %s [item:1]"
+        patterns = [r"\[(item):\d+\]", r"%s"]
+        self.assertEqual(
+            list(protected_tokens(source, patterns).items()),
+            [("%s", 2), ("[item:1]", 2)],
+        )
+        issues = validate_integrity(
+            Segment("fixture-overlapping-tokens", source),
+            "TARGET {other}",
+            [],
+            extra_patterns=patterns,
+        )
+        self.assertEqual([item.code for item in issues], ["protected-token-mismatch"])
+
     def test_quoted_markup_attributes_are_protected_through_angle_brackets(self) -> None:
         for quote in ('"', "'"):
             with self.subTest(quote=quote):
@@ -252,6 +267,24 @@ class ValidatorTests(unittest.TestCase):
         self.assertTrue(contains_term("Jos\u00e9", "Jos\u00e9, FIXTURE"))
         self.assertTrue(contains_term("stra\u00dfe", "STRASSE"))
         self.assertTrue(contains_term("\u03a6\u03af\u03bb", "\u03a6\u03af\u03bb\u037e"))
+
+    def test_term_matching_preserves_empty_literal_and_case_sensitive_edges(self) -> None:
+        for term, text, case_sensitive, expected in (
+            ("", "SOURCE", False, False),
+            ("", "", True, False),
+            ("Ice", "Device Ice", False, True),
+            ("Ice", "ice", True, False),
+            ("Ice", "Ice", True, True),
+            ("STRASSE", "die Stra\u00dfe", False, True),
+            ("STRASSE", "die Stra\u00dfe", True, False),
+            ("a.b", "a-b", False, False),
+            ("a.b", "a.b", False, True),
+        ):
+            with self.subTest(term=term, text=text, case_sensitive=case_sensitive):
+                self.assertEqual(
+                    contains_term(term, text, case_sensitive=case_sensitive), expected
+                )
+
     def test_crossed_markup_is_rejected_but_moved_spans_are_not(self) -> None:
         def codes(source: str, candidate: str) -> set[str]:
             return {item.code for item in validate_integrity(Segment("fixture-markup", source), candidate, [])}
