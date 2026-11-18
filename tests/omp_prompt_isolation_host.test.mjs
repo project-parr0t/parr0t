@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -30,7 +30,7 @@ async function publicHostModules(root) {
     assert.equal(typeof target, "string", `Selected host has no import export for ${subpath}`);
     return import(pathToFileURL(path.resolve(root, replacement === undefined ? target : target.replace("*", replacement))).href);
   }
-  const [extensions, loader, events, sessions, settings, registry, lifecycle, bus, write, bash] = await Promise.all([
+  const [extensions, loader, events, sessions, settings, registry, lifecycle, bus, write, bash, read] = await Promise.all([
     publicExport("./extensibility/extensions"),
     publicExport("./extensibility/extensions/loader"),
     publicExport("./utils/event-bus"),
@@ -41,8 +41,9 @@ async function publicHostModules(root) {
     publicExport("./irc/bus.js"),
     publicExport("./tools/write"),
     publicExport("./tools/bash"),
+    publicExport("./tools/read"),
   ]);
-  return { ...extensions, ...loader, ...events, ...sessions, ...settings, ...registry, ...lifecycle, ...bus, ...write, ...bash };
+  return { ...extensions, ...loader, ...events, ...sessions, ...settings, ...registry, ...lifecycle, ...bus, ...write, ...bash, ...read };
 }
 
 async function runIntegration() {
@@ -51,9 +52,10 @@ async function runIntegration() {
   const {
     ExtensionRunner, ExtensionRuntime, ExtensionToolWrapper, loadExtensions, loadExtensionFromFactory,
     wrapRegisteredTool, EventBus, SessionManager, Settings, AgentRegistry,
-    AgentLifecycleManager, IrcBus, WriteTool, BashTool, MAIN_AGENT_ID,
+    AgentLifecycleManager, IrcBus, WriteTool, BashTool, ReadTool, MAIN_AGENT_ID,
   } = await publicHostModules(root);
-  const workspace = mkdtempSync(path.join(os.tmpdir(), "parr0t-real-host-synthetic-"));
+  const workspace = realpathSync(mkdtempSync(path.join(os.tmpdir(), "parr0t-real-host-synthetic-")));
+  const assetRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), "parr0t-real-host-assets-")));
   const helperPath = fileURLToPath(new URL("../src/game_l10n/templates/omp-prompt-isolation.mjs", import.meta.url));
   const controlDirectory = path.join(workspace, ".game-l10n", "omp-control", "b".repeat(32));
   const originalControl = process.env.PARR0T_OMP_CONTROL_DIRECTORY;
@@ -76,7 +78,7 @@ async function runIntegration() {
   const observations = [];
   let sequence = 0;
 
-  async function makeSession(id, kind, depth, parentId) {
+  async function makeSession(id, kind, depth, parentId, selectedHelper = helperPath) {
     const manager = SessionManager.inMemory(workspace);
     const identity = { id, name: id, kind, depth, parentId };
     const eventBus = new EventBus();
@@ -84,7 +86,7 @@ async function runIntegration() {
     runtime.flagValues.set("parr0t-workspace", workspace);
     const spawned = [];
     const dispatchedTasks = [];
-    const loaded = await loadExtensions([helperPath], workspace, eventBus, runtime);
+    const loaded = await loadExtensions([selectedHelper], workspace, eventBus, runtime);
     assert.deepEqual(loaded.errors, [], "Actual helper file must load through the selected host");
     assert.equal(loaded.extensions.length, 1);
     const consumer = await loadExtensionFromFactory(pi => {
@@ -107,7 +109,7 @@ async function runIntegration() {
         async execute(_callId, input) {
           dispatchedTasks.push(input);
           for (const task of input.tasks) {
-            const worker = await makeSession(task.name ?? `${id}.Worker${spawned.length + 1}`, "sub", depth + 1, id);
+            const worker = await makeSession(task.name ?? `${id}.Worker${spawned.length + 1}`, "sub", depth + 1, id, selectedHelper);
             // Shared context is intentionally NOT replayed as the child's first
             // user prompt: this is the consumer-visible marker-loss risk.
             await worker.runner.emitBeforeAgentStart(task.task ?? task.steps?.[0] ?? "Synthetic task", undefined, []);
@@ -133,6 +135,7 @@ async function runIntegration() {
     function wrap(tool) { return new ExtensionToolWrapper(tool, runner, identity); }
     const write = wrap(new WriteTool(toolSession));
     const bash = wrap(new BashTool(toolSession));
+    const read = wrap(new ReadTool(toolSession));
     const registeredTools = new Map(runner.getAllRegisteredTools().map(entry =>
       [entry.definition.name, wrap(wrapRegisteredTool(entry, runner))]));
     const activeTools = new Map(registeredTools);
@@ -152,6 +155,9 @@ async function runIntegration() {
       id, runner, manager, spawned, dispatchedTasks, context, registeredTools, activeTools,
       write: input => write.execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
       bash: input => bash.execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
+      read: input => read.execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
+      exec: input => registered("parr0t_exec").execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
+      mode: input => registered("parr0t_framework_mode").execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
       task: input => registered("task").execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
       process: input => registered("parr0t_process").execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
       processSchema: () => registered("parr0t_process").parameters,
@@ -284,10 +290,11 @@ async function runIntegration() {
       return JSON.parse(result.stdout.toString());
     }
     const prepared = coreMetadata(`
-from game_l10n.control_plane import establish_control_plane_entry
+from game_l10n.control_plane import CONTROL_STATE_PATH,establish_control_plane_entry,initial_control_plane_state
 from game_l10n.data_plane_task import prepare_data_plane_task
 from game_l10n.native_runtime import configure_native_runtime,bind_data_plane_launch
 (w/"game-l10n.json").write_text("{}",encoding="utf-8")
+(w/CONTROL_STATE_PATH).write_text(json.dumps(initial_control_plane_state()),encoding="utf-8")
 establish_control_plane_entry(w)
 configure_native_runtime(w,"omp",{},omp_isolation="prompt")
 game=w/"synthetic-game"; game.mkdir()
@@ -324,6 +331,68 @@ print(json.dumps(native_launch_summary(w,w/sys.argv[3])))
     const sealed = JSON.parse((await seal()).details.stdout);
     assert.ok(sealed.issue_codes.includes("task_incomplete"));
     assert.ok(!sealed.issue_codes.includes("E_NATIVE_WORKER_NOT_STARTED"));
+
+    // The guarded file is loaded by the same real host loader, not imported as
+    // a mocked factory. Its native Python runner enforces the bound offline IO.
+    delete process.env.PARR0T_OMP_CONTROL_DIRECTORY;
+    // Match initialize_workspace: guarded startup requires the persisted Core
+    // state, not only the prompt reader's implicit initial-state fallback.
+    assert.equal(existsSync(path.join(workspace, ".game-l10n/control-plane-state.json")), true);
+    const guardPath = fileURLToPath(new URL("../src/game_l10n/templates/omp-isolation-guard.mjs", import.meta.url));
+    const guardedRoot = await makeSession("GuardedRoot", "main", 0, undefined, guardPath);
+    await guardedRoot.runner.emit({ type: "session_start" });
+    const registrationPath = path.join(workspace, ".game-l10n/native/omp-isolation",
+      `${createHash("sha256").update(guardedRoot.manager.getSessionId()).digest("hex")}.json`);
+    const registration = JSON.parse(readFileSync(registrationPath, "utf8"));
+    const asset = path.join(assetRoot, "selected.txt");
+    const unbound = path.join(assetRoot, "unbound.txt");
+    const resultFile = path.join(workspace, "offline-result.txt");
+    const script = path.join(workspace, "approved-offline.py");
+    writeFileSync(asset, "synthetic offline asset");
+    writeFileSync(unbound, "not authorized");
+    writeFileSync(script, "import sys\nfrom pathlib import Path\nPath(sys.argv[2]).write_bytes(Path(sys.argv[1]).read_bytes())\n");
+    const digest = file => createHash("sha256").update(readFileSync(file)).digest("hex");
+    const taskRelative = ".game-l10n/data-plane/offline/task.json";
+    const offlineRelative = ".game-l10n/data-plane/offline/relay.json";
+    mkdirSync(path.dirname(path.join(workspace, taskRelative)), { recursive: true });
+    const offlineArgv = [script, asset, resultFile];
+    const task = {
+      output_artifact: resultFile,
+      content_source_policy: { schema: "parr0t.content-source-policy.v1", policy_digest: "synthetic",
+        semantic_content_generation: true, content_network_access: false, allowed_external_sources: [] },
+      bound_local_assets: [{ path: asset, sha256: digest(asset) }],
+      offline_processing: [{ argv: offlineArgv, sha256: digest(script) }],
+    };
+    writeFileSync(path.join(workspace, taskRelative), JSON.stringify(task));
+    writeFileSync(path.join(workspace, offlineRelative), JSON.stringify({
+      schema: "parr0t.data-plane-relay.v4", task_id: "synthetic-offline",
+      task_path: taskRelative, launch_contract: { message_isolation: registration },
+    }));
+    const offlineWorker = await makeSession("OfflineWorker", "sub", 2, guardedRoot.id, guardPath);
+    await offlineWorker.runner.emit({ type: "session_start" });
+    await offlineWorker.runner.emitBeforeAgentStart(`PARR0T_OMP_RELAY=${offlineRelative}`, undefined, []);
+    await assert.rejects(offlineWorker.write({ path: `agent://${guardedRoot.id}`, content: "denied" }), /PARR0T_OMP_ISOLATION/);
+    await assert.rejects(offlineWorker.read({ path: unbound }), /PARR0T_OMP_ISOLATION/);
+    assert.notEqual((await offlineWorker.read({ path: asset })).isError, true);
+    assert.equal((await offlineWorker.exec({ argv: offlineArgv })).isError, false);
+    assert.equal(readFileSync(resultFile, "utf8"), "synthetic offline asset");
+    writeFileSync(asset, "changed after inventory");
+    await assert.rejects(offlineWorker.read({ path: asset }), /PARR0T_OMP_ISOLATION/);
+    await assert.rejects(offlineWorker.exec({ argv: offlineArgv }), /PARR0T_OMP_ISOLATION/);
+    const generation = registration.control_generation;
+    for (const mode of ["pause", "analysis", "shutdown", "localization"]) {
+      assert.equal((await guardedRoot.mode({ mode, user_requested: true })).isError, false);
+    }
+    assert.equal(JSON.parse(readFileSync(path.join(workspace, ".game-l10n/control-plane-state.json"), "utf8")).generation, generation);
+    assert.equal((await guardedRoot.mode({ mode: "analysis", user_requested: true })).isError, false);
+    const privateUri = pathToFileURL(path.join(workspace, taskRelative)).href;
+    assert.notEqual((await guardedRoot.read({ path: privateUri })).isError, true);
+    const exposed = JSON.parse(readFileSync(path.join(workspace, ".game-l10n/control-plane-state.json"), "utf8"));
+    assert.equal(exposed.status, "rotation_required");
+    assert.equal(exposed.issue_code, "control_plane_leak");
+    assert.equal((await guardedRoot.mode({ mode: "localization", user_requested: true })).isError, true);
+    assert.deepEqual(deliveries, []);
+    assert.deepEqual(observations, []);
   } finally {
     for (const session of sessions) {
       session.runner.clearManagedTimers();
@@ -337,6 +406,7 @@ print(json.dumps(native_launch_summary(w,w/sys.argv[3])))
     if (originalWorkspace === undefined) delete process.env.PARR0T_OMP_PROMPT_WORKSPACE;
     else process.env.PARR0T_OMP_PROMPT_WORKSPACE = originalWorkspace;
     rmSync(workspace, { recursive: true, force: true });
+    rmSync(assetRoot, { recursive: true, force: true });
   }
 }
 

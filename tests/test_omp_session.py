@@ -10,7 +10,9 @@ from unittest.mock import Mock, patch
 
 from game_l10n import omp_session
 from game_l10n.errors import ConfigurationError
-from game_l10n.control_plane import suspend_control_plane, control_plane_state
+from game_l10n.control_plane import (
+    CONTROL_STATE_PATH, initial_control_plane_state, suspend_control_plane, control_plane_state,
+)
 from game_l10n.framework_session import change_framework_mode, framework_session_state
 from game_l10n.user_request import record_user_request, user_request_binding, USER_REQUEST_PATH
 from tests.framework_approval_fixture import issue_approval
@@ -60,7 +62,7 @@ class OmpSessionTests(unittest.TestCase):
         (directory / "ready.json").write_text(json.dumps(proof), encoding="utf-8")
 
     def rotation(self):
-        state = suspend_control_plane(self.workspace)
+        state = suspend_control_plane(self.workspace, source_exposed=True)
         return patch.object(omp_session, "control_plane_state", return_value=state)
 
     def test_workspace_pending_and_ready_entry(self):
@@ -75,7 +77,9 @@ class OmpSessionTests(unittest.TestCase):
             self.plan("rotation")
 
     def test_rotation_requires_canonical_handoff(self):
-        with patch.object(omp_session, "control_plane_state", return_value={"status": "rotation_required"}):
+        state = suspend_control_plane(self.workspace, source_exposed=True)
+        (self.workspace / omp_session.CONTROL_HANDOFF_PATH).unlink()
+        with patch.object(omp_session, "control_plane_state", return_value=state):
             with self.assertRaisesRegex(ConfigurationError, "HANDOFF_REQUIRED"):
                 self.plan("rotation")
 
@@ -118,7 +122,7 @@ class OmpSessionTests(unittest.TestCase):
         self.assertEqual(command[11:13], ["--parr0t-workspace", str(self.workspace.resolve())])
 
     def test_model_and_guard_prerequisites(self):
-        for model in ("model-only", "provider/model;echo", "provider/model@@route", "provider/model:high:extra"):
+        for model in ("", "../model", "provider/model\nextra", "provider/*", "C:\\models\\fixture"):
             with self.subTest(model=model), self.assertRaisesRegex(ValueError, "EXACT_MODEL_REQUIRED"):
                 omp_session._plan_command(self.workspace, model, "workspace")
         with patch.object(omp_session.shutil, "which", return_value=None):
@@ -386,34 +390,50 @@ class OmpSessionTests(unittest.TestCase):
         self.assertEqual(json.loads(errors.getvalue())["issue_code"], "E_USER_REQUEST_INVALID")
         spawn.assert_not_called()
 
-    def test_auto_restart_selects_canonical_recovery_without_reactivating_caller(self):
-        for mode in ("analysis", "shutdown"):
+    def test_clean_pause_requires_explicit_resume_without_rotation_or_spawn(self):
+        for mode in ("analysis", "shutdown", "pause"):
             with self.subTest(mode=mode):
                 change_framework_mode(
                     self.workspace, mode, user_requested=True,
                     approval=issue_approval(self.workspace, mode),
                 )
-                lifecycle = framework_session_state(self.workspace)
                 control = control_plane_state(self.workspace)
-                with self.assertRaisesRegex(ValueError, "ROTATION_REQUIRED"):
-                    self.plan("workspace")
-                child = Mock(pid=123)
-                child.wait.return_value = 0
-                with patch.object(omp_session.subprocess, "Popen", return_value=child) as spawn:
-                    result = omp_session._launch(self.workspace, self.model, foreground=True)
-                self.assertEqual(result["mode"], "rotation")
-                self.assertEqual(result["handoff_receipt"], omp_session.CONTROL_HANDOFF_PATH)
-                self.assertEqual(result["user_request"], self.request)
-                self.assertEqual(Path(spawn.call_args.args[0][-1][1:]).read_bytes(), self.original_request)
+                lifecycle = framework_session_state(self.workspace)
+                with patch.object(omp_session.subprocess, "Popen") as spawn:
+                    for launch_mode in ("auto", "workspace"):
+                        with self.assertRaisesRegex(ValueError, "CLEAN_RESUME_REQUIRED"):
+                            omp_session._launch(self.workspace, self.model, mode=launch_mode, foreground=True)
+                    spawn.assert_not_called()
                 self.assertEqual(framework_session_state(self.workspace), lifecycle)
-                self.assertEqual(control_plane_state(self.workspace), control)
+                change_framework_mode(
+                    self.workspace, "localization", user_requested=True,
+                    approval=issue_approval(self.workspace, "localization"),
+                )
+                self.assertEqual(control_plane_state(self.workspace)["generation"], control["generation"])
                 self.assertEqual(user_request_binding(self.workspace), self.request)
+                self.plan()
+
+    def test_legacy_clean_suspension_resumes_in_place_even_with_active_lifecycle(self):
+        state = initial_control_plane_state()
+        state.update(
+            status="rotation_required", incident_id="1" * 32,
+            issue_code="framework_suspended", incident_code="framework_suspended",
+        )
+        (self.workspace / CONTROL_STATE_PATH).write_text(json.dumps(state), encoding="utf-8")
+        with patch.object(omp_session.subprocess, "Popen") as spawn:
+            with self.assertRaisesRegex(ValueError, "CLEAN_RESUME_REQUIRED"):
+                omp_session._launch(self.workspace, self.model, foreground=True)
+            spawn.assert_not_called()
+        change_framework_mode(
+            self.workspace, "localization", user_requested=True,
+            approval=issue_approval(self.workspace, "localization"),
+        )
+        self.plan()
+        self.assertEqual(control_plane_state(self.workspace)["generation"], state["generation"])
+        self.assertEqual(user_request_binding(self.workspace), self.request)
 
     def test_auto_restart_rejects_stale_handoff_before_spawn(self):
-        change_framework_mode(
-            self.workspace, "analysis", user_requested=True,
-            approval=issue_approval(self.workspace, "analysis"),
-        )
+        suspend_control_plane(self.workspace, source_exposed=True)
         path = self.workspace / omp_session.CONTROL_HANDOFF_PATH
         receipt = json.loads(path.read_text(encoding="utf-8"))
         receipt["from_generation"] += 1

@@ -286,8 +286,35 @@ class BranchUpdateTests(unittest.TestCase):
         self.assertEqual(complete["branches"][0]["action"], "skip_up_to_date")
         self.assertEqual(complete["validation_executed"], 0)
 
+    def test_explicit_core_topic_preserves_branch_additions_and_gains_main_ancestry(self) -> None:
+        self.git("branch", "fix/fixture-topic", self.sdk)
+        with patch("scripts.update_branches.audit_branches", side_effect=self.proof):
+            report = plan_updates(
+                self.repo, self.root / "topic-state", main_ref="main",
+                refs=["refs/heads/fix/fixture-topic"], require_ancestry=True,
+            )
+        row = report["branches"][0]
+        self.assertFalse(row["sdk"])
+        self.assertEqual(row["action"], "update_ready")
+        result = apply_updates(self.repo, report)
+        self.assertEqual(result["applied"], 1)
+        self.assertEqual(self.git("show", "fix/fixture-topic:adapter.py"), "# adapter")
+        self.assertEqual(self.git("show", "fix/fixture-topic:core.py"), "# newer core")
+        self.git("merge-base", "--is-ancestor", "main", "fix/fixture-topic")
+
+    def test_core_mirror_fast_forwards_without_creating_a_redundant_merge(self) -> None:
+        self.git("branch", "maintenance/fixture-mirror", "main~1")
+        with patch("scripts.update_branches.audit_branches", side_effect=self.proof):
+            report = plan_updates(
+                self.repo, self.root / "mirror-state", main_ref="main",
+                refs=["refs/heads/maintenance/fixture-mirror"], require_ancestry=True,
+            )
+        self.assertEqual(apply_updates(self.repo, report)["applied"], 1)
+        self.assertEqual(self.git("rev-parse", "maintenance/fixture-mirror"), self.git("rev-parse", "main"))
+
     def test_local_target_names_are_required(self) -> None:
-        for name in ("origin/sdk-fixture-1.0", "refs/remotes/origin/sdk-fixture-1.0", "main", "../sdk-fixture"):
+        for name in ("refs/remotes/origin/sdk-fixture-1.0", "HEAD", "../sdk-fixture", "topic/.hidden", "topic/name.lock"):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 local_ref(name)
         self.assertEqual(local_ref("sdk-fixture-1.0"), "refs/heads/sdk-fixture-1.0")
+        self.assertEqual(local_ref("fix/fixture-topic"), "refs/heads/fix/fixture-topic")

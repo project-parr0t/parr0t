@@ -12,7 +12,7 @@ from game_l10n.cli import main
 from game_l10n.control_plane import establish_control_plane_entry
 from game_l10n.formats import read_segments
 from game_l10n.native_pass import native_control_step, prepare_native_tasks
-from game_l10n.native_runtime import configure_native_runtime
+from game_l10n.native_runtime import configure_native_runtime, record_native_launch
 from game_l10n.workspace import initialize_workspace, record_sdk_selection
 from tests.test_workspace import activate_workspace_adapter, write_verified_inventory
 
@@ -61,6 +61,9 @@ class NativeResumeCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             work, source = self._workspace(Path(directory))
             manifest, results, first = self._checkpoint(work, source, "existing")
+            record_native_launch(
+                work, work / first["relay"]["dispatch"], event="capability-available",
+            )
             before = {p.relative_to(work): p.read_bytes() for p in work.rglob("*") if p.is_file()}
             code, status = self._command("status", "--workspace", str(work))
             self.assertEqual(code, 0)

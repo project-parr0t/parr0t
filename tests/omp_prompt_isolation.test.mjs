@@ -24,7 +24,7 @@ function writeJson(file, value) {
 function schema() {
   return { min() { return this; }, optional() { return this; }, describe() { return this; }, strict() { return this; } };
 }
-const fakeZod = { string: schema, array: schema, object: schema };
+const fakeZod = { string: schema, boolean: schema, array: schema, object: schema };
 fakeZod.z = fakeZod;
 function host(workspace, kind = "sub", depth = kind === "main" ? 0 : 2, api = {}) {
   const handlers = new Map();
@@ -164,6 +164,38 @@ describe("OMP prompt helper readiness", () => {
 });
 
 describe("OMP descendant communication boundary", () => {
+  test("only host-attested direct children can be cancelled, without exposing process inspection", async () => {
+    const f = fixture();
+    const parent = host(f.workspace, "sub", 1);
+    const other = host(f.workspace, "sub", 1);
+    const kill = { path: "proc://OwnedChild/kill", content: "" };
+    await deniedWithoutDelivery(parent, "write", kill);
+    await parent.emit("before_subagent_spawn", { invocationKind: "task", spawnKey: "UnownedChild" });
+    await deniedWithoutDelivery(parent, "write", { path: "proc://UnownedChild/kill", content: "" });
+    await parent.emit("tool_result", {
+      toolName: "task", input: { tasks: [{ task: "Synthetic owned child" }] }, isError: true,
+      details: { async: { type: "task", state: "running", jobId: "OwnedChild" },
+        progress: [{ id: "OwnedChild", status: "running" }] },
+    });
+    let cancellations = 0;
+    expect((await parent.call("write", kill, () => cancellations++))?.block).not.toBe(true);
+    const wrapped = { tool_uses: [{ recipient_name: "functions.write", parameters: kill }] };
+    expect((await parent.call("multi_tool_use.parallel", wrapped))?.block).not.toBe(true);
+    for (const [tool, input] of [
+      ["read", { path: "proc://OwnedChild" }],
+      ["read", { path: "proc://OwnedChild/streams" }],
+      ["write", { path: "proc://UnownedChild/kill", content: "" }],
+      ["write", { path: "proc://ownedchild/kill", content: "" }],
+      ["write", { path: kill.path, content: "not empty" }],
+      ["write", { ...kill, recipient: "Main" }],
+      ["write", { ...kill, target: "history://Main" }],
+    ]) await deniedWithoutDelivery(parent, tool, input);
+    await deniedWithoutDelivery(other, "write", kill);
+    expect(cancellations).toBe(1);
+    await parent.emit("tool_result", { toolName: "write", input: kill, isError: false });
+    await deniedWithoutDelivery(parent, "write", kill);
+  });
+
   test("restricts every fresh descendant before session_start or the first user prompt", async () => {
     const f = fixture();
     for (const depth of [1, 2, 3, 8]) {
@@ -224,9 +256,19 @@ describe("OMP descendant communication boundary", () => {
       ["multi_tool_use.parallel", { tool_uses: [{ recipient_name: "functions.bash", parameters: { command: "printf synthetic > agent://Main" } }] }],
       ["invoke_tool", { tool: "bash", input: JSON.stringify({ command: "printf synthetic > agent://Main" }) }],
       ["edit", { input: "[agent://Main#ABCD]\nPUT >1:\n+synthetic" }],
-      ["call_tool", { name: "unknown_extension", arguments: "{}" }],
+      ["call_tool", { name: "unknown_extension", arguments: JSON.stringify({ command: "write agent://Main" }) }],
     ];
     for (const [name, input] of calls) await deniedWithoutDelivery(session, name, input);
+  });
+
+  test("harmless supported local helpers are not denied by an unknown name", async () => {
+    const session = host(fixture().workspace);
+    for (const [tool, input] of [
+      ["calculator", { expression: "1 + 2" }],
+      ["local_metadata", { path: "synthetic.json" }],
+      ["call_tool", { name: "local_metadata", arguments: JSON.stringify({ path: "synthetic.json" }) }],
+    ]) expect((await session.call(tool, input))?.block).not.toBe(true);
+    await deniedWithoutDelivery(session, "local_metadata", { path: "history://Main" });
   });
 
   test("denies parent-history task selectors even when they are not virtual URLs", async () => {

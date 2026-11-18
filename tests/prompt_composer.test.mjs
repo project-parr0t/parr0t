@@ -24,9 +24,9 @@ test("skip, logic, font and mod options compose without the existing-Korean stop
   assert.ok(prompt.includes("C:/Fixture Game"));
 });
 
-test("incomplete or nonpositive fallback settings cannot produce a prompt", () => {
+test("nonpositive fallback settings and counts without a model cannot produce a prompt", () => {
   for (const options of [
-    { fallbackModel: "fixture-model" }, { fallbackAttempts: "2" },
+    { fallbackAttempts: "2" },
     { fallbackModel: "fixture-model", fallbackAttempts: "0" },
     { fallbackModel: "fixture-model", fallbackAttempts: "1.5" },
     { fallbackModel: "fixture-model", fallbackAttempts: "-2" },
@@ -34,8 +34,8 @@ test("incomplete or nonpositive fallback settings cannot produce a prompt", () =
 });
 
 test("invalid native model selections are rejected before producing executable instructions", () => {
-  for (const value of [String.raw`C:\Fixture Game\Data`, "/tmp/fixture-game", "fixture/model name", "default", "inherit", "task", "smol", "slow", "luna", "sol", "@fixture"]) {
-    for (const role of ["baseModel", "triageModel", "strongModel", "contextModel", "fallbackModel"]) {
+  for (const value of [String.raw`C:\Fixture Game\Data`, "/tmp/fixture-game", "fixture/*", "fixture/../model", "default", "inherit", "task", "smol", "slow", "luna", "sol", "@fixture"]) {
+    for (const role of ["baseModel", "triageModel", "strongModel", "rewriteModel", "contextModel", "fallbackModel"]) {
       assert.throws(() => buildPrompt({ [role]: value, ...(role === "fallbackModel" ? { fallbackAttempts: "2" } : {}) }),
         /폴더 경로나 별칭 대신 정확한 모델 ID/);
     }
@@ -77,7 +77,7 @@ test("role models, tier limits and requested images combine while disabled conte
   for (const key of ["triage_max_calls", "strong_max_calls", "review_max_workers", "triage_max_workers", "strong_max_workers"]) assert.ok(prompt.includes(`routing.${key}`));
   assert.ok(!buildPrompt().includes("이미지 번역: 요청함"));
   assert.throws(() => buildPrompt({ reviewMaxWorkers: "0" }));
-  assert.throws(() => buildPrompt({ strongMaxWorkers: "65" }));
+  assert.ok(buildPrompt({ strongMaxWorkers: "65" }).includes("65 (routing.strong_max_workers)"));
 });
 
 test("explicit models produce exact role override and fallback policy commands in either operation", () => {
@@ -85,6 +85,7 @@ test("explicit models produce exact role override and fallback policy commands i
     baseModel: "fixture/translator@fixture-route:low",
     triageModel: "fixture/triager:medium",
     strongModel: "fixture/strong@fixture-route:high",
+    rewriteModel: "공급자/수정(버전)+모델@경로:high",
     contextModel: "fixture/context:low",
     fallbackModel: "fixture/fallback@fixture-route:high", fallbackAttempts: "007",
   };
@@ -95,6 +96,7 @@ test("explicit models produce exact role override and fallback policy commands i
       "--role-model", `translation=${options.baseModel}`,
       "--role-model", `triage=${options.triageModel}`,
       "--role-model", `strong-review=${options.strongModel}`,
+      "--role-model", `rewrite=${options.rewriteModel}`,
       "--role-model", `context=${options.contextModel}`,
       "--role-model", `review-fallback=${options.fallbackModel}`,
       "--user-requested-models",
@@ -107,7 +109,7 @@ test("explicit models produce exact role override and fallback policy commands i
 });
 
 test("sparse role selections never fill unspecified roles with preset defaults", () => {
-  for (const [option, role] of [["baseModel", "translation"], ["triageModel", "triage"], ["strongModel", "strong-review"], ["contextModel", "context"]]) {
+  for (const [option, role] of [["baseModel", "translation"], ["triageModel", "triage"], ["strongModel", "strong-review"], ["rewriteModel", "rewrite"], ["contextModel", "context"]]) {
     const prompt = buildPrompt({ [option]: "  fixture/selected@fixture-route:high  " });
     assert.deepEqual(commandArgs(prompt, "native-runtime"), [
       "--workspace", "<workspace>", "--host", "<current-native-host>", "--role-model", `${role}=fixture/selected@fixture-route:high`, "--user-requested-models",
@@ -138,5 +140,11 @@ test("proxy catalogs require the bound schema and only replace defaults with val
   assert.equal(proxyModelGroups({ models: [{ id: "fixture/model" }] }), null);
   assert.equal(proxyModelGroups({ error: { message: "unavailable" } }), null);
   assert.deepEqual(proxyModelGroups({ object: "list", data: [{ id: "fixture/model:high" }, { id: "fixture/model:high" }, { id: "bad\nmodel" }] }), [{ label: "OpenCodex", models: ["fixture/model:high"] }]);
-  assert.throws(() => buildPrompt({ fallbackModel: "gpt-6.1-sol", fallbackAttempts: "3" }));
+  const prompt = buildPrompt({ fallbackModel: "gpt-6.1-sol" });
+  assert.deepEqual(commandArgs(prompt, "review-policy"), [
+    "--workspace", "<workspace>", "--fallback-model", "gpt-6.1-sol", "--user-requested",
+  ]);
+  assert.deepEqual(commandArgs(buildPrompt({ fallbackModel: "gpt-6.1-sol", fallbackAttempts: "7" }), "review-policy"), [
+    "--workspace", "<workspace>", "--fallback-model", "gpt-6.1-sol", "--max-calls", "7", "--user-requested",
+  ]);
 });

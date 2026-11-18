@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { linkSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import registerFrameworkModeApproval, { checkFrameworkToolCall } from "./framework-mode-approval.mjs";
-import createNativeRelayLifecycle from "./native-relay-lifecycle.mjs";
+import registerFrameworkModeApproval, { checkFrameworkToolCall, recordFrameworkExposure } from "./framework-mode-approval.mjs";
+import createNativeRelayLifecycle, { publishHostModels } from "./native-relay-lifecycle.mjs";
 
 // Enforce child host-tool communication boundaries without an OS sandbox.
 // Native processes use the public exec API, never the embedded URL filesystem.
@@ -18,7 +18,7 @@ const POLICY = [
 ].join("\n");
 const DENIAL = { block: true, reason: "PARR0T_OMP_PROMPT_ISOLATION: child communication or history access denied" };
 const ROUTES = /(?:agent|history|sessions?|irc|peers?|coop|messages?|proc):/i;
-const BRIDGES = new Set(["bash", "eval", "builtin", "builtins", "call_builtin", "invoke_builtin"]);
+const BRIDGES = new Set(["bash", "eval", "builtin", "builtins", "call_builtin", "invoke_builtin", "exec", "python", "tool"]);
 const MESSAGING = new Set([
   "irc", "coop", "message", "send", "send_message", "sendmessage", "send_agent_message",
   "agent_message", "write_agent", "read_agent", "message_agent", "communicate", "agent_send", "send_agent",
@@ -27,8 +27,7 @@ const MESSAGING = new Set([
   "read_history", "get_history", "read_session", "get_session", "get_session_history", "list_sessions",
 ]);
 const WRAPPERS = new Set(["parallel", "multi_tool_use", "tool_call", "call_tool", "invoke_tool"]);
-const LOCAL_TOOLS = new Set(["read", "write", "edit", "grep", "glob", "task", "wait", "todo", "parr0t_process", "lsp", "ast_edit"]);
-const LOCAL_DEVICES = new Set(["xd://parr0t_process", "xd://lsp", "xd://ast_edit", "xd://resolve", "xd://reject"]);
+const LOCAL_DEVICES = new Set(["xd://parr0t_process", "xd://parr0t_exec", "xd://lsp", "xd://ast_edit", "xd://resolve", "xd://reject"]);
 
 function normalized(value) {
   let text = String(value).normalize("NFKC");
@@ -52,18 +51,28 @@ function deniedTarget(value) {
   const target = normalized(value);
   return ROUTES.test(target) || (target.startsWith("xd://") && !LOCAL_DEVICES.has(target));
 }
-function deniedCall(name, input, depth = 0) {
+export function deniedCall(name, input, depth = 0, ownedChildren) {
   if (depth > 32) return true;
   const tool = toolName(name);
   const components = normalized(name).split(/[./:]/).filter(Boolean);
-  if (components.some(part => BRIDGES.has(part) || MESSAGING.has(part))) return true;
-  if (!LOCAL_TOOLS.has(tool) && !WRAPPERS.has(tool)) return true;
+  if (components.some(part => BRIDGES.has(part) || MESSAGING.has(part)
+      || /(?:history|sessions?|messages?|irc|(?:^|_)(?:agent|peer|coop)(?:_|$))/.test(part))) return true;
   if (typeof input === "string") {
     try { input = JSON.parse(input); } catch { return true; }
   }
   if (!input || typeof input !== "object") return false;
-  if (tool === "write" && typeof input.path === "string"
-      && /^proc:\/\/[a-z0-9_.-]+\/kill$/.test(normalized(input.path)) && input.content === "") return false;
+  // Unknown tool names are not intrinsically dangerous. Reject executable
+  // bridges by capability-shaped input while leaving harmless local helpers.
+  if (!["parr0t_process", "parr0t_exec", "task", "edit", "ast_edit"].includes(tool)
+      && ["code", "command", "script", "argv"].some(key => input[key] !== undefined)) return true;
+  if (["recipient", "recipient_id", "agent_id", "session_id", "sourceSession"].some(key =>
+    input[key] !== undefined && input[key] !== "")) return true;
+  if (tool === "write" && input.content === "" && typeof input.path === "string") {
+    const cancellation = /^proc:\/\/([^/]+)\/kill$/.exec(input.path);
+    if (cancellation && ownedChildren?.has(cancellation[1])
+        && input.target === undefined && input.uri === undefined && input.url === undefined
+        && input.paths === undefined) return false;
+  }
   // Only routing fields, not file contents, commands, prompts, or code.
   for (const key of ["path", "target", "uri", "url", "recipient", "recipient_id", "agent_id", "session_id", "sourceSession"]) {
     if (deniedTarget(input[key])) return true;
@@ -90,10 +99,10 @@ function deniedCall(name, input, depth = 0) {
     const calls = input.tool_uses ?? input.calls ?? input.tools;
     if (Array.isArray(calls)) return calls.some(call => deniedCall(
       call.recipient_name ?? call.toolName ?? call.name ?? call.tool,
-      call.parameters ?? call.input ?? call.arguments, depth + 1,
+      call.parameters ?? call.input ?? call.arguments, depth + 1, ownedChildren,
     ));
     return deniedCall(input.recipient_name ?? input.toolName ?? input.name ?? input.tool,
-      input.parameters ?? input.input ?? input.arguments, depth + 1);
+      input.parameters ?? input.input ?? input.arguments, depth + 1, ownedChildren);
   }
   return false;
 }
@@ -154,6 +163,7 @@ function bindTaskMarkers(name, input, marker) {
 export default function promptIsolation(pi) {
   pi.registerFlag("parr0t-workspace", { description: "Absolute Parr0t workspace for prompt child communication boundaries", type: "string" });
   let relay;
+  const ownedChildren = new Set();
   const lifecycle = createNativeRelayLifecycle({
     workspace,
     relayPath: () => relay,
@@ -228,6 +238,7 @@ export default function promptIsolation(pi) {
   pi.on("session_start", (_event, ctx) => {
     if (ctx.agent?.kind === "main") {
       registerReadiness(ctx);
+      publishHostModels(ctx, workspace(ctx));
       process.env[WORKSPACE_ENV] = workspace(ctx);
     }
   });
@@ -253,7 +264,7 @@ export default function promptIsolation(pi) {
     catch (error) { return { block: true, reason: error.message }; }
     if (ctx.agent?.kind !== "sub") return;
     try {
-      if (deniedCall(event.toolName, event.input)) return { ...DENIAL };
+      if (deniedCall(event.toolName, event.input, 0, ownedChildren)) return { ...DENIAL };
       if (relay) {
         const marker = `PARR0T_OMP_RELAY=${path.relative(realpathSync(workspace(ctx)), relay).split(path.sep).join("/")}`;
         if (toolName(event.toolName) === "task" || WRAPPERS.has(toolName(event.toolName))) {
@@ -265,6 +276,25 @@ export default function promptIsolation(pi) {
     } catch { return { ...DENIAL }; }
   });
   pi.on("before_subagent_spawn", lifecycle.before_subagent_spawn);
-  pi.on("tool_result", lifecycle.tool_result);
+  pi.on("tool_result", async (event, ctx) => {
+    if (toolName(event.toolName) === "task") {
+      // Public task-result IDs attest actual caller-owned processes. A
+      // before_subagent_spawn selection key is not a process ownership proof.
+      const own = id => {
+        if (typeof id === "string" && id && !/[/%?#\\\s\u0000-\u001f\u007f]/u.test(id)
+            && id !== "." && id !== "..") ownedChildren.add(id);
+      };
+      if (event.details?.async?.type === "task" && event.details.async.state === "running") own(event.details.async.jobId);
+      for (const child of event.details?.progress ?? []) {
+        if (child.status === "running" || child.status === "pending") own(child.id);
+      }
+    }
+    await lifecycle.tool_result(event, ctx);
+    await recordFrameworkExposure(event, ctx, realpathSync(workspace(ctx)));
+    if (!event.isError && toolName(event.toolName) === "write" && event.input?.content === "") {
+      const cancellation = /^proc:\/\/([^/]+)\/kill$/.exec(event.input.path ?? "");
+      if (cancellation) ownedChildren.delete(cancellation[1]);
+    }
+  });
   pi.on("agent_end", lifecycle.agent_end);
 }

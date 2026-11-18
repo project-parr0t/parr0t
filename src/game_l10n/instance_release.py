@@ -399,6 +399,10 @@ def validate_instance_release(
         expected_patch_id=metadata["patch_id"],
         expected_release_id=metadata["release_id"],
     )
+    if checkpoint["schema"] != CHECKPOINT_SCHEMA:
+        raise InstanceReleaseError(
+            "Instance publication requires a full future-update checkpoint; use local packaging for minimal integrity"
+        )
     if checkpoint["sdk"]["commit"].casefold() != metadata["commits"]["sdk"].casefold():
         raise InstanceReleaseError("Checkpoint SDK commit does not match instance metadata")
     checkpoint_builds = {item["id"] for item in checkpoint["game_builds"]}

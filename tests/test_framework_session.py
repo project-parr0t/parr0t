@@ -15,6 +15,7 @@ from game_l10n.cli import main
 from game_l10n.errors import ConfigurationError
 from game_l10n.models import ProjectContext, Segment
 from game_l10n.native_pass import prepare_native_tasks
+from game_l10n.native_runtime import record_native_launch
 from game_l10n.orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from game_l10n.providers import ProviderRegistry, ScriptedProvider
 from game_l10n.workspace import initialize_workspace
@@ -60,14 +61,80 @@ class FrameworkSessionTests(unittest.TestCase):
         result = self.change("shutdown")
         self.assertFalse(result["framework_session"]["instructions_active"])
         state = control_plane.control_plane_state(self.workspace)
-        self.assertEqual(state["issue_code"], "framework_suspended")
-        self.assertEqual(state["incident_code"], "framework_suspended")
+        self.assertEqual(state["status"], "ready")
+        self.assertEqual(state["issue_code"], "")
+        self.assertEqual(state["incident_code"], "")
         self.assertEqual(state["generation"], 1)
         with self.assertRaisesRegex(ConfigurationError, "FRAMEWORK_INACTIVE"):
             prepare_native_tasks(
                 self.workspace, self.workspace / "unopened.jsonl",
                 [Segment("fixture-1", "SOURCE_FIXTURE")], self.workspace / "tasks",
             )
+
+    def test_clean_code_only_lifecycle_resumes_in_same_generation_only_on_user_request(self) -> None:
+        before = control_plane.control_plane_state(self.workspace)
+        for mode in ("pause", "analysis", "shutdown"):
+            self.change(mode)
+            public = control_plane.public_control_plane_state(
+                control_plane.control_plane_state(self.workspace),
+            )
+            self.assertTrue(public["same_session_resume_allowed"])
+            self.assertFalse(public["fresh_recovery_required"])
+            with self.assertRaisesRegex(ConfigurationError, "FRAMEWORK_INACTIVE"):
+                control_plane.require_control_plane_ready(self.workspace)
+            with self.assertRaisesRegex(ConfigurationError, "USER_REQUEST_REQUIRED"):
+                framework_session.change_framework_mode(self.workspace, "localization")
+            self.assertEqual(framework_session.framework_session_state(self.workspace)["mode"], mode)
+            self.change("localization")
+            self.assertEqual(control_plane.require_control_plane_ready(self.workspace), before)
+
+    def test_diagnostic_source_exposure_cannot_resume_without_canonical_fresh_recovery(self) -> None:
+        self.change(logs=[self.external_log])
+        self.change("shutdown")
+        state = control_plane.control_plane_state(self.workspace)
+        public = control_plane.public_control_plane_state(state)
+        self.assertTrue(public["fresh_recovery_required"])
+        self.assertFalse(public["same_session_resume_allowed"])
+        with self.assertRaisesRegex(ConfigurationError, "ROTATION_REQUIRED"):
+            self.change("localization")
+        self.assertEqual(control_plane.control_plane_state(self.workspace), state)
+        self.assertEqual(framework_session.framework_session_state(self.workspace)["mode"], "shutdown")
+
+    def test_exposure_during_legacy_clean_suspension_requires_fresh_recovery(self) -> None:
+        for diagnostic_logs in (False, True):
+            with self.subTest(diagnostic_logs=diagnostic_logs):
+                legacy = control_plane.initial_control_plane_state()
+                legacy.update(
+                    status="rotation_required", incident_id="1" * 32,
+                    issue_code="framework_suspended", incident_code="framework_suspended",
+                )
+                (self.workspace / control_plane.CONTROL_STATE_PATH).write_text(
+                    json.dumps(legacy), encoding="utf-8",
+                )
+                if diagnostic_logs:
+                    self.change(logs=[self.external_log])
+                else:
+                    control_plane.record_control_plane_leak(
+                        self.workspace, "source_or_candidate_received",
+                    )
+                state = control_plane.control_plane_state(self.workspace)
+                self.assertEqual(state["issue_code"], "control_plane_leak")
+                self.assertTrue(control_plane.public_control_plane_state(state)["fresh_recovery_required"])
+                with self.assertRaisesRegex(ConfigurationError, "ROTATION_REQUIRED"):
+                    self.change("localization")
+                self.assertEqual(control_plane.control_plane_state(self.workspace), state)
+
+    def test_exposure_publication_cannot_overlap_clean_activation(self) -> None:
+        before = control_plane.control_plane_state(self.workspace)
+        with framework_session._framework_session_lock(self.workspace):
+            with self.assertRaisesRegex(ValueError, "FRAMEWORK_TRANSITION_BUSY"):
+                control_plane.record_control_plane_leak(
+                    self.workspace, "source_or_candidate_received",
+                )
+            self.assertEqual(control_plane.control_plane_state(self.workspace), before)
+        control_plane.record_control_plane_leak(self.workspace, "source_or_candidate_received")
+        with self.assertRaisesRegex(ConfigurationError, "ROTATION_REQUIRED"):
+            self.change("localization")
 
     def test_analysis_preserves_existing_contamination_without_new_session(self) -> None:
         incident = control_plane.record_control_plane_leak(self.workspace, "parent_opened_data_plane")
@@ -212,10 +279,23 @@ class FrameworkSessionTests(unittest.TestCase):
 
     def test_cli_cannot_reenable_localization_with_acceptance_or_entry(self) -> None:
         self.change()
+        inactive = framework_session.framework_session_state(self.workspace)
+        control = control_plane.control_plane_state(self.workspace)
+        entry = control_plane.control_plane_entry_state(self.workspace)
+        code, output, error = self.call("native-runtime", "--host", "omp")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["host"], "omp")
+        self.assertEqual(framework_session.framework_session_state(self.workspace), inactive)
+        self.assertEqual(control_plane.control_plane_state(self.workspace), control)
+        self.assertEqual(control_plane.control_plane_entry_state(self.workspace), entry)
+        with self.assertRaisesRegex(ConfigurationError, "FRAMEWORK_INACTIVE"):
+            record_native_launch(
+                self.workspace, self.workspace / ".game-l10n/native/relay/unopened.json",
+                event="capability-available",
+            )
         for command in (
             ("accept-control-plane-exposure", "--contracts-read", "--user-confirmed-exposure-acceptance"),
             ("enter-control-plane", "--contracts-read", "--source-unopened"),
-            ("native-runtime", "--host", "omp"),
         ):
             with self.subTest(command=command):
                 code, output, error = self.call(*command)
@@ -244,7 +324,7 @@ class FrameworkSessionTests(unittest.TestCase):
             framework_session.diagnostic_log_bytes(self.workspace, relative)
 
     def test_interrupted_fresh_recovery_does_not_open_localization(self) -> None:
-        self.change()
+        self.change(logs=[self.external_log])
         original = control_plane._atomic_json
 
         def fail_final_state(path: Path, payload: dict) -> None:

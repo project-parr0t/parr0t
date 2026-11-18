@@ -24,6 +24,7 @@ from game_l10n.native_runtime import (
 )
 from game_l10n.omp_isolation import (
     ISOLATION_ENV, ISOLATION_ISSUE, guard_sha256, isolation_path, require_omp_isolation,
+    tool_transport_contract,
 )
 from game_l10n.store import stable_hash
 from tests.omp_isolation_fixture import bind_omp_isolation, install_omp_isolation
@@ -50,6 +51,7 @@ class OmpIsolationTests(unittest.TestCase):
 
     def prepare(self):
         configure_native_runtime(self.root, "omp", {})
+        establish_control_plane_entry(self.root)
         prepare_native_tasks(self.root, self.source, self.segments, self.tasks,
                              route_binding={"provider": "native-luna", "attempt": 1})
         step = self.step()
@@ -121,6 +123,14 @@ class OmpIsolationTests(unittest.TestCase):
                                        worker_id="synthetic-worker", model=launch["model"])
         self.assertEqual(summary["started_workers"], 1)
 
+    def test_prompt_contract_names_the_actual_loaded_helper_and_native_process_device(self):
+        contract = tool_transport_contract(prompt=True)
+        self.assertEqual(contract["required_extension"], "omp-prompt-isolation.mjs")
+        self.assertEqual(contract["subagent_python_tool"], "parr0t_process")
+        self.assertEqual(contract["subagent_python_tool_device"], "xd://parr0t_process")
+        self.assertEqual(contract["command_argv_policy"], "execute_complete_bound_argv_with_parr0t_process")
+        self.assertFalse(contract["outbound_messaging_allowed"])
+
     def test_template_changes_rejected_before_worker_start_or_import(self):
         _, relay, payload = self.prepare()
         record_native_launch(self.root, relay, event="capability-available")
@@ -164,6 +174,23 @@ class OmpIsolationTests(unittest.TestCase):
             self.assertEqual(native_launch_summary(self.root, relay)["started_workers"], 0)
             self.assertTrue(list(relay.parent.glob(relay.name + ".legacy-*")))
 
+    def test_unchanged_guard_launch_waits_without_replaying_or_rebinding(self):
+        initial, relay, payload = self.prepare()
+        record_native_launch(self.root, relay, event="capability-available")
+        launch = payload["launch_contract"]
+        record_native_launch(
+            self.root, relay, event="worker-started", task=launch["tasks"][0],
+            worker_id="synthetic-live-worker", model=launch["model"],
+        )
+        ledger = relay.with_name(relay.stem + "-launch.json")
+        original = relay.read_bytes(), ledger.read_bytes()
+        for _ in range(2):
+            waiting = self.step()
+            self.assertEqual(waiting["action"], "wait_for_active_wave")
+            self.assertEqual(waiting["wave"], initial["wave"])
+            self.assertEqual((relay.read_bytes(), ledger.read_bytes()), original)
+        self.assertEqual(native_launch_summary(self.root, relay)["started_workers"], 1)
+
     def test_started_legacy_unsafe_launch_is_never_certified_or_relabelled(self):
         _, relay, payload = self.prepare()
         launch = payload["launch_contract"]
@@ -191,7 +218,7 @@ class OmpIsolationTests(unittest.TestCase):
             self.step(resume_relay=True)
         self.assertEqual((relay.read_bytes(), ledger_path.read_bytes()), before)
 
-    def test_data_plane_stale_proof_cannot_bind_and_safe_repair_keeps_task_ordinal(self):
+    def test_data_plane_fresh_proof_issues_new_task_without_spending_semantic_attempt(self):
         (self.root / "game-l10n.json").write_text("{}", encoding="utf-8")
         establish_control_plane_entry(self.root)
         configure_native_runtime(self.root, "omp", {})
@@ -214,12 +241,21 @@ class OmpIsolationTests(unittest.TestCase):
         repaired = install_omp_isolation(self.root)
         with patch.dict(os.environ, {ISOLATION_ENV: repaired["session_id"]}):
             resumed = prepare_data_plane_task(self.root, output, worker_role="source_probe", config=config)
-            self.assertEqual(resumed["task_id"], prepared["task_id"])
-            self.assertEqual((output / "task.json").read_bytes(), original_task)
-            bind_data_plane_launch(self.root, relay)
-            updated = json.loads(relay.read_text(encoding="utf-8"))
-            self.assertEqual(updated["task_id"], prepared["task_id"])
+            self.assertEqual(resumed["status"], "ready")
+            self.assertNotEqual(resumed["task_id"], prepared["task_id"])
+            repaired_relay = self.root / resumed["relay_path"]
+            bind_data_plane_launch(self.root, repaired_relay)
+            updated = json.loads(repaired_relay.read_text(encoding="utf-8"))
+            previous_task = json.loads(original_task)
+            repaired_task = json.loads((self.root / updated["task_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(updated["task_id"], resumed["task_id"])
             self.assertEqual(updated["attempt"], json.loads(original_relay)["attempt"])
+            self.assertEqual(repaired_task["attempt"], previous_task["attempt"])
+            self.assertGreater(repaired_task["task_revision"], previous_task["task_revision"])
+            self.assertNotEqual(repaired_task["output_envelope"], previous_task["output_envelope"])
+            self.assertEqual(repaired_task.get("purpose", ""), previous_task.get("purpose", ""))
+            for key in ("worker_role", "stage", "source_roots", "sdk_root", "sdk_inventory_fingerprint", "language_binding"):
+                self.assertEqual(repaired_task[key], previous_task[key])
             self.assertEqual(updated["launch_contract"]["message_isolation"], repaired)
 
     def test_codex_and_registered_host_api_do_not_require_omp_proof(self):
@@ -235,14 +271,16 @@ class OmpIsolationTests(unittest.TestCase):
         self.assertEqual(native_runtime(self.root)["transport"], "native-host-api")
 
     def test_registration_never_clears_rotation_or_auto_resumes(self):
-        self.prepare()
+        _, relay, _ = self.prepare()
         marked = record_control_plane_leak(self.root, "unvalidated_worker_response")
         original = (self.root / ".game-l10n/control-plane-state.json").read_bytes()
         install_omp_isolation(self.root, session_id=self.proof["session_id"])
         with self.assertRaises(ConfigurationError):
             self.step(resume_relay=True)
-        with self.assertRaises(ConfigurationError):
-            configure_native_runtime(self.root, "omp", {})
+        configured = configure_native_runtime(self.root, "omp", {})
+        self.assertEqual(configured["host"], "omp")
+        with self.assertRaisesRegex(ConfigurationError, "ROTATION_REQUIRED"):
+            record_native_launch(self.root, relay, event="capability-available")
         self.assertEqual(control_plane_state(self.root)["status"], "rotation_required")
         self.assertEqual(control_plane_state(self.root)["generation"], marked["generation"])
         self.assertEqual((self.root / ".game-l10n/control-plane-state.json").read_bytes(), original)

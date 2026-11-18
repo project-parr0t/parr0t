@@ -15,11 +15,13 @@ from uuid import uuid4
 
 from .control_plane import (
     CONTROL_HANDOFF_PATH, _validated_control_plane_handoff,
-    control_plane_entry_state, control_plane_state,
+    control_plane_entry_state, control_plane_state, public_control_plane_state,
 )
 from .framework_session import framework_session_state
 from .errors import ConfigurationError
 from .user_request import user_request_binding
+from .model_policy import exact_native_model
+from .native_host import resolve_native_model
 
 
 def _startup_prompt(
@@ -94,6 +96,16 @@ def _resolve_mode(workspace: Path, mode: str) -> str:
         raise ValueError("E_OMP_CONTROL_MODE_REQUIRED")
     state = control_plane_state(workspace)
     session = framework_session_state(workspace)
+    public = public_control_plane_state(state)
+    if (
+        state["status"] != "rotation_required" and session["mode"] != "localization"
+    ) or (
+        state["status"] == "rotation_required" and public.get("same_session_resume_allowed")
+    ):
+        raise ValueError(
+            "E_OMP_CONTROL_CLEAN_RESUME_REQUIRED: explicitly resume the clean session "
+            "through the root framework-mode tool; no generation rotation is required"
+        )
     if mode == "auto":
         mode = "rotation" if state["status"] == "rotation_required" else "workspace"
     if mode == "workspace":
@@ -117,13 +129,11 @@ def _plan_command(
 ) -> tuple[list[str], Path, Path | None]:
     """Validate prerequisites and plan a fresh session without writing anything."""
     workspace = workspace.resolve()
-    if not re.fullmatch(
-        r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/+\-]*"
-        r"(?:@[A-Za-z0-9][A-Za-z0-9._/\-]*)?(?::[A-Za-z0-9][A-Za-z0-9._\-]*)?", model
-    ):
+    if not exact_native_model(model):
         raise ValueError("E_OMP_CONTROL_EXACT_MODEL_REQUIRED")
     if not (workspace / "game-l10n.json").is_file():
         raise ValueError("E_OMP_CONTROL_WORKSPACE_REQUIRED")
+    model = resolve_native_model(workspace, "omp", model)
     mode = _resolve_mode(workspace, mode)
     control_plane_entry_state(workspace)
     executable = shutil.which("omp")
@@ -180,7 +190,8 @@ def _launch(
     session_dir.mkdir(parents=True)
     record = {
         "schema": "parr0t.omp-control-launch.v1", "status": "starting",
-        "model": model, "session_directory": str(session_dir),
+        "model": command[command.index("--model") + 1], "requested_model": model,
+        "session_directory": str(session_dir),
         "handoff_receipt": CONTROL_HANDOFF_PATH if mode == "rotation" else None,
         "mode": mode, "omp_isolation": "guarded" if guarded else "prompt", "process_id": None,
         "user_request": user_request_binding(workspace),

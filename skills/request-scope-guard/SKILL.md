@@ -11,17 +11,17 @@ Keep execution inside the user's explicit intent. Separate discovery, authorized
 
 1. Identify the requested outcome, named targets, permitted changes, constraints, and external effects.
 2. Treat an explicit request to build, change, edit, fix, or install as authorization for ordinary necessary writes within that request. Do not ask again for every in-scope edit.
-3. Treat a request to explain, review, inspect, diagnose, or report as read-only unless the user also requests implementation.
-4. Do not treat access, feasibility, an available tool, or a useful idea as authorization.
+3. Treat a request to explain, review, inspect, diagnose, or report as read-only unless the user also requests implementation. A requested inspection may include bounded visual/font/atlas inspection without authorizing translation.
+4. Do not treat access, feasibility, an available tool, or a useful idea as authorization. Image inspection and image translation are separate scopes; follow the explicit requested scope.
 5. Follow the user's latest instruction when it narrows or changes earlier authorization. Ask only when a material ambiguity remains.
 
 ## Classify each material action
 
-- **Read-only discovery:** Search, browse, read, list, inspect, and analyze freely when relevant to the request. Request only technical access required by the environment; do not use that access to broaden the task.
-- **Necessary in-scope implementation:** Perform ordinary, reversible edits and proportionate verification needed to complete an explicitly requested change.
+- **Read-only discovery:** Search, browse, read, list, inspect, and analyze relevant bound local inputs. Use only the requested scope; image/font/atlas inspection requires an explicit inspection request and bound assets.
+- **Necessary in-scope implementation:** Perform ordinary, reversible edits and proportionate verification needed to complete an explicitly requested change. Permitted local SDK, parser, compiler, or build-tool execution may support the authorized task when its exact local inputs/outputs are bounded and it does not install, launch, or mutate the game.
 - **Optional or adjacent improvement:** Do not implement it. Finish the requested work, then present the idea as a proposal and wait for explicit acceptance. Do not add speculative code, configuration, scaffolding, dependencies, or TODOs for the proposal.
 - **Unrequested mutation:** Do not write, rename, move, overwrite, or alter data merely because doing so may be helpful. Ask for the user's intent if the action is necessary to continue; otherwise leave it untouched and mention the option.
-- **Destructive or externally consequential action:** Require explicit authorization for deletion, force overwrite, history rewrite, data reset, publication, deployment, sending messages, purchases, or changes to external systems. Resolve the exact target and consequence before acting.
+- **Destructive or externally consequential action:** Require explicit authorization for deletion, force overwrite, history rewrite, data reset, publication, deployment, sending messages/data, purchases, or changes to external systems. Game installation and launch require explicit user authorization for the actual action; permission for static/local build work does not imply either.
 
 ## Ask without acting
 
@@ -46,7 +46,7 @@ Use the user's language for the question. A suitable pattern is: "요청하신 �
 ## Keep implementation minimal
 
 - Implement only behavior required by the acceptance criteria or directly necessary for it to function.
-- Prefer existing project patterns and dependencies. Any new or newly executed third-party dependency, migration tool, service, framework, package, plugin, repository, binary, or configuration provider requires `skills/third-party-consent/SKILL.md`, exact risk disclosure, explicit user approval, and a consumed core approval record. No materiality or convenience exception applies.
+- Prefer existing first-party and already-declared project tools. New or unapproved third-party code, dependencies, tools, services, packages, plugins, repositories, binaries, or configuration providers require the exact consent workflow in `skills/third-party-consent/SKILL.md`. Reuse of exact bytes within complete, current repository validation and approved scope needs no duplicate consent; local execution still must remain within the authorized task and data boundary.
 - Fix an adjacent issue only when it directly blocks the requested outcome. Otherwise report it separately without changing it.
 - Run proportionate checks needed to verify requested work, but do not add unrelated tests, refactors, formatting sweeps, or generated artifacts.
 - Do not commit, push, publish, deploy, send, or merge unless explicitly requested.

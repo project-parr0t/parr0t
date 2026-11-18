@@ -139,13 +139,16 @@ def _readme(manifest: dict[str, Any]) -> bytes:
         "3. 화면에서 설치, 복원 또는 설치 상태 확인을 선택합니다.\n"
         "4. 게임 폴더에서 실행하면 현재 폴더를 사용합니다. 다른 위치라면 절대/상대 경로를 입력하거나 설치기 창으로 끌어 놓습니다.\n\n"
         "이 패키지는 특정 스토어 또는 런처 설정을 변경하지 않습니다.\n"
-        "설치기는 영수증에 기록된 파일만 관리하며, 비대화형 실행은 일회성 승인이 필요합니다.\n"
+        "설치기는 영수증에 기록된 파일만 관리하며, 비대화형 실행은 정확한 작업 범위 승인이 필요합니다.\n"
         f"설치 상태와 패치 ID는 게임 폴더의 {STATUS_FILE_NAME}에서 확인합니다.\n"
-        f"{CHECKPOINT_NAME}은 향후 번역 수정과 게임 업데이트 대응을 위한 배포 체크포인트입니다.\n"
+        f"{CHECKPOINT_NAME}은 배포 무결성을 기록하며, 전체 체크포인트 모드는 향후 업데이트 정보도 포함합니다.\n"
     ).encode("utf-8")
 
 
-def build_filesystem_package(payload_root: Path, spec_path: Path, output_path: Path) -> dict[str, Any]:
+def build_filesystem_package(
+    payload_root: Path, spec_path: Path, output_path: Path, *,
+    required_for_distribution: bool = True,
+) -> dict[str, Any]:
     payload_root = payload_root.resolve()
     spec_path = spec_path.resolve()
     output_path = output_path.resolve()
@@ -172,6 +175,10 @@ def build_filesystem_package(payload_root: Path, spec_path: Path, output_path: P
         )
     except ReleaseCheckpointError as error:
         raise SteamPackageError(str(error)) from error
+    if not isinstance(required_for_distribution, bool):
+        raise SteamPackageError("required_for_distribution must be boolean")
+    if required_for_distribution and checkpoint["schema"] != CHECKPOINT_SCHEMA:
+        raise SteamPackageError("Distribution requires a full future-update release checkpoint")
     manifest["checkpoint"] = {
         "path": CHECKPOINT_NAME,
         "schema": checkpoint["schema"],
@@ -259,14 +266,14 @@ def validate_filesystem_package(package_path: Path) -> dict[str, Any]:
         if not isinstance(manifest["display_name"], str) or not manifest["display_name"].strip():
             raise SteamPackageError("Package display name is invalid")
         checkpoint_bytes = archive.read(CHECKPOINT_NAME)
+        checkpoint = json.loads(checkpoint_bytes.decode("utf-8"))
         if manifest.get("checkpoint") != {
             "path": CHECKPOINT_NAME,
-            "schema": CHECKPOINT_SCHEMA,
+            "schema": checkpoint.get("schema") if isinstance(checkpoint, dict) else None,
             "bytes": len(checkpoint_bytes),
             "sha256": _sha256(checkpoint_bytes),
         }:
             raise SteamPackageError("Package release checkpoint binding is invalid")
-        checkpoint = json.loads(checkpoint_bytes.decode("utf-8"))
         try:
             validate_release_checkpoint(
                 checkpoint,
