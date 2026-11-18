@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .errors import ConfigurationError
-from .inventory_scope import _BasisSnapshot, inventory_scope
+from .inventory_scope import _BasisSnapshot, _validate_active_display_scope, inventory_scope
 from .localization_authority import localization_authority_contract
 from .models import FailureCode, Segment, TranslationResult
 from .review_selection import target_language_review_reasons
@@ -34,8 +34,6 @@ UI_COMPOSITION_FIELDS = (
 UI_SLOT_ROLES = {"standalone", "label", "value", "state_value", "template_fragment"}
 INVENTORY_COMPARISON_KEY = "inventory_comparison_key"
 PRIMARY_IDENTITY_SCHEMA = "parr0t.primary-inventory-identity.v1"
-DISPLAY_SCOPE_SCHEMA = "parr0t.display-scope.v1"
-DISPLAY_SCOPE_EVIDENCE_FIELD = "display_scope_evidence"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,46 +50,6 @@ def validate_inventory_display_scope(
     active_rows, _ = inventory_scope(payload)
     _validate_active_display_scope(payload, active_rows, required=required)
 
-
-def _validate_active_display_scope(
-    payload: dict[str, Any], active_rows: list[dict[str, Any]], *, required: bool = False,
-) -> None:
-    coverage = payload.get("coverage")
-    required = required or (isinstance(coverage, dict) and coverage.get("scope_correction") is not None)
-    tracking = coverage.get("display_scope") if isinstance(coverage, dict) else None
-    if tracking is None and not required:
-        return
-    if not isinstance(tracking, dict) or tracking.get("schema") != DISPLAY_SCOPE_SCHEMA:
-        raise ConfigurationError("Inventory requires a valid coverage.display_scope declaration")
-    for key in ("raw_occurrence_count", "display_candidate_count", "control_only_count", "unclassified_count"):
-        value = tracking.get(key)
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise ConfigurationError(f"Inventory display scope {key} must be a non-negative integer")
-    if tracking["control_only_count"] + tracking["unclassified_count"] > tracking["raw_occurrence_count"]:
-        raise ConfigurationError("Inventory raw occurrence accounting is inconsistent")
-    if active_rows and tracking["raw_occurrence_count"] == 0:
-        raise ConfigurationError("Inventory display candidates require source occurrences")
-    fingerprint = tracking.get("evidence_fingerprint")
-    if not isinstance(fingerprint, str) or not fingerprint.strip():
-        raise ConfigurationError("Inventory display scope requires an evidence_fingerprint")
-    if tracking["display_candidate_count"] != len(active_rows):
-        raise ConfigurationError("Inventory display candidate count must match segments")
-    for row in active_rows:
-        metadata = row.get("metadata", {}) if isinstance(row, dict) else {}
-        evidence = metadata.get(DISPLAY_SCOPE_EVIDENCE_FIELD) if isinstance(metadata, dict) else None
-        if (
-            not isinstance(evidence, dict)
-            or evidence.get("kind") not in {"positive_display_binding", "possible_display_dependency"}
-            or not isinstance(evidence.get("evidence_fingerprint"), str)
-            or re.fullmatch(r"[0-9a-f]{64}", evidence["evidence_fingerprint"]) is None
-            or not isinstance(row.get("source"), str)
-            or evidence.get("source_sha256") != sha256(row["source"].encode("utf-8")).hexdigest()
-            or not isinstance(metadata.get("display_binding_id"), str)
-            or not metadata["display_binding_id"].strip()
-        ):
-            raise ConfigurationError("Every inventory target requires display binding or dependency evidence")
-        if metadata.get("storage_role") in {"shared_control_value", "lookup_key", "index", "script_operand"} and metadata.get("display_projection_required") is not True:
-            raise ConfigurationError("Control storage requires a separate display projection")
 
 PRIMARY_IDENTITY_PATH = Path(".game-l10n/inventory-primary-identity.json")
 _SURROGATE = re.compile(r"[\ud800-\udfff]")

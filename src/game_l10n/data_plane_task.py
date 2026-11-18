@@ -2894,6 +2894,9 @@ def prepare_data_plane_task(
             [
                 "raw_literal_presence_alone_is_not_display_or_completeness_evidence",
                 "derive_display_targets_from_format_roles_bindings_and_runtime_reference_evidence",
+                "resolve_supported_format_roles_and_display_consumer_dependencies_before_materializing_targets",
+                "keep_unclassified_raw_occurrences_out_of_context_translation_and_review",
+                "do_not_infer_display_use_from_language_container_membership_or_evidence_hash_alone",
                 "include_player_visible_system_messages_and_dynamic_display_dependencies",
                 "retain_unresolved_player_visible_candidates",
                 "account_raw_occurrences_by_provenance_and_category_separately_from_display_target_counts",
@@ -2903,6 +2906,8 @@ def prepare_data_plane_task(
                 "serialize_large_deterministic_parse_caches_natively_from_files_not_as_model_or_tool_rpc_text_payloads",
                 "exclude_only_evidenced_non_display_occurrences_never_blanket_engine_or_module_categories",
                 "record_exclusion_reason_codes_counts_and_evidence_fingerprints_in_coverage_exclusions",
+                "preserve_control_storage_bytes_and_emit_separate_display_only_projections",
+                "attach_only_target_bound_semantic_context_not_whole_command_trees_editor_records_or_parse_caches",
                 "use_existing_coverage_static_scope_contract_for_reachability_exclusions",
                 "preserve_physical_occurrences_and_source_order_never_deduplicate_by_text_value",
             ]
@@ -2914,6 +2919,7 @@ def prepare_data_plane_task(
                 "cache_role_local_structural_parse_provenance_and_display_dependency_evidence",
                 "construct_inventory_from_cached_single_pass_evidence_without_repeated_source_reads",
                 "do_not_read_or_derive_from_counterpart_inventory",
+                "independently_discover_source_locations_and_eligibility_never_relabel_a_shared_segment_list",
                 "emit_inventory_comparison_key_for_method_specific_ids",
                 "report_selected_vs_observed_engine_identity_conflicts_as_sdk_identity_mismatch",
             ]
@@ -2929,8 +2935,8 @@ def prepare_data_plane_task(
             private_payload["requirements"].extend(
                 [
                     "reuse_cached_inventory_artifact_without_rescanning_source",
-                    "repair_only_missing_display_binding_and_dependency_evidence",
-                    "preserve_cached_inventory_occurrences_order_and_ids",
+                    "repair_cached_format_roles_and_actual_display_dependency_evidence_without_promoting_raw_only_rows",
+                    "preserve_raw_occurrence_history_and_stable_ids_use_bound_scope_correction_for_retired_targets",
                 ]
             )
             private_payload["inventory_scope_repair"] = {
