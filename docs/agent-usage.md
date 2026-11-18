@@ -22,7 +22,7 @@ Semantic localization is content-network deny by default. Apply `skills/translat
 For a new job:
 
 1. Confirm repository/workspace access and only that the source path exists; do not inspect its contents.
-2. Initialize and follow status contracts. Clean entry: `enter-control-plane --workspace <workspace> --contracts-read --source-unopened`. Record exposure before recovery. Rotate by default; explicit user acceptance follows `control-plane-contract.md` when host rules permit. Never auto-launch replacements.
+2. Initialize; bind `user-request`; follow status. `enter-control-plane --workspace <workspace> --contracts-read --source-unopened`. Exposure/recovery: `control-plane-contract.md`. Never auto-launch replacements.
 3. Ask once whether Git may be used for this game task; record only the answer. Disabled forbids Git mutation/publication in that workspace, not authenticated SDK access, download, inventory, or activation. Never infer the answer from transport or missing `.git`.
 4. Bind `native-runtime --host codex|omp` before dispatch. Model overrides use `--role-model role=exact-id --user-requested-models`. Preserve host/isolation and started bindings; see `codex-app-deepseek.md`.
 

@@ -61,7 +61,7 @@ def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str],
         if isinstance(stored, dict) and "model_policy" in stored:
             policy_config = stored
     if host == "omp":
-        bindings = {"native-luna": "openai-codex/gpt-6-luna", "native-sol": "opencodex/gpt-6.1-sol:high"}
+        bindings = {"native-luna": "openai-codex/gpt-6-luna:high", "native-sol": "opencodex/gpt-6.1-sol:high"}
     elif host == "codex":
         bindings = {"native-luna": "gpt-6-luna", "native-sol": "gpt-6.1-sol"}
     else:

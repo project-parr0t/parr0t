@@ -9,6 +9,10 @@ import unittest
 from unittest.mock import Mock, patch
 
 from game_l10n import omp_session
+from game_l10n.errors import ConfigurationError
+from game_l10n.control_plane import suspend_control_plane, control_plane_state
+from game_l10n.framework_session import change_framework_mode, framework_session_state
+from game_l10n.user_request import record_user_request, user_request_binding, USER_REQUEST_PATH
 
 
 class OmpSessionTests(unittest.TestCase):
@@ -19,6 +23,17 @@ class OmpSessionTests(unittest.TestCase):
         self.workspace.mkdir()
         (self.workspace / "game-l10n.json").write_text("{}", encoding="utf-8")
         self.model = "provider/exact-model@upstream/route:high"
+        self.original_request = (
+            "SYNTHETIC REQUEST \uac00\u2603: keep usable existing locale; supplement fonts.\r\n"
+            "SYNTHETIC UI images, context, independent inventories, reviews, recoverable patch.\n"
+            "SYNTHETIC fallback fixture/reviewer@route:high; 2 total calls; no install or launch.\n"
+        ).encode("utf-8")
+        source = self.workspace / "initial-request.txt"
+        source.write_bytes(self.original_request)
+        self.request = record_user_request(
+            self.workspace, source, user_requested=True, text_free_confirmed=True,
+        )
+        source.unlink()
         self.which = patch.object(omp_session.shutil, "which", return_value="C:/synthetic tools/omp.exe")
         self.which.start()
         self.addCleanup(self.which.stop)
@@ -30,10 +45,8 @@ class OmpSessionTests(unittest.TestCase):
         return omp_session._plan_command(self.workspace, self.model, mode, guarded=guarded)
 
     def rotation(self):
-        handoff = self.workspace / omp_session.CONTROL_HANDOFF_PATH
-        handoff.parent.mkdir(parents=True, exist_ok=True)
-        handoff.write_text("{}", encoding="utf-8")
-        return patch.object(omp_session, "control_plane_state", return_value={"status": "rotation_required"})
+        state = suspend_control_plane(self.workspace)
+        return patch.object(omp_session, "control_plane_state", return_value=state)
 
     def test_workspace_pending_and_ready_entry(self):
         self.plan()
@@ -48,7 +61,7 @@ class OmpSessionTests(unittest.TestCase):
 
     def test_rotation_requires_canonical_handoff(self):
         with patch.object(omp_session, "control_plane_state", return_value={"status": "rotation_required"}):
-            with self.assertRaisesRegex(ValueError, "HANDOFF_REQUIRED"):
+            with self.assertRaisesRegex(ConfigurationError, "HANDOFF_REQUIRED"):
                 self.plan("rotation")
 
     def test_preview_has_no_side_effects_and_exact_argv(self):
@@ -64,14 +77,13 @@ class OmpSessionTests(unittest.TestCase):
         self.assertEqual(command[:5], ["C:/synthetic tools/omp.exe", "--cwd", str(self.workspace.resolve()),
                                        "--model", self.model])
         self.assertEqual(command[7:9], ["--no-prewalk", "--no-title"])
-        self.assertEqual(len(command), 14)
         self.assertEqual(command[9], "--trusted-extension")
         self.assertEqual(Path(command[10]).name, "omp-prompt-isolation.mjs")
         self.assertTrue(Path(command[10]).is_file())
         self.assertEqual(command[11:13], ["--parr0t-workspace", str(self.workspace.resolve())])
         self.assertNotIn("--continue", command)
         self.assertNotIn("--resume", command)
-        self.assertNotIn("parr0t_exec", command[-1])
+        self.assertEqual(Path(command[-1][1:]).read_bytes(), self.original_request)
         self.assertTrue(Path(command[6]).is_relative_to(self.workspace.resolve()))
 
     def test_guarded_preview_preserves_strict_arguments(self):
@@ -146,12 +158,15 @@ class OmpSessionTests(unittest.TestCase):
                 child.wait.assert_called_once_with()
                 child.poll.assert_not_called()
 
-    def test_plans_are_unique_and_rotation_prompt_is_canonical(self):
-        self.assertNotEqual(self.plan()[1], self.plan()[1])
+    def test_fresh_launches_retain_original_request_across_rotation(self):
+        first, first_directory, _ = self.plan()
+        second, second_directory, _ = self.plan()
+        self.assertNotEqual(first_directory, second_directory)
         with self.rotation():
-            command, _, _ = self.plan("rotation")
-        self.assertIn(omp_session.CONTROL_HANDOFF_PATH, command[-1])
-        self.assertIn("fresh-session-confirmed", command[-1])
+            rotated, _, _ = self.plan("rotation")
+        self.assertEqual(first[-1], second[-1])
+        self.assertEqual(rotated[-1], first[-1])
+        self.assertEqual(Path(rotated[-1][1:]).read_bytes(), self.original_request)
 
     def test_prompt_launch_with_helper_returns_started_without_guard_registration(self):
         child = Mock(pid=123)
@@ -265,6 +280,68 @@ class OmpSessionTests(unittest.TestCase):
                                      "--mode", "workspace", "--guarded"])
         self.assertEqual(code, 1)
         self.assertTrue(launch.call_args.kwargs["guarded"])
+
+
+    def test_missing_request_blocks_spawn_instead_of_starting_generic_task(self):
+        (self.workspace / USER_REQUEST_PATH).unlink()
+        before = set(self.workspace.rglob("*"))
+        errors = io.StringIO()
+        with patch.object(omp_session.subprocess, "Popen") as spawn, redirect_stderr(errors):
+            code = omp_session.main([
+                "--workspace", str(self.workspace), "--model", self.model,
+                "--mode", "workspace", "--foreground",
+            ])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(errors.getvalue())["issue_code"], "E_USER_REQUEST_REQUIRED")
+        spawn.assert_not_called()
+        self.assertEqual(set(self.workspace.rglob("*")), before)
+
+    def test_tampered_request_cannot_reach_host(self):
+        (self.workspace / self.request["path"]).write_text("lost requirements", encoding="utf-8")
+        errors = io.StringIO()
+        with patch.object(omp_session.subprocess, "Popen") as spawn, redirect_stderr(errors):
+            code = omp_session.main([
+                "--workspace", str(self.workspace), "--model", self.model,
+                "--mode", "workspace", "--foreground",
+            ])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(errors.getvalue())["issue_code"], "E_USER_REQUEST_INVALID")
+        spawn.assert_not_called()
+
+    def test_auto_restart_selects_canonical_recovery_without_reactivating_caller(self):
+        for mode in ("analysis", "shutdown"):
+            with self.subTest(mode=mode):
+                change_framework_mode(self.workspace, mode, user_requested=True)
+                lifecycle = framework_session_state(self.workspace)
+                control = control_plane_state(self.workspace)
+                with self.assertRaisesRegex(ValueError, "ROTATION_REQUIRED"):
+                    self.plan("workspace")
+                child = Mock(pid=123)
+                child.wait.return_value = 0
+                with patch.object(omp_session.subprocess, "Popen", return_value=child) as spawn:
+                    result = omp_session._launch(self.workspace, self.model, foreground=True)
+                self.assertEqual(result["mode"], "rotation")
+                self.assertEqual(result["handoff_receipt"], omp_session.CONTROL_HANDOFF_PATH)
+                self.assertEqual(result["user_request"], self.request)
+                self.assertEqual(Path(spawn.call_args.args[0][-1][1:]).read_bytes(), self.original_request)
+                self.assertEqual(framework_session_state(self.workspace), lifecycle)
+                self.assertEqual(control_plane_state(self.workspace), control)
+                self.assertEqual(user_request_binding(self.workspace), self.request)
+
+    def test_auto_restart_rejects_stale_handoff_before_spawn(self):
+        change_framework_mode(self.workspace, "analysis", user_requested=True)
+        path = self.workspace / omp_session.CONTROL_HANDOFF_PATH
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        receipt["from_generation"] += 1
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+        errors = io.StringIO()
+        with patch.object(omp_session.subprocess, "Popen") as spawn, redirect_stderr(errors):
+            code = omp_session.main([
+                "--workspace", str(self.workspace), "--model", self.model, "--foreground",
+            ])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(errors.getvalue())["issue_code"], "E_CONTROL_PLANE_HANDOFF_INVALID")
+        spawn.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -35,6 +35,7 @@ from .framework_session import (
     diagnostic_log_bytes,
     framework_session_state,
 )
+from .user_request import record_user_request, user_request_binding
 from .coverage import (
     COMPLETION_SCHEMA,
     completion_attestation,
@@ -1802,6 +1803,19 @@ def cmd_accept_control_plane_exposure(args: argparse.Namespace) -> int:
         "control_plane": public_control_plane_state(result),
         "entry_gate": public_control_plane_entry_state(control_plane_entry_state(work_dir)),
     }, ensure_ascii=False))
+    return 0
+
+
+def cmd_user_request(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    if args.input:
+        binding = record_user_request(
+            work_dir, Path(args.input), user_requested=args.user_requested,
+            text_free_confirmed=args.text_free_confirmed,
+        )
+    else:
+        binding = user_request_binding(work_dir)
+    print(json.dumps({"status": "recorded", **binding}, ensure_ascii=False))
     return 0
 
 
@@ -4461,6 +4475,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     control_accept.set_defaults(func=cmd_accept_control_plane_exposure)
 
+    user_request = sub.add_parser(
+        "user-request", help="Bind or verify the immutable original text-free user request",
+    )
+    user_request.add_argument("--workspace", required=True)
+    user_request.add_argument("--input", help="Original UTF-8 request staged inside the workspace, never a transcript")
+    user_request.add_argument("--user-requested", action="store_true")
+    user_request.add_argument("--text-free-confirmed", action="store_true")
+    user_request.set_defaults(func=cmd_user_request)
+
     framework_status = sub.add_parser("framework-status", help="Report framework instruction lifecycle")
     framework_status.add_argument("--workspace", required=True)
     framework_status.set_defaults(func=cmd_framework_status)
@@ -4790,6 +4813,7 @@ def main(argv: list[str] | None = None) -> int:
             cmd_framework_status,
             cmd_framework_mode,
             cmd_diagnostic_log,
+            cmd_user_request,
         }
         if args.func not in recovery_commands:
             workspace = getattr(args, "workspace", None)

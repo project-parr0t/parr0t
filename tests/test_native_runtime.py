@@ -225,7 +225,7 @@ class NativeRuntimeTests(unittest.TestCase):
         })
         configure_native_runtime(self.root, "omp", {"native-sol": "fixture/selected-sol"})
         self.assertEqual(native_runtime(self.root)["models"], {
-            "native-luna": "openai-codex/gpt-6-luna", "native-sol": "fixture/selected-sol",
+            "native-luna": "openai-codex/gpt-6-luna:high", "native-sol": "fixture/selected-sol",
         })
         configure_native_runtime(self.root, "omp", {})
         self.assertEqual(native_runtime(self.root)["models"]["native-sol"], "fixture/selected-sol")
@@ -236,7 +236,7 @@ class NativeRuntimeTests(unittest.TestCase):
     def test_fresh_omp_sol_wave_binds_exact_provider_path_and_effort(self) -> None:
         configure_native_runtime(self.root, "omp", {})
         self.assertEqual(native_runtime(self.root)["models"], {
-            "native-luna": "openai-codex/gpt-6-luna", "native-sol": "opencodex/gpt-6.1-sol:high",
+            "native-luna": "openai-codex/gpt-6-luna:high", "native-sol": "opencodex/gpt-6.1-sol:high",
         })
         prepare_native_tasks(
             self.root, self.source, self.segments, self.tasks,
@@ -268,7 +268,7 @@ class NativeRuntimeTests(unittest.TestCase):
 
     def test_unavailable_relay_creates_no_fake_results_and_resumes_same_wave(self) -> None:
         _, relay, payload = self.prepare()
-        self.assertEqual(payload["launch_contract"]["model"], "openai-codex/gpt-6-luna")
+        self.assertEqual(payload["launch_contract"]["model"], "openai-codex/gpt-6-luna:high")
         self.assertEqual(payload["launch_contract"]["spawn_model_parameter"], "tasks[].model")
         record_native_launch(self.root, relay, event="capability-unavailable")
         sealed = seal_native_wave_relay(self.root, relay, relay_ended=True)
