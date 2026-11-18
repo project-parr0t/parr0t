@@ -1,10 +1,10 @@
 # Minimal user-directed corrections
 
-A typo, a few tone/voice adjustments, or a bounded data change is not a new translation run. Start from the current release checkpoint and classify the request before doing any discovery:
+A typo, a few tone/voice adjustments, or a bounded data change is not a new translation run. Start from the current full `parr0t.release-checkpoint/v1` checkpoint and classify the request before doing any discovery. Local integrity checkpoints are valid for local packaging, but lack the dependency bindings needed by `apply-user-correction` and `correction-ui`; those consumers reject them before reading correction inputs or creating output.
 
 - **Exact value:** the user supplied or approved the final target text or data value. Apply it deterministically with zero model calls.
 - **Bounded wording:** the user identified a small set that needs tone, voice, nuance, or naturalness work but did not supply final wording. Freeze those IDs and their reverse dependency closure, then use the focused semantic route below.
-- **Structural/global change:** stable mapping is ambiguous, more than 32 targets are directly named, or a glossary, character voice, context, schema, or review policy changed globally. Use selective continuation from `docs/release-checkpoint.md`; do not pretend it is an exact correction.
+- **Structural/global change:** stable mapping is ambiguous, or a glossary, character voice, context, schema, or review policy changed globally. Use selective continuation from `docs/release-checkpoint.md`; target count alone does not make a correction global.
 
 One narrow private data-plane lookup may resolve a user-visible label or description to stable IDs. The control plane receives only the resolved IDs, counts, fingerprints, and deterministic codes. It must not search the full translation, reopen the game root, or read candidate text.
 
@@ -33,7 +33,7 @@ Search executes in the local index. An agent must not imitate it by opening the 
 Each flag has one of two routes:
 
 - **Direct:** the user enters the final replacement. Deterministic integrity checks run immediately; pressing apply writes the standard `parr0t.user-correction-request/v1` and one new full result artifact. It makes zero model calls.
-- **Agent:** the user records an interpretation, problem, or reference. Export writes `parr0t.user-interpretation-task/v1` containing only the flagged IDs and their reverse dependency closure, capped at 32 records. A fresh data-plane agent may read that task and return `parr0t.user-interpretation-proposals/v1`. Proposals are not accepted translations until the user reviews and approves them in the UI.
+- **Agent:** the user records an interpretation, problem, or reference. Export freezes the flagged IDs and their complete reverse dependency closure, then writes a `parr0t.user-interpretation-batches/v1` manifest at `--agent-task` and bounded `parr0t.user-interpretation-task/v1` files. `--agent-task-size` sets the positive per-task record bound, defaulting to 32 without a whole-job target cap. Fresh data-plane agents read only their bound tasks and return `parr0t.user-interpretation-proposals/v1`. Proposals are not accepted translations until the user reviews and approves them in the UI; partial imports remain pending.
 
 The proposal file has exactly:
 
@@ -81,7 +81,7 @@ game-l10n apply-user-correction \
   --user-requested
 ```
 
-The command requires exact ID agreement across the current verified inventory and checkpoint. Supply `--existing` to preserve the workspace's unchanged result records field-for-field; when it is unavailable, Parr0t materializes the released candidates from the checkpoint. It verifies every source and released-target binding, changes only named IDs, preserves every other target, increments the changed candidate generation, records explicit user authority, and runs deterministic placeholder, control-code, script-intrusion, UI-composition, and hard-length checks. It makes zero model calls and does not inspect or mutate the game installation.
+The command requires exact ID agreement across the current verified inventory and checkpoint. Supply `--existing` to preserve unaffected result records field-for-field; when it is unavailable, Parr0t materializes the released candidates from the checkpoint. Explicitly approved unchanged dependencies retain their candidate text, digest, and generation while recording the user-approved dependency review. The command verifies every source and released-target binding, changes only named candidates, increments the changed candidate generation, records explicit user authority, and runs deterministic placeholder, control-code, script-intrusion, UI-composition, and hard-length checks. It makes zero model calls and does not inspect or mutate the game installation.
 
 The result summary is the correction receipt. Retain its request, checkpoint, inventory, base-result, output, and changed-candidate digests in the private workspace so a later correction can prove exactly what changed without rereading content.
 
@@ -91,15 +91,15 @@ The result summary is the correction receipt. Retain its request, checkpoint, in
 
 For a bounded wording request, use the already verified inventory, released results, checkpoint, target-scoped context fingerprints, glossary, and character profiles. Do not repeat extraction, inventory reconciliation, whole-flow context analysis, or full review.
 
-1. Freeze the directly requested IDs and their reverse dependency closure. The combined set must remain at or below 32; otherwise use selective continuation.
+1. Freeze the directly requested IDs and their complete reverse dependency closure. Partition semantic work using the configured positive task bound; the default is 32 records per task, not a maximum correction-set size.
 2. Load only the bound records and already attested context relevant to that set. If required context is missing, gather it once for those IDs only.
-3. Send the whole frozen set as one ordered semantic batch to one fresh data-plane worker. Do not create a call, prompt file, agent, or retry loop per record.
-4. Run one ordered independent focused review batch only for generated wording. Rewrite only flagged records in one batch. Exact values and non-semantic data changes do not receive semantic review.
+3. Send each bounded ordered semantic batch to one fresh data-plane worker. Do not create a call, prompt file, agent, or retry loop per record.
+4. Run ordered independent focused review only for generated wording in each batch. Rewrite only flagged records. Exact values and non-semantic data changes do not receive semantic review.
 5. Run deterministic validation on the frozen set, merge it into the unchanged released result once, repack owning payloads once, and verify the package once.
 
 If the UI already resolved the requested IDs, that fixed set is authoritative. Do not run another label search, global text search, vector search, inventory scan, or context reconstruction. An agent may read only the exported focused task and must return only proposals for its bound records.
 
-The normal ceiling is two semantic calls for the complete correction set: one rewrite and one focused review. A provider failure enters the existing resumable failure queue for only the affected IDs; it must not reopen the full pipeline. Stop after two failures with the same cause. Do not spawn a controller, promote an SDK, maintain branches, publish, install, launch, or create a new task/result format as part of a correction.
+The default semantic route is one rewrite followed by one focused review per bounded batch, not a two-call whole-job quota. Failures enter the existing resumable queue for only affected IDs and follow the approved retry, fresh-route fallback, and runtime-repair policy; they must not reopen the full pipeline or loop indefinitely on unchanged operational failure. Do not spawn a controller, promote an SDK, maintain branches, publish, install, launch, or invent ad hoc task/result formats as part of a correction.
 
 ## Dependency boundary
 

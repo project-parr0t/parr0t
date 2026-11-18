@@ -54,7 +54,6 @@ from .data_plane_task import (
     DATA_PLANE_PROFILES,
     DATA_PLANE_RELAY_SCHEMA,
     DATA_PLANE_RECEIPT_SCHEMA,
-    MAX_CONTEXT_WORKERS,
     _load_bound_data_plane_relay,
     claim_context_chunk,
     commit_context_fragment,
@@ -96,12 +95,16 @@ from .language_policy import (
 from .filesystem_package import build_filesystem_package, validate_filesystem_package
 from .model_policy import NATIVE_ROLE_ROUTES, native_role_models
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext
-from .native_followup import collect_native_followup, prepare_native_followup
+from .native_followup import DEFAULT_EXCHANGE_RECORDS, collect_native_followup, prepare_native_followup
 from .native_translation_retry import (
     STATE_NAME as NATIVE_RETRY_STATE_NAME,
     _load_state as _load_native_retry_state,
     advance_native_translation_retries,
+    export_native_translation_retry_cohort,
+    repair_native_translation_retries,
+    revise_native_translation_retry_content,
     require_pre_fallback_retry_state,
+    native_translation_retry_route_plan,
     start_native_translation_retries,
 )
 from .native_runtime import (
@@ -116,7 +119,6 @@ from .native_review import (collect_native_review, collect_native_rewrite,
 from .instance_release import validate_instance_release
 from .native_resume import native_resume_status
 from .native_pass import (
-    DEFAULT_BULK_BUDGET_GATE_RECORDS,
     DEFAULT_MAX_MATERIAL_TOKENS,
     DEFAULT_MAX_RECORDS,
     DEFAULT_MAX_WORKERS,
@@ -144,6 +146,7 @@ from .provider_policy import (
     validate_provider_policy,
 )
 from .runtime_approval import create_runtime_approval
+from .release_checkpoint import CHECKPOINT_NAME, generate_local_release_integrity
 from .third_party_approval import create_third_party_approval, require_third_party_approval
 from .store import stable_hash, stable_hash_sequence
 from .steam import build_steam_package, inspect_installed_state, validate_steam_package
@@ -152,11 +155,13 @@ from .translation_exchange import (
     prepare_translation_exchange,
     process_translation_exchange,
     seal_translation_exchange,
+    select_external_translation_block,
 )
 from .tooling import cached_tool_state, run_cached_tool
 from .extractor_preparation import (
     ACTION as EXTRACTOR_PREPARATION_ACTION,
     PURPOSE as EXTRACTOR_PREPARATION_PURPOSE,
+    apply_extractor_requirements,
     check_extractor_preparation,
     preparation_state,
     require_extractor_preparation,
@@ -230,11 +235,15 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
         "docs/provider-protocol.md",
         "docs/control-plane-contract.md",
     ),
-    "await_explicit_user_request_to_resume_failure_queue": (
+    "resume_authorized_failure_queue": (
         "docs/coverage-gates.md",
         "docs/fallback-routing.md",
         "docs/control-plane-contract.md",
     ),
+    "repair_failure_queue_continuation": (
+        "docs/fallback-routing.md", "docs/control-plane-contract.md",
+    ),
+    "failure_queue_paused": ("docs/control-plane-contract.md",),
     "resolve_blocking_terminal_unresolved": (
         "docs/coverage-gates.md",
         "docs/fallback-routing.md",
@@ -383,7 +392,7 @@ def _status_data_plane_task(work_dir: Path, action: str) -> dict[str, Any] | Non
         task["last_receipt"] = receipt
         task["continuation_required"] = True
         if any(code.startswith("E_NATIVE_") for code in receipt.get("issue_codes", []) if isinstance(code, str)):
-            task["failure_action"] = "repair_native_runtime_then_resume_same_task"
+            task["failure_action"] = "repair_native_runtime_then_prepare_fresh_bound_task"
         if "inventory_display_scope_required" in receipt.get("issue_codes", []):
             task["failure_action"] = "repair_cached_inventory_display_bindings_then_retry"
     operational_failure = current_data_plane_operational_failure(work_dir, role, purpose=purpose)
@@ -468,6 +477,10 @@ def _public_inventory_gate(state: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "status": state.get("status"),
         "static_complete": state.get("static_complete") is True,
+        "assurance_mode": state.get("assurance_mode", "independent"),
+        "assurance_complete": state.get("assurance_complete", state.get("static_complete")) is True,
+        "independent_verified": state.get("independent_verified", state.get("static_complete")) is True,
+        "declared_complete": state.get("declared_complete", state.get("static_complete")) is True,
         "primary_segments": state.get("primary_segments", 0),
         "independent_segments": state.get("independent_segments", 0),
         "agreed_target_count": state.get("agreed_target_count", 0),
@@ -477,7 +490,7 @@ def _public_inventory_gate(state: dict[str, Any] | None) -> dict[str, Any]:
         "primary_identity_binding": dict(
             state.get("primary_identity_binding", {})
         ),
-        "continuation_required": state.get("static_complete") is not True,
+        "continuation_required": not (state.get("assurance_complete", state.get("static_complete")) is True),
         "reconciliation": {
             "generation": reconciliation.get("generation", 0),
             "progress_state": reconciliation.get("progress_state", "unknown"),
@@ -654,6 +667,16 @@ def _completion_state_valid(payload: dict[str, Any]) -> bool:
         and target_completion
     ):
         return False
+    if "assurance_completion" in payload:
+        expected_assurance = bool(
+            result_alignment["complete"] and target_scope["full_inventory"] and target_completion
+            and (source_inventory["static_complete"] or (
+                source_inventory.get("assurance_mode") == "primary_only"
+                and source_inventory.get("declared_complete") is True
+            ))
+        )
+        if payload["assurance_completion"] is not expected_assurance:
+            return False
     return True
 
 
@@ -742,6 +765,7 @@ def _orchestrator(
     context_pack: ContextPack,
     *,
     progress_callback: Any | None = None,
+    metadata_only: bool = False,
 ) -> LocalizationOrchestrator:
     config = load_config(work_dir)
     require_direct_provider_pipeline(config, "direct translation/review orchestration")
@@ -821,6 +845,7 @@ def _orchestrator(
         context_pack=context_pack,
         work_dir=work_dir,
         progress_callback=progress_callback,
+        metadata_only=metadata_only,
     )
 
 
@@ -884,17 +909,7 @@ def _analyze_context(
         registry,
         chain,
         max_chunk_chars=int(routing.get("context_chunk_chars", 30000)),
-        max_workers=min(
-            MAX_CONTEXT_WORKERS,
-            max(
-                1,
-                int(
-                    routing.get(
-                        "context_max_workers", routing.get("max_workers", 1)
-                    )
-                ),
-            ),
-        ),
+        max_workers=int(routing.get("context_max_workers", routing.get("max_workers", 1))),
         context_mode=context_mode or str(config.get("project", {}).get("context_mode", "auto")),
         **_context_localization_inputs(work_dir, config),
     )
@@ -909,6 +924,36 @@ def _analyze_context(
     )
 
 
+def _api_continuation_status(
+    work_dir: Path, config: dict[str, Any], segments: list, results: list,
+) -> dict[str, dict[str, Any]] | None:
+    if effective_execution_mode(config) == CODEX_APP_EXECUTION_MODE or (
+        config.get("provider_preset") == "custom" and _native_translation_route_plan(config)
+    ):
+        return None
+    pending = [item for item in results if item.status == "failed"]
+    if not pending:
+        return {}
+    by_id = {item.id: item for item in segments}
+    try:
+        context_path = _path_in_workspace(
+            work_dir, config.get("files", {}).get("context_pack", "context/context-pack.json"),
+            must_exist=True,
+        )
+        context = ContextPack(**json.loads(context_path.read_text(encoding="utf-8-sig")))
+        evaluator = _orchestrator(work_dir, context, metadata_only=True)
+        return {item.segment_id: evaluator.continuation_status(by_id[item.segment_id], item)
+                for item in pending}
+    except (GameL10nError, OSError, ValueError, TypeError, KeyError):
+        return {
+            item.segment_id: {
+                "eligible": False, "next_action": "repair", "route_binding": None,
+                "issue_code": "E_CONTINUATION_STATE_REPAIR_REQUIRED",
+            }
+            for item in pending
+        }
+
+
 def _finalize_translation_results(
     *,
     work_dir: Path,
@@ -920,18 +965,16 @@ def _finalize_translation_results(
     review_required: bool,
     language_binding_state: dict[str, Any],
 ) -> tuple[dict[str, Any], int]:
+    config = load_config(work_dir)
     queue = update_failure_queue(
         work_dir,
         target_segments,
         results,
         inventory_fingerprint=inventory_state["primary_fingerprint"],
+        continuation_status=_api_continuation_status(work_dir, config, target_segments, results),
     )
+    allow_incomplete = config.get("failure_queue", {}).get("allow_incomplete_artifact") is True
     checkpoint = held_checkpoint_path(work_dir)
-    blocking = queue["blocking_count"] > 0
-    result_artifact = checkpoint if blocking else destination
-    write_results(result_artifact, results)
-    if queue["pending_count"] and not blocking:
-        write_results(checkpoint, results)
     runtime = runtime_coverage_state(work_dir, inventory_state["primary_fingerprint"])
     completion = completion_attestation(
         target_segments,
@@ -942,7 +985,13 @@ def _finalize_translation_results(
         review_required=review_required,
         target_language=language_binding_state["target_language"],
         language_binding=language_binding_state,
+        allow_incomplete_artifact=allow_incomplete,
     )
+    blocking = queue["blocking_count"] > 0 and not completion.get("incomplete_artifact_authorized", False)
+    result_artifact = checkpoint if blocking else destination
+    write_results(result_artifact, results)
+    if queue["pending_count"] and not blocking:
+        write_results(checkpoint, results)
     completion["result_artifact"] = _result_artifact_binding(work_dir, result_artifact)
     completion_path = save_completion_attestation(work_dir, completion)
     failed = sum(item.status == "failed" for item in results)
@@ -978,6 +1027,8 @@ def _finalize_translation_results(
                 if static_complete
                 else "target_scope_complete"
                 if target_complete
+                else "authorized_incomplete_artifact"
+                if completion.get("incomplete_artifact_authorized")
                 else "incomplete"
             ),
             "segments": len(results),
@@ -994,15 +1045,17 @@ def _finalize_translation_results(
             "completion_attestation": str(completion_path),
             "target_completion": target_complete,
             "static_completion": static_complete,
+            "assurance_completion": completion.get("assurance_completion", static_complete),
+            "artifact_assurance": completion.get("artifact_assurance"),
             "runtime_completion": completion["runtime_completion"],
             "issue_codes": completion["issue_codes"],
         },
-        0 if target_complete else 2,
+        0 if target_complete or completion.get("incomplete_artifact_authorized") else 2,
     )
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    if args.git_choice != "pending" and not getattr(
+    if args.git_choice == "enabled" and not getattr(
         args, "user_confirmed_git_choice", False
     ):
         raise ConfigurationError(
@@ -1015,6 +1068,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         git_choice=args.git_choice,
         game_roots=[Path(item) for item in args.game_root],
         provider_preset=args.provider_preset,
+        target_language=args.target_language,
     )
     print(f"Initialized private agent workspace: {Path(args.workspace).resolve()}")
     print(
@@ -1047,6 +1101,7 @@ def cmd_image_localization_policy(args: argparse.Namespace) -> int:
         requested=args.mode == "requested",
         user_requested=bool(args.user_requested),
         requested_scope=args.scope,
+        inspection_only=args.mode == "inspect",
     )
     print(json.dumps(state, ensure_ascii=False))
     return 0
@@ -1067,10 +1122,17 @@ def cmd_verify_image_ui_inventory(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     require_sdk_activation(work_dir, config)
+    candidate_discovery = None
+    if args.candidate_discovery:
+        discovery_path = _path_in_workspace(
+            work_dir, args.candidate_discovery, must_exist=True,
+        )
+        candidate_discovery = json.loads(discovery_path.read_text(encoding="utf-8-sig"))
     result = verify_image_ui_inventory(
         work_dir,
         _path_in_workspace(work_dir, args.inventory, must_exist=True),
         game_roots=[Path(item) for item in config.get("game_roots", [])],
+        candidate_discovery=candidate_discovery,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -1233,10 +1295,10 @@ def cmd_resume_failures(args: argparse.Namespace) -> int:
     retry_ids = {
         item["target_id"]
         for item in queue["entries"]
-        if item.get("retryable_on_user_resume") is True
+        if item.get("retryable") is True and item.get("continuation_authorized", True) is True
     }
     if not retry_ids:
-        raise ValueError("Failure queue has no targets eligible for user-requested resume")
+        raise ValueError("Failure queue has no authorized retryable targets")
     segments = read_segments(source)
     segment_by_id = {item.id: item for item in segments}
     if not retry_ids <= set(segment_by_id):
@@ -1262,10 +1324,26 @@ def cmd_resume_failures(args: argparse.Namespace) -> int:
             force=args.force_context,
             context_mode=args.context_mode,
         )
+        orchestrator = _orchestrator(
+            work_dir, context_pack, progress_callback=progress.apply_event,
+        )
+        continuations = {
+            item.id: orchestrator.continuation_status(item, previous[item.id])
+            for item in retry_segments
+        }
+        retry_segments = [item for item in retry_segments if continuations[item.id]["eligible"]]
+        if not retry_segments:
+            print(json.dumps({
+                "status": "repair_required", "next_action": "repair_failure_queue_continuation",
+                "resumed_targets": 0, "continuations": continuations,
+            }, ensure_ascii=False))
+            return 2
+        before_attempts = sum(len(previous[item.id].attempts) for item in retry_segments)
         progress.update(stage="translation")
-        retried = _orchestrator(
-            work_dir, context_pack, progress_callback=progress.apply_event
-        ).translate_many(retry_segments, force=True)
+        retried = orchestrator.continue_many(
+            retry_segments, {item.id: previous[item.id] for item in retry_segments},
+        )
+        new_attempt_records = sum(len(item.attempts) for item in retried) - before_attempts
         previous.update({item.segment_id: item for item in retried})
         merged = [previous[item.id] for item in segments]
         progress.update(stage="finalizing")
@@ -1282,7 +1360,8 @@ def cmd_resume_failures(args: argparse.Namespace) -> int:
         summary.update(
             {
                 "mode": "failure_queue_resume",
-                "retried": len(retried),
+                "resumed_targets": len(retried),
+                "new_attempt_records": new_attempt_records,
                 "context_cached": context_cached,
                 "context_mode": context_pack.context_mode,
             }
@@ -1356,6 +1435,7 @@ def cmd_correction_ui(args: argparse.Namespace) -> int:
         request_output_path=request_output,
         corrected_output_path=corrected_output,
         agent_task_path=agent_task,
+        agent_task_size=args.agent_task_size,
         expected_inventory_fingerprint=inventory_state["primary_fingerprint"],
     )
     serve_correction_ui(correction_workspace, port=args.port)
@@ -1450,7 +1530,7 @@ def cmd_import_native_shard(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     require_sdk_activation(work_dir, load_config(work_dir))
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
-    result = import_native_shard(work_dir, source, args.name)
+    result = import_native_shard(work_dir, source, args.name, model=args.model)
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -1565,7 +1645,33 @@ def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
             else None
         ),
         content_source_scope=getattr(args, "content_source_scope", None) or "",
+        inspection_assets=(
+            [_source_path(work_dir, value, config) for value in args.inspection_asset]
+            if args.inspection_asset else None
+        ),
+        offline_processing=(
+            json.loads(_path_in_workspace(work_dir, args.offline_processing, must_exist=True).read_text(encoding="utf-8"))
+            if args.offline_processing else None
+        ),
     )
+    if (
+        args.worker_role == "image_ui_inventory"
+        and result.get("dispatch_allowed") is False
+        and result.get("next_action") == EXTRACTOR_PREPARATION_ACTION
+    ):
+        requirements_path = result.get("extractor_requirements_path")
+        requirements_sha256 = result.get("extractor_requirements_sha256")
+        if not isinstance(requirements_path, str) or not isinstance(requirements_sha256, str):
+            raise ConfigurationError("E_IMAGE_EXTRACTOR_REPAIR_INVALID")
+        apply_extractor_requirements(
+            work_dir,
+            _path_in_workspace(work_dir, requirements_path, must_exist=True),
+            requirements_sha256,
+        )
+        result["extractor_requirements_applied"] = True
+        result["data_plane_task"] = _status_data_plane_task(
+            work_dir, EXTRACTOR_PREPARATION_ACTION,
+        )
     if result.get("status") == "ready":
         bind_data_plane_launch(work_dir, work_dir / result["relay_path"])
         result.update(
@@ -1847,7 +1953,7 @@ def cmd_diagnostic_log(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
+def _prepare_native_pass(args: argparse.Namespace) -> dict[str, Any]:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     require_sdk_activation(work_dir, config)
@@ -1877,6 +1983,11 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
     ordered_native_review = bool(declared_native_roles) and pass_kind in {"review", "rewrite"}
     segments = read_segments(source)
     retry_state = None
+    retry_state_path = None
+    predecessor_receipt = (
+        _path_in_workspace(work_dir, args.predecessor_receipt, must_exist=True)
+        if getattr(args, "predecessor_receipt", None) else None
+    )
     if getattr(args, "retry_state", None):
         retry_state_path = _path_in_workspace(
             work_dir, args.retry_state, must_exist=True
@@ -1894,79 +2005,99 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
             or getattr(args, "content_source_scope", None)
         ):
             raise ConfigurationError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
-    if custom_native_mode or ordered_native_review:
+        descriptor = (retry_state.get("primary_lineage") or {}).get("translation_predecessor")
+        if descriptor:
+            bound_receipt = _path_in_workspace(work_dir, descriptor["receipt"], must_exist=True)
+            if predecessor_receipt is not None and predecessor_receipt != bound_receipt:
+                raise ConfigurationError("E_TRANSLATION_PREDECESSOR_INVALID")
+            predecessor_receipt = bound_receipt
+    if custom_native_mode or codex_app_mode or ordered_native_review:
+        runtime_models = native_runtime(work_dir, required=True)["models"]
         if pass_kind == "translation":
-            plan = _native_translation_route_plan(config)
+            plan = _native_translation_retry_plan(
+                work_dir, config, predecessor_receipt=predecessor_receipt,
+                retry_state_path=retry_state_path,
+            )
             provider = args.native_provider or (plan[0]["provider"] if plan else "")
             limits = {item["provider"]: 1 + item["max_retries"] for item in plan}
             attempt = args.route_attempt or 1
             if args.review_tier is not None or provider not in limits or not 1 <= attempt <= limits[provider]:
                 raise ConfigurationError("E_NATIVE_ROUTE_INVALID: translation route/attempt is not configured")
         else:
-            from .native_review import select_native_review_route
+            from .native_review import partition_native_review_routes
             routing = config.get("routing", {})
             if pass_kind == "review":
                 if args.review_tier not in {"triage", "strong"}:
                     raise ConfigurationError("E_NATIVE_REVIEW_TIER_INVALID")
                 role = "review_triagers" if args.review_tier == "triage" else "reviewers"
                 stage = "review-triage" if args.review_tier == "triage" else "review"
+                tier_limit = routing.get(f"{args.review_tier}_max_calls")
             else:
                 if args.review_tier is not None:
                     raise ConfigurationError("E_NATIVE_REVIEW_TIER_INVALID")
-                role, stage = "rewriters", "review-rewrite"
-            routes = routing.get(role, [])
-            provider = select_native_review_route(
-                segments, routes, stage=stage,
-                route_models=native_runtime(work_dir, required=True)["models"],
+                role, stage, tier_limit = "rewriters", "review-rewrite", None
+            groups = partition_native_review_routes(
+                segments, routing.get(role, []), stage=stage, route_models=runtime_models,
+                attempt_limits=routing.get("review_attempt_limits", {}), tier_limit=tier_limit,
             )
+            if args.route_attempt not in {None, 1}:
+                raise ConfigurationError("E_NATIVE_ROUTE_INVALID: review attempts follow current candidate evidence")
+            if args.native_provider is not None and args.native_provider not in groups:
+                raise ConfigurationError("E_NATIVE_ROUTE_INVALID: requested route is not a next candidate route")
+            if len(groups) != 1 or not next(iter(groups), "").startswith("native-"):
+                partitions = []
+                for provider, selected in groups.items():
+                    key = stable_hash({
+                        "provider": provider, "model": runtime_models.get(provider),
+                        "source": stable_hash_sequence(asdict(item) for item in selected),
+                        "tier": args.review_tier, "execution": execution,
+                    })
+                    directory = output / "routes" / key
+                    directory.mkdir(parents=True, exist_ok=True)
+                    partition_source = directory / "input.jsonl"
+                    if partition_source.exists():
+                        if stable_hash_sequence(asdict(item) for item in read_segments(partition_source)) != stable_hash_sequence(asdict(item) for item in selected):
+                            raise ConfigurationError("E_NATIVE_PARTITION_IMMUTABLE")
+                    else:
+                        with partition_source.open("x", encoding="utf-8") as handle:
+                            for item in selected:
+                                handle.write(json.dumps(asdict(item), ensure_ascii=False, sort_keys=True) + "\n")
+                    metadata = {
+                        "provider": provider, "count": len(selected),
+                        "input": str(partition_source.relative_to(work_dir)),
+                    }
+                    if provider.startswith("native-") and args.native_provider in {None, provider}:
+                        child = argparse.Namespace(**vars(args))
+                        child.input = str(partition_source)
+                        child.output = str(directory / "tasks")
+                        child.native_provider = provider
+                        child.route_attempt = 1
+                        try:
+                            metadata.update(status="native_pass_ready", prepared=_prepare_native_pass(child))
+                        except (GameL10nError, ValueError) as error:
+                            code = str(error).partition(":")[0]
+                            if not code.startswith("E_") or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" for c in code):
+                                code = "E_NATIVE_PARTITION_PREPARATION_FAILED"
+                            metadata.update(status="repair_required", issue_code=code,
+                                            next_action="repair_native_partition")
+                    else:
+                        metadata.update(
+                            status=("native_route_pending" if provider.startswith("native-")
+                                    else "external_route_required" if provider else "routes_exhausted"),
+                            next_action=("prepare_native_pass" if provider.startswith("native-")
+                                         else "process_configured_review_fallback" if provider
+                                         else "collect_reviewed_candidates"),
+                        )
+                    partitions.append(metadata)
+                return {"status": "partitioned" if partitions else "complete",
+                        "pass_kind": pass_kind, "partitions": partitions}
+            provider = next(iter(groups))
             attempt = 1
-            if (args.native_provider is not None and args.native_provider != provider
-                    or args.route_attempt not in {None, 1}):
-                raise ConfigurationError("E_NATIVE_ROUTE_INVALID: review route must follow configured order")
-        if provider not in native_runtime(work_dir, required=True)["models"]:
+        if provider not in runtime_models:
             raise ConfigurationError("E_NATIVE_RUNTIME_INVALID: native route has no exact model")
         route_binding = {"provider": provider, "attempt": attempt}
-    elif pass_kind == "translation" and codex_app_mode:
-        plan = _native_translation_route_plan(config)
-        provider = args.native_provider or plan[0]["provider"]
-        limits = {item["provider"]: 1 + item["max_retries"] for item in plan}
-        attempt = args.route_attempt or 1
-        if provider not in limits or not 1 <= attempt <= limits[provider]:
-            raise ConfigurationError(
-                "Native translation provider/attempt is outside the configured route plan"
-            )
-        route_binding = {"provider": provider, "attempt": attempt}
-    elif pass_kind == "review" and codex_app_mode:
-        tier = args.review_tier
-        if tier not in {"triage", "strong"}:
-            raise ConfigurationError(
-                "Codex App review passes require --review-tier triage or strong"
-            )
-        route_key = "review_triagers" if tier == "triage" else "reviewers"
-        configured_routes = config.get("routing", {}).get(route_key, [])
-        provider = next(
-            (
-                item
-                for item in configured_routes
-                if isinstance(item, str) and item.startswith("native-")
-            ),
-            "",
-        )
-        if not provider:
-            raise ConfigurationError(
-                f"Codex App {tier} review has no configured native route"
-            )
-        route_binding = {"provider": provider, "attempt": 1}
-        if args.native_provider is not None and args.native_provider != provider:
-            raise ConfigurationError("E_NATIVE_ROUTE_INVALID: review provider is not configured for this tier")
-    elif (
-        args.native_provider is not None
-        or args.route_attempt is not None
-        or args.review_tier is not None
-    ):
-        raise ConfigurationError(
-            "Native provider/attempt and review tier must match a Codex App native pass"
-        )
+    elif args.native_provider is not None or args.route_attempt is not None or args.review_tier is not None:
+        raise ConfigurationError("Native route selection requires a configured native workflow")
     if route_binding is not None:
         runtime_models = native_runtime(work_dir, required=True)["models"]
         model = runtime_models.get(route_binding["provider"])
@@ -2038,9 +2169,6 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
         if args.max_workers is not None
         else int(config.get("routing", {}).get("max_workers", DEFAULT_MAX_WORKERS))
     )
-    bulk_budget_gate_records = int(
-        execution.get("bulk_budget_gate_records", DEFAULT_BULK_BUDGET_GATE_RECORDS)
-    )
     max_elapsed_minutes = (
         args.max_elapsed_minutes
         if args.max_elapsed_minutes is not None
@@ -2093,7 +2221,6 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
         min_records=min_records,
         max_material_tokens=max_material_tokens,
         max_workers=max_workers,
-        bulk_budget_gate_records=bulk_budget_gate_records,
         max_elapsed_minutes=max_elapsed_minutes,
         max_input_tokens=max_input_tokens,
         max_provider_cost_usd=max_provider_cost_usd,
@@ -2103,7 +2230,11 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
         max_root_model_calls_per_turn=max_root_model_calls_per_turn,
         max_root_input_tokens_per_turn=max_root_input_tokens_per_turn,
         control_turn_budget_user_approved=control_turn_budget_user_approved,
+        review_split_max_depth=int(execution.get("native_review_split_max_depth", 11)),
+        review_split_max_record_amplification=execution.get("native_review_split_max_record_amplification"),
+        review_tier=args.review_tier,
         route_binding=route_binding,
+        predecessor_receipt=predecessor_receipt,
         language_binding=language_binding(work_dir, config),
         content_source_grant=(
             _path_in_workspace(
@@ -2117,12 +2248,16 @@ def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
         content_source_scope=getattr(args, "content_source_scope", None) or "",
         content_source_task_kind=content_source_task_kind,
         _content_source_policy=(
-            retry_state["content_source_policy"]
+            retry_state.get("active_content_source_policy", retry_state["content_source_policy"])
             if retry_state is not None
             else None
         ),
     )
-    print(json.dumps(result, ensure_ascii=False))
+    return result
+
+
+def cmd_prepare_native_pass(args: argparse.Namespace) -> int:
+    print(json.dumps(_prepare_native_pass(args), ensure_ascii=False))
     return 0
 
 
@@ -2156,21 +2291,26 @@ def cmd_prepare_native_followup(args: argparse.Namespace) -> int:
         work_dir, args.primary_results, must_exist=True
     )
     retry_summary = None
-    if effective_execution_mode(config) == CODEX_APP_EXECUTION_MODE or (
+    if args.retry_state or effective_execution_mode(config) == CODEX_APP_EXECUTION_MODE or (
         config.get("provider_preset") == "custom" and _native_translation_route_plan(config)
     ):
         if not args.retry_state:
             raise ConfigurationError(
-                "E_NATIVE_PRE_FALLBACK_RETRY_REQUIRED: complete the configured native "
-                "translation attempts before follow-up"
+                "E_NATIVE_PRE_FALLBACK_RETRY_REQUIRED: bind the configured native retry "
+                "state or its independently ready immutable cohort receipt"
             )
         retry_summary = require_pre_fallback_retry_state(
             work_dir,
             _path_in_workspace(work_dir, args.retry_state, must_exist=True),
             source,
             primary_results,
-            route_plan=_native_translation_retry_plan(work_dir, config),
+            route_plan=_native_translation_retry_plan(
+                work_dir, config,
+                retry_state_path=_path_in_workspace(work_dir, args.retry_state, must_exist=True),
+            ),
         )
+        source = work_dir / retry_summary["cohort_input"]
+        primary_results = work_dir / retry_summary["cohort_results"]
     result = prepare_native_followup(
         work_dir,
         source,
@@ -2178,6 +2318,11 @@ def cmd_prepare_native_followup(args: argparse.Namespace) -> int:
         primary_results,
         _path_in_workspace(work_dir, args.output),
         exchange_prefix=args.exchange_prefix,
+        cohort_lineage=(retry_summary.get("cohort_lineage") if retry_summary is not None else None),
+        exchange_max_records=(
+            args.exchange_max_records if args.exchange_max_records is not None
+            else config.get("execution", {}).get("translation_exchange_max_records", DEFAULT_EXCHANGE_RECORDS)
+        ),
         external_fallback=(config.get("provider_preset") != "custom" or
                            len(_native_translation_route_plan(config)) <
                            len(config.get("routing", {}).get("translators", []))),
@@ -2205,8 +2350,9 @@ def _native_translation_route_plan(config: dict[str, Any]) -> list[dict[str, Any
     routing = config.get("routing", {})
     retries = routing.get("translator_retries", {})
     routes = []
+    adapters = {item["name"] for item in config.get("providers", [])}
     for route in routing.get("translators", []):
-        if not isinstance(route, str) or not route.startswith("native-"):
+        if not isinstance(route, str) or route in adapters:
             break  # Never promote a native route ahead of an earlier external route.
         routes.append(route)
     return [
@@ -2215,28 +2361,21 @@ def _native_translation_route_plan(config: dict[str, Any]) -> list[dict[str, Any
     ]
 
 def _native_translation_retry_plan(
-    work_dir: Path, config: dict[str, Any]
+    work_dir: Path, config: dict[str, Any], *,
+    predecessor_receipt: Path | None = None, retry_state_path: Path | None = None,
 ) -> list[dict[str, Any]]:
-    plan = _native_translation_route_plan(config)
-    models = native_runtime(work_dir, required=True)["models"]
-    if any(item["provider"] not in models for item in plan):
-        raise ConfigurationError(
-            "E_NATIVE_RUNTIME_INVALID: retry route has no exact runtime model"
-        )
-    return [
-        {**item, "model": models[item["provider"]]}
-        for item in plan
-    ]
+    return native_translation_retry_route_plan(
+        work_dir, config, predecessor_receipt=predecessor_receipt,
+        retry_state_path=retry_state_path,
+    )
 
 
 def cmd_start_native_translation_retries(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     require_sdk_activation(work_dir, config)
-    if not _native_translation_route_plan(config) or (
-        effective_execution_mode(config) != CODEX_APP_EXECUTION_MODE
-        and config.get("provider_preset") != "custom"
-    ):
+    if (effective_execution_mode(config) != CODEX_APP_EXECUTION_MODE
+            and config.get("provider_preset") != "custom"):
         raise ConfigurationError(
             "E_PROVIDER_MODE_DRIFT: native retries require configured native translation routes"
         )
@@ -2244,6 +2383,7 @@ def cmd_start_native_translation_retries(args: argparse.Namespace) -> int:
     segments = read_segments(source)
     content_policy = None
     primary_lineage = None
+    predecessor_receipt = None
     if getattr(args, "content_source_manifest", None):
         manifest_path = _path_in_workspace(
             work_dir, args.content_source_manifest, must_exist=True
@@ -2281,13 +2421,18 @@ def cmd_start_native_translation_retries(args: argparse.Namespace) -> int:
             "content_source_policy_digest": content_policy["policy_digest"],
             "route_binding": policy_manifest.get("route_binding"),
         }
+        if "translation_predecessor" in policy_manifest:
+            primary_lineage["translation_predecessor"] = policy_manifest["translation_predecessor"]
+            predecessor_receipt = _path_in_workspace(
+                work_dir, policy_manifest["translation_predecessor"]["receipt"], must_exist=True,
+            )
     result = start_native_translation_retries(
         work_dir,
         source,
         segments,
         _path_in_workspace(work_dir, args.results, must_exist=True),
         _path_in_workspace(work_dir, args.output),
-        route_plan=_native_translation_retry_plan(work_dir, config),
+        route_plan=_native_translation_retry_plan(work_dir, config, predecessor_receipt=predecessor_receipt),
         content_policy=content_policy,
         primary_lineage=primary_lineage,
     )
@@ -2299,10 +2444,8 @@ def cmd_advance_native_translation_retries(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     require_sdk_activation(work_dir, config)
-    if not _native_translation_route_plan(config) or (
-        effective_execution_mode(config) != CODEX_APP_EXECUTION_MODE
-        and config.get("provider_preset") != "custom"
-    ):
+    if (effective_execution_mode(config) != CODEX_APP_EXECUTION_MODE
+            and config.get("provider_preset") != "custom"):
         raise ConfigurationError(
             "E_PROVIDER_MODE_DRIFT: native retries require configured native translation routes"
         )
@@ -2313,7 +2456,43 @@ def cmd_advance_native_translation_retries(args: argparse.Namespace) -> int:
         work_dir,
         state.parent,
         _path_in_workspace(work_dir, args.results, must_exist=True),
-        route_plan=_native_translation_retry_plan(work_dir, config),
+        route_plan=_native_translation_retry_plan(work_dir, config, retry_state_path=state),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_repair_native_translation_retries(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    config = load_config(work_dir)
+    require_sdk_activation(work_dir, config)
+    state_dir = _path_in_workspace(work_dir, args.state_dir, must_exist=True)
+    result = repair_native_translation_retries(
+        work_dir, state_dir,
+        route_plan=_native_translation_retry_plan(work_dir, config, retry_state_path=state_dir / NATIVE_RETRY_STATE_NAME),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_revise_native_retry_content(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    require_sdk_activation(work_dir, load_config(work_dir))
+    result = revise_native_translation_retry_content(
+        work_dir, _path_in_workspace(work_dir, args.state_dir, must_exist=True),
+        grant_path=_path_in_workspace(work_dir, args.content_source_grant, must_exist=True),
+        scope_id=args.content_source_scope,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_export_native_retry_cohort(args: argparse.Namespace) -> int:
+    work_dir = Path(args.workspace).resolve()
+    require_sdk_activation(work_dir, load_config(work_dir))
+    result = export_native_translation_retry_cohort(
+        work_dir, _path_in_workspace(work_dir, args.state_dir, must_exist=True),
+        cohort=args.cohort,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -2435,55 +2614,46 @@ def cmd_process_native_review_followup(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     require_sdk_activation(work_dir, config)
-    if args.operation == "judge":
-        from .review_policy import review_policy_status
-        policy = review_policy_status(config, work_dir)
-        if policy["status"] != "configured":
-            print(json.dumps({**policy,
-                              "action": ("configure_native_runtime"
-                                         if policy["status"] == "native_binding_required"
-                                         else "configure_review_policy"),
-                              "issue_code": ("E_NATIVE_RUNTIME_INVALID"
-                                             if policy["status"] == "native_binding_required"
-                                             else "E_REVIEW_FALLBACK_POLICY_REQUIRED")}))
-            return 1
-        if "review-fallback" in native_role_models(config):
-            provider = NATIVE_ROLE_ROUTES["review-fallback"]
-            print(json.dumps({
-                "status": "native_pass_required", "action": "prepare_native_pass",
-                "issue_code": "E_NATIVE_REVIEW_NATIVE_FALLBACK_REQUIRED",
-                "provider": provider,
-                "command_argv": [
-                    "game-l10n", "prepare-native-pass", "--workspace", str(work_dir),
-                    "--input", args.input, "--output", args.output,
-                    "--pass-kind", "review", "--review-tier", "strong",
-                    "--native-provider", provider,
-                ],
-            }))
-            return 1
     role = "judge_fallback" if args.operation == "judge" else "selective_rewrite"
-    if role not in config.get("native_workflow", {}).get("external_provider_roles", []):
-        raise ConfigurationError("E_PROVIDER_MODE_DRIFT: review role is not authorized")
+    from .native_review import partition_native_review_routes
+    routing = config.get("routing", {})
+    route_key = "reviewers" if args.operation == "judge" else "rewriters"
+    stage = "review" if args.operation == "judge" else "review-rewrite"
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     output = _path_in_workspace(work_dir, args.output)
     total_records = len(read_segments(source))
+    groups = partition_native_review_routes(
+        read_segments(source), routing.get(route_key, []), stage=stage,
+        route_models=(native_runtime(work_dir) or {}).get("models", {}),
+        attempt_limits=routing.get("review_attempt_limits", {}),
+        tier_limit=routing.get("strong_max_calls") if args.operation == "judge" else None,
+    )
+    if any(provider.startswith("native-") for provider in groups):
+        print(json.dumps({
+            "status": "route_partition_required", "action": "prepare_native_pass",
+            "issue_code": "E_NATIVE_REVIEW_NATIVE_FALLBACK_REQUIRED",
+            "routes": [{"provider": provider, "count": len(items)} for provider, items in groups.items()],
+            "command_argv": [
+                "game-l10n", "prepare-native-pass", "--workspace", str(work_dir),
+                "--input", args.input, "--output", args.output,
+                "--pass-kind", "review" if args.operation == "judge" else "rewrite",
+                *(["--review-tier", "strong"] if args.operation == "judge" else []),
+            ],
+        }))
+        return 1
     cached_path = output / "results.json"
     cached_records = (
         len(read_translation_results(cached_path)) if cached_path.is_file() else 0
     )
-    if cached_records < total_records:
-        _require_provider_credential(config, "deepseek")
-    # This factory validates the immutable Codex App preset and creates only
-    # its configured DeepSeek adapter. This command never calls translate.
-    orchestrator = _codex_app_fallback_orchestrator(work_dir)
+    orchestrator = _configured_fallback_orchestrator(work_dir, role=role)
     orchestrator.config.retry_refusals_once = False
     orchestrator.config.grace_retries = 0
     from .review_policy import review_call_limit
     routing = config.get("routing", {})
     orchestrator.config.reviewer_chain = list(routing.get("reviewers", []))
-    primary_review_provider = (routing.get("reviewers") or ["native-sol"])[0]
+    primary_review_provider = (routing.get("reviewers") or [""])[0]
     primary_review_limit = review_call_limit(
-        primary_review_provider, routing.get("reviewers", ["native-sol"]),
+        primary_review_provider, routing.get("reviewers", []),
         routing.get("review_attempt_limits", {}),
         model=(native_runtime(work_dir) or {}).get("models", {}).get(primary_review_provider, ""),
         tier_limit=routing.get("strong_max_calls"),
@@ -2534,22 +2704,33 @@ def _native_review_integrity_options(work_dir: Path, config: dict[str, Any]) -> 
             "max_length_ratio": float(routing.get("max_length_ratio", 4.0))}
 
 
-def _codex_app_fallback_orchestrator(work_dir: Path) -> LocalizationOrchestrator:
+def _configured_fallback_orchestrator(
+    work_dir: Path, *, role: str, translation_routes: list[str] | None = None,
+) -> LocalizationOrchestrator:
     config = load_config(work_dir)
     validate_provider_policy(config)
-    if effective_execution_mode(config) != CODEX_APP_EXECUTION_MODE:
-        raise ConfigurationError(
-            "E_PROVIDER_MODE_DRIFT: process-translation-exchange is reserved for "
-            "the configured Codex App translation_fallback route"
-        )
-    provider_policy = config.get("provider_policy", {})
-    if "translation_fallback" not in provider_policy.get("external_provider_roles", []):
-        # Older generated policy keeps this field under native_workflow.
-        native_roles = config.get("native_workflow", {}).get("external_provider_roles", [])
-        if "translation_fallback" not in native_roles:
-            raise ConfigurationError(
-                "E_PROVIDER_MODE_DRIFT: translation_fallback is not authorized"
-            )
+    if role not in {"translation_fallback", "judge_fallback", "selective_rewrite"}:
+        raise ConfigurationError("E_PROVIDER_MODE_DRIFT: unknown fallback role")
+    native = config.get("native_workflow", {})
+    declared = native.get("external_provider_roles")
+    if declared is not None and role not in declared:
+        raise ConfigurationError("E_PROVIDER_MODE_DRIFT: fallback role is not authorized")
+    routing = config["routing"]
+    role_key = {"translation_fallback": "translators", "judge_fallback": "reviewers",
+                "selective_rewrite": "rewriters"}[role]
+    adapters = {item["name"]: item for item in config.get("providers", [])}
+    if role == "translation_fallback":
+        if translation_routes is None:
+            raise ConfigurationError("E_TRANSLATION_CONTINUATION_REQUIRED")
+        selected = translation_routes
+    else:
+        selected = [route for route in routing.get(role_key, []) if route in adapters]
+    if not selected:
+        raise ConfigurationError("E_PROVIDER_MODE_DRIFT: no configured external fallback route")
+    for route in selected:
+        adapter = adapters.get(route)
+        if adapter is None or ("allowed_roles" in adapter and role not in adapter["allowed_roles"]):
+            raise ConfigurationError("E_PROVIDER_MODE_DRIFT: adapter is not authorized for this fallback role")
     file_config = config.get("files", {})
     context_path = _path_in_workspace(
         work_dir,
@@ -2574,12 +2755,14 @@ def _codex_app_fallback_orchestrator(work_dir: Path) -> LocalizationOrchestrator
         ),
         CharacterProfile,
     )
-    return LocalizationOrchestrator(
+    orchestrator = LocalizationOrchestrator(
         registry=registry,
         config=OrchestratorConfig(
-            translator_chain=["deepseek"],
-            reviewer_chain=[],
-            translator_retries={},
+            translator_chain=selected if role == "translation_fallback" else [],
+            reviewer_chain=selected if role == "judge_fallback" else [],
+            rewriter_chain=selected if role == "selective_rewrite" else [],
+            translator_retries={route: routing.get("translator_retries", {}).get(route, 0)
+                                for route in selected} if role == "translation_fallback" else {},
             review_attempt_limits=dict(routing.get("review_attempt_limits", {})),
             **{key: routing.get(key) for key in ("triage_max_calls", "strong_max_calls", "review_max_workers", "triage_max_workers", "strong_max_workers")},
             require_review=False,
@@ -2612,6 +2795,11 @@ def _codex_app_fallback_orchestrator(work_dir: Path) -> LocalizationOrchestrator
         context_pack=context_pack,
         work_dir=work_dir,
     )
+    if role == "judge_fallback":
+        orchestrator.config.reviewer_chain = list(routing.get("reviewers", []))
+    elif role == "selective_rewrite":
+        orchestrator.config.rewriter_chain = list(routing.get("rewriters", []))
+    return orchestrator
 
 
 def cmd_process_translation_exchange(args: argparse.Namespace) -> int:
@@ -2644,20 +2832,15 @@ def cmd_process_translation_exchange(args: argparse.Namespace) -> int:
     bundle = _path_in_workspace(work_dir, args.bundle, must_exist=True)
     preflight = seal_translation_exchange(work_dir, bundle)
     executable_fallbacks = preflight["pending_count"] + (
-        preflight["failure_count"] if args.user_requested_retry else 0
+        preflight["failure_count"] if args.retry_failures else 0
     )
-    if executable_fallbacks:
-        _require_provider_credential(config, "deepseek")
-    orchestrator = _codex_app_fallback_orchestrator(work_dir)
-    fallback_provider = next(
-        (
-            item
-            for item in config.get("providers", [])
-            if isinstance(item, dict) and item.get("name") == "deepseek"
-        ),
-        {},
+    selection = select_external_translation_block(work_dir, bundle, config)
+    route_models = selection["route_models"]
+    orchestrator = _configured_fallback_orchestrator(
+        work_dir, role="translation_fallback", translation_routes=list(route_models),
     )
-    fallback_model = str(fallback_provider.get("model", ""))
+    fallback_route = next(iter(route_models))
+    fallback_model = route_models[fallback_route]
     with live_processing_ui(
         operation="fallback_processing", total_records=executable_fallbacks
     ) as progress:
@@ -2666,9 +2849,13 @@ def cmd_process_translation_exchange(args: argparse.Namespace) -> int:
             work_dir,
             bundle,
             lambda segments: orchestrator.translate_many(segments),
-            route="deepseek",
+            route=fallback_route,
             model=fallback_model,
-            retry_failures=bool(args.user_requested_retry),
+            route_models=route_models,
+            full_route_plan=selection["full_route_plan"],
+            resume_translator=orchestrator.continue_many,
+            continuation_status=orchestrator.continuation_status,
+            retry_failures=bool(args.retry_failures),
             max_input_tokens=(
                 int(max_input_tokens) if max_input_tokens is not None else None
             ),
@@ -2678,14 +2865,12 @@ def cmd_process_translation_exchange(args: argparse.Namespace) -> int:
             ),
             started_at_epoch=args.budget_started_at_epoch,
             resolve_uncertain_input_tokens=args.resolve_uncertain_input_tokens,
-            wave_size=min(
-                32, max(1, int(config["routing"].get("max_workers", 1)))
-            ),
+            wave_size=int(config["routing"].get("max_workers", 1)),
             input_tokens_unlimited=unlimited,
             progress_callback=progress.apply_event,
         )
     print(json.dumps(result, ensure_ascii=False))
-    return 0 if result["status"] == "complete" else 1
+    return 0 if result["status"] == "complete" or result.get("native_continuation") else 1
 
 
 def cmd_collect_native_followup(args: argparse.Namespace) -> int:
@@ -2693,13 +2878,36 @@ def cmd_collect_native_followup(args: argparse.Namespace) -> int:
     config = load_config(work_dir)
     require_sdk_activation(work_dir, config)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
-    result = collect_native_followup(
-        work_dir,
-        _path_in_workspace(work_dir, args.followup, must_exist=True),
-        read_segments(source),
-        _path_in_workspace(work_dir, args.review_output),
-        _path_in_workspace(work_dir, args.unresolved_output),
-    )
+    followup = _path_in_workspace(work_dir, args.followup, must_exist=True)
+    segments = read_segments(source)
+    review_output = _path_in_workspace(work_dir, args.review_output)
+    unresolved_output = _path_in_workspace(work_dir, args.unresolved_output)
+    if any(
+        output == source or (output.is_file() and output.samefile(source))
+        for output in (review_output, unresolved_output)
+    ) or review_output == unresolved_output or (
+        review_output.is_file() and unresolved_output.is_file()
+        and review_output.samefile(unresolved_output)
+    ):
+        raise ConfigurationError(
+            "E_NATIVE_FOLLOWUP_OUTPUT_PATH: outputs must be distinct and must not overwrite input"
+        )
+    successors = getattr(args, "successor_followup", None) or []
+    if successors or getattr(args, "collect_chain", False):
+        from .native_followup import collect_native_followup_chain
+        followups = [followup]
+        for successor in successors:
+            followups.append(_path_in_workspace(work_dir, successor, must_exist=True))
+        result = collect_native_followup_chain(
+            work_dir, followups,
+            segments,
+            review_output=review_output,
+            unresolved_output=unresolved_output,
+        )
+    else:
+        result = collect_native_followup(
+            work_dir, followup, segments, review_output, unresolved_output,
+        )
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result["translation_barrier_complete"] else 1
 
@@ -2740,7 +2948,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             "framework_session": session,
             "core_runtime": _core_runtime(),
             "next_actions": [
-                "analyze_framework_logs" if session["mode"] == "analysis" else "framework_shutdown"
+                {"analysis": "analyze_framework_logs", "pause": "framework_paused", "shutdown": "framework_shutdown"}[session["mode"]]
             ],
             "required_contracts": ["docs/control-plane-contract.md"],
         }, ensure_ascii=False))
@@ -2801,8 +3009,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     local_artifact: dict[str, Any] = {"status": "not_checked"}
     inventory_gate: dict[str, Any] = {"status": "not_checked"}
     extractor_preparation: dict[str, Any] = {"status": "not_checked"}
-    if policy.get("initial_choice") == "pending":
-        action = "ask_user_for_initial_git_choice"
+    inventory_verified = False
+    queue_pending = False
+    queue = None
     game_roots = [Path(item) for item in config.get("game_roots", [])]
     missing_roots = [str(path) for path in game_roots if not path.exists()]
     if action is None and not game_roots:
@@ -2837,12 +3046,32 @@ def cmd_status(args: argparse.Namespace) -> int:
         except (GameL10nError, OSError, ValueError, json.JSONDecodeError):
             sdk_activation = {"status": "required"}
             action = "activate_selected_sdk_implementation"
+    image_action = {
+        "scope_required": "verify_requested_ui_image_scope",
+        "scope_incomplete": "verify_requested_ui_image_scope",
+        "localization_required": "run_requested_ui_image_localization",
+    }.get(image_localization.get("status"))
+    image_requirements = config.get("extractor_requirements") or {}
+    image_source_metadata = (
+        image_requirements.get("source_metadata", {})
+        if isinstance(image_requirements, dict) else {}
+    )
+    if (
+        sdk_activation.get("status") == "active"
+        and image_localization.get("status") in {"scope_required", "scope_incomplete"}
+        and isinstance(image_source_metadata, dict)
+        and isinstance(image_source_metadata.get("image_candidate_discovery"), dict)
+    ):
+        image_preparation = preparation_state(work_dir, config, active)
+        image_localization["extractor_preparation"] = image_preparation
+        if image_preparation["status"] == "pending":
+            image_action = EXTRACTOR_PREPARATION_ACTION
     if action is None:
         # Existing inventory pairs and downstream checkpoints remain untouched.
         # Every new inventory dispatch independently enforces current readiness.
-        pair_present = all(
-            (work_dir / "inputs" / name).is_file()
-            for name in ("primary-inventory.json", "independent-inventory.json")
+        pair_present = (work_dir / "inputs" / "primary-inventory.json").is_file() and (
+            config.get("coverage", {}).get("require_independent_inventory") is False
+            or (work_dir / "inputs" / "independent-inventory.json").is_file()
         )
         historical_attestation = (work_dir / ".game-l10n" / "inventory-attestation.json").is_file()
         if not pair_present and not historical_attestation:
@@ -2873,6 +3102,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         elif (
             primary_inventory_path.is_file()
             and not independent_inventory_path.is_file()
+            and config.get("coverage", {}).get("require_independent_inventory") is not False
         ):
             action = "extract_independent_source_inventory"
         elif (
@@ -2887,6 +3117,14 @@ def cmd_status(args: argparse.Namespace) -> int:
                 label="INVENTORY_ATTESTATION",
                 expected_schema="parr0t.inventory-attestation.v1",
             )
+            if config.get("coverage", {}).get("require_independent_inventory") is False:
+                try:
+                    inventory_state = require_inventory_attestation(
+                        work_dir, primary_inventory_path, config=config,
+                    )
+                    inventory_issue = None
+                except (GameL10nError, OSError, ValueError, json.JSONDecodeError):
+                    inventory_issue = "PRIMARY_INVENTORY_NOT_VERIFIED"
             if inventory_issue:
                 state_issue_codes.append(inventory_issue)
                 action = "repair_invalid_workspace_state"
@@ -2898,8 +3136,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                     work_dir, config=config, sdk_activation=active
                 )
                 inventory_verified = bool(
-                    inventory_state.get("status") == "static_verified"
-                    and inventory_state.get("static_complete") is True
+                    inventory_state.get("status") in {"static_verified", "primary_only"}
+                    and (inventory_state.get("static_complete") is True
+                         or inventory_state.get("assurance_complete") is True)
                     and isinstance(inventory_state.get("primary_fingerprint"), str)
                     and inventory_state.get("primary_fingerprint")
                     and isinstance(inventory_state.get("primary_path"), str)
@@ -2921,7 +3160,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 else:
                     try:
                         inventory_state = require_inventory_attestation(
-                            work_dir, Path(inventory_state["primary_path"])
+                            work_dir, Path(inventory_state["primary_path"]), config=config,
                         )
                     except (GameL10nError, OSError, ValueError, json.JSONDecodeError):
                         inventory_verified = False
@@ -2973,11 +3212,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                             isinstance(item, dict) and item.get("blocking") is True
                             for item in queue.get("terminal_entries", [])
                         )
-                if action is None and queue_pending:
-                    action = "await_explicit_user_request_to_resume_failure_queue"
-                elif action is None and queue_blocking_terminal:
-                    action = "resolve_blocking_terminal_unresolved"
-                elif action is None:
+                if action is None:
                     context_path = _path_in_workspace(
                         work_dir,
                         config.get("files", {}).get(
@@ -3048,8 +3283,16 @@ def cmd_status(args: argparse.Namespace) -> int:
                         elif result_issue := _completion_result_issue(work_dir, completion):
                             state_issue_codes.append(result_issue)
                             action = "rebuild_current_inventory_translation_attestation"
-                        elif completion.get("static_completion") is not True:
-                            action = "resolve_translation_review_gaps"
+                        elif not (completion.get("assurance_completion", completion["static_completion"])
+                                  or completion.get("incomplete_artifact_authorized")):
+                            terminal_only = (
+                                queue_blocking_terminal and not queue_pending
+                                and completion["target_scope"].get("full_inventory") is True
+                                and completion["semantic_review"].get("complete") is True
+                                and completion["semantic_review"].get("failed_count") == 0
+                            )
+                            action = ("resolve_blocking_terminal_unresolved"
+                                      if terminal_only else "resolve_translation_review_gaps")
                         else:
                             image_status = image_localization.get("status")
                             if image_status == "invalid":
@@ -3058,8 +3301,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                                     for item in image_localization.get("issue_codes", [])
                                 )
                                 action = "repair_invalid_workspace_state"
-                            elif image_status == "scope_required":
-                                action = "verify_requested_ui_image_scope"
+                            elif image_status in {"scope_required", "scope_incomplete"}:
+                                action = image_action
                             elif image_status == "localization_required":
                                 action = "run_requested_ui_image_localization"
                             else:
@@ -3081,6 +3324,42 @@ def cmd_status(args: argparse.Namespace) -> int:
         if extractor_preparation["status"] == "pending":
             action = EXTRACTOR_PREPARATION_ACTION
     action = action or "run_primary_translation_review_pipeline"
+    failure_resume = None
+    if inventory_verified and queue_pending:
+        checkpoint = held_checkpoint_path(work_dir)
+        continuation = None
+        direct_api = effective_execution_mode(config) != CODEX_APP_EXECUTION_MODE and not (
+            config.get("provider_preset") == "custom" and _native_translation_route_plan(config)
+        )
+        if direct_api and checkpoint.is_file():
+            try:
+                continuation = _api_continuation_status(
+                    work_dir, config, read_segments(Path(inventory_state["primary_path"])),
+                    read_translation_results(checkpoint),
+                )
+            except (GameL10nError, OSError, ValueError, TypeError):
+                state_issue_codes.append("FAILURE_QUEUE_CHECKPOINT_REPAIR_REQUIRED")
+        queue = load_failure_queue(
+            work_dir, inventory_state["primary_fingerprint"], continuation_status=continuation,
+        )
+        authorized = [item for item in queue["entries"]
+                      if item.get("retryable") is True
+                      and item.get("continuation_authorized", True) is True
+                      and item.get("continuation_eligible") is True]
+        automatic = config.get("failure_queue", {}).get("automatic_resume", True) and queue.get("paused") is not True
+        failure_resume = {
+            "pending_count": len(queue["entries"]), "authorized_count": len(authorized),
+            "automatic_resume": automatic, "checkpoint": str(held_checkpoint_path(work_dir)),
+            "repair_count": sum(item.get("continuation_eligible") is not True for item in queue["entries"]),
+            "continuations": [{"target_id": item["target_id"], **item.get("continuation", {})}
+                              for item in queue["entries"]],
+        }
+        if direct_api and action in {"run_primary_translation_review_pipeline", "resolve_translation_review_gaps"}:
+            action = (
+                "resume_authorized_failure_queue" if authorized and automatic
+                else "failure_queue_paused" if not automatic
+                else "repair_failure_queue_continuation"
+            )
     if config.get("provider_preset") == "custom" and _native_translation_route_plan(config):
         action = {
             "run_primary_translation_review_pipeline": "run_native_translation_review_pipeline",
@@ -3108,6 +3387,16 @@ def cmd_status(args: argparse.Namespace) -> int:
             elif native_resume["status"] == "invalid":
                 action = "repair_native_checkpoint_metadata"
                 state_issue_codes.extend(native_resume["issue_codes"])
+    parallel_work = []
+    if sdk_activation.get("status") == "active" and image_action and image_action != action:
+        parallel_work.append({
+            "action": image_action,
+            "data_plane_task": _status_data_plane_task(work_dir, image_action),
+            "required_contracts": _status_contracts(image_action),
+            "contract_set": _status_contract_set(
+                contract_base, image_action, int(control_state.get("generation", 0)),
+            ),
+        })
     print(
         json.dumps(
             {
@@ -3141,10 +3430,12 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "local_artifact": local_artifact,
                 "native_resume": native_resume,
                 "inventory_gate": inventory_gate,
+                "failure_queue": failure_resume,
                 "state_issue_codes": state_issue_codes,
                 "data_plane_task": _status_data_plane_task(work_dir, action),
                 "contract_base": contract_base,
                 "next_actions": [action],
+                "parallel_work": parallel_work,
                 "required_contracts": _status_contracts(action),
                 "contract_set": _status_contract_set(
                     contract_base, action, int(control_state.get("generation", 0))
@@ -3273,6 +3564,55 @@ def cmd_verify_sdk_promotion(args: argparse.Namespace) -> int:
     return 0
 
 
+def _prepare_local_package_spec(work_dir: Path, config: dict[str, Any], spec_path: Path) -> Path:
+    spec = json.loads(spec_path.read_text(encoding="utf-8-sig"))
+    if not isinstance(spec, dict) or "local_checkpoint" not in spec:
+        return spec_path
+    if config.get("release_checkpoint", {}).get("required_for_distribution", False):
+        raise ConfigurationError("E_RELEASE_CHECKPOINT_DISTRIBUTION_REQUIRED")
+    if spec.get("checkpoint_file"):
+        raise ConfigurationError("E_RELEASE_CHECKPOINT_AMBIGUOUS: select existing or generated checkpoint")
+    request = spec.pop("local_checkpoint")
+    if not isinstance(request, dict) or set(request) != {"inventory", "results", "ownership"}:
+        raise ConfigurationError("E_LOCAL_CHECKPOINT_REQUEST_INVALID")
+    ownership = request["ownership"]
+    if not isinstance(ownership, dict) or set(ownership) != {"owner", "license"}:
+        raise ConfigurationError("E_LOCAL_CHECKPOINT_OWNERSHIP_REQUIRED")
+    inventory_path = _path_in_workspace(work_dir, request["inventory"], must_exist=True)
+    result_path = _path_in_workspace(work_dir, request["results"], must_exist=True)
+    integrity = _native_review_integrity_options(work_dir, config)
+    project = config.get("project", {})
+    checkpoint, evidence = generate_local_release_integrity(
+        work_dir, inventory_path, read_translation_results(result_path),
+        patch_id=spec["patch_id"], release_id=spec["release_id"],
+        owner=ownership["owner"], license_name=ownership["license"],
+        source_language=project["source_language"], target_language=project["target_language"],
+        review_required=config.get("routing", {}).get("require_review", True),
+        allow_incomplete_artifact=config.get("failure_queue", {}).get("allow_incomplete_artifact", False),
+        **integrity,
+    )
+    directory = work_dir / ".game-l10n" / "local-packages" / stable_hash({
+        "spec": spec, "checkpoint": checkpoint, "evidence": evidence,
+    })
+    directory.mkdir(parents=True, exist_ok=True)
+    spec["checkpoint_file"] = CHECKPOINT_NAME
+    for name, payload in (
+        ("integrity-evidence.json", evidence),
+        (CHECKPOINT_NAME, checkpoint),
+        ("spec.json", spec),
+    ):
+        path = directory / name
+        body = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        if path.exists():
+            if path.read_text(encoding="utf-8") != body:
+                raise ConfigurationError("E_LOCAL_CHECKPOINT_IMMUTABLE")
+        else:
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(body, encoding="utf-8")
+            temporary.replace(path)
+    return directory / "spec.json"
+
+
 def cmd_steam_package(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
@@ -3281,8 +3621,9 @@ def cmd_steam_package(args: argparse.Namespace) -> int:
     require_external_workdir(work_dir, sdk_root)
     result = build_steam_package(
         _path_in_workspace(work_dir, args.payload, must_exist=True),
-        _path_in_workspace(work_dir, args.spec, must_exist=True),
+        _prepare_local_package_spec(work_dir, config, _path_in_workspace(work_dir, args.spec, must_exist=True)),
         _path_in_workspace(work_dir, args.output),
+        required_for_distribution=bool(config.get("release_checkpoint", {}).get("required_for_distribution", False)),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -3307,8 +3648,9 @@ def cmd_filesystem_package(args: argparse.Namespace) -> int:
     require_external_workdir(work_dir, sdk_root)
     result = build_filesystem_package(
         _path_in_workspace(work_dir, args.payload, must_exist=True),
-        _path_in_workspace(work_dir, args.spec, must_exist=True),
+        _prepare_local_package_spec(work_dir, config, _path_in_workspace(work_dir, args.spec, must_exist=True)),
         _path_in_workspace(work_dir, args.output),
+        required_for_distribution=bool(config.get("release_checkpoint", {}).get("required_for_distribution", False)),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -3383,6 +3725,7 @@ def cmd_approve_runtime(args: argparse.Namespace) -> int:
         executable_path=Path(args.executable) if args.executable else None,
         ttl_minutes=ttl_minutes,
         user_confirmed=args.user_confirmed,
+        workflow_reuse=bool(args.workflow_reuse),
     )
     print(
         json.dumps(
@@ -3452,6 +3795,7 @@ def cmd_approve_third_party(args: argparse.Namespace) -> int:
         ttl_minutes=ttl_minutes,
         risk_disclosed=args.risk_disclosed,
         user_confirmed=args.user_confirmed,
+        workflow_reuse=bool(args.workflow_reuse),
     )
     print(
         json.dumps(
@@ -3484,6 +3828,8 @@ def cmd_consume_third_party_approval(args: argparse.Namespace) -> int:
         source=args.source,
         version=args.version,
         digest=args.digest,
+        purpose=args.purpose,
+        data_scope=args.data_scope,
         consume=True,
     )
     print(
@@ -3528,8 +3874,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             if executable and not shutil.which(executable):
                 issues.append(f"provider {provider.get('name')}: command not found: {executable}")
     policy = config.get("repository", {})
-    if policy.get("initial_choice") == "pending":
-        issues.append("repository: initial Git choice is still pending")
     print(
         json.dumps(
             {
@@ -3574,7 +3918,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Read-only source game folder; may be provided more than once",
     )
-    init.add_argument("--git-choice", choices=["pending", "enabled", "disabled"], default="pending")
+    init.add_argument("--git-choice", choices=["pending", "enabled", "disabled"], default="disabled")
+    init.add_argument("--target-language", default="ko", help="Explicit target language for the initialized workspace")
     init.add_argument(
         "--user-confirmed-git-choice",
         action="store_true",
@@ -3588,7 +3933,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["openai-deepseek", "codex-app-deepseek", "custom"],
         default="codex-app-deepseek",
         help=(
-            "OpenAI/DeepSeek APIs, locked Codex App native workers with DeepSeek fallback, "
+            "OpenAI/DeepSeek APIs, native workers with configurable authorized fallback roles, "
             "or a manually configured provider chain"
         ),
     )
@@ -3621,7 +3966,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Record an explicit user request to enable or disable the optional UI-image route",
     )
     image_policy.add_argument("--workspace", required=True)
-    image_policy.add_argument("--mode", choices=["requested", "disabled"], required=True)
+    image_policy.add_argument("--mode", choices=["requested", "inspect", "disabled"], required=True)
     image_policy.add_argument(
         "--scope",
         default="player_visible_ui_text_assets",
@@ -3651,10 +3996,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     image_inventory = sub.add_parser(
         "verify-image-ui-inventory",
-        help="Verify that every optional image target is definite player-visible UI text",
+        help="Verify requested player-visible image text scope and bound assets",
     )
     image_inventory.add_argument("--workspace", required=True)
     image_inventory.add_argument("--inventory", required=True)
+    image_inventory.add_argument(
+        "--candidate-discovery",
+        help="Core-generated workspace image/font candidate discovery JSON",
+    )
     image_inventory.set_defaults(func=cmd_verify_image_ui_inventory)
 
     image_acceptance = sub.add_parser(
@@ -3724,7 +4073,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     resume = sub.add_parser(
         "resume-failures",
-        help="Retry the metadata-only failure queue after a new explicit user request",
+        help="Continue authorized retryable failures without replaying successful targets",
     )
     resume.add_argument("--workspace", required=True)
     resume.add_argument("--input", required=True, help="Current ordered source targets")
@@ -3739,12 +4088,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resume.add_argument("--output", required=True)
     resume.add_argument("--force-context", action="store_true")
-    resume.add_argument(
-        "--user-requested",
-        action="store_true",
-        required=True,
-        help="Assert that the user explicitly requested resuming the saved failure queue",
-    )
     resume.set_defaults(func=cmd_resume_failures)
 
     correction = sub.add_parser(
@@ -3797,7 +4140,13 @@ def build_parser() -> argparse.ArgumentParser:
     correction_ui.add_argument(
         "--agent-task",
         default="translations/user-interpretation-task.json",
-        help="Bounded private task exported for a semantic agent",
+        help="Private batch manifest for bounded semantic-agent tasks",
+    )
+    correction_ui.add_argument(
+        "--agent-task-size",
+        type=int,
+        default=32,
+        help="Positive record bound per exported agent task; default: 32",
     )
     correction_ui.add_argument(
         "--port",
@@ -3874,6 +4223,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Canonical native retry state whose exact pending input, route, "
             "attempt, and content-source policy are inherited"
         ),
+    )
+    native_prepare.add_argument(
+        "--predecessor-receipt",
+        help="Immutable Core receipt proving eligible failure-only continuation after an API block",
     )
     native_prepare.add_argument(
         "--review-tier",
@@ -4058,6 +4411,7 @@ def build_parser() -> argparse.ArgumentParser:
     native_import.add_argument("--workspace", required=True)
     native_import.add_argument("--input", required=True)
     native_import.add_argument("--name", required=True)
+    native_import.add_argument("--model", help="Exact model for a standalone shard without runtime binding")
     native_import.set_defaults(func=cmd_import_native_shard)
 
     native_wave_import = sub.add_parser(
@@ -4165,10 +4519,10 @@ def build_parser() -> argparse.ArgumentParser:
     native_followup.add_argument(
         "--retry-state",
         help=(
-            "Canonical completed native retry state; required by the Codex App preset "
-            "before external fallback"
+            "Canonical retry-state.json or immutable Core cohort lineage.json receipt"
         ),
     )
+    native_followup.add_argument("--exchange-max-records", type=int)
     native_followup.set_defaults(func=cmd_prepare_native_followup)
 
     native_retry_start = sub.add_parser(
@@ -4197,6 +4551,33 @@ def build_parser() -> argparse.ArgumentParser:
     native_retry_advance.add_argument("--results", required=True)
     native_retry_advance.set_defaults(func=cmd_advance_native_translation_retries)
 
+    native_retry_repair = sub.add_parser(
+        "repair-native-translation-retries",
+        help="Bind approved route extensions to operationally unfinished targets only",
+    )
+    native_retry_repair.add_argument("--workspace", required=True)
+    native_retry_repair.add_argument("--state-dir", required=True)
+    native_retry_repair.set_defaults(func=cmd_repair_native_translation_retries)
+
+    native_retry_content = sub.add_parser(
+        "revise-native-retry-content",
+        help="Bind a versioned approved source grant to future unfinished retry work",
+    )
+    native_retry_content.add_argument("--workspace", required=True)
+    native_retry_content.add_argument("--state-dir", required=True)
+    native_retry_content.add_argument("--content-source-grant", required=True)
+    native_retry_content.add_argument("--content-source-scope", required=True)
+    native_retry_content.set_defaults(func=cmd_revise_native_retry_content)
+
+    native_retry_cohort = sub.add_parser(
+        "export-native-translation-retry-cohort",
+        help="Freeze independently ready successes or genuinely exhausted native targets",
+    )
+    native_retry_cohort.add_argument("--workspace", required=True)
+    native_retry_cohort.add_argument("--state-dir", required=True)
+    native_retry_cohort.add_argument("--cohort", choices=["successful", "native_exhausted", "all"], required=True)
+    native_retry_cohort.set_defaults(func=cmd_export_native_retry_cohort)
+
     native_followup_collect = sub.add_parser(
         "collect-native-followup",
         help=(
@@ -4210,6 +4591,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     native_followup_collect.add_argument(
         "--followup", required=True, help="Prepared native follow-up directory"
+    )
+    native_followup_collect.add_argument(
+        "--collect-chain", action="store_true",
+        help="Collect verified predecessor/root successes even when there is only one native follow-up",
+    )
+    native_followup_collect.add_argument(
+        "--successor-followup", action="append", default=[],
+        help="Core-bound successor follow-up directory; repeat in route order to collect the full chain",
     )
     native_followup_collect.add_argument("--review-output", required=True)
     native_followup_collect.add_argument("--unresolved-output", required=True)
@@ -4284,9 +4673,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     exchange_process.add_argument(
-        "--user-requested-retry",
+        "--retry-failures",
         action="store_true",
-        help="Retry previously recorded fallback failures after a new user request",
+        help="Continue eligible recorded failures within the original authorized scope",
     )
     exchange_process.set_defaults(func=cmd_process_translation_exchange)
 
@@ -4315,6 +4704,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exact scope ID bound by --content-source-grant",
     )
     data_plane_prepare.set_defaults(func=cmd_prepare_data_plane_task)
+    data_plane_prepare.add_argument("--inspection-asset", action="append", help="Exact approved local image/font inspection asset")
+    data_plane_prepare.add_argument("--offline-processing", help="Workspace JSON manifest of approved exact offline argv bindings")
 
     extractor_check = sub.add_parser(
         "check-extractor-preparation", help="Run bound local format checks inside the isolated preparation worker",
@@ -4499,7 +4890,7 @@ def build_parser() -> argparse.ArgumentParser:
         "framework-mode", help="Withdraw localization instructions for shutdown or private analysis",
     )
     framework_mode.add_argument("--workspace", required=True)
-    framework_mode.add_argument("--mode", choices=["analysis", "shutdown"], required=True)
+    framework_mode.add_argument("--mode", choices=["pause", "analysis", "shutdown", "localization"], required=True)
     framework_mode.add_argument("--user-requested", action="store_true")
     framework_mode.add_argument("--approval-stdin", action="store_true", help="Private host approval proof on stdin")
     framework_mode.add_argument("--log", action="append", default=[], help="Exact user-approved log file")
@@ -4717,7 +5108,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[
             "translation",
             "rewrite",
-            "review",
+            "triage",
+            "strong_review",
+            "dialogue_review",
+            "terminology_review",
             "localization_context",
             "image_localization",
         ],
@@ -4747,6 +5141,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--executable", help="Exact executable inside the game root; required only for launch"
     )
     approve_runtime.add_argument("--ttl-minutes", type=int)
+    approve_runtime.add_argument("--workflow-reuse", action="store_true", help="Record explicit permission to reuse this exact bounded action")
     approve_runtime.add_argument(
         "--user-confirmed",
         action="store_true",
@@ -4781,6 +5176,7 @@ def build_parser() -> argparse.ArgumentParser:
     approve_third_party.add_argument("--purpose", required=True)
     approve_third_party.add_argument("--data-scope", required=True)
     approve_third_party.add_argument("--ttl-minutes", type=int)
+    approve_third_party.add_argument("--workflow-reuse", action="store_true", help="Record explicit reusable consent for this exact purpose and data scope")
     approve_third_party.add_argument("--risk-disclosed", action="store_true", required=True)
     approve_third_party.add_argument("--user-confirmed", action="store_true", required=True)
     approve_third_party.set_defaults(func=cmd_approve_third_party)
@@ -4797,6 +5193,8 @@ def build_parser() -> argparse.ArgumentParser:
     consume_third_party.add_argument("--source", required=True)
     consume_third_party.add_argument("--version", required=True)
     consume_third_party.add_argument("--digest", required=True)
+    consume_third_party.add_argument("--purpose")
+    consume_third_party.add_argument("--data-scope")
     consume_third_party.set_defaults(func=cmd_consume_third_party_approval)
 
     doctor = sub.add_parser("doctor", help="Check workspace configuration without sending game data")
@@ -4822,6 +5220,16 @@ def main(argv: list[str] | None = None) -> int:
             cmd_framework_mode,
             cmd_diagnostic_log,
             cmd_user_request,
+            cmd_policy,
+            cmd_native_runtime,
+            cmd_configure_native_host,
+            cmd_review_policy,
+            cmd_image_localization_policy,
+            cmd_target_language_policy,
+            cmd_grant_content_source,
+            cmd_approve_third_party,
+            cmd_consume_third_party_approval,
+            cmd_approve_runtime,
         }
         if args.func not in recovery_commands:
             workspace = getattr(args, "workspace", None)

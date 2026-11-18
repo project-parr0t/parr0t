@@ -1,3 +1,7 @@
+import { exactModelSelector } from "./model-catalog.mjs";
+
+export const DEFAULT_REVIEW_FALLBACK_CALLS = 3;
+
 const policies = {
   check: "현재 빌드에서 사용 가능한 한국어가 이미 확인되면 새 번역은 시작하지 마라. 일부 언어 파일만으로 완성된 한국어가 있다고 단정하지 마라.",
   skip: "기존 한국어 패치의 존재 여부 검사를 생략하라. 내장·설치된 한국어의 존재·완성도 확인이나 외부 한국어 패치 검색은 하지 마라. 한국어가 있을 수 있다는 이유로 중단하지 말고 원어부터 번역하라. 검사하지 않은 상태를 ‘한국어 패치 없음’으로 보고하지 마라. 이 옵션은 번역·검수·엔진 및 번역 대상 조사를 생략하는 뜻이 아니다.",
@@ -9,21 +13,26 @@ export function buildPrompt(options = {}) {
     operation = "localize", repositoryUrl = "",
     gameType = "dialogue", koreanPolicy = "check", delivery = "patch",
     fonts = false, images = false, gamePath = "", fallbackModel = "", fallbackAttempts = "",
-    baseModel = "", triageModel = "", strongModel = "", analyzeContext = true, contextModel = "",
+    baseModel = "", triageModel = "", strongModel = "", rewriteModel = "", analyzeContext = true, contextModel = "",
   } = options;
   if (!["localize", "migrate"].includes(operation) || !["dialogue", "logic"].includes(gameType) || !Object.hasOwn(policies, koreanPolicy) || !["patch", "mod"].includes(delivery)) {
     throw new Error("선택 항목을 확인하세요.");
   }
   const model = String(fallbackModel).trim();
-  const attempts = String(fallbackAttempts).trim();
-  if (Boolean(model) !== Boolean(attempts)) throw new Error("폴백 모델과 횟수를 함께 지정하세요.");
+  const requestedAttempts = String(fallbackAttempts).trim();
+  const attempts = requestedAttempts || (model ? String(DEFAULT_REVIEW_FALLBACK_CALLS) : "");
+  if (attempts && !model) throw new Error("횟수를 지정할 폴백 모델을 선택하세요.");
   if (attempts && (!/^\d+$/.test(attempts) || BigInt(attempts) < 1n)) throw new Error("폴백 횟수는 1 이상의 정수로 지정하세요.");
   if (/[\r\n]/.test(model)) throw new Error("모델 ID는 한 줄로 입력하세요.");
-  const roleModels = [["translation", "기초 번역 모델", baseModel], ["triage", "약검수 모델", triageModel], ["strong-review", "강검수 모델", strongModel]];
+  const roleModels = [["translation", "기초 번역 모델", baseModel], ["triage", "약검수 모델", triageModel], ["strong-review", "강검수 모델", strongModel], ["rewrite", "수정 모델", rewriteModel]];
   if (analyzeContext) roleModels.push(["context", "문맥 파악 모델", contextModel]);
   if (roleModels.some(([, , value]) => /[\r\n]/.test(String(value)))) throw new Error("모델 ID는 한 줄로 입력하세요.");
-  const isSol = value => String(value).split("@", 1)[0].split(":", 1)[0].split("/").at(-1) === "gpt-6.1-sol";
-  if (model && isSol(model) && BigInt(attempts) > 2n) throw new Error("Sol 모델의 검수는 최대 2회입니다.");
+  for (const [, label, value] of [...roleModels, ["review-fallback", "폴백 검수 모델", model]]) {
+    const id = String(value).trim();
+    if (id && !exactModelSelector(id)) {
+      throw new Error(`${label}: 폴더 경로나 별칭 대신 정확한 모델 ID를 입력하세요.`);
+    }
+  }
   const reviewLimits = [
     ["triageMaxCalls", "최대 약검수", "triage_max_calls"],
     ["strongMaxCalls", "최대 강검수", "strong_max_calls"],
@@ -35,7 +44,7 @@ export function buildPrompt(options = {}) {
   for (const [key, label, routing] of reviewLimits) {
     const value = String(options[key] ?? "").trim();
     if (!value) continue;
-    if (!/^\d+$/.test(value) || BigInt(value) < 1n || (key.endsWith("Workers") && BigInt(value) > 64n)) throw new Error(`${label} 값을 확인하세요.`);
+    if (!/^\d+$/.test(value) || BigInt(value) < 1n) throw new Error(`${label} 값을 확인하세요.`);
     limitLines.push(`${label}: ${BigInt(value)} (routing.${routing})`);
   }
 
@@ -86,20 +95,20 @@ export function buildPrompt(options = {}) {
     : "문맥 파악: 새 모델 분석 생략. 유효한 기존 문맥 체크포인트와 필수 타입·UI·로직 메타데이터만 재사용하고 새 문맥 모델을 호출하지 마라. 유효한 문맥이 없으면 필수 문맥 게이트를 통과했다고 꾸미지 말고 필요한 입력·승인 경계를 보고하라.");
   if (limitLines.length) sections.push(limitLines.join("\n") + "\n횟수는 대상별 최초 시도를 포함한 상한이다. 전체 검수와 약·강별 동시성 상한 중 작은 값을 적용하고 기존 호스트·모델 안전 상한도 넘지 마라. 지정한 항목만 review-policy로 기록하고 미지정 제한은 기존 설정을 유지하라. 횟수 제한으로 커버리지를 줄이거나 실패를 성공·제외로 바꾸지 마라.");
   if (operation === "localize") sections.push(images
-    ? "이미지 번역: 요청함. 이미지 접근 전에 image-localization-policy --mode requested --user-requested를 기록하고 docs/image-localization.md를 따르라. 텍스트 작업 완료 후 엔진 UI/아틀라스 바인딩 또는 사용자가 지목한 자산에서 시작하여 플레이어 노출 UI의 실제 글자 영역을 시각적으로 확정하라. 확정된 영역만 번역하고 전체 이미지 재귀 스캔·무차별 OCR은 하지 마라. 크기·형식·알파·아틀라스·애니메이션과 글자 영역 밖 픽셀을 보존하고 독립 시각 검수·결정적 검증을 수행하라. 불확실한 자산은 번역 완료로 처리하지 말고 확정 대상이 없으면 no_targets로 텍스트 경로를 계속하라."
-    : "이미지 번역: 요청하지 않음. 이미지 검사·OCR·편집·이미지 번역 계획을 수행하지 마라.");
+    ? "이미지 번역: 요청함. 이미지 접근 전에 image-localization-policy --mode requested --user-requested를 기록하고 docs/image-localization.md를 따르라. 텍스트 완료를 기다리지 말고 엔진 바인딩 또는 사용자가 지목한 UI·CG·배경 자산의 플레이어 노출 글자 영역을 확정하라. 승인된 범위만 검사·번역하고 무차별 OCR은 하지 마라. 크기·형식·알파·아틀라스·애니메이션과 글자 영역 밖 픽셀을 보존하고 독립 시각 검수·결정적 검증을 수행하라. 미검사·불확실한 요청 범위를 no_targets나 완료로 처리하지 마라."
+    : "이미지 번역: 요청하지 않음. 번역·OCR·편집은 하지 마라. 요청한 폰트·레이아웃 검증에 필요한 제한된 시각 검사는 해당 작업 범위에서 허용하되 이미지 번역 승인으로 확대하지 마라.");
   if (operation === "localize" && fonts) {
     sections.push("게임에 맞는 한국어 폰트 설정도 포함하라. 기존 폰트·폴백·아틀라스 바인딩을 조사하고 장르·분위기·화면별 역할에 맞춰 폰트·크기·굵기·자간·줄 간격을 설정하라. 이미 적절한 폰트는 불필요하게 교체하지 마라. 한글·기호·원래 언어의 글리프와 레이아웃을 검증하고, 폰트는 사용·변형·재배포 라이선스가 허용하는 경우에만 필요한 고지와 함께 포함하라. 기존 한국어가 사용 가능해 새 번역을 중단하더라도 요청한 폰트 보완은 수행하라.");
   }
   if (operation === "localize") sections.push(delivery === "mod"
     ? "결과물은 모드 형태로 제작하라. 해당 빌드에서 지원되는 모드·플러그인 인터페이스와 로더 호환 버전을 검증하고, 게임 본체 덮어쓰기나 실행 파일 패치로 임의 전환하지 마라. 활성화·비활성화·제거·원상 복원 절차를 제공하고 게임 본체·원어 리소스를 재배포하지 마라. 로더는 자동 설치하지 마라. 지원 경로가 없으면 제약을 보고하고 DRM·안티치트를 우회하지 마라."
     : "외부 작업 폴더에 적용·복원 정보가 포함된 복원 가능한 패치를 만들어라.");
-  sections.push("Sol 모델을 사용하는 강검수는 대상당 최초 호출을 포함해 최대 2회로 제한하라. 오류·거부 재시도, 수정 후 확인, 분할 재시도와 재개에서도 같은 대상의 횟수를 합산하라. 성공한 대상은 잠그고 다시 검수하지 마라. 번역 재시도 횟수와 혼동하지 마라.");
+  sections.push("검수 횟수는 명시한 대상별 상한과 기존 설정을 따르고 모델 이름으로 추가 상한을 만들지 마라. 최초 호출·오류·거부 재시도·수정 후 확인과 재개에서도 같은 정확한 경로의 호출을 합산하라. 성공한 대상은 잠그고 다시 검수하지 마라.");
   sections.push(model
-    ? `폴백 검수 모델: ${model}\n폴백 검수 최대 횟수: ${BigInt(attempts)}회 (대상당 최초 호출 포함). 이 사전 지정 값을 preset 기본값보다 우선하여 보존하고 같은 값을 다시 묻지 마라.\n폴백 모델과 대상별 총 호출 횟수를 함께 바인딩하라:\ngame-l10n review-policy --workspace <workspace> --fallback-model ${JSON.stringify(model)} --max-calls ${BigInt(attempts)} --user-requested\n기존 기본 DeepSeek 모델과 일치하는지 확인하는 데 그치지 마라. 현재 네이티브 preset/호스트의 허용된 review-fallback 역할이면 native-review-fallback으로 정확히 바인딩하고, 호스트·허용 전송이 호환되지 않거나 아직 바인딩되지 않았으면 요청한 모델과 횟수를 보존한 pending으로 유지하라. 네이티브 요청 모델을 DeepSeek API에 대신 보내지 마라.`
-    : "사전 템플릿·사용자 요청에 폴백 검수 모델과 횟수가 이미 지정되어 있으면 그 값을 그대로 따르고 다시 묻지 마라. 누락된 값만 폴백 사용 전에 사용자에게 확인하라. 임의의 모델·횟수를 기본값으로 채우지 마라.");
+    ? `폴백 검수 모델: ${model}\n폴백 검수 최대 횟수: ${requestedAttempts ? `${BigInt(attempts)}회` : `기존 명시 상한 유지, 없으면 ${DEFAULT_REVIEW_FALLBACK_CALLS}회`} (대상당 최초 호출 포함). 명시 값을 preset 기본값보다 우선하여 보존하고 같은 값을 다시 묻지 마라.\n폴백 모델과 대상별 총 호출 정책을 기록하라:\ngame-l10n review-policy --workspace <workspace> --fallback-model ${JSON.stringify(model)}${requestedAttempts ? ` --max-calls ${BigInt(attempts)}` : ""} --user-requested\n기존 기본 DeepSeek 모델과 일치하는지 확인하는 데 그치지 마라. 현재 네이티브 preset/호스트의 허용된 review-fallback 역할이면 native-review-fallback으로 정확히 바인딩하고, 호스트·허용 전송이 호환되지 않거나 아직 바인딩되지 않았으면 요청한 모델과 횟수를 보존한 pending으로 유지하라. 네이티브 요청 모델을 DeepSeek API에 대신 보내지 마라.`
+    : `명시한 폴백 모델·횟수는 기존 기본값보다 우선하고 다시 묻지 마라. 횟수를 생략한 폴백 경로는 문서화된 기본값 ${DEFAULT_REVIEW_FALLBACK_CALLS}회(대상당 최초 호출 포함)를 사용한다. 호스트·전송·제공자 역할의 승인 경계는 유지하고 임의의 모델로 대체하지 마라.`);
   if (options.fallbackViaOpenCodex && model) sections.push("폴백 모델은 감지된 OpenCodex 프록시 카탈로그에서 선택했다. 정확한 모델 ID와 허용된 프록시 경로를 보존하고 직접 API나 다른 모델로 몰래 전환하지 마라. 카탈로그 표시는 실제 가용성·모델 호출 권한의 증거가 아니므로 실행 전 바인딩과 지원 여부를 검증하라.");
-  sections.push("폴백은 성공을 보존한 채 실패한 항목에만 적용하라. 설정 누락·호스트 미바인딩·호환되지 않는 전송은 모델 실패·거부·경로 소진·source_preserved가 아니며, 정확한 요청을 보존한 pending으로 유지하라. preset의 모델 기본값보다 명시 선택을 우선하되 기록된 네이티브 역할 모델 재정의만 좁은 예외로 적용하고, provider mode·제공자 역할 권한·허용 경로는 바꾸지 마라. Git·제공자 설정의 기존 승인과 정책을 보존하라. 별도 승인 없이 커밋·푸시·릴리스 게시나 실제 게임 설치·실행을 하지 말고, 로컬 결과물과 검증 범위를 먼저 보고하라.");
+  sections.push("폴백은 성공을 보존한 채 실패한 항목에만 적용하라. 설정 누락·호스트 미바인딩·호환되지 않는 전송은 모델 실패·거부·경로 소진·source_preserved가 아니며 정확한 요청을 보존하라. preset은 초기 기본값이며 명시한 역할 모델·경로·재시도 횟수가 우선한다. 전송·자격 증명·제공자 역할의 승인 경계와 시작된 워커의 정확한 바인딩은 유지하라. 모델 인수는 정확한 argv 값으로 전달하고 셸 문자열로 해석하지 마라. 확인된 제공자·가드 운영 오류는 원래 증거를 보존하고 코어가 만든 새 manifest의 이미 승인된 다음 경로로 미완료 항목만 진행하라. 실제 사용자 중지와 변경된 작업 범위의 승인 경계는 지켜라. 별도 승인 없이 커밋·푸시·릴리스 게시나 실제 게임 설치·실행을 하지 말고 로컬 결과물과 검증 범위를 먼저 보고하라.");
   if (String(gamePath).trim()) sections.push(`게임 폴더:\n${String(gamePath).trim()}`);
   else if (operation === "localize") sections.push("게임 폴더는 이 요청에 첨부한 폴더를 사용하라.");
   return sections.join("\n\n") + "\n";

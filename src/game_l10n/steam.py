@@ -358,10 +358,10 @@ def _readme(manifest: dict[str, Any]) -> bytes:
         "3. 화면에서 설치, 복원 또는 설치 상태 확인을 선택합니다.\n\n"
         "설치기는 Steam 게임 위치를 자동으로 찾고, 찾지 못하면 게임 폴더를 물어봅니다.\n"
         "사용자가 메뉴에서 선택하고 최종 확인한 작업은 별도의 Parr0t 승인 파일이 필요하지 않습니다.\n"
-        "에이전트나 스크립트의 비대화형 설치/복원만 별도의 일회성 승인이 필요합니다.\n"
+        "에이전트나 스크립트의 비대화형 설치/복원은 정확한 작업 범위 승인이 필요하며, 명시적으로 허용된 경우에만 만료 전 재사용할 수 있습니다.\n"
         f"설치 상태와 패치 ID는 게임 폴더의 {STATUS_FILE_NAME}에서 확인합니다.\n"
         "설치기는 이 패치의 영수증에 기록된 파일만 관리하며 다른 게임 파일은 변경하지 않습니다.\n"
-        f"{CHECKPOINT_NAME}은 향후 번역 수정과 게임 업데이트 대응을 위한 배포 체크포인트입니다.\n"
+        f"{CHECKPOINT_NAME}은 배포 무결성을 기록하며, 전체 체크포인트 모드는 향후 업데이트 정보도 포함합니다.\n"
     )
     return text.encode("utf-8")
 
@@ -373,7 +373,10 @@ def _zip_entry(archive: zipfile.ZipFile, name: str, data: bytes) -> None:
     archive.writestr(info, data)
 
 
-def build_steam_package(payload_root: Path, spec_path: Path, output_path: Path) -> dict[str, Any]:
+def build_steam_package(
+    payload_root: Path, spec_path: Path, output_path: Path, *,
+    required_for_distribution: bool = True,
+) -> dict[str, Any]:
     payload_root = payload_root.resolve()
     spec_path = spec_path.resolve()
     output_path = output_path.resolve()
@@ -403,6 +406,10 @@ def build_steam_package(payload_root: Path, spec_path: Path, output_path: Path) 
         )
     except ReleaseCheckpointError as error:
         raise SteamPackageError(str(error)) from error
+    if not isinstance(required_for_distribution, bool):
+        raise SteamPackageError("required_for_distribution must be boolean")
+    if required_for_distribution and checkpoint["schema"] != CHECKPOINT_SCHEMA:
+        raise SteamPackageError("Distribution requires a full future-update release checkpoint")
     manifest["checkpoint"] = {
         "path": CHECKPOINT_NAME,
         "schema": checkpoint["schema"],
@@ -478,14 +485,14 @@ def validate_steam_package(package_path: Path) -> dict[str, Any]:
             raise SteamPackageError("Package manifest schema is not supported")
         checkpoint_contract = manifest.get("checkpoint")
         checkpoint_bytes = archive.read(CHECKPOINT_NAME)
+        checkpoint = json.loads(checkpoint_bytes.decode("utf-8"))
         if not isinstance(checkpoint_contract, dict) or checkpoint_contract != {
             "path": CHECKPOINT_NAME,
-            "schema": CHECKPOINT_SCHEMA,
+            "schema": checkpoint.get("schema") if isinstance(checkpoint, dict) else None,
             "bytes": len(checkpoint_bytes),
             "sha256": _sha256(checkpoint_bytes),
         }:
             raise SteamPackageError("Package release checkpoint binding is invalid")
-        checkpoint = json.loads(checkpoint_bytes.decode("utf-8"))
         try:
             validate_release_checkpoint(
                 checkpoint,

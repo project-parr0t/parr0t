@@ -10,14 +10,117 @@ from dataclasses import asdict
 from pathlib import Path
 
 from game_l10n.formats import read_segments, read_translation_results
-from game_l10n.native_pass import import_native_wave, prepare_native_tasks
+from game_l10n.native_pass import import_native_wave
 from game_l10n.native_review import collect_native_review
-from tests.test_native_pass import review_segment
+from tests.test_native_pass import review_segment, prepare_native_tasks, write_semantic_result_rows
 from game_l10n.orchestrator import OrchestratorConfig
 
-from tests import write_semantic_result_rows
 
 class NativeReviewTests(unittest.TestCase):
+    def test_explicit_review_budget_does_not_reset_when_candidate_generation_advances(self):
+        from game_l10n.models import AttemptRecord
+        from game_l10n.native_review import _bound_result, _pending_segment, partition_native_review_routes
+        segment = review_segment("same-task-new-candidate")
+        result = _bound_result(segment)
+        result.attempts = [
+            AttemptRecord("review", "configured", "rewrite", ordinal=3,
+                          model="fixture/exact", candidate_generation=0, operational=False),
+        ]
+        groups = partition_native_review_routes(
+            [_pending_segment(segment, result)], ["configured"], stage="review",
+            route_models={"configured": "fixture/exact"}, attempt_limits={"configured": 3},
+        )
+        self.assertEqual(list(groups), [""])
+
+    def test_new_exact_model_under_same_role_is_not_suppressed_by_old_failure_or_rewrite(self):
+        from game_l10n.models import AttemptRecord
+        from game_l10n.native_review import _bound_result, _pending_segment, partition_native_review_routes
+        segment = review_segment("changed-model")
+        result = _bound_result(segment)
+        result.attempts = [
+            AttemptRecord("review", "configured-role", "error", ordinal=ordinal,
+                          model="fixture/old", candidate_generation=1)
+            for ordinal in (1, 2)
+        ]
+        groups = partition_native_review_routes(
+            [_pending_segment(segment, result)], ["configured-role"], stage="review",
+            route_models={"configured-role": "fixture/new"},
+            attempt_limits={"configured-role": 2},
+        )
+        self.assertEqual(list(groups), ["configured-role"])
+        result.attempts = [AttemptRecord(
+            "review-rewrite", "configured-role", "success", model="fixture/old", candidate_generation=1,
+        )]
+        groups = partition_native_review_routes(
+            [_pending_segment(segment, result)], ["configured-role"], stage="review-rewrite",
+            route_models={"configured-role": "fixture/new"},
+        )
+        self.assertEqual(list(groups), ["configured-role"])
+
+    def test_mixed_pending_routes_partition_by_configured_policy_not_model_name(self):
+        from game_l10n.models import AttemptRecord
+        from game_l10n.native_review import _bound_result, _pending_segment, partition_native_review_routes
+        routes = ["native-sol", "native-configured", "external-configured"]
+        segments = []
+        for name, attempts in (("primary", []), ("secondary", [("native-sol", "error")]),
+                               ("external", [("native-sol", "error"), ("native-configured", "error")]),
+                               ("exhausted", [(route, "error") for route in routes])):
+            segment = review_segment(name)
+            result = _bound_result(segment)
+            result.attempts = [AttemptRecord("review", route, status, candidate_generation=1)
+                               for route, status in attempts]
+            segments.append(_pending_segment(segment, result))
+        groups = partition_native_review_routes(segments, routes, stage="review")
+        self.assertEqual(list(groups), [*routes, ""])
+        self.assertEqual([[s.id for s in group] for group in groups.values()],
+                         [["primary"], ["secondary"], ["external"], ["exhausted"]])
+        segment = review_segment("configured-four-calls")
+        result = _bound_result(segment)
+        result.attempts = [AttemptRecord("review", "native-sol", "rewrite", ordinal=3,
+                                        candidate_generation=1)]
+        groups = partition_native_review_routes(
+            [_pending_segment(segment, result)], routes, stage="review",
+            attempt_limits={"native-sol": 4},
+        )
+        self.assertEqual(list(groups), ["native-sol"])
+
+    def test_completed_review_cohort_progresses_while_sibling_wave_is_pending(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            segments = [review_segment("ready"), review_segment("pending")]
+            source.write_text("".join(json.dumps(asdict(s)) + "\n" for s in segments))
+            segments = read_segments(source)
+            tasks, results = root / "tasks", root / "results"
+            prepare_native_tasks(
+                root, source, segments, tasks, pass_kind="review",
+                max_records=1, max_workers=1,
+                route_binding={"provider": "native-configured", "model": "exact-model", "attempt": 1},
+            )
+            results.mkdir()
+            write_semantic_result_rows(results / "task-0001.jsonl", [{
+                "target_id": "ready", "status": "success", "text": "OK",
+                "provider": "native-configured",
+            }])
+            import_native_wave(root, tasks / "manifest.json", results, 1)
+            summary = collect_native_review(
+                root, source, tasks / "manifest.json", root / "collected", tier="strong"
+            )
+            self.assertEqual(summary["accepted"], 1)
+            self.assertEqual(summary["awaiting"], 1)
+            self.assertFalse(summary["complete"])
+            self.assertEqual([s.id for s in read_segments(root / "collected/awaiting-input.jsonl")],
+                             ["pending"])
+            approved = read_translation_results(root / "collected/accepted.json")[0]
+            self.assertEqual(approved.reviewer, "native-configured")
+            self.assertEqual(approved.attempts[0].model, "exact-model")
+            accepted_bytes = (root / "collected/accepted.json").read_bytes()
+            self.assertEqual(collect_native_review(
+                root, source, tasks / "manifest.json", root / "collected", tier="strong"
+            ), summary)
+            self.assertEqual((root / "collected/accepted.json").read_bytes(), accepted_bytes)
+            self.assertEqual(len(approved.attempts), 1)
+
     def test_delivery_preserves_failures_and_only_includes_pending_when_authorized(self):
         from game_l10n.models import AttemptRecord, TranslationResult
         from game_l10n.formats import write_results
@@ -395,19 +498,21 @@ class NativeReviewTests(unittest.TestCase):
             calls = []
             def judge(result, *args):
                 calls.append("judge")
-                result.attempts.append(AttemptRecord("review", "deepseek", "approved", candidate_generation=1))
+                result.attempts.append(AttemptRecord("review", "native-looking-adapter", "approved", candidate_generation=1))
                 return ReviewVerdictEnvelope(ReviewVerdict.OK)
             fake = SimpleNamespace(
                 registry=SimpleNamespace(get=lambda name: SimpleNamespace(name=name, fingerprint=lambda: {"name": name})),
                 context_pack=ContextPack(), glossary=[], project=SimpleNamespace(target_language=""),
-                config=OrchestratorConfig(["deepseek"], ["deepseek"], require_review=False,
-                                          review_attempt_limits={"deepseek": 1}),
+                config=OrchestratorConfig(["native-looking-adapter"], ["native-looking-adapter"], require_review=False,
+                                          review_attempt_limits={"native-looking-adapter": 1},
+                                          rewriter_chain=["native-looking-adapter"]),
                 _judge_with_refusal_retry=judge,
             )
             first = process_native_review_followup(root, source, root / "out", fake,
-                                                   operation="judge", deadline_epoch=time.time()+60)
+                                                   operation="judge", deadline_epoch=time.time()+60,
+                                                   primary_review_provider="native-sol")
             second = process_native_review_followup(root, source, root / "out", fake,
-                                                    operation="judge")
+                                                    operation="judge", primary_review_provider="native-sol")
             self.assertEqual(first["accepted"], 1)
             self.assertEqual(second["executed"], 0)
             self.assertEqual(second["deadline_pending"], 0)
@@ -417,18 +522,231 @@ class NativeReviewTests(unittest.TestCase):
             source = root / "rewrite.jsonl"
             source.write_text(json.dumps(asdict(_pending_segment(base, result))) + "\n")
             def rewrite(result, *args):
-                result.attempts.append(AttemptRecord("review-rewrite", "deepseek", "success", candidate_generation=1))
+                result.attempts.append(AttemptRecord("review-rewrite", "native-looking-adapter", "success", candidate_generation=1))
                 return AgentEnvelope(AgentStatus.SUCCESS, "REVISED")
             fake._rewrite_with_refusal_retry = rewrite
             fake._set_candidate = LocalizationOrchestrator._set_candidate
             summary = process_native_review_followup(root, source, root / "rewrite-out", fake,
-                                                     operation="rewrite", deadline_epoch=time.time()+60)
+                                                     operation="rewrite", deadline_epoch=time.time()+60,
+                                                     primary_review_provider="native-sol")
             self.assertEqual(summary["accepted"], 0)
             self.assertEqual(summary["confirmation_pending"], 1)
             confirmation = read_segments(root / "rewrite-out/confirmation-input.jsonl")[0]
             binding = confirmation.metadata["_parr0t_candidate"]
             self.assertEqual(binding["generation"], 2)
             self.assertEqual(binding["digest"], stable_hash("REVISED"))
+
+    @staticmethod
+    def _followup_fixture(root, *, operation, attempts, routes, response):
+        from game_l10n.models import AttemptRecord, ContextPack
+        from game_l10n.native_review import _bound_result, _pending_segment
+        from game_l10n.orchestrator import LocalizationOrchestrator
+        base = review_segment("fixture")
+        result = _bound_result(base)
+        result.attempts = [
+            AttemptRecord("review", "configured-primary",
+                          "error" if operation == "judge" else "rewrite", candidate_generation=1),
+            *attempts,
+        ]
+        if operation == "rewrite":
+            result.metadata["rewrite_issues"] = ["voice"]
+        source = root / "input.jsonl"
+        source.write_text(json.dumps(asdict(_pending_segment(base, result))) + "\n", encoding="utf-8")
+        (root / "game-l10n.json").write_text(json.dumps({
+            "routing": {"reviewers": ["configured-primary", *routes]},
+        }), encoding="utf-8")
+        fake = SimpleNamespace(
+            registry=SimpleNamespace(get=lambda name: SimpleNamespace(
+                name=name, fingerprint=lambda: {"name": name})),
+            context_pack=ContextPack(), glossary=[], project=SimpleNamespace(target_language=""),
+            config=OrchestratorConfig(
+                routes, routes, require_review=False,
+                review_attempt_limits={route: 1 for route in routes}, rewriter_chain=routes,
+            ),
+            _judge_with_refusal_retry=response, _rewrite_with_refusal_retry=response,
+            _set_candidate=LocalizationOrchestrator._set_candidate,
+        )
+        return source, fake
+
+    def test_failed_rewrite_advances_to_next_route_and_locks_confirmation_cache(self):
+        from game_l10n.models import AgentEnvelope, AgentStatus, AttemptRecord
+        from game_l10n.native_review import _bound_result, process_native_review_followup
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calls = []
+            def rewrite(result, provider, *args):
+                calls.append(provider.name)
+                result.attempts.append(AttemptRecord(
+                    "review-rewrite", provider.name, "success", candidate_generation=1))
+                return AgentEnvelope(AgentStatus.SUCCESS, "REVISED")
+            source, fake = self._followup_fixture(root, operation="rewrite", attempts=[
+                AttemptRecord("review-rewrite", "external-a", "error", candidate_generation=1),
+                AttemptRecord("review-rewrite", "external-b", "error", candidate_generation=0),
+            ], routes=["external-a", "external-b"], response=rewrite)
+            original = source.read_bytes()
+            first = process_native_review_followup(root, source, root / "out", fake, operation="rewrite")
+            self.assertEqual((first["executed"], first["accepted"], first["confirmation_pending"]), (1, 0, 1))
+            confirmation = read_segments(root / "out/confirmation-input.jsonl")[0]
+            candidate = _bound_result(confirmation)
+            self.assertEqual((candidate.text, candidate.candidate_generation), ("REVISED", 2))
+            self.assertEqual(confirmation.metadata["_parr0t_candidate"]["provider"], "external-b")
+            snapshots = {name: (root / "out" / name).read_bytes() for name in
+                         ("results.json", "accepted.json", "confirmation-input.jsonl")}
+            second = process_native_review_followup(root, source, root / "out", fake, operation="rewrite")
+            self.assertEqual((second["executed"], second["confirmation_pending"]), (0, 1))
+            self.assertEqual(calls, ["external-b"])
+            self.assertEqual(source.read_bytes(), original)
+            for name, content in snapshots.items():
+                self.assertEqual((root / "out" / name).read_bytes(), content)
+
+    def test_failed_followup_cache_advances_then_exhausts_without_replay(self):
+        from game_l10n.models import AttemptRecord
+        from game_l10n.native_review import _bound_result, process_native_review_followup
+        for operation in ("judge", "rewrite"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                calls = []
+                def fail(result, provider, *args):
+                    calls.append(provider.name)
+                    result.attempts.append(AttemptRecord(
+                        "review" if operation == "judge" else "review-rewrite",
+                        provider.name, "error", candidate_generation=result.candidate_generation))
+                    return None
+                source, fake = self._followup_fixture(root, operation=operation, attempts=[],
+                    routes=["external-a", "external-b"], response=fail)
+                for expected in (1, 1, 0, 0):
+                    summary = process_native_review_followup(
+                        root, source, root / "out", fake, operation=operation)
+                    self.assertEqual((summary["executed"], summary["unresolved"], summary["accepted"]),
+                                     (expected, 1, 0))
+                self.assertEqual(calls, ["external-a", "external-b"])
+                pending = _bound_result(read_segments(root / "out/unresolved-input.jsonl")[0])
+                self.assertEqual(pending.text, "T")
+                self.assertEqual(pending.candidate_generation, 1)
+                self.assertFalse(pending.acceptance_authority)
+                self.assertEqual([a.provider for a in pending.attempts[-2:]], calls)
+
+    def test_exhausted_rewrite_history_stays_pending_without_provider_lookup(self):
+        from game_l10n.models import AttemptRecord
+        from game_l10n.native_review import process_native_review_followup
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, fake = self._followup_fixture(root, operation="rewrite", attempts=[
+                AttemptRecord("review-rewrite", route, "error", candidate_generation=1)
+                for route in ("external-a", "external-b")
+            ], routes=["external-a", "external-b"], response=None)
+            def unexpected(route):
+                self.fail("exhausted rewrite must not resolve another provider")
+            fake.registry.get = unexpected
+            summary = process_native_review_followup(root, source, root / "out", fake, operation="rewrite")
+            self.assertEqual((summary["executed"], summary["unresolved"], summary["accepted"]), (0, 1, 0))
+            self.assertEqual(read_translation_results(root / "out/accepted.json"), [])
+
+    def test_judge_preserves_external_then_native_route_order(self):
+        from game_l10n.errors import ConfigurationError
+        from game_l10n.models import AttemptRecord
+        from game_l10n.native_review import process_native_review_followup
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calls = []
+            def fail(result, provider, *args):
+                calls.append(provider.name)
+                result.attempts.append(AttemptRecord(
+                    "review", provider.name, "error", candidate_generation=1))
+                return None
+            source, fake = self._followup_fixture(root, operation="judge", attempts=[],
+                routes=["external-a", "native-second", "external-b"], response=fail)
+            get = fake.registry.get
+            def provider(route):
+                if route == "native-second":
+                    raise ConfigurationError("native route")
+                return get(route)
+            fake.registry.get = provider
+            first = process_native_review_followup(root, source, root / "out", fake, operation="judge")
+            self.assertEqual(first["executed"], 1)
+            saved = (root / "out/results.json").read_bytes()
+            with self.assertRaisesRegex(ValueError, "NATIVE_FALLBACK_REQUIRED"):
+                process_native_review_followup(root, source, root / "out", fake, operation="judge")
+            self.assertEqual(calls, ["external-a"])
+            self.assertEqual((root / "out/results.json").read_bytes(), saved)
+
+    def test_default_primary_uses_configured_role_and_current_generation_only(self):
+        from game_l10n.models import AttemptRecord
+        from game_l10n.native_review import _bound_result, _pending_segment, process_native_review_followup
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, fake = self._followup_fixture(root, operation="judge", attempts=[],
+                routes=["external-a"], response=None)
+            base = read_segments(source)[0]
+            result = _bound_result(base)
+            for provider, generation in (("foreign-primary", 1), ("configured-primary", 0)):
+                result.attempts = [AttemptRecord("review", provider, "error", candidate_generation=generation)]
+                source.write_text(json.dumps(asdict(_pending_segment(base, result))) + "\n", encoding="utf-8")
+                with self.subTest(provider=provider), self.assertRaisesRegex(ValueError, "PRIMARY_BARRIER_REQUIRED"):
+                    process_native_review_followup(root, source, root / "wrong", fake,
+                        operation="judge", deadline_epoch=0)
+                if generation == 1:
+                    explicit = process_native_review_followup(root, source, root / "explicit", fake,
+                        operation="judge", deadline_epoch=0, primary_review_provider=provider)
+                    self.assertEqual((explicit["executed"], explicit["unresolved"]), (0, 1))
+            result.attempts = [
+                AttemptRecord("review", "configured-primary", "rewrite", ordinal=4, candidate_generation=0),
+                AttemptRecord("review", "configured-primary", "rewrite", candidate_generation=1),
+            ]
+            source.write_text(json.dumps(asdict(_pending_segment(base, result))) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "FALLBACK_NOT_FAILED"):
+                process_native_review_followup(root, source, root / "limit", fake,
+                    operation="judge", deadline_epoch=0, primary_review_limit=2)
+            result.attempts[-1].ordinal = 2
+            source.write_text(json.dumps(asdict(_pending_segment(base, result))) + "\n", encoding="utf-8")
+            summary = process_native_review_followup(root, source, root / "limit", fake,
+                operation="judge", deadline_epoch=0, primary_review_limit=2)
+            self.assertEqual((summary["executed"], summary["unresolved"]), (0, 1))
+            (root / "game-l10n.json").write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "PRIMARY_BARRIER_REQUIRED"):
+                process_native_review_followup(root, source, root / "unbound", fake,
+                    operation="judge", deadline_epoch=0, primary_review_limit=2)
+            explicit = process_native_review_followup(root, source, root / "bound", fake,
+                operation="judge", deadline_epoch=0, primary_review_limit=2,
+                primary_review_provider="configured-primary")
+            self.assertEqual((explicit["executed"], explicit["unresolved"]), (0, 1))
+
+    def test_independent_accepted_followup_stays_immutable_while_sibling_advances(self):
+        from dataclasses import replace
+        from game_l10n.models import AttemptRecord, ReviewVerdict, ReviewVerdictEnvelope
+        from game_l10n.native_review import process_native_review_followup
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calls = []
+            def judge(result, provider, *args):
+                calls.append((result.segment_id, provider.name))
+                approved = result.segment_id == "ready" or provider.name == "external-b"
+                result.attempts.append(AttemptRecord(
+                    "review", provider.name, "approved" if approved else "error",
+                    candidate_generation=result.candidate_generation))
+                return ReviewVerdictEnvelope(ReviewVerdict.OK) if approved else None
+            source, fake = self._followup_fixture(root, operation="judge", attempts=[],
+                routes=["external-a", "external-b"], response=judge)
+            segment = read_segments(source)[0]
+            source.write_text("".join(
+                json.dumps(asdict(replace(segment, id=target))) + "\n"
+                for target in ("ready", "pending")
+            ), encoding="utf-8")
+            original = source.read_bytes()
+            first = process_native_review_followup(root, source, root / "out", fake, operation="judge")
+            self.assertEqual((first["executed"], first["accepted"], first["unresolved"]), (2, 1, 1))
+            ready = read_translation_results(root / "out/results.json")[0].to_dict()
+            second = process_native_review_followup(root, source, root / "out", fake, operation="judge")
+            self.assertEqual((second["executed"], second["accepted"], second["unresolved"]), (1, 2, 0))
+            self.assertEqual(read_translation_results(root / "out/results.json")[0].to_dict(), ready)
+            self.assertEqual(calls.count(("ready", "external-a")), 1)
+            self.assertEqual([provider for target, provider in calls if target == "pending"],
+                             ["external-a", "external-b"])
+            cache = (root / "out/results.json").read_bytes()
+            third = process_native_review_followup(root, source, root / "out", fake, operation="judge")
+            self.assertEqual((third["executed"], third["accepted"]), (0, 2))
+            self.assertEqual((root / "out/results.json").read_bytes(), cache)
+            self.assertEqual(source.read_bytes(), original)
 
     def test_review_followup_cli_does_not_require_a_time_ceiling(self) -> None:
         from game_l10n.cli import build_parser, cmd_process_native_review_followup
@@ -463,13 +781,15 @@ class NativeReviewTests(unittest.TestCase):
                                           review_attempt_limits={"deepseek": 1}),
                 _judge_with_refusal_retry=judge,
             )
-            summary = process_native_review_followup(root, source, root / "out", fake, operation="judge")
+            summary = process_native_review_followup(root, source, root / "out", fake,
+                operation="judge", primary_review_provider="native-sol")
             # A cache written before the gate existed: the same row stored as approved.
             cache = root / "out" / "results.json"
             rows = json.loads(cache.read_text(encoding="utf-8"))
             rows["results"][0]["status"] = "reviewed"
             cache.write_text(json.dumps(rows), encoding="utf-8")
-            resumed = process_native_review_followup(root, source, root / "out", fake, operation="judge")
+            resumed = process_native_review_followup(root, source, root / "out", fake,
+                operation="judge", primary_review_provider="native-sol")
         self.assertEqual(summary["accepted"], 0)
         self.assertEqual(summary["rewrite_pending"], 1)
         self.assertEqual((resumed["executed"], resumed["accepted"], resumed["rewrite_pending"]), (0, 0, 1))

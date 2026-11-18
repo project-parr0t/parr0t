@@ -153,6 +153,12 @@ def record_target_language_policy(
         raise ConfigurationError("E_LANGUAGE_POLICY_INVALID: project is missing")
     current = target_language_policy(work_dir)
     normalized = normalize_language_tag(target_language, field="target_language")
+    if (
+        current["authorization"] == "explicit_user_request"
+        and current["target_language"] == normalized
+        and config["project"].get("target_language") == normalized
+    ):
+        return {**current, "policy_digest": language_policy_digest(current)}
     policy = {
         "schema": LANGUAGE_POLICY_SCHEMA,
         "target_language": normalized,

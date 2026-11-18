@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
 from game_l10n.formats import read_segments
 from game_l10n.models import Segment
@@ -26,6 +27,110 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 class NativeFollowupTests(unittest.TestCase):
+    def test_frozen_subset_keeps_root_lineage_and_historical_success_policy(self) -> None:
+        from game_l10n.content_source_policy import (
+            content_source_policy, create_content_source_grant, direct_model_provenance,
+        )
+        from game_l10n.store import stable_hash_sequence
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segments = [Segment("old-success", "S"), Segment("new-failure", "S")]
+            source, primary = root / "cohort-source.jsonl", root / "cohort-results.jsonl"
+            _write_jsonl(source, [asdict(segment) for segment in segments])
+            for scope in ("historical", "active"):
+                create_content_source_grant(
+                    root, authority="explicit_user", scope_id=scope,
+                    task_kinds=["translation"], routes=["native-pass:translation"],
+                    external_sources=[f"synthetic://fixture/{scope}"], user_confirmed=True,
+                )
+            old_policy = content_source_policy(
+                root, task_kind="translation", route="native-pass:translation", scope_id="historical"
+            )
+            active_policy = content_source_policy(
+                root, task_kind="translation", route="native-pass:translation", scope_id="active"
+            )
+            plan = [{"provider": "native-configured", "model": "exact-model", "max_retries": 0}]
+            lineage = {"source_fingerprint": "different-root-fingerprint",
+                       "content_source_policy_digest": old_policy["policy_digest"]}
+            cohort = {"schema": "parr0t.native-translation-retry-cohort.v1",
+                      "source_fingerprint": stable_hash_sequence(asdict(segment) for segment in segments)}
+            _write_jsonl(primary, [
+                {"target_id": "old-success", "status": "success", "text": "T",
+                 "candidate_generation": 1, "candidate_digest": stable_hash("T"),
+                 "provider": "native-configured",
+                 "content_provenance": direct_model_provenance(old_policy, "exact-model", route="native-configured")},
+                {"target_id": "new-failure", "status": "error", "text": "", "provider": "native-configured"},
+            ])
+            verified = {"cohort_lineage": cohort, "content_source_policies": [old_policy, active_policy],
+                        "primary_lineage": lineage, "route_plan": plan}
+            with patch("game_l10n.native_translation_retry.verify_native_translation_retry_cohort",
+                       return_value=verified) as verify:
+                result = prepare_native_followup(
+                    root, source, segments, primary, root / "followup", exchange_prefix="cohort",
+                    content_source_policy=active_policy, retry_lineage=lineage,
+                    retry_route_plan=plan, cohort_lineage=cohort,
+                )
+                verify.assert_called_once_with(root, cohort, source_path=source, results_path=primary)
+            self.assertEqual((result["candidate_count"], result["fallback_count"]), (1, 1))
+            candidate = read_segments(root / result["primary_candidates"])[0].metadata[CANDIDATE_METADATA_KEY]
+            self.assertEqual(candidate["content_provenance"]["policy_digest"], old_policy["policy_digest"])
+            manifest = json.loads((root / "followup/followup.json").read_text())
+            self.assertEqual(manifest["retry_lineage"], lineage)
+            exchange = json.loads((root / result["fallback_bundles"][0] / "exchange-manifest.json").read_text())
+            self.assertEqual(exchange["retry_lineage"], lineage)
+            self.assertEqual(exchange["content_source_policy_history"], [old_policy, active_policy])
+
+    def test_valid_cohorts_progress_while_a_sibling_bundle_requires_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segments = [Segment(str(i), "SOURCE") for i in range(3)]
+            source, primary = root / "source.jsonl", root / "primary.jsonl"
+            _write_jsonl(source, [asdict(s) for s in segments])
+            _write_jsonl(primary, [
+                {"target_id": s.id, "status": "success" if i == 0 else "error",
+                 "text": "TARGET" if i == 0 else "", "provider": "configured", "issues": [],
+                 **({"candidate_generation": 1, "candidate_digest": stable_hash("TARGET")} if i == 0 else {})}
+                for i, s in enumerate(segments)
+            ])
+            prepared = prepare_native_followup(
+                root, source, segments, primary, root / "followup",
+                exchange_prefix="cohorts", exchange_max_records=1,
+            )
+            first, second = [root / p for p in prepared["fallback_bundles"]]
+            request = json.loads((first / REQUESTS_NAME).read_text())
+            _write_jsonl(first / SUCCESS_NAME, [{
+                "target_id": request["target_id"], "status": "success", "text": "FALLBACK",
+                "route": "configured", "attempt": 1,
+                "source_sha256": request["source_sha256"],
+                "context_sha256": request["context_sha256"],
+            }])
+            (second / REQUESTS_NAME).write_text("{}\n")
+            summary = collect_native_followup(
+                root, root / "followup", segments, root / "review.jsonl", root / "unresolved.jsonl"
+            )
+            self.assertTrue(summary["review_ready"])
+            self.assertFalse(summary["translation_barrier_complete"])
+            self.assertEqual(summary["candidate_count"], 2)
+            self.assertEqual(summary["blocked_bundles"], [prepared["fallback_bundles"][1]])
+            self.assertEqual([s.id for s in read_segments(root / "review.jsonl")], ["0", "1"])
+            self.assertEqual([s.id for s in read_segments(root / "unresolved.jsonl")], ["2"])
+
+    def test_exchange_shard_size_is_configurable_above_previous_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segments = [Segment("line", "S")]
+            source, primary = root / "source.jsonl", root / "primary.jsonl"
+            _write_jsonl(source, [asdict(s) for s in segments])
+            _write_jsonl(primary, [{"target_id": "line", "status": "error", "text": "",
+                                   "provider": "configured", "issues": []}])
+            summary = prepare_native_followup(
+                root, source, segments, primary, root / "followup",
+                exchange_prefix="configured", exchange_max_records=4096,
+            )
+            self.assertEqual(len(summary["fallback_bundles"]), 1)
+            manifest = json.loads((root / "followup/followup.json").read_text())
+            self.assertEqual(manifest["exchange_max_records"], 4096)
+
     def test_single_exchange_collects_only_bound_first_candidates(self):
         from dataclasses import replace
         from game_l10n.native_followup import collect_translation_exchange_candidates

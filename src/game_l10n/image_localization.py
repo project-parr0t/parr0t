@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -26,6 +27,8 @@ _UI_BINDING_KINDS = {
     "engine_ui_binding",
     "atlas_region_binding",
     "user_identified_ui_asset",
+    "engine_player_visible_binding",
+    "user_identified_player_visible_asset",
 }
 _DETECTION_METHODS = {
     "engine_metadata",
@@ -94,12 +97,12 @@ def image_localization_policy(work_dir: Path) -> dict[str, Any]:
         not isinstance(payload, dict)
         or set(payload) != required
         or payload.get("schema") != POLICY_SCHEMA
-        or payload.get("status") not in {"disabled", "requested"}
+        or payload.get("status") not in {"disabled", "requested", "inspection_requested"}
         or not isinstance(payload.get("request_revision"), int)
         or isinstance(payload.get("request_revision"), bool)
         or payload["request_revision"] < 0
         or not isinstance(payload.get("requested_scope"), str)
-        or (payload["status"] == "requested" and not payload["requested_scope"].strip())
+        or (payload["status"] != "disabled" and not payload["requested_scope"].strip())
         or (payload["status"] == "disabled" and payload["requested_scope"] != "")
     ):
         raise ConfigurationError("E_IMAGE_POLICY_INVALID: policy shape is invalid")
@@ -112,6 +115,7 @@ def record_image_localization_policy(
     requested: bool,
     user_requested: bool,
     requested_scope: str = "player_visible_ui_text_assets",
+    inspection_only: bool = False,
 ) -> dict[str, Any]:
     if not user_requested:
         raise ConfigurationError(
@@ -122,9 +126,12 @@ def record_image_localization_policy(
     normalized_scope = requested_scope.strip() if requested else ""
     if requested and not normalized_scope:
         raise ConfigurationError("E_IMAGE_SCOPE_REQUIRED: requested image scope is empty")
+    status = ("inspection_requested" if inspection_only else "requested") if requested else "disabled"
+    if current["status"] == status and current["requested_scope"] == normalized_scope:
+        return current
     payload = {
         "schema": POLICY_SCHEMA,
-        "status": "requested" if requested else "disabled",
+        "status": status,
         "request_revision": int(current["request_revision"]) + 1,
         "requested_scope": normalized_scope,
     }
@@ -141,10 +148,91 @@ def require_image_localization_requested(work_dir: Path) -> dict[str, Any]:
     policy = image_localization_policy(work_dir)
     if policy["status"] != "requested":
         raise ConfigurationError(
-            "E_IMAGE_USER_REQUEST_REQUIRED: text localization is the default; do not inspect "
-            "images or run OCR without an explicit recorded user request"
+            "E_IMAGE_USER_REQUEST_REQUIRED: image translation requires an explicit recorded "
+            "request; font or visual inspection alone does not authorize translation"
         )
     return policy
+
+
+def require_image_inspection_requested(work_dir: Path) -> dict[str, Any]:
+    """Inspection does not grant image translation or game-file mutation."""
+    policy = image_localization_policy(work_dir)
+    if policy["status"] not in {"requested", "inspection_requested"}:
+        raise ConfigurationError("E_IMAGE_INSPECTION_REQUEST_REQUIRED")
+    return policy
+
+
+@dataclass(frozen=True, slots=True)
+class _ImageSources:
+    game_roots: tuple[Path, ...]
+    roots: tuple[Path, ...]
+    derived_root: Path
+    derived_assets: dict[str, str]
+    derived_digest: str
+
+
+def _image_sources(work_dir: Path, game_roots: list[Path]) -> _ImageSources:
+    from .data_plane_task import image_candidate_source_roots
+
+    derived_root = work_dir.resolve() / "inputs" / "image-assets"
+    originals = tuple(
+        root.resolve() for root in game_roots
+        if not root.absolute().is_relative_to(derived_root)
+        and not root.resolve().is_relative_to(derived_root)
+    )
+    candidate_path = work_dir.resolve() / "inputs" / "image-inspection-candidates.json"
+    if candidate_path.resolve() != candidate_path or derived_root.resolve() != derived_root:
+        return _ImageSources(originals, originals, derived_root, {}, "")
+    try:
+        before = candidate_path.read_bytes() if candidate_path.is_file() else None
+    except OSError:
+        before = None
+    roots = tuple(root.resolve() for root in image_candidate_source_roots(work_dir, list(originals)))
+    assets = {}
+    if derived_root in roots:
+        if before is None or candidate_path.read_bytes() != before:
+            raise ConfigurationError("E_IMAGE_DERIVED_ASSET_CONTEXT_CHANGED")
+        try:
+            discovery = json.loads(before.decode("utf-8-sig"))
+            entries = discovery["bound_local_assets"]
+        except (UnicodeError, ValueError, KeyError, TypeError) as exc:
+            raise ConfigurationError("E_IMAGE_DERIVED_ASSET_CONTEXT_INVALID") from exc
+        for entry in entries:
+            source = Path(entry["path"])
+            if source.is_relative_to(derived_root):
+                assets[str(source)] = entry["sha256"]
+    derived_digest = hashlib.sha256(before).hexdigest() if derived_root in roots and before is not None else ""
+    return _ImageSources(originals, roots, derived_root, assets, derived_digest)
+
+
+def _require_derived_asset(source: Path, digest: str, sources: _ImageSources) -> None:
+    if (
+        source.is_relative_to(sources.derived_root)
+        and sources.derived_assets.get(str(source)) != digest
+    ):
+        raise ConfigurationError("E_IMAGE_DERIVED_ASSET_UNATTESTED")
+
+
+def bound_inspection_assets(
+    work_dir: Path, asset_paths: list[Path], *, game_roots: list[Path],
+) -> list[dict[str, str]]:
+    """Bind explicit local visual/font files for inspection, never translation."""
+    require_image_inspection_requested(work_dir)
+    sources = _image_sources(work_dir, game_roots)
+    roots = sources.roots
+    if not asset_paths or not roots:
+        raise ConfigurationError("E_IMAGE_INSPECTION_ASSET_REQUIRED")
+    entries = {}
+    for path in asset_paths:
+        source = path.resolve()
+        if not source.is_file() or not any(is_within(source, root) for root in roots):
+            raise ConfigurationError("E_IMAGE_INSPECTION_ASSET_INVALID")
+        if source.is_relative_to(sources.derived_root) and str(source) not in sources.derived_assets:
+            raise ConfigurationError("E_IMAGE_DERIVED_ASSET_UNATTESTED")
+        digest = _sha256(source)
+        _require_derived_asset(source, digest, sources)
+        entries[str(source)] = {"path": str(source), "sha256": digest}
+    return [entries[path] for path in sorted(entries)]
 
 
 def _load_workspace_json(work_dir: Path, path: Path, *, label: str) -> tuple[Path, dict[str, Any]]:
@@ -164,7 +252,7 @@ def _validate_inventory(
     work_dir: Path,
     manifest_path: Path,
     game_roots: list[Path],
-) -> tuple[Path, dict[str, Any], int]:
+) -> tuple[Path, dict[str, Any], int, _ImageSources]:
     resolved, payload = _load_workspace_json(
         work_dir, manifest_path, label="IMAGE_UI_INVENTORY"
     )
@@ -190,7 +278,11 @@ def _validate_inventory(
         "uncertain_asset_count",
         "non_ui_asset_count",
     }
-    if not isinstance(coverage, dict) or set(coverage) != coverage_fields:
+    if (
+        not isinstance(coverage, dict)
+        or set(coverage) - coverage_fields - {"requested_scope", "unexamined_asset_count"}
+        or coverage_fields - set(coverage)
+    ):
         raise ConfigurationError("E_IMAGE_UI_INVENTORY_INVALID: coverage is invalid")
     counts = [
         coverage.get("candidate_asset_count"),
@@ -199,15 +291,25 @@ def _validate_inventory(
         coverage.get("non_ui_asset_count"),
     ]
     if (
-        coverage.get("declared_complete") is not True
+        not isinstance(coverage.get("declared_complete"), bool)
         or any(not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in counts)
-        or counts[0] != counts[1] + counts[2] + counts[3]
+        or not isinstance(coverage.get("unexamined_asset_count", 0), int)
+        or isinstance(coverage.get("unexamined_asset_count", 0), bool)
+        or coverage.get("unexamined_asset_count", 0) < 0
+        or counts[0] != counts[1] + counts[2] + counts[3] + coverage.get("unexamined_asset_count", 0)
     ):
         raise ConfigurationError("E_IMAGE_UI_INVENTORY_INVALID: coverage accounting is incomplete")
+    policy = image_localization_policy(work_dir)
+    if (
+        policy["requested_scope"] != "player_visible_ui_text_assets"
+        and coverage.get("requested_scope") != policy["requested_scope"]
+    ):
+        raise ConfigurationError("E_IMAGE_SCOPE_UNEXAMINED: inventory does not attest requested scope")
     assets = payload.get("assets")
     if not isinstance(assets, list) or len(assets) != counts[1]:
         raise ConfigurationError("E_IMAGE_UI_INVENTORY_INVALID: confirmed asset count is inconsistent")
-    roots = [item.resolve() for item in game_roots]
+    sources = _image_sources(work_dir, game_roots)
+    roots = sources.roots
     if not roots:
         raise ConfigurationError("E_IMAGE_UI_INVENTORY_INVALID: no configured game root")
     seen_assets: set[str] = set()
@@ -241,6 +343,7 @@ def _validate_inventory(
         source = (roots[root_index] / Path(relative)).resolve()
         if not is_within(source, roots[root_index]) or not source.is_file():
             raise ConfigurationError("E_IMAGE_UI_INVENTORY_INVALID: source asset is missing")
+        _require_derived_asset(source, asset["source_sha256"], sources)
         if not _is_sha256(asset.get("source_sha256")) or _sha256(source) != asset["source_sha256"]:
             raise ConfigurationError("E_IMAGE_UI_INVENTORY_INVALID: source asset digest changed")
         if not isinstance(asset.get("format"), str) or not asset["format"].strip():
@@ -257,8 +360,14 @@ def _validate_inventory(
             or set(binding) != {"kind", "evidence_sha256"}
             or binding.get("kind") not in _UI_BINDING_KINDS
             or not _is_sha256(binding.get("evidence_sha256"))
+            or (
+                binding.get("kind") in {
+                    "engine_player_visible_binding", "user_identified_player_visible_asset"
+                }
+                and policy["requested_scope"] == "player_visible_ui_text_assets"
+            )
         ):
-            raise ConfigurationError("E_IMAGE_UI_INVENTORY_INVALID: definite UI binding is missing")
+            raise ConfigurationError("E_IMAGE_UI_INVENTORY_INVALID: requested player-visible binding is missing")
         regions = asset.get("text_regions")
         if not isinstance(regions, list) or not regions:
             raise ConfigurationError("E_IMAGE_UI_INVENTORY_INVALID: confirmed text regions are missing")
@@ -305,7 +414,34 @@ def _validate_inventory(
                     "E_IMAGE_UI_INVENTORY_INVALID: only visually confirmed player-visible text is eligible"
                 )
             region_count += 1
-    return resolved, payload, region_count
+    return resolved, payload, region_count, sources
+
+
+def bound_local_assets(
+    work_dir: Path,
+    manifest_path: Path,
+    *,
+    game_roots: list[Path],
+    asset_ids: Any = None,
+    inspection_only: bool = False,
+) -> list[dict[str, str]]:
+    """Return only exact canonical unchanged assets from a validated inventory."""
+    if inspection_only:
+        require_image_inspection_requested(work_dir)
+    else:
+        require_image_localization_requested(work_dir)
+    _, inventory, _, sources = _validate_inventory(work_dir, manifest_path, game_roots)
+    selected = None if asset_ids is None else set(asset_ids)
+    known = {asset["id"] for asset in inventory["assets"]}
+    if selected is not None and (not selected or not selected <= known):
+        raise ConfigurationError("E_IMAGE_ASSET_SCOPE_INVALID")
+    entries = {}
+    for asset in inventory["assets"]:
+        if selected is not None and asset["id"] not in selected:
+            continue
+        source = (sources.roots[asset["source_root_index"]] / asset["relative_path"]).resolve()
+        entries[str(source)] = {"path": str(source), "sha256": asset["source_sha256"]}
+    return [entries[path] for path in sorted(entries)]
 
 
 def verify_image_ui_inventory(
@@ -313,25 +449,115 @@ def verify_image_ui_inventory(
     manifest_path: Path,
     *,
     game_roots: list[Path],
+    candidate_discovery: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    policy = require_image_localization_requested(work_dir)
-    resolved, payload, region_count = _validate_inventory(
+    policy = image_localization_policy(work_dir)
+    inspection_only = policy["status"] == "inspection_requested"
+    if inspection_only:
+        require_image_inspection_requested(work_dir)
+    else:
+        require_image_localization_requested(work_dir)
+    if candidate_discovery is None:
+        scope_path = work_dir / SCOPE_PATH
+        if scope_path.is_file():
+            try:
+                previous = json.loads(scope_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                previous = None
+            if (
+                isinstance(previous, dict)
+                and previous.get("schema") == SCOPE_SCHEMA
+                and previous.get("request_revision") == policy["request_revision"]
+                and previous.get("policy_digest") == _policy_digest(policy)
+                and "candidate_discovery" in previous
+            ):
+                raise ConfigurationError(
+                    "E_IMAGE_CANDIDATE_DISCOVERY_REQUIRED: revalidate the exact current candidate discovery; "
+                    "omitting it cannot replace an already-bound scope"
+                )
+    resolved, payload, region_count, sources = _validate_inventory(
         work_dir, manifest_path, game_roots
     )
     target_count = len(payload["assets"])
+    coverage = payload["coverage"]
+    incomplete = (
+        not coverage["declared_complete"]
+        or coverage["uncertain_asset_count"] > 0
+        or coverage.get("unexamined_asset_count", 0) > 0
+    )
+    discovery_binding = None
+    if candidate_discovery is not None:
+        if (
+            not isinstance(candidate_discovery, dict)
+            or candidate_discovery.get("schema") != "parr0t.image-inspection-candidates.v1"
+            or candidate_discovery.get("requested_scope") != policy["requested_scope"]
+            or not isinstance(candidate_discovery.get("bound_local_assets"), list)
+            or not isinstance(candidate_discovery.get("unexamined_sources"), list)
+        ):
+            raise ConfigurationError("E_IMAGE_CANDIDATE_DISCOVERY_INVALID")
+        roots = sources.roots
+        verified_sources = {
+            str((roots[asset["source_root_index"]] / asset["relative_path"]).resolve()): asset["source_sha256"]
+            for asset in payload["assets"]
+        }
+        candidates = {}
+        for entry in candidate_discovery["bound_local_assets"]:
+            if (
+                not isinstance(entry, dict) or set(entry) != {"path", "sha256"}
+                or not isinstance(entry.get("path"), str) or not _is_sha256(entry.get("sha256"))
+            ):
+                raise ConfigurationError("E_IMAGE_CANDIDATE_DISCOVERY_INVALID")
+            path = Path(entry["path"])
+            _require_derived_asset(path, entry["sha256"], sources)
+            if (
+                not path.is_absolute() or str(path.resolve()) != entry["path"]
+                or not any(is_within(path, root) for root in roots)
+                or not path.is_file()
+                or (
+                    verified_sources.get(entry["path"], "") != entry["sha256"]
+                    and _sha256(path) != entry["sha256"]
+                )
+            ):
+                raise ConfigurationError("E_IMAGE_CANDIDATE_DISCOVERY_STALE")
+            if entry["path"] in candidates and candidates[entry["path"]] != entry["sha256"]:
+                raise ConfigurationError("E_IMAGE_CANDIDATE_DISCOVERY_INVALID")
+            candidates[entry["path"]] = entry["sha256"]
+        if any(candidates.get(path) != digest for path, digest in verified_sources.items()):
+            raise ConfigurationError("E_IMAGE_CANDIDATE_SCOPE_MISMATCH")
+        discovery_binding = {
+            "digest": stable_hash(candidate_discovery),
+            "requested_scope": policy["requested_scope"],
+            "bound_asset_count": len(candidates),
+            "reported_candidate_asset_count": coverage["candidate_asset_count"],
+            "unexamined_source_count": len(candidate_discovery["unexamined_sources"]),
+        }
+        incomplete = incomplete or (
+            coverage["candidate_asset_count"] < len(candidates)
+            or bool(candidate_discovery["unexamined_sources"])
+        )
     receipt = {
         "schema": SCOPE_SCHEMA,
-        "status": "verified_targets" if target_count else "no_targets",
+        "status": (
+            "scope_incomplete" if incomplete
+            else "inspection_verified" if inspection_only
+            else "verified_targets" if target_count else "no_targets"
+        ),
         "request_revision": policy["request_revision"],
         "policy_digest": _policy_digest(policy),
         "inventory_path": resolved.relative_to(work_dir.resolve()).as_posix(),
         "inventory_sha256": _sha256(resolved),
+        "game_roots": [str(root) for root in sources.game_roots],
+        "source_roots": [str(root) for root in sources.roots],
+        "derived_assets_digest": sources.derived_digest,
         "target_count": target_count,
         "region_count": region_count,
-        "issue_codes": [],
+        "issue_codes": ["IMAGE_SCOPE_UNEXAMINED"] if incomplete else [],
     }
+    if discovery_binding is not None:
+        receipt["candidate_discovery"] = discovery_binding
     _atomic_json(work_dir / SCOPE_PATH, receipt)
     return receipt
+
 
 
 def _current_scope(work_dir: Path) -> dict[str, Any] | None:
@@ -357,9 +583,12 @@ def _current_scope(work_dir: Path) -> dict[str, Any] | None:
     inventory = (work_dir / str(receipt.get("inventory_path", ""))).resolve()
     if (
         not isinstance(receipt, dict)
-        or set(receipt) != required
+        or required - set(receipt)
+        or set(receipt) - required - {
+            "candidate_discovery", "game_roots", "source_roots", "derived_assets_digest",
+        }
         or receipt.get("schema") != SCOPE_SCHEMA
-        or receipt.get("status") not in {"verified_targets", "no_targets"}
+        or receipt.get("status") not in {"verified_targets", "no_targets", "scope_incomplete", "inspection_verified"}
         or receipt.get("request_revision") != policy.get("request_revision")
         or receipt.get("policy_digest") != _policy_digest(policy)
         or not is_within(inventory, work_dir.resolve())
@@ -368,9 +597,58 @@ def _current_scope(work_dir: Path) -> dict[str, Any] | None:
         or _sha256(inventory) != receipt["inventory_sha256"]
         or not isinstance(receipt.get("target_count"), int)
         or not isinstance(receipt.get("region_count"), int)
-        or receipt.get("issue_codes") != []
+        or receipt.get("issue_codes") != (
+            ["IMAGE_SCOPE_UNEXAMINED"] if receipt.get("status") == "scope_incomplete" else []
+        )
     ):
         return None
+    if "candidate_discovery" in receipt:
+        discovery = receipt["candidate_discovery"]
+        fields = {
+            "digest", "requested_scope", "bound_asset_count",
+            "reported_candidate_asset_count", "unexamined_source_count",
+        }
+        if (
+            not isinstance(discovery, dict) or set(discovery) != fields
+            or not _is_sha256(discovery.get("digest"))
+            or discovery.get("requested_scope") != policy["requested_scope"]
+            or any(
+                isinstance(discovery.get(key), bool)
+                or not isinstance(discovery.get(key), int) or discovery[key] < 0
+                for key in ("bound_asset_count", "reported_candidate_asset_count", "unexamined_source_count")
+            )
+        ):
+            return None
+        if (
+            discovery["reported_candidate_asset_count"] < discovery["bound_asset_count"]
+            or discovery["unexamined_source_count"] > 0
+        ) and receipt["status"] != "scope_incomplete":
+            return None
+    root_fields = {"game_roots", "source_roots", "derived_assets_digest"}
+    if root_fields & set(receipt):
+        if (
+            root_fields - set(receipt)
+            or not isinstance(receipt["game_roots"], list)
+            or not isinstance(receipt["source_roots"], list)
+            or any(
+                not isinstance(root, str) or not Path(root).is_absolute()
+                for root in [*receipt["game_roots"], *receipt["source_roots"]]
+            )
+        ):
+            return None
+        try:
+            _, current, regions, sources = _validate_inventory(
+                work_dir, inventory, [Path(root) for root in receipt["game_roots"]],
+            )
+        except (ConfigurationError, OSError, ValueError):
+            return None
+        if (
+            [str(root) for root in sources.roots] != receipt["source_roots"]
+            or sources.derived_digest != receipt["derived_assets_digest"]
+            or len(current["assets"]) != receipt["target_count"]
+            or regions != receipt["region_count"]
+        ):
+            return None
     return receipt
 
 
@@ -468,7 +746,7 @@ def verify_image_localization_results(
         raise ConfigurationError(
             "E_IMAGE_SCOPE_REQUIRED: verify a current nonempty UI-image inventory first"
         )
-    inventory_resolved, inventory, _ = _validate_inventory(
+    inventory_resolved, inventory, _, _ = _validate_inventory(
         work_dir, inventory_path, game_roots
     )
     if (
@@ -590,8 +868,32 @@ def public_image_localization_state(work_dir: Path) -> dict[str, Any]:
     if policy["status"] == "disabled":
         return {"status": "disabled", "request_revision": policy["request_revision"], "issue_codes": []}
     scope = _current_scope(work_dir)
+    discovery = scope.get("candidate_discovery", {}) if scope is not None else {}
+    discovery_summary = {
+        "candidate_discovery": {key: discovery[key] for key in (
+            "digest", "bound_asset_count", "reported_candidate_asset_count", "unexamined_source_count",
+        )}
+    } if discovery else {}
+    if policy["status"] == "inspection_requested":
+        return {
+            "status": "inspection_only",
+            "request_revision": policy["request_revision"],
+            "requested_scope": policy["requested_scope"],
+            "translation_authorized": False,
+            "inventory_status": scope["status"] if scope is not None else "scope_required",
+            "issue_codes": scope["issue_codes"] if scope is not None else [],
+            **discovery_summary,
+        }
     if scope is None:
         return {"status": "scope_required", "request_revision": policy["request_revision"], "issue_codes": []}
+    if scope["status"] == "scope_incomplete":
+        return {
+            "status": "scope_incomplete",
+            "request_revision": policy["request_revision"],
+            "target_count": scope["target_count"],
+            "issue_codes": scope["issue_codes"],
+            **discovery_summary,
+        }
     if scope["status"] == "no_targets":
         return {
             "status": "no_targets",

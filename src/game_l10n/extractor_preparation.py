@@ -65,6 +65,75 @@ def _codes(value: Any) -> list[str]:
     return sorted(value)
 
 
+def apply_extractor_requirements(
+    work_dir: Path, requirements_path: Path, expected_sha256: str,
+) -> dict[str, Any]:
+    """Apply an exact Core-produced additive repair without changing other policy."""
+    from .workspace import _write_config, load_config
+
+    work_dir = work_dir.resolve()
+    try:
+        relative = (work_dir / requirements_path).resolve().relative_to(work_dir).as_posix()
+    except ValueError as exc:
+        raise ConfigurationError("E_EXTRACTOR_REQUIREMENTS_INVALID: workspace artifact required") from exc
+    path = _file(work_dir, relative)
+    if (
+        not isinstance(expected_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        or not path.is_file() or _digest(path) != expected_sha256
+    ):
+        raise ConfigurationError("E_EXTRACTOR_REQUIREMENTS_INVALID: artifact binding changed")
+    requirements = _read(path)
+    capabilities = set(_codes(requirements.get("required_capabilities")))
+    formats = set(_codes(requirements.get("required_formats")))
+    metadata = requirements.get("source_metadata")
+    if not isinstance(metadata, dict) or not metadata:
+        raise ConfigurationError("E_EXTRACTOR_REQUIREMENTS_INVALID: source metadata required")
+    config = load_config(work_dir)
+    previous = config.get("extractor_requirements") or {}
+    if not isinstance(previous, dict):
+        raise ConfigurationError("E_EXTRACTOR_REQUIREMENTS_INVALID: existing requirements malformed")
+    if previous:
+        prior_metadata = previous.get("source_metadata")
+        if not isinstance(prior_metadata, dict):
+            raise ConfigurationError("E_EXTRACTOR_REQUIREMENTS_INVALID: existing source metadata malformed")
+        image_fields = ("image_candidate_discovery", "image_candidate_discovery_history")
+        if any(key in prior_metadata or key in metadata for key in image_fields):
+            prior_image = prior_metadata.get("image_candidate_discovery")
+            image = metadata.get("image_candidate_discovery")
+            prior_history = prior_metadata.get("image_candidate_discovery_history", [])
+            history = metadata.get("image_candidate_discovery_history", [])
+            if (
+                not isinstance(image, dict) or not image
+                or prior_image is not None and not isinstance(prior_image, dict)
+                or not isinstance(prior_history, list) or not isinstance(history, list)
+                or any(not isinstance(item, dict) for item in history)
+                or history[:len(prior_history)] != prior_history
+                or (prior_image is None or prior_image == image) and history != prior_history
+                or prior_image is not None and prior_image != image and prior_image not in history
+            ):
+                raise ConfigurationError("E_EXTRACTOR_REQUIREMENTS_INVALID: image revisions require retained history")
+        if (
+            not set(_codes(previous.get("required_capabilities"))) <= capabilities
+            or not set(_codes(previous.get("required_formats"))) <= formats
+            or any(
+                key not in metadata
+                or (key not in image_fields and metadata[key] != value)
+                for key, value in prior_metadata.items()
+            )
+            or any(
+                requirements.get(key) != value
+                for key, value in previous.items()
+                if key not in {"required_capabilities", "required_formats", "source_metadata"}
+            )
+        ):
+            raise ConfigurationError("E_EXTRACTOR_REQUIREMENTS_INVALID: repair must preserve existing requirements")
+    if requirements != previous:
+        config["extractor_requirements"] = requirements
+        _write_config(work_dir, config)
+    return requirements
+
+
 def preparation_required(work_dir: Path, config: dict[str, Any]) -> bool:
     selection = config.get("sdk_selection", {})
     decision = selection.get("decision") or {}
@@ -154,7 +223,10 @@ def _binding(work_dir: Path, config: dict[str, Any], activation: dict[str, Any])
     }, profile
 
 
-def _validate_evidence(work_dir: Path, evidence: dict[str, Any], binding: dict[str, Any], profile: dict[str, Any]) -> int:
+def _validate_evidence(
+    work_dir: Path, evidence: dict[str, Any], binding: dict[str, Any],
+    profile: dict[str, Any], config: dict[str, Any],
+) -> int:
     if evidence.get("schema") != ATTESTATION_SCHEMA or evidence.get("status") != "ready" or evidence.get("binding") != binding:
         _fail()
     records = evidence.get("checks")
@@ -191,6 +263,8 @@ def _validate_evidence(work_dir: Path, evidence: dict[str, Any], binding: dict[s
             count += 1
         if actual != record.get("outputs"):
             _fail()
+    from .data_plane_task import validate_image_candidate_preparation
+    validate_image_candidate_preparation(work_dir, config, evidence)
     return count
 
 
@@ -209,7 +283,7 @@ def require_extractor_preparation(work_dir: Path, config: dict[str, Any], activa
         original = task.get("extractor_requirements")
         if original is not None and original != config.get("extractor_requirements"):
             _fail()
-        count = _validate_evidence(work_dir, evidence, binding, profile)
+        count = _validate_evidence(work_dir, evidence, binding, profile, config)
         return {"status": "ready", "counts": {"checks": len(profile["checks"]), "cases": count}, "attestation_path": ATTESTATION_PATH}
     except (ConfigurationError, OSError, ValueError, TypeError, KeyError, AttributeError):
         _fail()
@@ -268,7 +342,7 @@ def _check_extractor_preparation(work_dir: Path, relay_path: Path) -> dict[str, 
     if current_binding != binding:
         _fail()
     evidence = {"schema": ATTESTATION_SCHEMA, "status": "ready", "task_id": task["task_id"], "relay_path": relay_path.resolve().relative_to(work_dir.resolve()).as_posix(), "binding": binding, "checks": records}
-    _validate_evidence(work_dir, evidence, binding, profile)
+    _validate_evidence(work_dir, evidence, binding, profile, current)
     _write(work_dir / ATTESTATION_PATH, evidence)
     return require_extractor_preparation(work_dir, config, activation)
 

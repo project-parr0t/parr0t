@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-import re
+import unicodedata
 from typing import Any
 
 from .errors import ConfigurationError
@@ -13,6 +13,7 @@ NATIVE_ROLE_ROUTES = {
     "strong-review": "native-strong-review",
     "context": "native-context",
     "review-fallback": "native-review-fallback",
+    "rewrite": "native-rewrite",
 }
 _ROLE_SLOTS = {
     "translation": ("translators", 0),
@@ -20,15 +21,23 @@ _ROLE_SLOTS = {
     "strong-review": ("reviewers", 0),
     "context": ("context_analyzers", 0),
     "review-fallback": ("reviewers", 1),
+    "rewrite": ("rewriters", 0),
 }
 
 
 def exact_native_model(value: str) -> bool:
+    """Validate an opaque selector, not a Core catalog or provider-name grammar."""
     return (
         isinstance(value, str)
-        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@+\-]*", value) is not None
-        and value not in {"default", "inherit", "task", "smol", "slow", "luna", "sol"}
-        and not value.startswith("@")
+        and bool(value)
+        and value == value.strip()
+        and not any(unicodedata.category(char).startswith("C") for char in value)
+        and not any(char in value for char in "\\*?[]")
+        and not value.startswith(("/", ".", "~", "@"))
+        and "://" not in value
+        and not (len(value) > 2 and value[0].isalpha() and value[1:3] == ":/")
+        and not any(part in {".", ".."} for part in value.split("/"))
+        and value.casefold() not in {"default", "inherit", "task", "smol", "slow", "luna", "sol"}
     )
 
 
@@ -71,24 +80,6 @@ def model_selection_authorization(config: dict[str, Any], route: str, model: str
     }
 
 
-def codex_app_routes(config: dict[str, Any]) -> dict[str, list[str]]:
-    routes = {
-        "context_analyzers": ["native-sol", "native-luna"],
-        "translators": ["native-luna", "native-sol", "deepseek"],
-        "review_triagers": ["native-luna"],
-        "reviewers": ["native-sol", "deepseek"],
-        "rewriters": ["deepseek"],
-    }
-    for role in native_role_models(config):
-        key, index = _ROLE_SLOTS[role]
-        routes[key][index] = NATIVE_ROLE_ROUTES[role]
-    return routes
-
-
-def codex_app_translation_retries(config: dict[str, Any]) -> dict[str, int]:
-    primary = codex_app_routes(config)["translators"][0]
-    return {primary: 5, "native-sol": 3}
-
 
 def apply_native_role_models(config: dict[str, Any], models: dict[str, str]) -> dict[str, Any]:
     """Replace named role slots only; preserve unspecified roles and provider settings."""
@@ -105,14 +96,27 @@ def apply_native_role_models(config: dict[str, Any], models: dict[str, str]) -> 
     for role in models:
         key, index = _ROLE_SLOTS[role]
         routes = routing.get(key)
-        if not isinstance(routes, list) or len(routes) <= index:
-            raise ConfigurationError("E_MODEL_POLICY_ROLE_UNAVAILABLE: role has no configured slot")
-        previous = routes[index]
+        if routes is None:
+            routes = routing[key] = []
+        if not isinstance(routes, list) or len(routes) < index:
+            raise ConfigurationError("E_MODEL_POLICY_ROLE_UNAVAILABLE: role has no configured primary")
+        previous = routes[index] if len(routes) > index else None
         route = NATIVE_ROLE_ROUTES[role]
+        if len(routes) == index:
+            routes.append(route)
+        else:
+            routes[index] = route
         if role == "translation" and previous != route:
             retries = routing.setdefault("translator_retries", {})
             if previous in retries:
-                retries[route] = retries.pop(previous)
-        routes[index] = route
+                retries.setdefault(route, retries[previous])
+                if previous not in routes:
+                    del retries[previous]
+        if role in {"triage", "strong-review", "review-fallback"} and previous != route:
+            limits = routing.get("review_attempt_limits", {})
+            if previous in limits:
+                limits.setdefault(route, limits[previous])
+                if previous not in routing.get("reviewers", []) + routing.get("review_triagers", []):
+                    del limits[previous]
     updated["model_policy"] = {"source": "user_prompt", "native_roles": selected}
     return updated

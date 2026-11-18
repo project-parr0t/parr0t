@@ -43,20 +43,12 @@ TASK_PAYLOAD_SCHEMA = "parr0t.native-task-payload.v1"
 DEFAULT_MAX_RECORDS = 64
 DEFAULT_MIN_RECORDS = 8
 DEFAULT_MAX_MATERIAL_TOKENS = 8_000
-DEFAULT_REVIEW_MAX_RECORDS = 2_048
+DEFAULT_REVIEW_MAX_RECORDS = 256
 DEFAULT_REVIEW_MIN_RECORDS = 64
-DEFAULT_REVIEW_MAX_MATERIAL_TOKENS = 262_144
-DEFAULT_REVIEW_INITIAL_RECORDS = 256
-DEFAULT_REVIEW_INITIAL_MATERIAL_TOKENS = 65_536
+DEFAULT_REVIEW_MAX_MATERIAL_TOKENS = 65_536
 DEFAULT_REVIEW_SPLIT_MAX_DEPTH = 11
 DEFAULT_REVIEW_SPLIT_MAX_CALLS = 16
-# The serialized v7 worker contract keeps the older compatibility ceiling above.
-# Deterministic orchestration applies these tighter cost guards without invalidating
-# already prepared manifests or successful checkpoints.
-CORE_REVIEW_SPLIT_EFFECTIVE_MAX_DEPTH = 3
-CORE_REVIEW_SPLIT_MAX_RECORD_AMPLIFICATION = 2.0
 DEFAULT_MAX_WORKERS = 8
-DEFAULT_BULK_BUDGET_GATE_RECORDS = 4_096
 PASS_KINDS = {"translation", "review", "rewrite"}
 NATIVE_CONTROL_STATE_SCHEMA = "parr0t.native-control-state.v3"
 LEGACY_NATIVE_CONTROL_STATE_SCHEMA = "parr0t.native-control-state.v1"
@@ -125,7 +117,8 @@ def _normalized_language_binding(binding: dict[str, Any] | None) -> dict[str, An
 
 
 def _failure_split_contract(
-    pass_kind: str, *, manifest_version: int = TASK_MANIFEST_VERSION
+    pass_kind: str, *, manifest_version: int = TASK_MANIFEST_VERSION,
+    max_depth: int = DEFAULT_REVIEW_SPLIT_MAX_DEPTH,
 ) -> dict[str, Any]:
     enabled = pass_kind == "review"
     core_owned = enabled and manifest_version >= TASK_MANIFEST_VERSION
@@ -144,7 +137,7 @@ def _failure_split_contract(
         ),
         "successful_rows_locked": enabled,
         "retry_successful_rows": False,
-        "max_depth": DEFAULT_REVIEW_SPLIT_MAX_DEPTH if enabled else 0,
+        "max_depth": max_depth if enabled else 0,
         "max_semantic_calls": (
             1
             if core_owned
@@ -162,10 +155,11 @@ def _failure_split_contract(
 
 
 def _worker_contract(
-    pass_kind: str = "translation", *, manifest_version: int = TASK_MANIFEST_VERSION
+    pass_kind: str = "translation", *, manifest_version: int = TASK_MANIFEST_VERSION,
+    max_depth: int = DEFAULT_REVIEW_SPLIT_MAX_DEPTH,
 ) -> dict[str, Any]:
     split_contract = _failure_split_contract(
-        pass_kind, manifest_version=manifest_version
+        pass_kind, manifest_version=manifest_version, max_depth=max_depth
     )
     worker_owned_split = split_contract["enabled"] and (
         split_contract.get("owner", "semantic_worker") == "semantic_worker"
@@ -178,7 +172,6 @@ def _worker_contract(
         "max_agent_depth": 1,
         "delegation_allowed": False,
         "model_controller_role_allowed": False,
-        "max_model_calls_per_task": 24 if worker_owned_split else 16,
         "max_semantic_model_calls_per_task": split_contract["max_semantic_calls"],
         "per_record_semantic_call_loop_allowed": False,
         "max_prompt_artifacts_per_task": 1,
@@ -241,10 +234,11 @@ def _result_contract() -> dict[str, Any]:
 
 
 def _detail_contract(
-    pass_kind: str = "translation", *, manifest_version: int = TASK_MANIFEST_VERSION
+    pass_kind: str = "translation", *, manifest_version: int = TASK_MANIFEST_VERSION,
+    max_depth: int = DEFAULT_REVIEW_SPLIT_MAX_DEPTH,
 ) -> dict[str, Any]:
     split_contract = _failure_split_contract(
-        pass_kind, manifest_version=manifest_version
+        pass_kind, manifest_version=manifest_version, max_depth=max_depth
     )
     return {
         "review_control": review_control_contract(),
@@ -322,7 +316,6 @@ def _execution_contract(
     record_count: int,
     *,
     pass_kind: str,
-    bulk_budget_gate_records: int,
     max_elapsed_minutes: int | None,
     max_input_tokens: int | None,
     max_provider_cost_usd: float | None,
@@ -332,25 +325,16 @@ def _execution_contract(
     max_root_model_calls_per_turn: int | None,
     max_root_input_tokens_per_turn: int | None,
     control_turn_budget_user_approved: bool,
+    review_split_max_depth: int = DEFAULT_REVIEW_SPLIT_MAX_DEPTH,
+    review_split_max_record_amplification: float | None = None,
+    review_tier: str | None = None,
 ) -> dict[str, Any]:
-    budget_complete = (
-        isinstance(max_elapsed_minutes, int)
-        and max_elapsed_minutes > 0
-        and isinstance(max_input_tokens, int)
-        and max_input_tokens > 0
-        and (
-            provider_cost_unmetered
-            or (
-                isinstance(max_provider_cost_usd, (int, float))
-                and not isinstance(max_provider_cost_usd, bool)
-                and max_provider_cost_usd > 0
-            )
+    budget_approved = bool(
+        user_approved_budget and any(
+            value is not None
+            for value in (max_elapsed_minutes, max_input_tokens, max_provider_cost_usd)
         )
     )
-    budget_approved = bool(user_approved_budget and budget_complete)
-    # A size threshold is not user authority to invent a time/token/cost limit.
-    # Explicit complete bounds apply at any inventory size once the user approves them.
-    bulk_gate_active = budget_approved
     control_turn_budget_active = bool(
         control_turn_budget_user_approved
         and any(
@@ -364,6 +348,7 @@ def _execution_contract(
     )
     return {
         "pass_kind": pass_kind,
+        "review_tier": review_tier,
         "strategy": "direct_single_task" if task_count == 1 else "bounded_slot_queue",
         "orchestration_owner": "deterministic_core_via_isolated_wave_relay",
         "model_controller_allowed": False,
@@ -393,9 +378,6 @@ def _execution_contract(
             max_root_input_tokens_per_turn if control_turn_budget_active else None
         ),
         "max_root_progress_messages_per_wave": 0,
-        "max_worker_model_calls_per_task": (
-            24 if pass_kind == "review" else 16
-        ),
         "budget_exhaustion_action": (
             "checkpoint_and_return_control"
             if control_turn_budget_active
@@ -411,14 +393,11 @@ def _execution_contract(
         "new_proof_layers_allowed": False,
         "aggregate_once_per_wave": True,
         "progress_reporting": "completion_checkpoint_or_blocker_only",
-        "max_unchanged_progress_observations": 1,
-        "max_control_actions_without_progress": 2,
         "capacity_failure_action": "defer_task_and_end_worker_attempt",
         "automatic_root_turn_restart_allowed": False,
         "detail_contract_schema": "parr0t.detail-contract.v1",
         "bulk_budget_gate": {
-            "active": bulk_gate_active,
-            "activation_records": bulk_budget_gate_records,
+            "active": budget_approved,
             "pilot_waves_without_approved_budget": 0,
             "user_approved": budget_approved,
             "max_elapsed_minutes": max_elapsed_minutes,
@@ -426,6 +405,10 @@ def _execution_contract(
             "max_provider_cost_usd": max_provider_cost_usd,
             "provider_cost_unmetered": provider_cost_unmetered,
             "missing_budget_action": "continue_without_inferred_limit",
+        },
+        "review_optimization_policy": {
+            "max_depth": review_split_max_depth,
+            "max_record_amplification": review_split_max_record_amplification,
         },
     }
 
@@ -532,6 +515,9 @@ def _manifest_contract_payload(
         payload["result_contract"] = manifest["result_contract"]
     if manifest.get("route_binding") is not None:
         payload["route_binding"] = manifest["route_binding"]
+    for field in ("translation_route_plan", "translation_predecessor"):
+        if manifest.get(field) is not None:
+            payload[field] = manifest[field]
     if "execution_namespace" in manifest:
         payload["execution_namespace"] = manifest["execution_namespace"]
     if manifest.get("language_binding") is not None:
@@ -660,6 +646,32 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
             fingerprint_payload["result_contract"] = result_contract
         if route_binding is not None:
             fingerprint_payload["route_binding"] = route_binding
+        for field in ("translation_route_plan", "translation_predecessor"):
+            if payload.get(field) is not None:
+                fingerprint_payload[field] = payload[field]
+        if payload.get("translation_route_plan") is not None:
+            from .translation_exchange import _validated_translation_route_plan
+            plan = _validated_translation_route_plan(payload["translation_route_plan"])
+            selected = next((i for i, item in enumerate(plan) if item["provider"] == (route_binding or {}).get("provider")), None)
+            if (
+                pass_kind != "translation" or selected is None
+                or plan[selected]["transport"] != "native"
+                or plan[selected]["model"] != route_binding.get("model")
+            ):
+                raise ValueError("E_TRANSLATION_ROUTE_PLAN_INVALID: native manifest binding differs from the route graph")
+            predecessor = payload.get("translation_predecessor")
+            if predecessor is not None and (
+                not isinstance(predecessor, dict)
+                or set(predecessor) != {"receipt", "receipt_sha256", "contract_fingerprint"}
+                or not isinstance(predecessor["receipt"], str) or not predecessor["receipt"]
+                or any(not isinstance(predecessor[field], str) or re.fullmatch(r"[0-9a-f]{64}", predecessor[field]) is None
+                       for field in ("receipt_sha256", "contract_fingerprint"))
+            ):
+                raise ValueError("E_TRANSLATION_PREDECESSOR_INVALID")
+            if predecessor is None and any(item["transport"] == "external" for item in plan[:selected]):
+                raise ValueError("E_TRANSLATION_PREDECESSOR_REQUIRED")
+        elif payload.get("translation_predecessor") is not None:
+            raise ValueError("E_TRANSLATION_ROUTE_PLAN_INVALID: predecessor lacks its full route graph")
         if "execution_namespace" in payload:
             namespace = manifest_path.parent.resolve().relative_to(work_dir.resolve()).as_posix()
             if payload["execution_namespace"] != namespace:
@@ -700,14 +712,34 @@ def _load_task_manifest(work_dir: Path, manifest_path: Path) -> dict[str, Any]:
                     "E_DETAIL_CONTRACT_CONFLICT: authorized review policy "
                     "must bind exact triage or strong_review scope"
                 )
-        expected_detail = _detail_contract(pass_kind, manifest_version=version)
+        if not isinstance(execution_contract, dict):
+            raise ValueError("E_DETAIL_CONTRACT_CONFLICT: execution contract is missing")
+        optimization = execution_contract.get("review_optimization_policy", {})
+        if not isinstance(optimization, dict):
+            raise ValueError("E_DETAIL_CONTRACT_CONFLICT: review optimization policy is invalid")
+        max_depth = optimization.get("max_depth", DEFAULT_REVIEW_SPLIT_MAX_DEPTH)
+        amplification = optimization.get("max_record_amplification")
+        if (
+            not isinstance(max_depth, int) or isinstance(max_depth, bool) or max_depth < 0
+            or amplification is not None and (
+                not isinstance(amplification, (int, float)) or isinstance(amplification, bool)
+                or not math.isfinite(amplification) or amplification < 1
+            )
+            or execution_contract.get("review_tier") not in {None, "triage", "strong"}
+        ):
+            raise ValueError("E_DETAIL_CONTRACT_CONFLICT: review optimization policy is invalid")
+        expected_detail = _detail_contract(pass_kind, manifest_version=version, max_depth=max_depth)
         legacy_detail = json.loads(json.dumps(expected_detail))
         # Host repair is execution-only. Preserve the immutable fingerprints and
         # successes of manifests prepared before that control action was added.
         legacy_detail["review_control"]["allowed_actions"].remove("repair_native_runtime")
+        expected_worker = _worker_contract(pass_kind, manifest_version=version, max_depth=max_depth)
+        legacy_worker = dict(expected_worker)
+        legacy_worker["max_model_calls_per_task"] = (
+            24 if version < TASK_MANIFEST_VERSION and pass_kind == "review" else 16
+        )
         if (
-            worker_contract
-            != _worker_contract(pass_kind, manifest_version=version)
+            worker_contract not in (expected_worker, legacy_worker)
             or detail_contract not in (expected_detail, legacy_detail)
         ):
             raise ValueError("E_DETAIL_CONTRACT_CONFLICT: native task contract was changed")
@@ -1003,6 +1035,29 @@ def _require_candidate_bindings(segments: list[Segment], pass_kind: str) -> None
             )
 
 
+def _native_translation_predecessor(
+    work_dir: Path, plan: list[dict[str, Any]], provider: str,
+    receipt_path: Path | None, segments: list[Segment],
+) -> dict[str, Any] | None:
+    from .translation_exchange import verify_translation_predecessor
+    from .formats import read_segments
+    selected = next((i for i, item in enumerate(plan) if item["provider"] == provider), None)
+    if selected is None or plan[selected]["transport"] != "native":
+        raise ValueError("E_NATIVE_ROUTE_INVALID: selected route is not a configured native translator")
+    requires_predecessor = any(item["transport"] == "external" for item in plan[:selected])
+    if receipt_path is None:
+        if requires_predecessor:
+            raise ValueError("E_TRANSLATION_PREDECESSOR_REQUIRED: use the preceding external block's native_continuation receipt")
+        return None
+    verified = verify_translation_predecessor(work_dir, receipt_path, full_route_plan=plan)
+    if provider not in {item["provider"] for item in verified["native_route_plan"]}:
+        raise ValueError("E_TRANSLATION_PREDECESSOR_INVALID: wrong native successor block")
+    authorized = {item.id: asdict(item) for item in read_segments(work_dir / verified["source"])}
+    if not segments or any(authorized.get(item.id) != asdict(item) for item in segments):
+        raise ValueError("E_TRANSLATION_PREDECESSOR_INVALID: native input is not an unchanged failure-only subset")
+    return {key: verified[key] for key in ("receipt", "receipt_sha256", "contract_fingerprint")}
+
+
 def prepare_native_tasks(
     work_dir: Path,
     source_path: Path,
@@ -1014,7 +1069,6 @@ def prepare_native_tasks(
     min_records: int | None = None,
     max_material_tokens: int | None = None,
     max_workers: int = DEFAULT_MAX_WORKERS,
-    bulk_budget_gate_records: int = DEFAULT_BULK_BUDGET_GATE_RECORDS,
     max_elapsed_minutes: int | None = None,
     max_input_tokens: int | None = None,
     max_provider_cost_usd: float | None = None,
@@ -1024,8 +1078,13 @@ def prepare_native_tasks(
     max_root_model_calls_per_turn: int | None = None,
     max_root_input_tokens_per_turn: int | None = None,
     control_turn_budget_user_approved: bool = False,
+    review_split_max_depth: int = DEFAULT_REVIEW_SPLIT_MAX_DEPTH,
+    review_tier: str | None = None,
+    review_split_max_record_amplification: float | None = None,
     route_binding: dict[str, Any] | None = None,
     language_binding: dict[str, Any] | None = None,
+    predecessor_receipt: Path | None = None,
+    translation_route_plan: list[dict[str, Any]] | None = None,
     _review_split: dict[str, Any] | None = None,
     content_source_grant: Path | None = None,
     content_source_scope: str = "",
@@ -1040,6 +1099,13 @@ def prepare_native_tasks(
     )
     if pass_kind not in PASS_KINDS:
         raise ValueError(f"pass_kind must be one of: {', '.join(sorted(PASS_KINDS))}")
+    predecessor_context = None
+    if pass_kind == "translation" and predecessor_receipt is not None:
+        from .translation_exchange import verify_translation_predecessor
+        predecessor_context = verify_translation_predecessor(work_dir, predecessor_receipt)
+        if not explicit_content_source_policy:
+            _content_source_policy = predecessor_context.get("content_source_policy")
+            explicit_content_source_policy = _content_source_policy is not None
     language_binding = _normalized_language_binding(language_binding)
     if route_binding is not None and (
         set(route_binding) not in (
@@ -1105,6 +1171,14 @@ def prepare_native_tasks(
     )
     if semantic_task_kind not in allowed_policy_kinds:
         raise ValueError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
+    if review_tier is not None and (pass_kind != "review" or review_tier not in {"triage", "strong"}):
+        raise ValueError("review_tier must be triage or strong for a review pass")
+    if pass_kind == "review" and review_tier is None:
+        review_tier = {"triage": "triage", "strong_review": "strong"}.get(semantic_task_kind)
+    if review_tier is not None and semantic_task_kind in {"triage", "strong_review"} and (
+        review_tier != ("triage" if semantic_task_kind == "triage" else "strong")
+    ):
+        raise ValueError("E_CONTENT_SOURCE_POLICY_IMMUTABLE: review tier conflicts with bound scope")
     if _content_source_policy is None:
         source_policy = content_source_policy(
             work_dir,
@@ -1138,29 +1212,70 @@ def prepare_native_tasks(
             if pass_kind == "review"
             else DEFAULT_MAX_MATERIAL_TOKENS
         )
-    if not 1 <= max_records <= DEFAULT_REVIEW_MAX_RECORDS:
-        raise ValueError("max_records must be between 1 and 2048")
+    if not isinstance(max_records, int) or isinstance(max_records, bool) or max_records < 1:
+        raise ValueError("max_records must be a positive integer")
     if min_records is None:
         min_records = min(
             DEFAULT_REVIEW_MIN_RECORDS if pass_kind == "review" else DEFAULT_MIN_RECORDS,
             max_records,
         )
-    if not 1 <= min_records <= max_records:
+    if not isinstance(min_records, int) or isinstance(min_records, bool) or not 1 <= min_records <= max_records:
         raise ValueError("min_records must be between 1 and max_records")
-    if not 256 <= max_material_tokens <= 1_000_000:
-        raise ValueError("max_material_tokens must be between 256 and 1000000")
-    if not 1 <= max_workers <= 64:
-        raise ValueError("max_workers must be between 1 and 64")
+    if not isinstance(max_material_tokens, int) or isinstance(max_material_tokens, bool) or max_material_tokens < 1:
+        raise ValueError("max_material_tokens must be a positive integer")
+    if not isinstance(max_workers, int) or isinstance(max_workers, bool) or max_workers < 1:
+        raise ValueError("max_workers must be a positive integer")
     from .native_runtime import native_worker_ceiling
+    config_path = work_dir / "game-l10n.json"
+    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
+    routing = config.get("routing", {})
+    role = "translators" if pass_kind == "translation" else "rewriters" if pass_kind == "rewrite" else (
+        "review_triagers" if review_tier == "triage" else "reviewers"
+    )
+    provider = (route_binding or {}).get("provider") or next(iter(routing.get(role, [])), "")
+    if predecessor_context is not None and route_binding is None:
+        provider = predecessor_context["native_route_plan"][0]["provider"]
     if pass_kind == "review":
-        config_path = work_dir / "game-l10n.json"
-        config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
-        routing = config.get("routing", {})
-        provider = (route_binding or {}).get("provider") or "native-sol"
-        tier = "triage" if provider in routing.get("review_triagers", ["native-luna"]) else "strong"
-        max_workers = review_worker_limit(routing, max_workers, tier=tier)
-    max_workers = native_worker_ceiling(work_dir, (route_binding or {}).get("provider") or (
-        "native-luna" if pass_kind == "translation" else "native-sol"), max_workers)
+        max_workers = review_worker_limit(
+            routing, max_workers, tier=review_tier or "strong"
+        )
+    if provider:
+        max_workers = native_worker_ceiling(work_dir, provider, max_workers)
+    translation_predecessor = None
+    if pass_kind == "translation":
+        from .translation_exchange import configured_translation_route_plan, _validated_translation_route_plan
+        configured_plan = configured_translation_route_plan(work_dir, config)
+        if translation_route_plan is not None:
+            translation_route_plan = _validated_translation_route_plan(translation_route_plan)
+            if configured_plan and configured_plan != translation_route_plan:
+                raise ValueError("E_TRANSLATION_ROUTE_PLAN_CHANGED: use a fresh namespace for changed routes")
+        else:
+            translation_route_plan = configured_plan or None
+        if translation_route_plan is not None:
+            translation_predecessor = _native_translation_predecessor(
+                work_dir, translation_route_plan, provider, predecessor_receipt, segments,
+            )
+            if predecessor_context is not None and translation_predecessor != {
+                key: predecessor_context[key] for key in ("receipt", "receipt_sha256", "contract_fingerprint")
+            }:
+                raise ValueError("E_TRANSLATION_PREDECESSOR_INVALID: predecessor changed during preparation")
+            selected_model = next(item["model"] for item in translation_route_plan if item["provider"] == provider)
+            if route_binding is not None and route_binding.get("model", selected_model) != selected_model:
+                raise ValueError("E_MODEL_POLICY_BINDING_CONFLICT: selected model differs from configured translation route")
+            route_binding = {**(route_binding or {"provider": provider, "attempt": 1}), "model": selected_model}
+        elif predecessor_receipt is not None:
+            raise ValueError("E_TRANSLATION_ROUTE_PLAN_INVALID: predecessor requires the complete configured route graph")
+    elif predecessor_receipt is not None or translation_route_plan is not None:
+        raise ValueError("E_TRANSLATION_ROUTE_PLAN_INVALID: translation continuation is not a review policy")
+    if not isinstance(review_split_max_depth, int) or isinstance(review_split_max_depth, bool) or review_split_max_depth < 0:
+        raise ValueError("review_split_max_depth must be a non-negative integer")
+    if review_split_max_record_amplification is not None and (
+        not isinstance(review_split_max_record_amplification, (int, float))
+        or isinstance(review_split_max_record_amplification, bool)
+        or not math.isfinite(review_split_max_record_amplification)
+        or review_split_max_record_amplification < 1
+    ):
+        raise ValueError("review_split_max_record_amplification must be finite and at least one")
     if _review_split is not None and pass_kind != "review":
         raise ValueError("Review split metadata is valid only for review passes")
     review_split = _review_split or (
@@ -1191,30 +1306,29 @@ def prepare_native_tasks(
         or not isinstance(review_split["root_source_fingerprint"], str)
     ):
         raise ValueError("Review split metadata is invalid")
-    if not 1 <= bulk_budget_gate_records <= DEFAULT_BULK_BUDGET_GATE_RECORDS:
-        raise ValueError(
-            "bulk_budget_gate_records may be lowered but cannot exceed the core default"
-        )
-    if max_elapsed_minutes is not None and max_elapsed_minutes < 1:
-        raise ValueError("max_elapsed_minutes must be positive")
-    if max_input_tokens is not None and max_input_tokens < 1:
-        raise ValueError("max_input_tokens must be positive")
+    if max_elapsed_minutes is not None and (
+        not isinstance(max_elapsed_minutes, int) or isinstance(max_elapsed_minutes, bool) or max_elapsed_minutes < 1
+    ):
+        raise ValueError("max_elapsed_minutes must be a positive integer")
+    if max_input_tokens is not None and (
+        not isinstance(max_input_tokens, int) or isinstance(max_input_tokens, bool) or max_input_tokens < 1
+    ):
+        raise ValueError("max_input_tokens must be a positive integer")
     if max_provider_cost_usd is not None and (
-        not math.isfinite(max_provider_cost_usd) or max_provider_cost_usd <= 0
+        not isinstance(max_provider_cost_usd, (int, float))
+        or isinstance(max_provider_cost_usd, bool)
+        or not math.isfinite(max_provider_cost_usd) or max_provider_cost_usd <= 0
     ):
         raise ValueError("max_provider_cost_usd must be positive")
     if provider_cost_unmetered and max_provider_cost_usd is not None:
         raise ValueError(
             "provider_cost_unmetered and max_provider_cost_usd are mutually exclusive"
         )
-    if user_approved_budget and (
-        max_elapsed_minutes is None
-        or max_input_tokens is None
-        or (not provider_cost_unmetered and max_provider_cost_usd is None)
+    if user_approved_budget and not any(
+        value is not None
+        for value in (max_elapsed_minutes, max_input_tokens, max_provider_cost_usd)
     ):
-        raise ValueError(
-            "A user-approved bulk budget requires elapsed, input-token, and cost-or-unmetered limits"
-        )
+        raise ValueError("A user-approved budget requires at least one explicit limit")
     control_turn_limits = (
         max_root_model_calls_per_wave,
         max_root_model_calls_per_turn,
@@ -1251,16 +1365,8 @@ def prepare_native_tasks(
 
     if review_split is not None and not review_split["root_source_fingerprint"]:
         review_split = {**review_split, "root_source_fingerprint": fingerprint}
-    task_max_records = (
-        min(max_records, DEFAULT_REVIEW_INITIAL_RECORDS)
-        if pass_kind == "review"
-        else max_records
-    )
-    task_max_material_tokens = (
-        min(max_material_tokens, DEFAULT_REVIEW_INITIAL_MATERIAL_TOKENS)
-        if pass_kind == "review"
-        else max_material_tokens
-    )
+    task_max_records = max_records
+    task_max_material_tokens = max_material_tokens
     task_min_records = min(min_records, task_max_records)
     manifest_path = output_dir / "manifest.json"
     execution_namespace = output_dir.resolve().relative_to(work_dir.resolve()).as_posix()
@@ -1293,6 +1399,8 @@ def prepare_native_tasks(
             == task_max_material_tokens
             and manifest.get("review_split") == review_split
             and manifest.get("route_binding") == route_binding
+            and manifest.get("translation_route_plan") == translation_route_plan
+            and manifest.get("translation_predecessor") == translation_predecessor
             and manifest.get("execution_namespace", execution_namespace) == execution_namespace
             and manifest.get("language_binding") == language_binding
             and manifest.get("task_payload_schema") == TASK_PAYLOAD_SCHEMA
@@ -1307,7 +1415,6 @@ def prepare_native_tasks(
                 max_workers,
                 len(segments),
                 pass_kind=pass_kind,
-                bulk_budget_gate_records=bulk_budget_gate_records,
                 max_elapsed_minutes=max_elapsed_minutes,
                 max_input_tokens=max_input_tokens,
                 max_provider_cost_usd=max_provider_cost_usd,
@@ -1317,6 +1424,9 @@ def prepare_native_tasks(
                 max_root_model_calls_per_turn=max_root_model_calls_per_turn,
                 max_root_input_tokens_per_turn=max_root_input_tokens_per_turn,
                 control_turn_budget_user_approved=control_turn_budget_user_approved,
+                review_split_max_depth=review_split_max_depth,
+                review_split_max_record_amplification=review_split_max_record_amplification,
+                review_tier=review_tier,
             )
             valid = (
                 manifest["execution_contract"] == expected_execution_contract
@@ -1356,6 +1466,7 @@ def prepare_native_tasks(
                         not item["dispatch_authorized"] for item in task_rows
                     ),
                 }
+        raise ValueError("E_NATIVE_TASK_MANIFEST_IMMUTABLE: prepare changed execution policy in a new task namespace")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     expected: set[str] = set()
@@ -1365,6 +1476,11 @@ def prepare_native_tasks(
     current_tokens = 0
     for ordinal, segment in enumerate(segments):
         estimated_tokens = _estimated_material_tokens(segment)
+        if estimated_tokens > task_max_material_tokens:
+            raise ValueError(
+                "E_NATIVE_INPUT_CAPACITY_EXCEEDED: compact the bound target context "
+                "or configure a larger max_material_tokens within the selected model's capacity"
+            )
         # A mostly full translation batch ends at a scene change so a scene is translated
         # by one worker with one shared context; hard caps are unchanged.
         scene_break = (
@@ -1435,7 +1551,6 @@ def prepare_native_tasks(
         max_workers,
         len(segments),
         pass_kind=pass_kind,
-        bulk_budget_gate_records=bulk_budget_gate_records,
         max_elapsed_minutes=max_elapsed_minutes,
         max_input_tokens=max_input_tokens,
         max_provider_cost_usd=max_provider_cost_usd,
@@ -1445,6 +1560,9 @@ def prepare_native_tasks(
         max_root_model_calls_per_turn=max_root_model_calls_per_turn,
         max_root_input_tokens_per_turn=max_root_input_tokens_per_turn,
         control_turn_budget_user_approved=control_turn_budget_user_approved,
+        review_split_max_depth=review_split_max_depth,
+        review_tier=review_tier,
+        review_split_max_record_amplification=review_split_max_record_amplification,
     )
     budget_gate = execution_contract["bulk_budget_gate"]
     for task in tasks:
@@ -1453,8 +1571,8 @@ def prepare_native_tasks(
             or budget_gate["user_approved"] is True
             or task["wave"] <= budget_gate["pilot_waves_without_approved_budget"]
         )
-    worker_contract = _worker_contract(pass_kind)
-    detail_contract = _detail_contract(pass_kind)
+    worker_contract = _worker_contract(pass_kind, max_depth=review_split_max_depth)
+    detail_contract = _detail_contract(pass_kind, max_depth=review_split_max_depth)
     result_contract = _result_contract()
     contract_fingerprint = stable_hash(
         {
@@ -1463,6 +1581,8 @@ def prepare_native_tasks(
             "execution_contract": execution_contract,
             "result_contract": result_contract,
             **({"route_binding": route_binding} if route_binding is not None else {}),
+            **({"translation_route_plan": translation_route_plan} if translation_route_plan is not None else {}),
+            **({"translation_predecessor": translation_predecessor} if translation_predecessor is not None else {}),
             "language_binding": language_binding,
             "content_source_policy": source_policy,
             "execution_namespace": execution_namespace,
@@ -1483,6 +1603,8 @@ def prepare_native_tasks(
         "records": len(segments),
         "review_split": review_split,
         "route_binding": route_binding,
+        **({"translation_route_plan": translation_route_plan} if translation_route_plan is not None else {}),
+        **({"translation_predecessor": translation_predecessor} if translation_predecessor is not None else {}),
         "execution_namespace": execution_namespace,
         "language_binding": language_binding,
         "content_source_policy": source_policy,
@@ -1645,6 +1767,10 @@ def _normalize_review_failure(
     return normalized
 
 
+class _NativeSourceBindingError(ValueError):
+    """Shared source authority failed, invalidating dependent task imports."""
+
+
 def _validate_manifest_rows(
     work_dir: Path,
     manifest: dict[str, Any],
@@ -1661,7 +1787,7 @@ def _validate_manifest_rows(
 
         artifact = manifest.get("source_artifact")
         if not isinstance(artifact, str) or not artifact.strip():
-            raise ValueError("Optional-slot source artifact is invalid")
+            raise _NativeSourceBindingError("Optional-slot source artifact is invalid")
         try:
             if Path(artifact).is_absolute():
                 raise ValueError("Optional-slot source artifact must be relative")
@@ -1671,13 +1797,13 @@ def _validate_manifest_rows(
                 raise ValueError("Optional-slot source artifact must be a file")
             ordered = read_segments(source)
         except (OSError, UnicodeError, ValueError, TypeError, KeyError):
-            raise ValueError("Optional-slot source artifact is invalid") from None
+            raise _NativeSourceBindingError("Optional-slot source artifact is invalid") from None
         if (
             len(ordered) != manifest.get("records")
             or stable_hash_sequence(asdict(segment) for segment in ordered)
             != manifest.get("source_fingerprint")
         ):
-            raise ValueError("Optional-slot source no longer matches its task manifest")
+            raise _NativeSourceBindingError("Optional-slot source no longer matches its task manifest")
         source_ids = {segment.id for segment in ordered}
         for segment in ordered:
             if segment.metadata.get("ui_empty_target") is not None:
@@ -1686,17 +1812,12 @@ def _validate_manifest_rows(
                     isinstance(target_id, str) and target_id in source_ids
                     for target_id in related
                 ):
-                    raise ValueError("Optional-slot composition references an unbound target")
+                    raise _NativeSourceBindingError("Optional-slot composition references an unbound target")
         # Cache only a fully validated source; reuse once per wave/import scan.
         bound_segments.update((segment.id, segment) for segment in ordered)
     content_policy = _bound_manifest_content_source_policy(manifest)
     route_binding = manifest.get("route_binding") or {}
-    provenance_route = route_binding.get("provider") or (
-        "native-luna"
-        if manifest.get("pass_kind", "translation") == "translation"
-        else "native-sol"
-    )
-    provenance_model = route_binding.get("model") or provenance_route
+    runtime_models = (native_runtime(work_dir) or {}).get("models", {})
     if route_binding:
         expected_provider = route_binding["provider"]
         for row in rows:
@@ -1713,8 +1834,11 @@ def _validate_manifest_rows(
             segment=bound_segments.get(row["target_id"])
             if isinstance(row.get("target_id"), str) else None,
             content_policy=content_policy,
-            provenance_model=provenance_model,
-            provenance_route=provenance_route,
+            provenance_model=route_binding.get("model") or runtime_models.get(
+                route_binding.get("provider") or row.get("provider", "native-worker"),
+                "",
+            ),
+            provenance_route=route_binding.get("provider") or row.get("provider", "native-worker"),
         )
         for row in rows
     ]
@@ -1740,7 +1864,7 @@ def _validate_manifest_rows(
     return validated
 
 
-def import_native_shard(work_dir: Path, source: Path, shard_name: str) -> dict[str, Any]:
+def import_native_shard(work_dir: Path, source: Path, shard_name: str, *, model: str | None = None) -> dict[str, Any]:
     require_control_plane_ready(work_dir)
     safe_name = SAFE_NAME.sub("-", shard_name.casefold()).strip("-.")
     if not safe_name:
@@ -1750,14 +1874,18 @@ def import_native_shard(work_dir: Path, source: Path, shard_name: str) -> dict[s
         task_kind="translation",
         route="native-pass:translation",
     )
+    runtime_models = (native_runtime(work_dir) or {}).get("models", {})
     rows = []
     for row in _read_jsonl(source):
         provider = str(row.get("provider", "native-worker"))
+        exact_model = model or runtime_models.get(provider)
+        if not isinstance(exact_model, str) or not exact_model:
+            raise ValueError("E_NATIVE_MODEL_BINDING_REQUIRED: import with an exact model or configured runtime binding")
         rows.append(
             _validate_row(
                 row,
                 content_policy=source_policy,
-                provenance_model=provider,
+                provenance_model=exact_model,
                 provenance_route=provider,
             )
         )
@@ -1781,7 +1909,7 @@ def import_native_wave(
     source_dir: Path,
     wave: int,
 ) -> dict[str, Any]:
-    """Validate and import one completed manifest wave without exposing result text."""
+    """Import each fully validated task atomically; preserve independent peers."""
 
     require_control_plane_ready(work_dir)
     if not isinstance(wave, int) or isinstance(wave, bool) or wave < 1:
@@ -1812,40 +1940,57 @@ def import_native_wave(
     planned: list[tuple[Path, list[dict[str, Any]]]] = []
     wave_ids: set[str] = set()
     bound_segments: dict[str, Segment] = {}
+    errors: list[ValueError] = []
+    source_binding_invalid = False
     for task in tasks:
-        expected_ids = _validate_manifest_task_file(manifest_path, manifest, task)
-        result_path = source_dir / task["file"]
-        if not result_path.is_file():
-            raise ValueError("Native wave result is incomplete")
         try:
+            expected_ids = _validate_manifest_task_file(manifest_path, manifest, task)
+            destination = _manifest_shard_path(work_dir, manifest, task)
+            result_path = source_dir / task["file"]
+            if not result_path.is_file():
+                if not destination.is_file():
+                    raise ValueError("Native wave result is incomplete")
+                result_path = destination
             raw_rows = _read_jsonl(result_path)
-        except (ValueError, json.JSONDecodeError):
-            raise ValueError(
-                "E_NATIVE_WAVE_RESULT_INVALID: Native wave result is invalid"
-            ) from None
-        result_ids = [row.get("target_id") for row in raw_rows]
-        if result_ids != expected_ids:
-            raise ValueError(
-                "Native wave result does not match its exclusive task binding"
-            )
-        if wave_ids.intersection(result_ids):
-            raise ValueError("Native wave results overlap")
-        try:
-            rows = _validate_manifest_rows(
-                work_dir, manifest, raw_rows, bound_segments=bound_segments
-            )
+            result_ids = [row.get("target_id") for row in raw_rows]
+            if result_ids != expected_ids:
+                raise ValueError("Native wave result does not match its exclusive task binding")
+            if wave_ids.intersection(result_ids):
+                raise ValueError("Native wave results overlap")
+            try:
+                rows = _validate_manifest_rows(
+                    work_dir, manifest, raw_rows, bound_segments=bound_segments
+                )
+            except _NativeSourceBindingError:
+                raise
+            except (ValueError, json.JSONDecodeError) as exc:
+                if str(exc) in {
+                    "E_EXTERNAL_CONTENT_PROVENANCE_DENIED", "E_OUTPUT_PROVENANCE_INVALID",
+                }:
+                    raise ValueError(str(exc)) from None
+                raise ValueError("E_NATIVE_WAVE_RESULT_INVALID: Native wave result is invalid") from None
+            if destination.is_file():
+                previous = _validate_manifest_rows(
+                    work_dir, manifest, _read_jsonl(destination), bound_segments=bound_segments
+                )
+                if previous != rows:
+                    raise ValueError("E_NATIVE_IMPORTED_TASK_CHANGED: preserve the validated task checkpoint")
+            wave_ids.update(result_ids)
+            planned.append((destination, rows))
         except (ValueError, json.JSONDecodeError) as exc:
-            if str(exc) in {
-                "E_EXTERNAL_CONTENT_PROVENANCE_DENIED",
-                "E_OUTPUT_PROVENANCE_INVALID",
-            }:
-                raise ValueError(str(exc)) from None
-            raise ValueError("E_NATIVE_WAVE_RESULT_INVALID: Native wave result is invalid") from None
-        wave_ids.update(result_ids)
-        planned.append((_manifest_shard_path(work_dir, manifest, task), rows))
+            source_binding_invalid |= isinstance(exc, _NativeSourceBindingError)
+            errors.append(ValueError(
+                "E_NATIVE_WAVE_RESULT_INVALID: Native wave result is invalid"
+                if isinstance(exc, json.JSONDecodeError) else str(exc)
+            ))
 
+    if source_binding_invalid:
+        raise ValueError("E_NATIVE_WAVE_RESULT_INVALID: Native wave source binding is invalid")
     for destination, rows in planned:
-        _atomic_jsonl(destination, rows)
+        if not destination.is_file():
+            _atomic_jsonl(destination, rows)
+    if errors:
+        raise errors[0]
     receipt = _write_wave_receipt(work_dir, manifest, tasks, wave)
 
     records = sum(len(rows) for _, rows in planned)
@@ -1973,8 +2118,7 @@ def _write_wave_relay_dispatch(
         legacy_results = previous_launch.get("legacy_results", [])
     launch = launch_contract(
         work_dir,
-        (manifest.get("route_binding") or {}).get("provider")
-        or ("native-luna" if manifest["pass_kind"] == "translation" else "native-sol"),
+        _configured_manifest_provider(work_dir, manifest),
         [binding["task"] for binding in bindings],
     )
     _preserve_legacy_launch_fields(launch, previous_launch)
@@ -2896,10 +3040,6 @@ def _imported_native_waves(
                     "E_NATIVE_CONTROL_IMPORTED_SHARD_INVALID: imported shard binding changed"
                 )
             present.append(True)
-        if any(present) and not all(present):
-            raise ValueError(
-                "E_NATIVE_CONTROL_STATE_INVALID: a wave is only partially imported"
-            )
         if all(present):
             _write_wave_receipt(work_dir, manifest, tasks, wave)
             imported_waves.append(wave)
@@ -3054,17 +3194,32 @@ def _inherit_native_control_usage(
     _atomic_json(child_path, child_state)
 
 
+def _configured_manifest_provider(work_dir: Path, manifest: dict[str, Any]) -> str:
+    bound = (manifest.get("route_binding") or {}).get("provider")
+    if bound:
+        return bound
+    config_path = work_dir / "game-l10n.json"
+    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
+    kind = (manifest.get("content_source_policy") or {}).get("task_kind", manifest.get("pass_kind"))
+    role = {"translation": "translators", "rewrite": "rewriters", "triage": "review_triagers"}.get(kind, "reviewers")
+    if manifest.get("execution_contract", {}).get("review_tier") == "triage":
+        role = "review_triagers"
+    return next(iter(config.get("routing", {}).get(role, [])), "")
+
+
 def _native_review_call_budget(work_dir: Path, manifest_path: Path, manifest: dict[str, Any]) -> int | None:
-    provider = (manifest.get("route_binding") or {}).get("provider") or "native-sol"
+    provider = _configured_manifest_provider(work_dir, manifest)
+    if not provider:
+        return None
     config_path = work_dir / "game-l10n.json"
     config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
     routing = config.get("routing", {})
-    triage = (provider in routing.get("review_triagers", ["native-luna"])
-              and provider not in routing.get("reviewers", []))
+    triage = (manifest.get("execution_contract", {}).get("review_tier") == "triage"
+              or (manifest.get("content_source_policy") or {}).get("task_kind") == "triage")
     runtime = native_runtime(work_dir) if provider.startswith("native-") else None
-    model = (runtime or {}).get("models", {}).get(provider, "")
+    model = (manifest.get("route_binding") or {}).get("model") or (runtime or {}).get("models", {}).get(provider, "")
     limit = (routing.get("triage_max_calls") if triage else review_call_limit(
-        provider, routing.get("reviewers", ["native-sol"]),
+        provider, routing.get("reviewers", [provider] if provider else []),
         routing.get("review_attempt_limits", {}), model=model,
         tier_limit=routing.get("strong_max_calls"),
     ))
@@ -3119,7 +3274,10 @@ def _prepare_review_split_child(
     _atomic_jsonl(child_source, (asdict(segment) for segment in failed))
 
     child_max_records = max(1, parent_task_records // 2)
-    child_max_material = max(256, parent_task_material // 2)
+    child_max_material = max(
+        max(_estimated_material_tokens(segment) for segment in failed),
+        parent_task_material // 2,
+    )
     execution_contract = current_manifest["execution_contract"]
     control_turn_budget_user_approved = (
         execution_contract.get("control_turn_budget_user_approved") is True
@@ -3135,7 +3293,6 @@ def _prepare_review_split_child(
         min_records=min(int(current_manifest["min_records"]), child_max_records),
         max_material_tokens=child_max_material,
         max_workers=int(current_manifest["max_workers"]),
-        bulk_budget_gate_records=int(gate["activation_records"]),
         max_elapsed_minutes=gate.get("max_elapsed_minutes"),
         max_input_tokens=gate.get("max_input_tokens"),
         max_provider_cost_usd=gate.get("max_provider_cost_usd"),
@@ -3157,6 +3314,13 @@ def _prepare_review_split_child(
             else None
         ),
         control_turn_budget_user_approved=control_turn_budget_user_approved,
+        review_tier=execution_contract.get("review_tier"),
+        review_split_max_depth=execution_contract.get("review_optimization_policy", {}).get(
+            "max_depth", current_manifest["worker_contract"]["failure_split"]["max_depth"]
+        ),
+        review_split_max_record_amplification=execution_contract.get(
+            "review_optimization_policy", {}
+        ).get("max_record_amplification"),
         _review_split={
             "depth": next_depth,
             "semantic_passes": split["semantic_passes"] + 1,
@@ -3188,24 +3352,26 @@ def _review_split_stop_reason(
     parent_task_records = int(
         current_manifest.get("task_max_records", current_manifest["max_records"])
     )
-    if review_call_budget is None and (current_manifest.get("route_binding") or {}).get("provider", "native-sol") in {"native-sol", "openai-sol"}:
-        review_call_budget = 2
     if review_call_budget is not None and split["semantic_passes"] >= review_call_budget:
         return "review_call_limit"
     if len(failed) <= 1:
         return "smallest_safe_record_isolated"
-    if parent_task_records <= 1:
-        return "single_record_tasks_reached"
-    if split["depth"] >= min(
-        DEFAULT_REVIEW_SPLIT_MAX_DEPTH, CORE_REVIEW_SPLIT_EFFECTIVE_MAX_DEPTH
+    if parent_task_records <= 1 or (
+        current_manifest.get("tasks")
+        and all(task["records"] <= 1 for task in current_manifest["tasks"])
     ):
-        return "effective_split_depth_limit"
-    if split["semantic_passes"] >= DEFAULT_REVIEW_SPLIT_MAX_CALLS:
-        return "semantic_pass_limit"
-    projected_attempts = attempted_records + len(failed)
-    if root_records < 1 or (
-        projected_attempts / root_records
-        > CORE_REVIEW_SPLIT_MAX_RECORD_AMPLIFICATION
+        return "single_record_tasks_reached"
+    policy = current_manifest.get("execution_contract", {}).get("review_optimization_policy", {})
+    max_depth = policy.get(
+        "max_depth", current_manifest.get("worker_contract", {}).get(
+            "failure_split", {}
+        ).get("max_depth", DEFAULT_REVIEW_SPLIT_MAX_DEPTH)
+    )
+    if split["depth"] >= max_depth:
+        return "split_depth_limit"
+    amplification = policy.get("max_record_amplification")
+    if amplification is not None and (
+        root_records < 1 or (attempted_records + len(failed)) / root_records > amplification
     ):
         return "record_amplification_limit"
     return ""
@@ -3337,8 +3503,9 @@ def _native_control_step_single(
     # Probe the selected native API route before creating controller state.
     from .native_runtime import native_worker_ceiling
     try:
-        native_worker_ceiling(work_dir, (manifest.get("route_binding") or {}).get("provider") or (
-            "native-luna" if manifest["pass_kind"] == "translation" else "native-sol"), 1)
+        provider = _configured_manifest_provider(work_dir, manifest)
+        if provider:
+            native_worker_ceiling(work_dir, provider, 1)
     except ValueError as error:
         existing = _wave_relay_dispatch_path(work_dir, _native_control_plan_fingerprint(manifest), 1)
         if str(error) != ISOLATION_ISSUE or not existing.is_file():
@@ -3442,24 +3609,27 @@ def _native_control_step_single(
             if configured_max_root_calls is not None
             else None
         )
-        max_unchanged = int(
-            manifest["execution_contract"].get(
-                "max_unchanged_progress_observations", 1
-            )
-        )
         relay_issue = ""
+        unobserved_relay = False
         if relay_dispatch_path.is_file():
             existing_dispatch = json.loads(relay_dispatch_path.read_text(encoding="utf-8"))
             runtime = native_runtime(work_dir) or {}
             guarded_host = runtime.get("host") == "omp" and runtime.get("transport", "collaboration") == "collaboration"
             if "launch_contract" in existing_dispatch or guarded_host:
                 observed = native_launch_summary(work_dir, relay_dispatch_path)
+                unobserved_relay = (
+                    observed.get("launch_observed") is False
+                    and not relay_receipt_path.is_file()
+                )
+                if unobserved_relay:
+                    ready_results = 0
                 if ISOLATION_ISSUE in observed["issue_codes"]:
                     relay_issue = ISOLATION_ISSUE
         if (
             not relay_issue
             and
             require_relay_receipt
+            and not unobserved_relay
             and state["active_wave"] == next_wave
             and (
                 state["last_action"] == "dispatch_isolated_wave_relay"
@@ -3532,9 +3702,6 @@ def _native_control_step_single(
         ):
             action = "checkpoint_and_stop"
             issue_codes = ["E_NATIVE_WAVE_CONTROL_LIMIT"]
-        elif state["unchanged_observations"] >= max_unchanged:
-            action = "checkpoint_and_stop"
-            issue_codes = ["E_NATIVE_NO_MEASURABLE_PROGRESS"]
         elif ready_results == len(tasks):
             try:
                 try:
@@ -3592,7 +3759,10 @@ def _native_control_step_single(
                     else:
                         action = "dispatch_isolated_wave_relay"
                         issue_codes = []
-        elif ready_results:
+        elif relay_dispatch_path.is_file() and not (unobserved_relay or rebound_relay):
+            action = "wait_for_active_wave"
+            issue_codes = []
+        elif ready_results and not (unobserved_relay or rebound_relay):
             action = "wait_for_active_wave"
             issue_codes = ["E_NATIVE_WAVE_INCOMPLETE"]
         elif not all(
@@ -3609,7 +3779,9 @@ def _native_control_step_single(
         state["active_wave"] = 0
         state["control_steps_in_wave"] = 0
 
-    state["last_action"] = action
+    state["last_action"] = (
+        "publish_isolated_wave_relay" if action == "dispatch_isolated_wave_relay" else action
+    )
     _atomic_json(state_path, state)
     selected_tasks = (
         wave_tasks[next_wave]
@@ -3618,6 +3790,21 @@ def _native_control_step_single(
     )
     for task in selected_tasks:
         _validate_manifest_task_file(manifest_path, manifest, task)
+    if selected_tasks and manifest.get("translation_route_plan") is not None:
+        predecessor = manifest.get("translation_predecessor")
+        selected_segments = [
+            Segment(**row["segment"])
+            for task in selected_tasks
+            for row in _read_jsonl(manifest_path.parent / task["file"])
+        ]
+        verified_predecessor = _native_translation_predecessor(
+            work_dir, manifest["translation_route_plan"],
+            (manifest.get("route_binding") or {}).get("provider", ""),
+            work_dir / predecessor["receipt"] if predecessor is not None else None,
+            selected_segments,
+        )
+        if verified_predecessor != predecessor:
+            raise ValueError("E_TRANSLATION_PREDECESSOR_INVALID: immutable predecessor binding changed")
     if selected_tasks and require_runtime:
         native_runtime(work_dir, required=True)
     relay_dispatch = (
@@ -3635,6 +3822,9 @@ def _native_control_step_single(
     )
     if action == "dispatch_isolated_wave_relay" and rebound_relay:
         relay_dispatch = relay_dispatch_path.resolve().relative_to(work_dir.resolve()).as_posix()
+    if action == "dispatch_isolated_wave_relay":
+        state["last_action"] = action
+        _atomic_json(state_path, state)
     if action == "repair_native_runtime" and next_wave is not None:
         # Return the existing dispatch without rewriting its launch evidence.
         # A host repair must not require the parent to reconstruct a task.
@@ -3815,10 +4005,12 @@ def native_control_step(
         "chain_complete": chain["complete"],
         "record_attempts": record_attempts,
         "record_amplification_ratio": round(record_attempts / root_records, 6),
-        "max_record_amplification_ratio": (
-            CORE_REVIEW_SPLIT_MAX_RECORD_AMPLIFICATION
-        ),
-        "effective_max_depth": CORE_REVIEW_SPLIT_EFFECTIVE_MAX_DEPTH,
+        "max_record_amplification_ratio": current_manifest["execution_contract"].get(
+            "review_optimization_policy", {}
+        ).get("max_record_amplification"),
+        "effective_max_depth": current_manifest["execution_contract"].get(
+            "review_optimization_policy", {}
+        ).get("max_depth", current_manifest["worker_contract"]["failure_split"]["max_depth"]),
         "terminal_reason": "",
     }
     split_summary["remaining_call_budget"] = review_call_budget
@@ -3883,10 +4075,12 @@ def native_control_step(
             "record_amplification_ratio": round(
                 (record_attempts + len(failed)) / root_records, 6
             ),
-            "max_record_amplification_ratio": (
-                CORE_REVIEW_SPLIT_MAX_RECORD_AMPLIFICATION
-            ),
-            "effective_max_depth": CORE_REVIEW_SPLIT_EFFECTIVE_MAX_DEPTH,
+            "max_record_amplification_ratio": current_manifest["execution_contract"].get(
+                "review_optimization_policy", {}
+            ).get("max_record_amplification"),
+            "effective_max_depth": current_manifest["execution_contract"].get(
+                "review_optimization_policy", {}
+            ).get("max_depth", current_manifest["worker_contract"]["failure_split"]["max_depth"]),
             "terminal_reason": "",
         },
     }
