@@ -43,9 +43,22 @@ game-l10n translate `
   --output translations\reviewed.json
 ```
 
-`prepare-batches` now produces `inputs/wolf-primary.json` from the semantic batch collector and `inputs/wolf-independent.json` through a separately implemented raw-JSON shape audit, then records the shared inventory attestation. The two paths must agree on stable ID, source, and order. An explicit `--exclude-json` entry is declared as user-visible and leaves static coverage incomplete instead of silently shrinking the denominator.
+`prepare-batches` produces `inputs/wolf-primary.json` from the semantic batch collector and `inputs/wolf-independent.json` through a separately implemented raw-JSON traversal, then records the shared inventory attestation. Both traversals use the public normalized role specification in `game_l10n.wolf.scope`, not a claim to support every upstream WolfDawn schema. They must agree on stable ID, source, and order. An explicit `--exclude-json` entry leaves static coverage incomplete instead of silently shrinking the denominator.
 
-The context-first translation/review orchestrator remains authoritative. Batch v2 assigns a stable ID to each source occurrence instead of collapsing repeated text, so the same words may receive different translations in different scenes. The primary inventory preserves speaker, neighboring lines, extraction order, engine kind, and exact JSON references while the independent audit checks that the collector did not omit a supported source shape.
+### Display eligibility and unsupported formats
+
+The supported SDK-owned normalized contracts are:
+
+- `names.json` / `names[]`: `safety: safe` names remain possible display dependencies. Safety alone does not prove a particular screen renders a name.
+- Structured `scenes[].lines[]`: event lines remain possible display dependencies because this extraction does not retain the originating WScript opcode. Other nested `source`/`text` objects are not eligible just because they contain source-language characters, a speaker, or a familiar key.
+- `text/**/__strings.json` / `files[].lines[]`: plain dialogue and the payloads of `@putselect`, `@select`, `@toki-teach`, `@placename`, `@subtitle`, `@jimaku`, `@mono_txt`, and the `,msg,` field of `@sumo_actionlist` have supported display roles. Command prefixes/suffixes are not translated. These same payload rules apply to normalized scene lines, including player-visible system/error messages.
+- Empty lines and script comments (`#`, `::`) are control-only; `@mes` is speaker context, not an independent translation target. Unknown commands are unresolved, not proven non-display. Directory/file names such as `debug`, `engine`, or `module` never establish visibility.
+
+Source-language selection runs only after role classification. Context neighbors use eligible source-language display payloads, never unknown commands, comments, or non-target language noise. The primary collector and independent audit each retain an ordered raw census with physical references, source digests, role categories and classifications. Inventories declare `coverage.display_scope` and source-bound `metadata.display_scope_evidence`; fingerprints bind the retained structural evidence, not a runtime visibility claim. Unknown shapes and unsafe names stay raw/unclassified, outside translation/context/review, and emit `WOLF_UNCLASSIFIED_FORMAT_ROLE` with counts while holding static completeness. They are not silently dropped or fabricated as internal-only.
+
+Pending shapes require the existing isolated SDK/extractor-preparation workflow to add an evidence-backed format/consumer rule and independent regression, then regenerate and reconcile inventories. No per-game human whitelist or per-row model classification is required. For an already attested job, preserve canonical occurrence IDs, source and history using Core's `coverage.scope_correction` contract; this fresh-extraction role repair does not rewrite existing inventories or erase historical targets.
+
+Batch v2 assigns a stable ID to each source occurrence instead of collapsing repeated text. The primary inventory preserves speaker, eligible neighboring lines, extraction order, engine kind, and exact JSON references while the independent audit checks supported roles separately. Applying batches mutates only admitted target fields; unsupported files remain byte-for-byte unchanged, and unsupported fields in changed JSON documents retain their original values (JSON formatting may change).
 
 Import the deterministic delivery result into the batches, then apply it:
 

@@ -8,6 +8,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
+from .scope import (
+    VISIBLE_SCRIPT_COMMANDS, occurrence, scope_coverage, structured_role, target_metadata,
+)
+
 
 BATCH_FORMAT = "wolf-rpg-agent-batch-v2"
 LEGACY_BATCH_FORMAT = "wolf-rpg-agent-batch-v1"
@@ -18,15 +22,7 @@ CONTROL_RE = re.compile(
     r"|<[A-Za-z][A-Za-z0-9_:+?=/\-]*>|@[0-9]+|\$[A-Za-z_][A-Za-z0-9_]*"
 )
 MES_RE = re.compile(r"^@mes(?:\s+(.*))?$")
-VISIBLE_COMMANDS = (
-    (re.compile(r"^(@putselect\s+)(.*)$"), "choice"),
-    (re.compile(r"^(@select\s+\S+\s+\S+\s+)(.*)$"), "choice_prompt"),
-    (re.compile(r"^(@toki-teach\s+)(.*)$"), "notification"),
-    (re.compile(r"^(@placename\s+)(.*)$"), "place_name"),
-    (re.compile(r"^(@subtitle\s+\S+\s+)(.*)$"), "subtitle"),
-    (re.compile(r"^(@jimaku\s+)(.*)$"), "caption"),
-    (re.compile(r"^(@mono_txt\s+)(.*)$"), "monologue"),
-)
+VISIBLE_COMMANDS = tuple((re.compile(pattern), kind) for pattern, kind in VISIBLE_SCRIPT_COMMANDS)
 
 
 def controls(text: str) -> list[str]:
@@ -50,14 +46,12 @@ def _visible_payload(source: str) -> tuple[str, str, str, str] | None:
         return "dialogue", "", source, ""
     for pattern, kind in VISIBLE_COMMANDS:
         match = pattern.match(source)
-        if match and _has_source_text(match.group(2)):
+        if match:
             return kind, match.group(1), match.group(2), ""
     if source.startswith("@sumo_actionlist ") and ",msg," in source:
         prefix, rest = source.split(",msg,", 1)
-        if ";" in rest:
-            payload, suffix = rest.split(";", 1)
-            if _has_source_text(payload):
-                return "sumo_message", prefix + ",msg,", payload, ";" + suffix
+        payload, separator, suffix = rest.partition(";")
+        return "sumo_message", prefix + ",msg,", payload, separator + suffix if separator else ""
     return None
 
 
@@ -77,12 +71,12 @@ def _context_neighbors(lines: list[dict[str, Any]], index: int) -> tuple[str, st
     following = ""
     for position in range(index - 1, -1, -1):
         payload = _visible_payload(str(lines[position].get("source", "")))
-        if payload:
+        if payload and _has_source_text(payload[2]):
             previous = payload[2]
             break
     for position in range(index + 1, len(lines)):
         payload = _visible_payload(str(lines[position].get("source", "")))
-        if payload:
+        if payload and _has_source_text(payload[2]):
             following = payload[2]
             break
     return previous, following
@@ -96,6 +90,7 @@ def _add_item(
     source: str,
     context: dict[str, Any],
     ref: dict[str, Any],
+    role: str,
 ) -> None:
     item_id = _make_id(kind, speaker, source, ref)
     if item_id in items:
@@ -106,12 +101,14 @@ def _add_item(
         "speaker": speaker or "unknown",
         "source": source,
         "context": context,
+        "metadata": target_metadata(source, ref, role),
         "target": "",
         "refs": [ref],
     }
 
 
-def _collect_text_json(path: Path, root: Path, items: dict[str, dict[str, Any]]) -> None:
+def _collect_text_json(path: Path, root: Path, items: dict[str, dict[str, Any]],
+                       census: list[dict[str, Any]]) -> None:
     data = json.loads(path.read_text(encoding="utf-8-sig"))
     relative = path.relative_to(root).as_posix()
     for file_index, file_entry in enumerate(data.get("files", [])):
@@ -120,11 +117,19 @@ def _collect_text_json(path: Path, root: Path, items: dict[str, dict[str, Any]])
         speaker = "unknown"
         for line_index, line in enumerate(lines):
             source = str(line.get("source", ""))
+            raw_ref = {"json": relative, "type": "text", "file_index": file_index,
+                       "line_index": line_index}
             speaker_match = MES_RE.match(source)
             if speaker_match:
                 speaker = (speaker_match.group(1) or "unknown").strip()
+                census.append(occurrence(raw_ref, source, "speaker_context", "control_only"))
                 continue
             payload = _visible_payload(source)
+            classification = ("display_candidate" if payload and _has_source_text(payload[2])
+                              else "language_not_selected" if payload
+                              else "control_only" if not source or source.startswith(("#", "::", "\ufeff::"))
+                              else "unclassified")
+            census.append(occurrence(raw_ref, source, "text_script", classification))
             if not payload:
                 continue
             kind, prefix, text, suffix = payload
@@ -136,6 +141,7 @@ def _collect_text_json(path: Path, root: Path, items: dict[str, dict[str, Any]])
                 kind=kind,
                 speaker=speaker,
                 source=text,
+                role="text_script_" + kind,
                 context={"file": filename, "previous": previous, "next": following},
                 ref={
                     "json": relative,
@@ -148,31 +154,50 @@ def _collect_text_json(path: Path, root: Path, items: dict[str, dict[str, Any]])
             )
 
 
-def _collect_structured_json(path: Path, root: Path, items: dict[str, dict[str, Any]]) -> None:
+def _collect_structured_json(path: Path, root: Path, items: dict[str, dict[str, Any]],
+                             census: list[dict[str, Any]]) -> None:
     data = json.loads(path.read_text(encoding="utf-8-sig"))
     relative = path.relative_to(root).as_posix()
     for node_path, node in _walk_source_nodes(data):
         source = node["source"]
-        if not _has_source_text(source):
+        ref = {"json": relative, "type": "structured", "path": list(node_path)}
+        role = structured_role(node_path)
+        payload = _visible_payload(source) if role else None
+        classification = ("display_candidate" if payload and _has_source_text(payload[2])
+                          else "language_not_selected" if payload
+                          else "control_only" if role and (MES_RE.match(source) or not source or source.startswith(("#", "::", "\ufeff::")))
+                          else "unclassified")
+        census.append(occurrence(ref, source, role or "unsupported_structured", classification))
+        if classification != "display_candidate":
             continue
+        _, prefix, text, suffix = payload
+        if prefix or suffix:
+            ref.update(prefix=prefix, suffix=suffix)
         speaker = str(node.get("speaker") or node.get("speaker_src") or "UI/system")
         _add_item(
             items,
             kind="structured",
             speaker=speaker,
-            source=source,
+            source=text,
+            role=role,
             context={"file": relative},
-            ref={"json": relative, "type": "structured", "path": list(node_path)},
+            ref=ref,
         )
 
 
-def _collect_names(path: Path, root: Path, items: dict[str, dict[str, Any]]) -> None:
+def _collect_names(path: Path, root: Path, items: dict[str, dict[str, Any]],
+                   census: list[dict[str, Any]]) -> None:
     if not path.exists():
         return
     data = json.loads(path.read_text(encoding="utf-8-sig"))
     relative = path.relative_to(root).as_posix()
     for index, node in enumerate(data.get("names", [])):
         source = str(node.get("source", ""))
+        ref = {"json": relative, "type": "name", "index": index}
+        classification = ("unclassified" if node.get("safety") != "safe"
+                          else "display_candidate" if _has_source_text(source)
+                          else "language_not_selected")
+        census.append(occurrence(ref, source, "safe_name_dependency", classification))
         if node.get("safety") != "safe" or not _has_source_text(source):
             continue
         _add_item(
@@ -180,8 +205,9 @@ def _collect_names(path: Path, root: Path, items: dict[str, dict[str, Any]]) -> 
             kind="name",
             speaker="name/database",
             source=source,
+            role="safe_name_dependency",
             context={"note": node.get("note", "")},
-            ref={"json": relative, "type": "name", "index": index},
+            ref=ref,
         )
 
 
@@ -208,17 +234,17 @@ def prepare_batches(
         raise FileExistsError(f"Batch output directory must be empty: {output_dir}")
 
     items: dict[str, dict[str, Any]] = {}
-    _collect_names(source_root / "names.json", source_root, items)
-    excluded = {"names.json", "Text_Script.json", *excluded_json_names}
+    census: list[dict[str, Any]] = []
+    excluded_json_names = tuple(excluded_json_names)
+    _collect_names(source_root / "names.json", source_root, items, census)
+    excluded = {"names.json", *excluded_json_names}
     for path in sorted(source_root.glob("*.json")):
         if path.name not in excluded:
-            _collect_structured_json(path, source_root, items)
+            _collect_structured_json(path, source_root, items, census)
     text_root = source_root / "text"
     if text_root.exists():
         for path in sorted(text_root.rglob("__strings.json")):
-            relative_parts = {part.casefold() for part in path.relative_to(text_root).parts}
-            if "debug" not in relative_parts:
-                _collect_text_json(path, source_root, items)
+            _collect_text_json(path, source_root, items, census)
 
     ordered = list(items.values())
     batches: list[list[dict[str, Any]]] = []
@@ -243,6 +269,8 @@ def prepare_batches(
         "kind_counts": dict(Counter(item["kind"] for item in ordered)),
         "speaker_counts": dict(Counter(item["speaker"] for item in ordered)),
         "batches": [],
+        "coverage": scope_coverage(census, len(ordered), list(excluded_json_names)),
+        "raw_occurrences": census,
     }
     for index, batch in enumerate(batches, 1):
         filename = f"batch_{index:04d}.json"
@@ -319,7 +347,7 @@ def apply_batches(
                     documents[relative] = json.loads(path.read_text(encoding="utf-8-sig"))
                 document = documents[relative]
                 if ref["type"] == "structured":
-                    _get_at_path(document, ref["path"])["text"] = target
+                    _get_at_path(document, ref["path"])["text"] = ref.get("prefix", "") + target + ref.get("suffix", "")
                 elif ref["type"] == "name":
                     document["names"][ref["index"]]["text"] = target
                 elif ref["type"] == "text":
