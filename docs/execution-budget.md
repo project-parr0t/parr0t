@@ -55,6 +55,8 @@ Configured translation retries are fresh failed-only tasks, not extra calls hidd
 
 Deterministic acceptance is path-independent. Single-target, deferred batch, and fallback results pass the same structure, protected-token, glossary, UI, and locked-target-language gates before a success is cached. An evidence-bound optional UI slot may validly produce an empty string; absence of a candidate is represented separately and must not be inferred from text truthiness. Provider-independent impossible constraints, such as protected tokens longer than a bound UI character limit, fail preflight without spending a model call. That preflight rejection is not a provider attempt and cannot be used as route-exhaustion evidence or authority to preserve the source.
 
+Native retry collection applies the same bound optional-slot and integrity checks as native-pass ingestion. Exact empty output may remain a successful candidate when its inventory evidence permits it; unbound empty output and whitespace substitutions remain invalid.
+
 ## Delegation budget
 
 Use subagents when work divides into independent, non-overlapping bulk translation or review shards, or when parallel research materially shortens a blocking discovery phase. Keep simple packaging, a single script, a small bug fix, documentation, state inspection, and deterministic validation in the current agent.

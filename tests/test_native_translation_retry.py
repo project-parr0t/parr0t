@@ -13,8 +13,10 @@ from game_l10n.native_translation_retry import (
     advance_native_translation_retries,
     require_pre_fallback_retry_state,
     start_native_translation_retries,
+    NativeTranslationRetryError,
 )
 from tests import write_semantic_result_rows
+from tests.test_validators import optional_slot_fixture
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -126,6 +128,39 @@ class NativeTranslationRetryTests(unittest.TestCase):
                 root, state_dir / STATE_NAME, source, final_path
             )
             self.assertEqual(checked["next_action"], "external_fallback")
+
+    def test_optional_empty_success_survives_failed_only_retry_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            optional = optional_slot_fixture(target_id="optional")
+            segments = [Segment("label", "SOURCE_LABEL"), optional]
+            source = root / "source.jsonl"
+            source.write_text("".join(json.dumps(asdict(item)) + "\n" for item in segments), encoding="utf-8")
+            first = root / "first.jsonl"
+            _write_jsonl(first, [_result("label", "success", "TARGET_LABEL"), _result("optional", "error")])
+            state_dir = root / "retry"
+            state = start_native_translation_retries(root, source, segments, first, state_dir)
+            self.assertEqual([item.id for item in read_segments(root / state["pending_input"])], ["optional"])
+            retry = root / "retry.jsonl"
+            _write_jsonl(retry, [_result("optional", "success", "")])
+            state = advance_native_translation_retries(root, state_dir, retry)
+            self.assertEqual((state["next_action"], state["pending_count"], state["candidate_count"]), ("complete", 0, 2))
+            rows = [json.loads(line) for line in (root / state["pre_fallback_results"]).read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([(row["target_id"], row["status"], row["text"]) for row in rows], [
+                ("label", "success", "TARGET_LABEL"), ("optional", "success", ""),
+            ])
+
+    def test_empty_success_without_bound_authority_and_optional_whitespace_stay_invalid(self) -> None:
+        for segment, text in ((Segment("plain", "SOURCE"), ""), (optional_slot_fixture(), " ")):
+            with self.subTest(target=segment.id, text=text), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "source.jsonl"
+                source.write_text(json.dumps(asdict(segment)) + "\n", encoding="utf-8")
+                result = root / "result.jsonl"
+                _write_jsonl(result, [_result(segment.id, "success", text)])
+                with self.assertRaises(NativeTranslationRetryError):
+                    start_native_translation_retries(root, source, [segment], result, root / "retry")
+                self.assertFalse((root / "retry" / STATE_NAME).exists())
 
 
 if __name__ == "__main__":

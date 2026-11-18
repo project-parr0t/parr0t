@@ -40,7 +40,7 @@ async function fixture(run) {
       if (argv[0] === "preflight" && failPreflight) return { code: 1, stdout: "", killed: false };
       if (argv[0] === "start") started.add(argv[1]);
       if (argv[0] === "event") {
-        if (argv[1].startsWith("end:")) assert.ok(started.has("worker-0") && started.has("worker-1"));
+        if (argv[1].startsWith("end:")) assert.ok(started.has(argv[1].replace("end:", "worker-")));
         events.push(argv[1]);
       }
       return { code: 0, killed: false, stdout: JSON.stringify({ issue_codes: [], unstarted_tasks: keys.filter(key => !started.has(key)) }) };
@@ -64,15 +64,15 @@ async function fixture(run) {
   } finally { rmSync(workspace, { recursive: true, force: true }); }
 }
 
-test("fast context worker waits for sibling start and finalizer waits for every terminal event", async () => {
+test("context workers end independently and finalizer waits for every terminal event", async () => {
   await fixture(async ({ dispatch, enter, lifecycle, parent, events }) => {
     assert.equal((await dispatch(["worker-0", "worker-1"], "batch")).block, undefined);
     const first = await enter("worker-0", "First");
     await first.end({ willContinue: false, awaitingAsyncWork: false });
-    assert.deepEqual(events, ["start:0"]);
+    assert.deepEqual(events, ["start:0", "end:0"]);
     assert.equal((await lifecycle.tool_call({ toolName: "parr0t_process", input: { argv: ["seal-data-plane-task"] } }, parent)).block, true);
     const second = await enter("worker-1", "Second");
-    assert.deepEqual(events, ["start:0", "start:1", "end:0"]);
+    assert.deepEqual(events, ["start:0", "end:0", "start:1"]);
     assert.equal((await dispatch(["finalizer"], "too-early")).block, true);
     await second.end({ willContinue: false, awaitingAsyncWork: true });
     assert.equal((await dispatch(["finalizer"], "still-early")).block, true);
@@ -80,7 +80,7 @@ test("fast context worker waits for sibling start and finalizer waits for every 
     assert.equal((await dispatch(["finalizer"], "ready")).block, undefined);
     const finalizer = await enter("finalizer", "Finalizer");
     await finalizer.end({ willContinue: false, awaitingAsyncWork: false });
-    assert.deepEqual(events, ["start:0", "start:1", "end:0", "end:1", "finalizer-start", "finalizer-end"]);
+    assert.deepEqual(events, ["start:0", "end:0", "start:1", "end:1", "finalizer-start", "finalizer-end"]);
     assert.equal(await lifecycle.tool_call({ toolName: "parr0t_process", input: { argv: ["seal-data-plane-task"] } }, parent), undefined);
   });
 });
@@ -101,5 +101,27 @@ test("pre-spawn failures remain recoverable and changed task bytes never record 
     assert.equal((await dispatch(["worker-0"], "duplicate")).block, true);
     assert.deepEqual([...started], ["worker-0"]);
     assert.equal(readFileSync(taskPath, "utf8"), taskBytes);
+  });
+});
+
+test("partial batch admission failure cannot strand a completed sibling", async () => {
+  await fixture(async ({ dispatch, enter, lifecycle, parent, events }) => {
+    assert.equal((await dispatch(["worker-0", "worker-1"], "partial-batch")).block, undefined);
+    const first = await enter("worker-0", "First");
+    lifecycle.tool_result({ toolCallId: "partial-batch", isError: true });
+    await first.end({ willContinue: false, awaitingAsyncWork: false });
+    assert.deepEqual(events, ["start:0", "end:0"]);
+    assert.equal((await dispatch(["finalizer"], "failed-sibling")).block, true);
+    assert.equal(await lifecycle.tool_call({
+      toolName: "parr0t_process", input: { argv: ["seal-data-plane-task"] },
+    }, parent), undefined);
+    assert.equal((await dispatch(["worker-1"], "recover-unstarted")).block, undefined);
+    const second = await enter("worker-1", "Second");
+    await second.end({ willContinue: false, awaitingAsyncWork: false });
+    assert.equal((await dispatch(["worker-0"], "never-replay-completed")).block, true);
+    assert.equal((await dispatch(["finalizer"], "ready")).block, undefined);
+    const finalizer = await enter("finalizer", "Finalizer");
+    await finalizer.end({ willContinue: false, awaitingAsyncWork: false });
+    assert.deepEqual(events, ["start:0", "end:0", "start:1", "end:1", "finalizer-start", "finalizer-end"]);
   });
 });
