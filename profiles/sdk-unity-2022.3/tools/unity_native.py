@@ -294,21 +294,54 @@ def scan_native(path: Path, relative_path: str, *, method: str = "primary") -> d
         if len(lines) >= 2:
             occurrences.append({"kind": "app_info", "file": relative_path, "location": {"line_index": 1}, "source": lines[1], "classification": "display" if lines[1] else "non_display", "reason": "UNITY_PRODUCT_WINDOW_TITLE", "proof": {"format": "unity-app-info", "role": "product_name"}})
         return {"occurrences": occurrences, "types": {}, "dependencies": [], "pending": [], "proofs": {}}
+    from unity_native_resources import scan_resource_consumers
     _, leaves = _leaves(raw)
+    consumers = scan_resource_consumers(raw, relative_path, method=method)
+    bindings: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for binding in consumers["bindings"]:
+        bindings.setdefault((binding["resource_type"], binding["resource_id"]), []).append(binding)
     # Both methods traverse the resource tree separately; one dispatches by
     # directory leaf, the other groups supported public resource types first.
     if method == "independent":
         leaves = [leaf for kind in (4, 5, 6, 11) for leaf in leaves if leaf["path"][0] == kind]
-    occurrences, pending = [], []
+    occurrences, pending = [], list(consumers["pending"])
+    found = set()
     for leaf in leaves:
+        kind = leaf["path"][0]
+        role = kind in {4, 5}
         try:
-            values = _leaf_strings(leaf)
+            if kind == 11:
+                values, blocks, _ = _messages(leaf["data"], leaf["codepage"])
+                identifiers = [identifier for low, high, _ in blocks for identifier in range(low, high + 1)]
+            else:
+                values = _leaf_strings(leaf)
+                block = leaf["path"][1] if len(leaf["path"]) > 1 else None
+                identifiers = [(block - 1) * 16 + index if kind == 6 and type(block) is int and block > 0 else None for index in range(len(values))]
         except (ValueError, UnicodeError, LookupError) as exc:
-            pending.append({"reason": str(exc), "file": relative_path, "location": {"resource_path": leaf["path"]}, "affects_display": True})
+            relevant = role or any(key[0] == kind for key in bindings)
+            pending.append({"reason": str(exc), "file": relative_path, "location": {"resource_path": leaf["path"]}, "affects_display": relevant})
             continue
         for index, value in enumerate(values):
-            occurrences.append({"kind": "native_resource", "file": relative_path, "location": {"resource_path": leaf["path"], "entry_index": index}, "source": value, "classification": "display" if value else "non_display", "reason": "WINDOWS_RESOURCE_DISPLAY_FIELD" if value else "EMPTY_RESOURCE_SLOT", "proof": {"format": "windows-resource", "type": leaf["path"][0]}})
-    return {"occurrences": occurrences, "types": {}, "dependencies": [], "pending": pending, "proofs": {}}
+            identifier = identifiers[index]
+            evidence = bindings.get((kind, identifier), [])
+            if evidence:
+                found.add((kind, identifier))
+            display = bool(value) and (role or bool(evidence))
+            reason = ("EMPTY_RESOURCE_SLOT" if not value else
+                      "WINDOWS_RESOURCE_CAPTION_ROLE" if role else
+                      "BOUND_RESOURCE_DISPLAY_CONSUMER" if evidence else
+                      "UNCLASSIFIED_RESOURCE_TABLE_VALUE")
+            proof = {"format": "windows-resource", "type": kind}
+            if role:
+                proof["role"] = "menu_caption" if kind == 4 else "dialog_caption"
+            if evidence:
+                proof["consumers"] = evidence
+            occurrences.append({"kind": "native_resource", "file": relative_path, "location": {"resource_path": leaf["path"], "entry_index": index}, "source": value, "classification": "display" if display else "uncertain" if value else "non_display", "reason": reason, "proof": proof})
+    for key in sorted(set(bindings) - found):
+        pending.append({"reason": "native_display_resource_missing", "scope": "display_dependency",
+                        "file": relative_path, "resource_type": key[0], "resource_id": key[1],
+                        "consumers": bindings[key]})
+    return {"occurrences": occurrences, "types": {}, "dependencies": consumers["dependencies"], "pending": pending, "proofs": {}}
 
 
 def patch_native(raw: bytes, replacements: list[dict[str, Any]], *, app_info: bool = False) -> bytes:

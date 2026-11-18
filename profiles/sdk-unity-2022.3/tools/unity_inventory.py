@@ -121,6 +121,7 @@ def scan_snapshot(snapshot: Path, manifest: dict[str, Any], cache_path: Path, ou
     from unity_native import scan_native
     from unity_objects import bind_script_references, scan_serialized
     from unity_native_calls import scan_native_dependencies
+    from unity_native_resources import reconcile_resource_dependencies
     if method not in METHODS:
         raise ValueError("INVENTORY_METHOD_INVALID")
     if manifest.get("schema") != "parr0t.unity-source-snapshot.v1" or not str(manifest.get("unity_version", "")).startswith("2022.3."):
@@ -152,7 +153,9 @@ def scan_snapshot(snapshot: Path, manifest: dict[str, Any], cache_path: Path, ou
                 if path.name == "app.info":
                     result = scan_native(path, file, method=method)
                 else:
-                    results = [scan_native(path, file, method=method), scan_native_dependencies(path.read_bytes(), file, method=method)]
+                    resources = scan_native(path, file, method=method)
+                    native = scan_native_dependencies(path.read_bytes(), file, method=method)
+                    results = [resources, reconcile_resource_dependencies(resources, native)]
                     if _pe_is_managed(path):
                         results.append(scan_assembly(path, file, method=method))
                     result = _merge(results)
