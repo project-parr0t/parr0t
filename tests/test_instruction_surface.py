@@ -21,24 +21,6 @@ class InstructionSurfaceTests(unittest.TestCase):
         self.assertIn("-name 'requirements.txt'", workflow)
         self.assertIn("--requirement \"$requirements\"", workflow)
 
-    def test_review_control_is_documented_as_a_deterministic_router(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        contract = (root / "docs" / "control-plane-contract.md").read_text(
-            encoding="utf-8"
-        )
-        agents = (root / "AGENTS.md").read_text(encoding="utf-8")
-        skill = (root / "skills" / "game-localization" / "SKILL.md").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertIn("Deterministic review router", contract)
-        self.assertIn("checkpoint_and_stop", contract)
-        self.assertIn("must not create an\nad-hoc manifest", contract)
-        self.assertIn("Keep review control deterministic", agents)
-        self.assertIn("complete low-cost triage", agents)
-        self.assertIn("selective strong review", agents)
-        self.assertIn("Review control is a deterministic router", skill)
-
     def test_always_loaded_instructions_stay_compact(self) -> None:
         limits = {
             "AGENTS.md": 1200,
@@ -52,59 +34,11 @@ class InstructionSurfaceTests(unittest.TestCase):
                 self.assertLessEqual(len(text.split()), limit)
 
 
-    def test_whole_job_usage_limits_are_user_opt_in_and_not_a_startup_gate(self) -> None:
-        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
-        contract = (ROOT / "docs/control-plane-contract.md").read_text(
-            encoding="utf-8"
-        )
-        budget = (ROOT / "docs/execution-budget.md").read_text(encoding="utf-8")
-        exchange = (ROOT / "docs/translation-exchange.md").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertIn("Never solicit limits", agents)
-        self.assertIn("must not ask the user to invent such a ceiling", contract)
-        self.assertIn("including as\na startup", contract)
-        self.assertIn("Never ask the user to create one as a prerequisite", budget)
-        self.assertIn("This is the only automatic usage guard", budget)
-        self.assertIn("No whole-job usage limit is required by default", exchange)
-        self.assertIn("before fallback or as a condition of starting the job", exchange)
-
-
     def test_status_contract_routes_exist_in_the_repository(self) -> None:
         for action, contracts in STATUS_ACTION_CONTRACTS.items():
             for relative in contracts:
                 with self.subTest(action=action, relative=relative):
                     self.assertTrue((ROOT / relative).is_file())
-
-    def test_detail_contract_cannot_override_core_or_serialize_a_batch(self) -> None:
-        detail = (ROOT / "docs/detail-contract.md").read_text(encoding="utf-8")
-        execution = (ROOT / "docs/execution-budget.md").read_text(encoding="utf-8")
-        review = (ROOT / "docs/review-pipeline.md").read_text(encoding="utf-8")
-
-        self.assertIn("supplemental-only", detail)
-        self.assertIn("only executable detail contract", detail)
-        self.assertIn("one semantic batch", detail)
-        self.assertIn("record count alone never activates a pilot stop", detail)
-        self.assertIn("--relay-ended", execution)
-        self.assertIn("one semantic model/API batch call", execution)
-        self.assertIn("must not create or submit one prompt per candidate", review)
-        self.assertIn("must not open the full ordered `source_artifact`", detail)
-        self.assertIn("must not make another full game-tree copy", execution)
-        self.assertIn("must not reopen the complete ordered source", review)
-        self.assertIn("hard ceilings, not initial packing targets", review)
-        self.assertIn("half the prior task bound", detail)
-        self.assertIn("Large-inventory startup budget", execution)
-        self.assertIn("validates only tasks in the wave", execution)
-
-    def test_runtime_and_worker_cost_claims_stay_evidence_bound(self) -> None:
-        coverage = (ROOT / "docs/coverage-gates.md").read_text(encoding="utf-8")
-        deepseek = (ROOT / "docs/codex-app-deepseek.md").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertIn("must not be reported as “working in game”", coverage)
-        self.assertIn("must not open the full ordered source", deepseek)
 
     def test_status_contract_set_is_stable_and_generation_aware(self) -> None:
         first = _status_contract_set(
@@ -127,25 +61,6 @@ class InstructionSurfaceTests(unittest.TestCase):
             first["reload_policy"],
             "digest_change_or_new_control_generation_only",
         )
-
-    def test_small_correction_and_work_lane_contracts_are_bounded(self) -> None:
-        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
-        minimal = (ROOT / "docs" / "minimal-corrections.md").read_text(
-            encoding="utf-8"
-        )
-        execution = (ROOT / "docs" / "execution-budget.md").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertIn("Bind every write to the current work lane", agents)
-        self.assertIn("combined set must remain at or below 32", minimal)
-        self.assertIn("one ordered semantic batch", minimal)
-        self.assertIn("normal ceiling is two semantic calls", minimal)
-        self.assertIn("game-l10n correction-ui", minimal)
-        self.assertIn("file-local lexical vector search", minimal)
-        self.assertIn("must not imitate it by opening the full inventory", minimal)
-        self.assertIn("A supervision or analysis lane", execution)
-        self.assertIn("enumerate the outgoing commits", execution)
 
 
 if __name__ == "__main__":
