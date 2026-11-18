@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
+import hashlib
 import json
 import tempfile
 import unittest
@@ -110,6 +111,46 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(sealed["status"], "error")
         self.assertIn("task_incomplete", sealed["issue_codes"])
         self.assertTrue((output / "receipt.json").is_file())
+
+    def test_compiled_worker_binding_and_pending_preflight_preserve_missing_start_error(self) -> None:
+        _, _, relay = self.prepare_probe()
+        payload = json.loads(relay.read_text(encoding="utf-8"))
+        dispatch = payload["launch_contract"]["worker_dispatches"]["worker-0"]
+        task = self.root / payload["task_path"]
+        self.assertEqual(Path(dispatch["task_path"]), task)
+        self.assertEqual(dispatch["task_sha256"], hashlib.sha256(task.read_bytes()).hexdigest())
+        self.assertEqual(dispatch["slot"], 0)
+        for binding in (str(self.root), str(task), dispatch["task_sha256"], "PARR0T_OMP_TASK=worker-0"):
+            self.assertIn(binding, dispatch["worker_prompt"])
+        preflight = self.invoke_argv(payload["command_argv"]["capability-available"])
+        self.assertEqual(preflight["issue_codes"], [])
+        self.assertEqual(preflight["launch_state"], "awaiting_worker_start")
+        self.assertEqual(native_launch_summary(self.root, relay)["issue_codes"], ["E_NATIVE_WORKER_NOT_STARTED"])
+        sealed = self.invoke_argv(payload["command_argv"]["seal"])
+        self.assertIn("E_NATIVE_WORKER_NOT_STARTED", sealed["issue_codes"])
+
+    def test_admitted_worker_cannot_be_sealed_until_its_real_terminal_event(self) -> None:
+        _, output, relay = self.prepare_probe()
+        payload = json.loads(relay.read_text(encoding="utf-8"))
+        fingerprint = hashlib.sha256(relay.read_bytes()).hexdigest()
+        key = hashlib.sha256(f"{fingerprint}\0worker-0".encode()).hexdigest()
+        admission = self.root / f".game-l10n/native/omp-launch-admissions/{key}.json"
+        admission.parent.mkdir(parents=True)
+        record = {"schema": "parr0t.omp-native-admission.v1", "relay_sha256": fingerprint,
+                  "task": "worker-0", "parent_id": "fixture-relay", "worker_id": "fixture-worker"}
+        for state in ("reserved", "started", "ending"):
+            with self.subTest(state=state):
+                admission.write_text(json.dumps({**record, "state": state}), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "E_NATIVE_WORKER_ACTIVE"):
+                    seal_data_plane_task(self.root, relay, worker_ended=True)
+                self.assertFalse((output / "receipt.json").exists())
+        self.invoke_argv(payload["command_argv"]["capability-available"])
+        self.invoke_argv(["fixture-worker" if arg == "<worker-id>" else arg
+                         for arg in payload["command_argv"]["worker-started"]["worker-0"]])
+        admission.write_text(json.dumps({**record, "state": "ended"}), encoding="utf-8")
+        sealed = self.invoke_argv(payload["command_argv"]["seal"])
+        self.assertIn("task_incomplete", sealed["issue_codes"])
+        self.assertNotIn("E_NATIVE_WORKER_NOT_STARTED", sealed["issue_codes"])
 
 
     def test_operational_failure_requires_cancellation_and_preserves_valid_success(self) -> None:

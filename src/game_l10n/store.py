@@ -14,7 +14,7 @@ from .models import AttemptRecord, TranslationResult
 
 
 @contextmanager
-def exclusive_file_lock(path: Path, *, issue_code: str):
+def exclusive_file_lock(path: Path, *, issue_code: str, blocking: bool = False):
     """Serialize a short file transaction; process exit releases the OS lock."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b") as lock:
@@ -26,10 +26,10 @@ def exclusive_file_lock(path: Path, *, issue_code: str):
         try:
             if os.name == "nt":
                 import msvcrt
-                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
             else:
                 import fcntl
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
         except OSError:
             raise ValueError(issue_code) from None
         try:

@@ -90,13 +90,16 @@ async function runIntegration() {
           context: pi.zod.string().optional(),
           tasks: pi.zod.array(pi.zod.object({
             task: pi.zod.string().optional(),
+            model: pi.zod.string().optional(),
+            agent: pi.zod.string().optional(),
+            name: pi.zod.string().optional(),
             steps: pi.zod.array(pi.zod.string()).optional(),
           })),
         }),
         async execute(_callId, input) {
           dispatchedTasks.push(input);
           for (const task of input.tasks) {
-            const worker = await makeSession(`${id}.Worker${spawned.length + 1}`, "sub", depth + 1, id);
+            const worker = await makeSession(task.name ?? `${id}.Worker${spawned.length + 1}`, "sub", depth + 1, id);
             // Shared context is intentionally NOT replayed as the child's first
             // user prompt: this is the consumer-visible marker-loss risk.
             await worker.runner.emitBeforeAgentStart(task.task ?? task.steps?.[0] ?? "Synthetic task", undefined, []);
@@ -229,6 +232,58 @@ async function runIntegration() {
     assert.deepEqual(deliveries, []);
     assert.deepEqual(observations, []);
     for (const session of sessions) assert.equal(bus.unreadCount(session.id), 0);
+
+    // Compile a fresh first-party synthetic task. No installed game is read,
+    // no provider is contacted, and the actual host runs every lifecycle argv.
+    const coreSource = fileURLToPath(new URL("../src", import.meta.url));
+    function coreMetadata(program, extra = []) {
+      const result = Bun.spawnSync([python, "-X", "utf8", "-I", "-B", "-c",
+        "import json,sys; from pathlib import Path; sys.path.insert(0,sys.argv[1]); w=Path(sys.argv[2]);\n" + program,
+        coreSource, workspace, ...extra], { cwd: workspace, stdout: "pipe", stderr: "pipe" });
+      assert.equal(result.exitCode, 0, result.stderr.toString());
+      return JSON.parse(result.stdout.toString());
+    }
+    const prepared = coreMetadata(`
+from game_l10n.control_plane import establish_control_plane_entry
+from game_l10n.data_plane_task import prepare_data_plane_task
+from game_l10n.native_runtime import configure_native_runtime,bind_data_plane_launch
+(w/"game-l10n.json").write_text("{}",encoding="utf-8")
+establish_control_plane_entry(w)
+configure_native_runtime(w,"omp",{},omp_isolation="prompt")
+game=w/"synthetic-game"; game.mkdir()
+config={"game_roots":[str(game)],"sdk_root":str(w/"synthetic-sdk"),"sdk_selection":{"inventory_fingerprint":"synthetic"}}
+result=prepare_data_plane_task(w,w/".game-l10n/data-plane/source_probe",worker_role="source_probe",config=config)
+bind_data_plane_launch(w,w/result["relay_path"])
+print(json.dumps(result))
+`);
+    const compiledRelay = JSON.parse(readFileSync(path.join(workspace, prepared.relay_path), "utf8"));
+    const controlledRelay = await makeSession("CompiledRelay", "sub", 1, parent.id);
+    await controlledRelay.runner.emitBeforeAgentStart(`PARR0T_OMP_RELAY=${prepared.relay_path}\nSynthetic relay`, undefined, []);
+    await controlledRelay.task({ tasks: [{ task: "Synthetic dispatch" }] });
+    const delivered = controlledRelay.dispatchedTasks[0].tasks[0];
+    const dispatch = compiledRelay.launch_contract.worker_dispatches["worker-0"];
+    assert.equal(delivered.task, dispatch.worker_prompt);
+    assert.equal(delivered.model, dispatch.model);
+    assert.ok(delivered.task.includes(dispatch.task_path));
+    assert.ok(delivered.task.includes(dispatch.task_sha256));
+    const actualWorker = controlledRelay.spawned[0];
+    const summary = coreMetadata(`
+from game_l10n.native_runtime import native_launch_summary
+print(json.dumps(native_launch_summary(w,w/sys.argv[3])))
+`, [prepared.relay_path]);
+    assert.equal(summary.started_workers, 1);
+    assert.deepEqual(summary.issue_codes, []);
+    await assert.rejects(() => controlledRelay.task({ tasks: [{ task: "Synthetic retry after lost output" }] }),
+      /PARR0T_(?:NATIVE_LIFECYCLE|OMP_PROMPT_ISOLATION)/);
+    assert.equal(controlledRelay.dispatchedTasks.length, 1);
+    const seal = () => controlledRelay.process({ argv: compiledRelay.command_argv.seal });
+    await assert.rejects(seal, /PARR0T_(?:NATIVE_LIFECYCLE|OMP_PROMPT_ISOLATION)/);
+    await actualWorker.runner.emit({ type: "agent_end", messages: [], willContinue: true, awaitingAsyncWork: false });
+    await assert.rejects(seal, /PARR0T_(?:NATIVE_LIFECYCLE|OMP_PROMPT_ISOLATION)/);
+    await actualWorker.runner.emit({ type: "agent_end", messages: [], willContinue: false, awaitingAsyncWork: false });
+    const sealed = JSON.parse((await seal()).details.stdout);
+    assert.ok(sealed.issue_codes.includes("task_incomplete"));
+    assert.ok(!sealed.issue_codes.includes("E_NATIVE_WORKER_NOT_STARTED"));
   } finally {
     for (const session of sessions) {
       session.runner.clearManagedTimers();

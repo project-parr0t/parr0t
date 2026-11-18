@@ -497,6 +497,7 @@ describe("file-backed OMP host/message isolation", () => {
       mkdirSync(path.dirname(guardPath), { recursive: true });
       writeFileSync(guardPath, readFileSync(template));
       writeFileSync(path.join(path.dirname(guardPath), "framework-mode-approval.mjs"), readFileSync(path.join(path.dirname(template), "framework-mode-approval.mjs")));
+      writeFileSync(path.join(packageRoot, "templates/native-relay-lifecycle.mjs"), readFileSync(path.join(path.dirname(template), "native-relay-lifecycle.mjs")));
       writeFileSync(path.join(packageRoot, "templates/native-python.py"), readFileSync(path.join(path.dirname(template), "native-python.py")));
       writeFileSync(path.join(packageRoot, "__init__.py"), "");
       const cliPath = path.join(packageRoot, "cli.py");
@@ -613,6 +614,7 @@ describe("file-backed OMP host/message isolation", () => {
     const original = readFileSync(template);
     writeFileSync(copied, original);
     writeFileSync(path.join(path.dirname(copied), "framework-mode-approval.mjs"), readFileSync(path.join(path.dirname(template), "framework-mode-approval.mjs")));
+    writeFileSync(path.join(path.dirname(copied), "native-relay-lifecycle.mjs"), readFileSync(path.join(path.dirname(template), "native-relay-lifecycle.mjs")));
     const loaded = (await import(pathToFileURL(copied).href)).default;
     const root = host(f.workspace, "main", 0, "Anything", loaded);
     await root.emit("session_start");

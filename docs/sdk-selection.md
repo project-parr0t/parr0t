@@ -138,6 +138,19 @@ codes use `[a-z0-9][a-z0-9._-]*`. Every declared extractor, runner, fixture,
 expected result, profile, selected SDK decision, activated runtime, tool
 manifest and source/format requirement is bound into readiness.
 
+Keep approved third-party dependency trees outside `tools/`, for example under
+`.game-l10n/extractor-dependencies/`. The exportable tool manifest accepts source
+files, not dependency binaries such as `.pyd`/`.dll`. Bind the actual dependency
+location explicitly in runner arguments; staging metadata and preparation
+profiles must not retain the old location after an authorized move. Isolated
+`python -I` runners also need an explicit existing Core `src` dependency path
+when they import `game_l10n`; ambient `PYTHONPATH` is not a substitute. These
+paths do not authorize acquisition or execution of unapproved dependencies.
+
+A standalone synthetic runner invocation is a smoke check, not an inventory
+readiness receipt. After a profile/tool-path repair, obtain fresh readiness
+through the bound Core preparation check; do not relabel earlier receipts.
+
 After implementation, reactivate the **same** SDK selection if its bound tools
 changed, then run inside that isolated worker:
 

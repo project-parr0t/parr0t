@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .control_plane import control_plane_state, require_control_plane_ready
-from .store import stable_hash
+from .store import exclusive_file_lock, stable_hash
 from .omp_isolation import ISOLATION_ENV, ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
 from .model_policy import apply_native_role_models, exact_native_model, model_selection_authorization, native_role_bindings
 
@@ -361,6 +361,62 @@ def _relay_command_argv(work_dir: Path, relay_path: Path, relay: dict) -> dict[s
     return commands
 
 
+def _relay_worker_dispatches(work_dir: Path, relay_path: Path, relay: dict, contract: dict) -> dict:
+    """Compile metadata-only, complete native task prompts; never forward task contents."""
+    root = work_dir.resolve()
+    marker = "PARR0T_OMP_RELAY=" + relay_path.resolve().relative_to(root).as_posix()
+    native = relay.get("schema") == "parr0t.native-wave-relay.v1"
+    bindings = {row["task"]: row for row in relay.get("task_bindings", [])}
+    dispatches = {}
+    for key in contract["tasks"]:
+        binding = bindings[key] if native else {
+            "task": relay["task_path"], "task_sha256": relay["task_sha256"],
+        }
+        task = (root / binding["task"]).resolve()
+        digest = binding["task_sha256"]
+        if not task.is_relative_to(root) or not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+            raise ValueError("E_NATIVE_LAUNCH_INVALID: worker task binding changed")
+        slot = key if native or key == "finalizer" else int(key.removeprefix("worker-"))
+        prompt = (
+            f"{contract['worker_prompt']}\n\n{marker}\nPARR0T_OMP_TASK={key}\n"
+            f"Workspace: {root}\nTask: {task}\nTask SHA-256: {digest}\nSlot: {slot}\n"
+            "Use the absolute workspace as the native process working directory. "
+            "Do not search for another workspace or task."
+        )
+        if native:
+            prompt += f"\nManifest: {(root / relay['manifest']).resolve()}\nResult: {(root / binding['result']).resolve()}"
+        dispatches[key] = {
+            "model": contract["model"], "task_path": str(task), "task_sha256": digest,
+            "slot": slot, "worker_prompt": prompt,
+        }
+    return dispatches
+
+
+def require_native_workers_ended(work_dir: Path, relay_path: Path) -> None:
+    """A terminal seal cannot race a host-admitted worker, including an unrecorded start."""
+    relay_bytes = relay_path.read_bytes()
+    relay = json.loads(relay_bytes)
+    contract = relay.get("launch_contract") or {}
+    if "worker_dispatches" not in contract:
+        return
+    fingerprint = sha256(relay_bytes).hexdigest()
+    for task in contract["tasks"]:
+        key = sha256(f"{fingerprint}\0{task}".encode()).hexdigest()
+        admission = work_dir / ".game-l10n/native/omp-launch-admissions" / f"{key}.json"
+        if not admission.exists():
+            continue
+        _load(work_dir, relay_path)
+        record = json.loads(admission.read_text(encoding="utf-8"))
+        if (
+            record.get("schema") != "parr0t.omp-native-admission.v1"
+            or record.get("relay_sha256") != fingerprint or record.get("task") != task
+            or record.get("state") not in {"reserved", "started", "ending", "ended", "failed"}
+        ):
+            raise ValueError("E_NATIVE_LAUNCH_INVALID: host admission changed")
+        if record["state"] in {"reserved", "started", "ending"}:
+            raise ValueError("E_NATIVE_WORKER_ACTIVE: wait for the admitted worker before sealing")
+
+
 def bind_data_plane_launch(work_dir: Path, relay_path: Path) -> None:
     """Attach host routing to an existing core-bound task without rebuilding it."""
     if not relay_path.resolve().is_relative_to(work_dir.resolve() / ".game-l10n"):
@@ -463,6 +519,9 @@ def _contract_for_relay(work_dir: Path, relay: dict, relay_path: Path) -> dict |
     if contract is not None and "message_isolation" in contract:
         marker = "PARR0T_OMP_RELAY=" + relay_path.resolve().relative_to(work_dir.resolve()).as_posix()
         contract.update(relay_prompt_line=marker, worker_prompt_line=marker)
+        previous = relay.get("launch_contract")
+        if "worker_prompt" in contract and (previous is None or "worker_dispatches" in previous):
+            contract["worker_dispatches"] = _relay_worker_dispatches(work_dir, relay_path, relay, contract)
     if legacy_results and contract is not None:
         contract["legacy_results"] = legacy_results
     return contract
@@ -524,6 +583,19 @@ def record_native_launch(
     worker_id: str | None = None, model: str | None = None, observed_model: str | None = None,
     failure_code: str | None = None,
 ) -> dict[str, Any]:
+    require_control_plane_ready(work_dir)
+    with exclusive_file_lock(work_dir / ".game-l10n/native/launch.lock", issue_code="E_NATIVE_LAUNCH_BUSY", blocking=True):
+        return _record_native_launch(
+            work_dir, relay_path, event=event, task=task, worker_id=worker_id,
+            model=model, observed_model=observed_model, failure_code=failure_code,
+        )
+
+
+def _record_native_launch(
+    work_dir: Path, relay_path: Path, *, event: str, task: str | None = None,
+    worker_id: str | None = None, model: str | None = None, observed_model: str | None = None,
+    failure_code: str | None = None,
+) -> dict[str, Any]:
     relay, contract, ledger = _load(work_dir, relay_path)
     if failure_code is not None and (event != "model-unavailable" or failure_code not in MODEL_FAILURE_CODES):
         raise ValueError("E_NATIVE_LAUNCH_INVALID: failure evidence is only for an observed model dispatch failure")
@@ -574,7 +646,11 @@ def record_native_launch(
     else:
         raise ValueError("E_NATIVE_LAUNCH_INVALID: unsupported event")
     _write(_ledger_path(work_dir, relay_path), ledger)
-    return native_launch_summary(work_dir, relay_path)
+    summary = native_launch_summary(work_dir, relay_path)
+    if event == "capability-available" and summary["issue_codes"] == ["E_NATIVE_WORKER_NOT_STARTED"]:
+        # Preflight succeeded. Missing starts at this phase are expected, not a failed dispatch.
+        summary = {**summary, "issue_codes": [], "launch_state": "awaiting_worker_start"}
+    return summary
 
 
 def native_launch_summary(work_dir: Path, relay_path: Path) -> dict[str, Any]:
