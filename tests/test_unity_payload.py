@@ -80,7 +80,7 @@ class UnityPayloadTests(unittest.TestCase):
             ),
             TranslationResult(
                 segment_id="fixture-accepted", source="SOURCE_MENU",
-                text="합성 대상", status=accepted_status,
+                text=chr(0xAC00) * 4, status=accepted_status,
             ),
         ]
         result_path = root / ("fixture-incomplete" + suffix)
