@@ -115,6 +115,12 @@ class DisplayScopeContractTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             validate_inventory_display_scope(payload, required=True)
         payload["segments"][0]["metadata"]["display_projection_required"] = True
+        with self.assertRaises(ConfigurationError):
+            validate_inventory_display_scope(payload, required=True)
+        payload["segments"][0]["id"] = "synthetic-projection"
+        payload["segments"][0]["metadata"].update(
+            storage_role="display_only", display_projection_of="synthetic-control",
+        )
         validate_inventory_display_scope(payload, required=True)
         payload["coverage"]["display_scope"]["unclassified_count"] = 2
         with self.assertRaises(ConfigurationError):

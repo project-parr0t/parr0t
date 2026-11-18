@@ -6,7 +6,7 @@ from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any, Iterable
 
-from .inventory_scope import inventory_scope
+from .inventory_scope import _validate_active_display_scope, inventory_scope
 from .models import AttemptRecord, Segment, TranslationResult
 
 
@@ -38,6 +38,7 @@ def read_segments(path: Path) -> list[Segment]:
         if isinstance(payload, dict) and payload.get("schema") == "parr0t.source-inventory.v1":
             raw_rows, correction = inventory_scope(payload, path)
             corrected_scope = correction is not None
+            _validate_active_display_scope(payload, raw_rows)
         if not isinstance(raw_rows, list):
             raise ValueError("JSON segment input must contain a list")
 
