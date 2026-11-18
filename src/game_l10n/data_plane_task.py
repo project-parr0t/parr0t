@@ -23,6 +23,11 @@ from .context_analysis import (
     semantic_context_segments,
     validate_context_part,
 )
+from .content_source_policy import (
+    content_source_policy,
+    validate_content_source_policy,
+    validate_output_provenance,
+)
 from .control_plane import (
     control_plane_state,
     safe_artifact_path,
@@ -160,6 +165,9 @@ def _context_binding(
     resolved_context_mode: str,
     contract_fingerprints: dict[str, Any],
     localization: dict[str, Any] | None = None,
+    content_source_policy: dict[str, Any] | None = None,
+    semantic_route: str = "",
+    runtime_model: str = "",
 ) -> dict[str, Any]:
     inputs = _chunk_localization(segments, localization).get("localization_inputs")
     binding = {
@@ -171,6 +179,19 @@ def _context_binding(
         "context_preflight_policy_version": CONTEXT_PREFLIGHT_POLICY_VERSION,
         "context_mode": resolved_context_mode,
         "context_contract_fingerprints": contract_fingerprints,
+        **(
+            {
+                "semantic_route": semantic_route,
+                "runtime_model": runtime_model,
+            }
+            if content_source_policy is not None
+            else {}
+        ),
+        **(
+            {"content_source_policy_digest": content_source_policy["policy_digest"]}
+            if content_source_policy is not None
+            else {}
+        ),
     }
     return {**binding, "binding_id": stable_hash(binding)}
 
@@ -196,15 +217,20 @@ def _validate_context_fragment(
     *,
     binding: dict[str, Any],
     rows: list[dict[str, Any]],
+    content_source_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if not isinstance(payload, dict) or set(payload) != {
+    base_fields = {
         "schema",
         "binding_id",
         "result_id",
         "binding",
         "provider",
         "context_part",
-    }:
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) not in (base_fields, base_fields | {"content_provenance"})
+    ):
         raise ValueError("invalid context fragment")
     context_part = payload.get("context_part")
     provider = payload.get("provider")
@@ -217,10 +243,26 @@ def _validate_context_fragment(
         or not isinstance(context_part, dict)
         or payload.get("result_id")
         != stable_hash(
-            {"binding": binding, "provider": provider, "context_part": context_part}
+            {
+                "binding": binding,
+                "provider": provider,
+                "context_part": context_part,
+                **(
+                    {"content_provenance": payload["content_provenance"]}
+                    if "content_provenance" in payload
+                    else {}
+                ),
+            }
         )
     ):
         raise ValueError("invalid context fragment")
+    if content_source_policy is not None:
+        validate_output_provenance(
+            payload.get("content_provenance"),
+            policy=content_source_policy,
+            model=str(binding.get("runtime_model", provider)),
+            route=str(binding.get("semantic_route", provider)),
+        )
     allowed_ids = set(binding["ordered_evidence_ids"])
     validate_context_part(
         context_part,
@@ -247,11 +289,15 @@ def _find_context_fragment(
     *,
     binding: dict[str, Any],
     rows: list[dict[str, Any]],
+    content_source_policy: dict[str, Any] | None = None,
 ) -> tuple[Path, dict[str, Any]] | None:
     for path, payload in index.get(str(binding["binding_id"]), []):
         try:
             return path, _validate_context_fragment(
-                payload, binding=binding, rows=rows
+                payload,
+                binding=binding,
+                rows=rows,
+                content_source_policy=content_source_policy,
             )
         except (ValueError, TypeError, KeyError, ProviderError):
             continue
@@ -268,6 +314,9 @@ def _write_context_manifest(
     chunk_chars: int,
     contract_fingerprints: dict[str, Any],
     localization: dict[str, Any] | None = None,
+    content_source_policy: dict[str, Any] | None = None,
+    semantic_route: str = "",
+    runtime_model: str = "",
 ) -> tuple[Path, dict[str, Any]]:
     semantic = semantic_context_segments(segments, preflight)
     resolved_mode = (
@@ -303,12 +352,16 @@ def _write_context_manifest(
                 resolved_context_mode=resolved_mode,
                 contract_fingerprints=contract_fingerprints,
                 localization=localization,
+                content_source_policy=content_source_policy,
             )
             if binding_id != expected_binding["binding_id"]:
                 continue
             rows = [_context_row(item) for item in chunk]
             found = _find_context_fragment(
-                fragment_index, binding=expected_binding, rows=rows
+                fragment_index,
+                binding=expected_binding,
+                rows=rows,
+                content_source_policy=content_source_policy,
             )
             if found is not None:
                 reusable.append(
@@ -351,6 +404,9 @@ def _write_context_manifest(
                 resolved_context_mode=resolved_mode,
                 contract_fingerprints=contract_fingerprints,
                 localization=localization,
+                content_source_policy=content_source_policy,
+                semantic_route=semantic_route,
+                runtime_model=runtime_model,
             )
             units.append(
                 {
@@ -373,6 +429,16 @@ def _write_context_manifest(
         "configured_context_mode": context_mode,
         "resolved_context_mode": resolved_mode,
         "context_contract_fingerprints": contract_fingerprints,
+        **(
+            {"content_source_policy_digest": content_source_policy["policy_digest"]}
+            if content_source_policy is not None
+            else {}
+        ),
+        **(
+            {"content_source_policy": content_source_policy}
+            if content_source_policy is not None
+            else {}
+        ),
         "chunk_chars": chunk_chars,
         "source_records": len(segments),
         "semantic_records": len(semantic),
@@ -612,6 +678,16 @@ def _load_context_manifest(
         or manifest_id != stable_hash(identity)
         or manifest_id != task.get("context_manifest_id")
         or not isinstance(chunks, list)
+        or (
+            manifest.get("content_source_policy_digest") is not None
+            and manifest.get("content_source_policy_digest")
+            != task["content_source_policy"]["policy_digest"]
+        )
+        or (
+            manifest.get("content_source_policy") is not None
+            and manifest.get("content_source_policy")
+            != task["content_source_policy"]
+        )
     ):
         raise ConfigurationError("E_CONTEXT_MANIFEST_INVALID: manifest binding is invalid")
     return path, manifest
@@ -635,7 +711,12 @@ def _context_progress(
             or not rows
         ):
             raise ConfigurationError("E_CONTEXT_MANIFEST_INVALID: chunk binding is invalid")
-        found = _find_context_fragment(index, binding=binding, rows=rows)
+        found = _find_context_fragment(
+            index,
+            binding=binding,
+            rows=rows,
+            content_source_policy=manifest.get("content_source_policy"),
+        )
         if found is None:
             pending.append(chunk)
         else:
@@ -691,6 +772,7 @@ def _require_context_claim_binding(
         "slot": claim_slot,
         "provider": task["context_route"],
         "rows": chunk["rows"],
+        "content_source_policy": task["content_source_policy"],
     }
     if chunk.get("localization_inputs"):
         unsigned["localization_inputs"] = chunk["localization_inputs"]
@@ -781,6 +863,7 @@ def claim_context_chunk(
             "slot": slot,
             "provider": task["context_route"],
             "rows": chunk["rows"],
+            "content_source_policy": task["content_source_policy"],
             **(
                 {"localization_inputs": chunk["localization_inputs"]}
                 if chunk.get("localization_inputs")
@@ -846,13 +929,20 @@ def commit_context_fragment(
     _require_context_claim_binding(work_dir, task, manifest, resolved_claim, claim)
     if claim.get("status") != "claimed":
         raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: claim is not active")
-    if not isinstance(result, dict) or set(result) != {
+    result_fields = {
         "schema",
         "claim_id",
         "status",
         "context_part",
         "issue_code",
-    }:
+    }
+    if (
+        not isinstance(result, dict)
+        or set(result) not in (
+            result_fields,
+            result_fields | {"content_provenance"},
+        )
+    ):
         raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: result shape is invalid")
     status = result.get("status")
     issue_code = result.get("issue_code")
@@ -861,6 +951,19 @@ def commit_context_fragment(
         "claim_id"
     ) != claim.get("claim_id"):
         raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: result binding is invalid")
+    provider = str(claim["provider"])
+    binding = claim["binding"]
+    try:
+        provenance = validate_output_provenance(
+            result.get("content_provenance"),
+            policy=task["content_source_policy"],
+            model=str(binding.get("runtime_model", provider)),
+            route=str(binding.get("semantic_route", provider)),
+        )
+    except ValueError as exc:
+        if str(exc) == "E_EXTERNAL_CONTENT_PROVENANCE_DENIED":
+            raise ConfigurationError(str(exc)) from None
+        raise ConfigurationError("E_OUTPUT_PROVENANCE_INVALID") from None
     if status != "success":
         if (
             status not in {"fallback_required", "error"}
@@ -880,17 +983,21 @@ def commit_context_fragment(
         }
     if issue_code != "" or not isinstance(context_part, dict):
         raise ConfigurationError("E_CONTEXT_FRAGMENT_INVALID: success result is invalid")
-    binding = claim["binding"]
-    provider = str(claim["provider"])
     fragment = {
         "schema": CONTEXT_FRAGMENT_SCHEMA,
         "binding_id": claim["binding_id"],
         "result_id": stable_hash(
-            {"binding": binding, "provider": provider, "context_part": context_part}
+            {
+                "binding": binding,
+                "provider": provider,
+                "context_part": context_part,
+                "content_provenance": provenance,
+            }
         ),
         "binding": binding,
         "provider": provider,
         "context_part": context_part,
+        "content_provenance": provenance,
     }
     try:
         _validate_context_fragment(fragment, binding=binding, rows=claim["rows"])
@@ -1570,6 +1677,8 @@ def prepare_data_plane_task(
     config: dict[str, Any],
     sdk_activation: dict[str, Any] | None = None,
     purpose: str = "",
+    content_source_grant: Path | None = None,
+    content_source_scope: str = "",
 ) -> dict[str, Any]:
     """Prepare one exact, private discovery, inventory, or context worker task.
 
@@ -1667,11 +1776,14 @@ def prepare_data_plane_task(
     previous_issue_codes: list[str] = []
     previous_receipt_closes = False
     previous_task_path = output_dir / "task.json"
+    previous_source_policy: dict[str, Any] | None = None
     if previous_task_path.is_file():
         try:
             previous_task = json.loads(previous_task_path.read_text(encoding="utf-8"))
             if previous_task.get("purpose", "") != purpose:
                 raise ConfigurationError("E_DATA_PLANE_TASK_PURPOSE: output belongs to another purpose")
+            if isinstance(previous_task.get("content_source_policy"), dict):
+                previous_source_policy = previous_task["content_source_policy"]
             previous_attempt = previous_task.get("attempt", 0)
             valid_previous_attempt = (
                 isinstance(previous_attempt, int)
@@ -1832,6 +1944,39 @@ def prepare_data_plane_task(
             "check_command": "game-l10n check-extractor-preparation --workspace <workspace> --relay <relay-path>",
             "relay_path": _relative(work_dir, output_dir / "relay.json"),
         }
+    source_policy: dict[str, Any] | None = None
+
+    def _bound_source_policy(task_kind: str, route: str) -> dict[str, Any]:
+        previous = (
+            validate_content_source_policy(previous_source_policy)
+            if previous_source_policy is not None
+            else None
+        )
+        if previous is not None and (
+            previous["task_kind"] != task_kind or previous["route"] != route
+        ):
+            raise ConfigurationError(
+                "E_CONTENT_SOURCE_POLICY_IMMUTABLE: retry task scope changed"
+            )
+        if (
+            previous is not None
+            and content_source_grant is None
+            and not content_source_scope
+        ):
+            return previous
+        proposed = content_source_policy(
+            work_dir,
+            task_kind=task_kind,
+            route=route,
+            scope_id=content_source_scope,
+            grant_path=content_source_grant,
+        )
+        if previous is not None and proposed != previous:
+            raise ConfigurationError(
+                "E_CONTENT_SOURCE_POLICY_IMMUTABLE: retries cannot widen content access"
+            )
+        return proposed
+
     if worker_role == "inventory_reconciler":
         private_payload.update(
             data_plane_route_chain=route_chain,
@@ -1894,6 +2039,14 @@ def prepare_data_plane_task(
         route_index = (attempt - 1) % len(context_routes)
         route_cycle = (attempt - 1) // len(context_routes)
         worker_route = context_routes[route_index]
+        runtime_model = (
+            str(runtime["models"].get(worker_route, worker_route))
+            if runtime is not None
+            else worker_route
+        )
+        source_policy = _bound_source_policy(
+            "localization_context", "data-plane:context_analyzer"
+        )
         worker_model_family = (
             worker_route.removeprefix("native-")
             if worker_route.startswith("native-")
@@ -1948,6 +2101,9 @@ def prepare_data_plane_task(
             chunk_chars=context_chunk_chars,
             contract_fingerprints=context_fingerprints,
             localization=_context_localization(work_dir, config),
+            content_source_policy=source_policy,
+            semantic_route=worker_route,
+            runtime_model=runtime_model,
         )
         _, pending_context_chunks = _context_progress(work_dir, context_manifest)
         relay_max_workers = min(
@@ -2006,6 +2162,7 @@ def prepare_data_plane_task(
                     "result_schema": CONTEXT_CHUNK_RESULT_SCHEMA,
                     "fragment_schema": CONTEXT_FRAGMENT_SCHEMA,
                     "execution_contract": "worker_execution",
+                    "content_provenance_required": True,
                     "direct_context_pack_write_forbidden": True,
                     "success_requires_every_manifest_chunk": True,
                 },
@@ -2258,6 +2415,24 @@ def prepare_data_plane_task(
             work_dir, output_dir / "task.json", runtime
         )
 
+    semantic_kind = {
+        "context_analyzer": "localization_context",
+        "image_localizer": "image_localization",
+    }.get(worker_role, worker_role)
+    policy_route = (
+        f"data-plane:{worker_role}"
+        if worker_role in {"context_analyzer", "image_localizer"}
+        else "local-inspection"
+    )
+    if source_policy is None:
+        source_policy = _bound_source_policy(semantic_kind, policy_route)
+    private_payload["content_source_policy"] = source_policy
+    if source_policy["semantic_content_generation"]:
+        private_payload["runtime_model"] = (
+            str(runtime["models"].get(worker_route, worker_route))
+            if runtime is not None
+            else worker_route
+        )
     task_id = stable_hash(private_payload)
     task = {**private_payload, "task_id": task_id}
     task_path = output_dir / "task.json"
@@ -2566,6 +2741,24 @@ def _load_bound_data_plane_relay(
         != int(control_plane_state(work_dir).get("generation", 0))
     ):
         raise ConfigurationError("E_DATA_PLANE_RELAY_INVALID: task binding is invalid")
+    try:
+        source_policy = validate_content_source_policy(task["content_source_policy"])
+    except (KeyError, ValueError):
+        raise ConfigurationError("E_CONTENT_SOURCE_POLICY_IMMUTABLE") from None
+    expected_kind = {
+        "context_analyzer": "localization_context",
+        "image_localizer": "image_localization",
+    }.get(task["worker_role"], task["worker_role"])
+    expected_policy_route = (
+        f"data-plane:{task['worker_role']}"
+        if task["worker_role"] in {"context_analyzer", "image_localizer"}
+        else "local-inspection"
+    )
+    if (
+        source_policy["task_kind"] != expected_kind
+        or source_policy["route"] != expected_policy_route
+    ):
+        raise ConfigurationError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
     if "data_plane_route_chain" in task:
         route_chain = task["data_plane_route_chain"]
         route_index = task.get("data_plane_route_index")

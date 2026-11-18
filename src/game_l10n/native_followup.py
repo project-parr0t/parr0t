@@ -7,6 +7,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Iterable
 
+from .content_source_policy import validate_content_source_policy
 from .models import Segment
 from .privacy import is_within
 from .store import stable_hash, stable_hash_sequence
@@ -117,17 +118,39 @@ def _candidate_segment(segment: Segment, row: dict[str, Any]) -> Segment:
     metadata = dict(segment.metadata)
     if CANDIDATE_METADATA_KEY in metadata:
         raise NativeFollowupError("Source metadata uses the reserved native candidate key")
-    metadata[CANDIDATE_METADATA_KEY] = {
+    candidate = {
         "text": text,
         "generation": generation,
         "digest": digest,
         "provider": str(row.get("provider", "native-worker")),
     }
+    provenance = row.get("content_provenance")
+    if provenance is not None:
+        if (
+            not isinstance(provenance, dict)
+            or set(provenance)
+            != {
+                "schema",
+                "mode",
+                "model",
+                "route",
+                "policy_digest",
+                "external_sources_used",
+            }
+        ):
+            raise NativeFollowupError("Native success provenance is invalid")
+        candidate["content_provenance"] = dict(provenance)
+        candidate["content_provenance_lineage"] = [dict(provenance)]
+    metadata[CANDIDATE_METADATA_KEY] = candidate
     return replace(segment, metadata=metadata)
 
 
 def _load_primary_rows(
-    segments: list[Segment], primary_results: Path
+    segments: list[Segment],
+    primary_results: Path,
+    *,
+    content_source_policy: dict[str, Any] | None = None,
+    retry_route_models: dict[str, str] | None = None,
 ) -> tuple[list[Segment], list[Segment]]:
     rows = _read_jsonl(primary_results)
     expected_ids = [segment.id for segment in segments]
@@ -140,6 +163,24 @@ def _load_primary_rows(
     for segment, row in zip(segments, rows, strict=True):
         status = row.get("status")
         if status == "success":
+            if content_source_policy is not None:
+                provenance = row.get("content_provenance")
+                route = provenance.get("route") if isinstance(provenance, dict) else None
+                if (
+                    not isinstance(provenance, dict)
+                    or retry_route_models is None
+                    or not isinstance(route, str)
+                    or route not in retry_route_models
+                ):
+                    raise NativeFollowupError("E_OUTPUT_PROVENANCE_INVALID")
+                from .content_source_policy import validate_output_provenance
+
+                validate_output_provenance(
+                    provenance,
+                    policy=content_source_policy,
+                    model=retry_route_models[route],
+                    route=route,
+                )
             candidates.append(_candidate_segment(segment, row))
         elif status in {"refused", "error"} and row.get("text", "") == "":
             failures.append(segment)
@@ -157,6 +198,9 @@ def prepare_native_followup(
     *,
     exchange_prefix: str,
     external_fallback: bool = True,
+    content_source_policy: dict[str, Any] | None = None,
+    retry_lineage: dict[str, Any] | None = None,
+    retry_route_plan: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     work_dir = work_dir.resolve()
     source_path = source_path.resolve()
@@ -174,6 +218,57 @@ def prepare_native_followup(
 
     source_fingerprint = stable_hash_sequence(asdict(segment) for segment in segments)
     result_sha256 = _sha256(primary_results)
+    if content_source_policy is not None:
+        content_source_policy = validate_content_source_policy(
+            content_source_policy
+        )
+        if (
+            content_source_policy["task_kind"] != "translation"
+            or content_source_policy["route"] != "native-pass:translation"
+        ):
+            raise NativeFollowupError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
+    retry_route_models: dict[str, str] | None = None
+    if retry_route_plan is not None:
+        if (
+            not isinstance(retry_route_plan, list)
+            or not retry_route_plan
+            or any(
+                not isinstance(item, dict)
+                or set(item) not in (
+                    {"provider", "max_retries"},
+                    {"provider", "model", "max_retries"},
+                )
+                or not isinstance(item.get("provider"), str)
+                or not item["provider"]
+                or (
+                    "model" in item
+                    and (
+                        not isinstance(item["model"], str)
+                        or not item["model"]
+                    )
+                )
+                for item in retry_route_plan
+            )
+        ):
+            raise NativeFollowupError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
+        retry_route_models = {
+            item["provider"]: str(item.get("model", item["provider"]))
+            for item in retry_route_plan
+        }
+        if len(retry_route_models) != len(retry_route_plan):
+            raise NativeFollowupError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
+    if content_source_policy is not None and retry_route_models is None:
+        raise NativeFollowupError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
+    if retry_lineage is not None and (
+        not isinstance(retry_lineage, dict)
+        or retry_lineage.get("source_fingerprint") != source_fingerprint
+        or (
+            content_source_policy is not None
+            and retry_lineage.get("content_source_policy_digest")
+            != content_source_policy["policy_digest"]
+        )
+    ):
+        raise NativeFollowupError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
     manifest_path = output_dir / FOLLOWUP_MANIFEST_NAME
     if output_dir.exists() and any(output_dir.iterdir()):
         if not manifest_path.is_file():
@@ -184,6 +279,9 @@ def prepare_native_followup(
             or manifest.get("source_fingerprint") != source_fingerprint
             or manifest.get("primary_results_sha256") != result_sha256
             or manifest.get("external_fallback", True) != external_fallback
+            or manifest.get("content_source_policy") != content_source_policy
+            or manifest.get("retry_lineage") != retry_lineage
+            or manifest.get("retry_route_plan") != retry_route_plan
         ):
             raise NativeFollowupError("Existing native follow-up is bound to different inputs")
         artifact_paths = [
@@ -204,7 +302,12 @@ def prepare_native_followup(
             "manifest": _relative(work_dir, manifest_path),
         }
 
-    candidates, failures = _load_primary_rows(segments, primary_results)
+    candidates, failures = _load_primary_rows(
+        segments,
+        primary_results,
+        content_source_policy=content_source_policy,
+        retry_route_models=retry_route_models,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     candidate_path = output_dir / PRIMARY_CANDIDATES_NAME
     _atomic_jsonl(candidate_path, (asdict(segment) for segment in candidates))
@@ -220,6 +323,8 @@ def prepare_native_followup(
             exchange_id=f"{exchange_prefix}-{number:04d}",
             mode="fallback",
             source_queue="translation_fallback_pending",
+            content_source_policy=content_source_policy,
+            retry_lineage=retry_lineage,
         )
         bundles.append(_relative(work_dir, bundle))
 
@@ -234,6 +339,21 @@ def prepare_native_followup(
         "fallback_count": len(failures),
         "primary_candidates": _relative(work_dir, candidate_path),
         "fallback_bundles": bundles,
+        **(
+            {"content_source_policy": content_source_policy}
+            if content_source_policy is not None
+            else {}
+        ),
+        **(
+            {"retry_lineage": retry_lineage}
+            if retry_lineage is not None
+            else {}
+        ),
+        **(
+            {"retry_route_plan": retry_route_plan}
+            if retry_route_plan is not None
+            else {}
+        ),
     }
     if not external_fallback:
         manifest["external_fallback"] = False
@@ -263,12 +383,20 @@ def _exchange_success_candidates(work_dir: Path, bundle: Path) -> dict[str, dict
         request = requests.get(row.get("target_id"))
         if request is None:
             raise NativeFollowupError("Translation fallback success is not request-bound")
-        successes[row["target_id"]] = {
+        candidate = {
             "text": row["text"],
             "generation": 1,
             "digest": stable_hash(row["text"]),
             "provider": row["route"],
         }
+        if "content_provenance" in row:
+            candidate["content_provenance"] = dict(
+                row["content_provenance"]
+            )
+            candidate["content_provenance_lineage"] = [
+                dict(row["content_provenance"])
+            ]
+        successes[row["target_id"]] = candidate
     return successes
 
 

@@ -16,6 +16,9 @@ Resolve these locations before acting:
 
 Text-only default: images require `image-localization.md` policy; target language stays Korean unless the user explicitly changes it through `target-language-policy`.
 
+Semantic localization is content-network deny by default. Apply `skills/translation-source-isolation/SKILL.md`; it defines exact grants, immutable policy, direct-model provenance, and taint rejection. Local inventory inspection needs no grant.
+
+
 For a new job:
 
 1. Confirm repository/workspace access and only that the source path exists; do not inspect its contents.
@@ -54,14 +57,14 @@ Do not reorder barriers. Failures affect only their target and route; they canno
 - Independent ordered inventories prove static—not runtime—coverage. Raw presence or `declared_complete` never establishes display scope.
 - At 10,000+ records: scan once/method, cache evidence, reconcile identities before expansion, then repair gaps. Denominator growth is not progress.
 - Keep relevant narrative/voice, functional/UI, knowledge, adjacency, glossary, and immutable evidence target-scoped.
-- The text-free parent handles only IDs, counts, states, queues, paths, and codes. It dispatches only core relays and never inspects game-root contents; a missing SDK changes nothing.
+- The text-free parent handles only metadata and dispatches core relays; it never inspects game-root or semantic contents. A missing SDK changes nothing.
 - Explicit initial models override preset defaults; preserve provider permissions, transport, and unspecified roles. `codex-app-deepseek.md`.
 - Translation retries default to Luna 5, Sol 3, then DeepSeek; first calls excluded. Unbound routes remain pending.
 - Sol strong review: ≤2 calls/target across retries/confirmation/resume. Bind initial fallback model/count with `review-policy`; missing/incompatible bindings stay pending, never substitute DeepSeek. `review-pipeline.md`.
 - Translation is faithful transformation, not content generation. Independent review checks meaning, omission, voice, tone, function, conditions, units, terminology, allusions, placeholders, markup, control codes, ordering, and material layout risk.
 - Build only in the workspace; synthetic checks never install or launch games.
 - Apply proportional verification and stop after the changed layer passes. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.
-- Native uses only the `native-pass-step` relay and `--relay-ended`. Review's 2,048/262,144 ceiling, initial 256/65,536 packing, failed-only splits, depth 3, and 2.0x attempts shape batches; they are not whole-job limits. Never solicit a usage ceiling. None applies unless the user states it first. Only reached DeepSeek fallback requests receive the automatic input preflight.
+- Native uses `native-pass-step` and `--relay-ended`; review packing/splitting limits are in `control-plane-contract.md`. They are not whole-job limits: never solicit one unless the user first states it. Only reached DeepSeek fallback requests receive automatic input preflight.
 - Observe finitely and interruptibly. Operational errors require owner cancellation/sealing before configured fallback. Preserve successes/evidence; missing bindings stay pending.
 
 ## Status-driven routes
