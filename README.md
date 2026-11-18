@@ -23,6 +23,23 @@ Codex에서 요청 프롬프트로 시작하거나, OMP에서 프롬프트·통�
 
 Python 3.11 이상과 OMP가 설치되어 있어야 합니다. 전체 코어 저장소를 내려받고 아래처럼 **게임 폴더를 열지 않은 상태에서 외부 작업 폴더부터** 초기화합니다.
 
+일반 OMP 세션에서도 `parr0t_process`가 필요하면 OMP 사용자 확장 경로
+`~/.omp/agent/extensions/parr0t-native-process.ts`에 아래 한 줄을 두어 현재 코어의
+네이티브 실행 도구를 자동으로 등록합니다. 파일 URL은 실제 코어 위치로 바꿉니다.
+OMP의 자동 탐색은 `.ts`/`.js` 진입 파일을 대상으로 하므로 이 파일을 `.mjs`로 만들지 않습니다.
+
+```javascript
+export { default } from "file:///C:/path/to/parr0t/src/game_l10n/templates/omp-native-process.mjs";
+```
+
+이 확장은 일반 세션과 그 하위 세션에 실행 도구만 제공하며, 게임 파일을 열거나
+모델·권한·통신 정책을 변경하지 않습니다. 전용 도우미나 실행 가드가 이미 등록되어
+있으면 덮어쓰지 않습니다. 도구 존재만으로 워커 격리나 제어 세션 ready가 증명되지는
+않으므로 실제 게임 작업은 아래 정식 런처를 사용합니다. 이미 실행 중인 OMP는 확장을
+다시 불러오거나 새 세션으로 시작해야 합니다.
+
+외부 작업 초기화와 정식 제어 세션 실행:
+
 ```text
 python -m pip install -e .
 game-l10n init-workspace "<external-workspace>" --sdk-root "<repository>" --game-root "<source-root>"
