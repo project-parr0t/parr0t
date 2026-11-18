@@ -27,6 +27,7 @@ from game_l10n.native_runtime import (
 from game_l10n.native_translation_retry import start_native_translation_retries, advance_native_translation_retries
 from game_l10n.store import stable_hash
 from tests.omp_isolation_fixture import bind_omp_isolation
+from tests import write_semantic_result_rows
 
 
 class NativeRuntimeTests(unittest.TestCase):
@@ -42,8 +43,7 @@ class NativeRuntimeTests(unittest.TestCase):
 
     @staticmethod
     def write_rows(path: Path, rows: list[dict]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        write_semantic_result_rows(path, rows)
 
     def prepare_probe(self) -> tuple[dict, Path, Path]:
         game = self.root / "game"

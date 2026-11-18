@@ -28,6 +28,8 @@ Context chunk ceilings measure the complete serialized request rows, including I
 
 Each v7 task row binds the complete segment payload and the current source/target-language policy under `parr0t.native-task-payload.v1`. The default target is Korean; a different target requires a core-recorded explicit user policy. A data-plane worker consumes one immutable task snapshot and must not open the full ordered `source_artifact`. "Once" binds the worker to that single snapshot; it does not require one shell-output frame. When host transport would truncate the task, the worker may consume deterministic ordered byte or line ranges from the same unchanged file, verifying its digest, complete record count, order, and language binding before the one semantic call. The full source exists only for framework-side validation.
 
+Every new semantic task row also carries its complete `parr0t.content-source-policy.v1`. Default-deny rows use only the selected model and bound local payload/context. A named `parr0t.content-source-grant.v1` may allow only its exact scope, task kind, route, and sources; retries and core-owned review children retain the parent's authorization and cannot widen it. Results persist `parr0t.content-provenance.v1`; undeclared external sources or a mismatched model/policy digest fail import. Local inventory payloads carry a non-semantic local-inspection policy so source discovery remains usable without granting candidate generation or network content.
+
 ## Permitted detail
 
 A task may define only:

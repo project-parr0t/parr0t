@@ -72,6 +72,19 @@ async function fixture(factory = guard) {
     launch_contract: { message_isolation: registration, tasks: ["worker-0"] },
   };
   writeJson(relayPath, relayMetadata);
+  const taskPath = path.join(workspace, relayMetadata.task_path);
+  function setPolicy({ semantic = false, network = false, sources = [] } = {}) {
+    writeJson(taskPath, {
+      content_source_policy: {
+        schema: "parr0t.content-source-policy.v1",
+        policy_digest: semantic ? "synthetic-semantic-policy" : "synthetic-inventory-policy",
+        semantic_content_generation: semantic,
+        content_network_access: network,
+        allowed_external_sources: sources,
+      },
+    });
+  }
+  setPolicy();
   const marker = `PARR0T_OMP_RELAY=${relayRelative}`;
   async function child(depth, name = "Anything") {
     const session = host(workspace, "sub", depth, name, factory);
@@ -79,7 +92,7 @@ async function fixture(factory = guard) {
     await session.emit("before_agent_start", { prompt: `${marker}\nSynthetic assignment; no game data.` });
     return session;
   }
-  return { workspace, root, registrationPath, registration, relayPath, relayMetadata, relayRelative, marker, child };
+  return { workspace, root, registrationPath, registration, relayPath, relayMetadata, relayRelative, marker, child, setPolicy };
 }
 function framework(mode, revision = 1, logs = []) {
   return { schema: "parr0t.framework-session.v1", mode, revision, instructions_active: mode === "localization", user_requested: true, logs };
@@ -346,6 +359,30 @@ describe("file-backed OMP host/message isolation", () => {
     await expect(relay.call("write", { path: "xd://parr0t_exec", content: JSON.stringify({ argv: ["-c", "print('forbidden')"] }) }, async input => relay.exec(JSON.parse(input.content)))).rejects.toThrow("fixed core CLI");
     expect((await worker.call("write", { path: "xd://edit", content: "{}" })).block).toBe(true);
   });
+  test("semantic workers deny network tools, arbitrary processes, and unbound local reads", async () => {
+    const f = await fixture();
+    f.setPolicy({ semantic: true });
+    const worker = await f.child(2);
+    expect((await worker.call("web_search", { query: "synthetic" })).block).toBe(true);
+    expect((await worker.call("read", { path: "https://example.invalid/source" })).block).toBe(true);
+    expect((await worker.call("parr0t_exec", { argv: ["-c", "print('synthetic')"] })).block).toBe(true);
+    const unbound = path.join(f.workspace, "local.json");
+    expect((await worker.call("read", { path: unbound })).block).toBe(true);
+    const task = path.join(f.workspace, f.relayMetadata.task_path);
+    expect((await worker.call("read", { path: task }))?.block).not.toBe(true);
+    expect((await worker.call("grep", { path: task, pattern: "synthetic" }))?.block).not.toBe(true);
+    expect((await worker.call("glob", { path: task }))?.block).not.toBe(true);
+    expect((await worker.call("read", { path: path.join(f.workspace, "..", "outside.json") })).block).toBe(true);
+  });
+  test("semantic workers admit only an exact externally granted read target", async () => {
+    const f = await fixture();
+    const exact = "https://example.invalid/exact-source";
+    f.setPolicy({ semantic: true, network: true, sources: [exact] });
+    const worker = await f.child(2);
+    expect((await worker.call("read", { path: exact }))?.block).not.toBe(true);
+    expect((await worker.call("read", { path: exact + "/other" })).block).toBe(true);
+    expect((await worker.call("web_search", { query: `site:example.invalid synthetic` })).block).toBe(true);
+  });
   test("denial evidence is categorical, has no input text, and never rotates generation", async () => {
     const f = await fixture();
     const worker = await f.child(2);
@@ -514,7 +551,9 @@ describe("file-backed OMP host/message isolation", () => {
     expect((await relay.call("parr0t_exec", { argv: ["-c", "open('private-task.json').read()"] }, () => deliveries++)).block).toBe(true);
     expect(deliveries).toBe(1);
     const nativeRelative = ".game-l10n/native/relay/synthetic-wave-0001.json";
-    const nativeMetadata = { schema: "parr0t.native-wave-relay.v1", task_bindings: [{ task: "synthetic-task.json" }], launch_contract: { message_isolation: f.registration, tasks: ["synthetic-task.json"] } };
+    const nativeManifest = ".game-l10n/native/relay/synthetic-manifest.json";
+    const nativeMetadata = { schema: "parr0t.native-wave-relay.v1", manifest: nativeManifest, task_bindings: [{ task: "synthetic-task.json" }], launch_contract: { message_isolation: f.registration, tasks: ["synthetic-task.json"] } };
+    writeJson(path.join(f.workspace, nativeManifest), { content_source_policy: { schema: "parr0t.content-source-policy.v1", policy_digest: "synthetic-semantic-policy", semantic_content_generation: true, content_network_access: false, allowed_external_sources: [] } });
     writeJson(path.join(f.workspace, nativeRelative), nativeMetadata);
     const native = host(f.workspace, "sub", 1);
     await native.emit("session_start");
