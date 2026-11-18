@@ -95,7 +95,9 @@ python -m game_l10n.unity compile-payload `
   --output build\fixture-runtime.json
 ```
 
-`compile-payload` requires the matching independent-inventory attestation and embeds its fingerprint in the runtime payload. It refuses to emit a payload while the current failure queue contains a blocking target. `--allow-unreviewed` exists for an explicitly accepted exceptional workflow; it is intentionally off by default and does not bypass either gate.
+`compile-payload` requires the matching independent-inventory attestation and embeds its fingerprint in the runtime payload. A blocking failure queue holds output by default. Explicit `failure_queue.allow_incomplete_artifact` consent permits only the exact, unchanged `--reviewed` artifact bound to a current safe completion attestation, including its inventory, alignment, full scope, and target-language policy. Alternate paths cannot inherit consent, even with identical bytes. Such output and its summary are marked `artifact_assurance: explicit_incomplete`; source-preserved entries stay byte-for-byte source, and accepted-unreviewed entries remain unreviewed in the unchanged result artifact. Failed rows, changed source-preserved text, and ordinary translated-but-unreviewed rows are not admitted by this exception.
+
+`--allow-unreviewed` remains a separate, intentionally off-by-default exceptional workflow; it does not bypass inventory verification or authorize a blocking queue.
 
 ## Build a private Mono loader bridge
 

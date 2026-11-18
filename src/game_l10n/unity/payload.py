@@ -7,26 +7,37 @@ from pathlib import Path
 from typing import Any
 
 from ..coverage import require_inventory_attestation
+from ..errors import ToolExecutionError
 from ..formats import read_segments
+from ..tooling import require_incomplete_artifact
 
 
 LOCALE_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 REVIEWED_STATUSES = {"reviewed", "source_preserved"}
 
 
-def _require_patch_gate(work_dir: Path, segments_path: Path) -> dict[str, Any]:
+def _require_patch_gate(
+    work_dir: Path, segments_path: Path, reviewed_results_path: Path,
+) -> tuple[dict[str, Any], bool]:
     inventory = require_inventory_attestation(work_dir, segments_path)
     queue_path = work_dir / ".game-l10n" / "failure-queue.json"
     if not queue_path.is_file():
-        return inventory
+        return inventory, False
     queue = json.loads(queue_path.read_text(encoding="utf-8"))
     if queue.get("schema") != "parr0t.failure-queue.v1":
         raise ValueError("Failure queue schema is unsupported")
     if queue.get("inventory_fingerprint") != inventory["primary_fingerprint"]:
         raise ValueError("Failure queue is stale for the verified Unity inventory")
     if int(queue.get("blocking_count", 0)) > 0:
-        raise ValueError("Unity payload is held while a blocking translation target remains unresolved")
-    return inventory
+        try:
+            require_incomplete_artifact(work_dir, inventory, result_path=reviewed_results_path)
+        except ToolExecutionError as exc:
+            raise ValueError(
+                "Unity payload is held while a blocking translation target remains unresolved: "
+                f"{exc}"
+            ) from exc
+        return inventory, True
+    return inventory, False
 
 
 def _read_results(path: Path) -> list[dict[str, Any]]:
@@ -72,7 +83,9 @@ def compile_runtime_payload(
     output_path = output_path.resolve()
     if output_path in {segments_path.resolve(), reviewed_results_path.resolve()}:
         raise ValueError("Runtime payload output must not overwrite its source inventory or reviewed results")
-    inventory = _require_patch_gate(work_dir.resolve(), segments_path.resolve())
+    inventory, explicit_incomplete = _require_patch_gate(
+        work_dir.resolve(), segments_path.resolve(), reviewed_results_path.resolve(),
+    )
     segments = read_segments(segments_path)
     rows = _read_results(reviewed_results_path)
     by_id: dict[str, dict[str, Any]] = {}
@@ -91,6 +104,8 @@ def compile_runtime_payload(
     accepted_statuses = set(REVIEWED_STATUSES)
     if allow_unreviewed:
         accepted_statuses.update({"translated", "accepted_unreviewed"})
+    elif explicit_incomplete:
+        accepted_statuses.add("accepted_unreviewed")
 
     string_tables: dict[str, dict[str, dict[str, Any]]] = {}
     text_assets: dict[str, str] = {}
@@ -152,6 +167,8 @@ def compile_runtime_payload(
         "literal_strings": dict(sorted(literal_strings.items())),
         "ui_paths": sorted(ui_paths),
     }
+    if explicit_incomplete:
+        payload["artifact_assurance"] = "explicit_incomplete"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return {
@@ -161,4 +178,5 @@ def compile_runtime_payload(
         "text_assets": len(text_assets),
         "literal_strings": len(literal_strings),
         "ui_paths": len(ui_paths),
+        **({"artifact_assurance": "explicit_incomplete"} if explicit_incomplete else {}),
     }
