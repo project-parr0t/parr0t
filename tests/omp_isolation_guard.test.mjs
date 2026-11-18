@@ -29,7 +29,7 @@ function writeJson(file, value) {
 function host(workspace, kind = "main", depth = 0, name = "Anything", factory = guard, sessionId = "synthetic-root-session") {
   const handlers = new Map();
   const tools = new Map();
-  const shape = { optional() { return this; } };
+  const shape = { optional() { return this; }, strict() { return this; } };
   const pi = {
     registerFlag() {}, getFlag() { return kind === "main" ? workspace : undefined; },
     zod: { string: () => shape, array: () => shape, object: () => shape },
@@ -496,6 +496,8 @@ describe("file-backed OMP host/message isolation", () => {
       const guardPath = path.join(packageRoot, "templates/omp-isolation-guard.mjs");
       mkdirSync(path.dirname(guardPath), { recursive: true });
       writeFileSync(guardPath, readFileSync(template));
+      writeFileSync(path.join(path.dirname(guardPath), "framework-mode-approval.mjs"), readFileSync(path.join(path.dirname(template), "framework-mode-approval.mjs")));
+      writeFileSync(path.join(packageRoot, "templates/native-relay-lifecycle.mjs"), readFileSync(path.join(path.dirname(template), "native-relay-lifecycle.mjs")));
       writeFileSync(path.join(packageRoot, "templates/native-python.py"), readFileSync(path.join(path.dirname(template), "native-python.py")));
       writeFileSync(path.join(packageRoot, "__init__.py"), "");
       const cliPath = path.join(packageRoot, "cli.py");
@@ -611,6 +613,8 @@ describe("file-backed OMP host/message isolation", () => {
     mkdirSync(path.dirname(copied), { recursive: true });
     const original = readFileSync(template);
     writeFileSync(copied, original);
+    writeFileSync(path.join(path.dirname(copied), "framework-mode-approval.mjs"), readFileSync(path.join(path.dirname(template), "framework-mode-approval.mjs")));
+    writeFileSync(path.join(path.dirname(copied), "native-relay-lifecycle.mjs"), readFileSync(path.join(path.dirname(template), "native-relay-lifecycle.mjs")));
     const loaded = (await import(pathToFileURL(copied).href)).default;
     const root = host(f.workspace, "main", 0, "Anything", loaded);
     await root.emit("session_start");

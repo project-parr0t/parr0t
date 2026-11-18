@@ -10,6 +10,7 @@ from typing import Any
 
 from .control_plane import _atomic_json, suspend_control_plane
 from .errors import ConfigurationError
+from .framework_approval import consume_framework_approval, require_framework_approval_proof
 from .store import exclusive_file_lock
 
 FRAMEWORK_SESSION_SCHEMA = "parr0t.framework-session.v1"
@@ -105,10 +106,11 @@ def _snapshot_log(work_dir: Path, source: Path) -> dict[str, Any]:
 
 def change_framework_mode(
     work_dir: Path, mode: str, *, user_requested: bool = False,
-    logs: list[Path] | None = None,
+    logs: list[Path] | None = None, approval: dict | None = None,
 ) -> dict[str, Any]:
     if user_requested is not True:
         raise ConfigurationError("E_FRAMEWORK_USER_REQUEST_REQUIRED: explicit user request required")
+    require_framework_approval_proof(approval)
     if not isinstance(mode, str) or mode not in {"analysis", "shutdown"}:
         raise ConfigurationError("E_FRAMEWORK_MODE_INVALID: select analysis or shutdown")
     if mode != "analysis" and logs:
@@ -117,6 +119,9 @@ def change_framework_mode(
         raise ConfigurationError("E_FRAMEWORK_WORKSPACE_REQUIRED: initialized private workspace required")
     with _framework_session_lock(work_dir):
         previous = framework_session_state(work_dir)
+        consume_framework_approval(
+            work_dir, mode, revision=previous["revision"], logs=logs, approval=approval,
+        )
         state = {
             "schema": FRAMEWORK_SESSION_SCHEMA, "mode": mode,
             "revision": previous["revision"] + 1, "instructions_active": False,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import tempfile
 import unittest
@@ -36,6 +37,37 @@ class FormatTests(unittest.TestCase):
             corrected = _load_results(path)
             self.assertEqual([(row.segment_id, row.source, row.text) for row in corrected],
                              [("fixture", source, text), ("peer", "S", "T")])
+
+    def test_neighbor_enrichment_preserves_explicit_context_across_formats(self) -> None:
+        rows = [
+            {"id": "a", "source": "A", "previous": "external-before", "next": "external-after", "extra": "first"},
+            {"id": "b", "source": "B", "previous": "", "next": "", "extra": "middle"},
+            {"id": "c", "source": "C", "previous": "explicit-before", "next": "", "extra": "last"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            for suffix in (".json", ".jsonl", ".csv"):
+                with self.subTest(format=suffix):
+                    path = Path(directory) / f"segments{suffix}"
+                    if suffix == ".json":
+                        path.write_text(json.dumps(rows), encoding="utf-8")
+                    elif suffix == ".jsonl":
+                        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+                    else:
+                        with path.open("w", encoding="utf-8", newline="") as handle:
+                            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                            writer.writeheader()
+                            writer.writerows(rows)
+
+                    segments = read_segments(path)
+
+                    self.assertEqual(
+                        [(segment.previous, segment.next) for segment in segments],
+                        [("external-before", "external-after"), ("A", "C"), ("explicit-before", "")],
+                    )
+                    self.assertEqual(
+                        [segment.metadata for segment in segments],
+                        [{"extra": "first"}, {"extra": "middle"}, {"extra": "last"}],
+                    )
 
     def test_jsonl_segments_are_streamed_without_path_read_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

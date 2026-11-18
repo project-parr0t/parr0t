@@ -96,7 +96,7 @@ class OmpPromptRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(step["relay"]["tool_transport"], launch["tool_transport"])
         self.assertFalse(launch["tool_transport"]["required_extension"])
-        self.assertEqual(launch["model"], "openai-codex/gpt-6-luna")
+        self.assertEqual(launch["model"], "openai-codex/gpt-6-luna:high")
         commands = payload["command_argv"]
         self.run_cli(commands["capability-available"])
         for index, binding in enumerate(payload["task_bindings"]):

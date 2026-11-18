@@ -9,7 +9,7 @@ Parr0t is engine-neutral. Keep game/credential/title/job data in external worksp
 3. Run `game-l10n status --workspace <workspace>`. For `establish_text_free_control_plane`, read its contracts and run `game-l10n enter-control-plane --workspace <workspace> --contracts-read --source-unopened` before other work.
 4. Resolve each `required_contracts` entry against `contract_base`; read only those contracts. For other routes, use the table.
 
-`local_patch_ready` ends localization; user-requested shutdown/analysis withdraws localization directives under `docs/control-plane-contract.md`. Diagnose directly; diagnostic agents are optional.
+`local_patch_ready` ends localization. Only root changes analysis/shutdown with host-confirmed user approval; flags/failures/children cannot authorize it. See `docs/control-plane-contract.md`.
 
 ## Non-negotiable rules
 

@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import { accessSync, appendFileSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import registerFrameworkModeApproval, { checkFrameworkToolCall } from "./framework-mode-approval.mjs";
+import createNativeRelayLifecycle from "./native-relay-lifecycle.mjs";
 
 const TEMPLATE = fileURLToPath(import.meta.url);
 const GUARD_SHA256 = createHash("sha256").update(readFileSync(TEMPLATE)).digest("hex");
@@ -360,6 +362,18 @@ export default function isolationGuard(pi) {
   let relay;
   let childRole;
   let announcedMode;
+  const lifecycle = createNativeRelayLifecycle({
+    workspace: () => workspace,
+    relayPath: () => childRole === "diagnostic" ? undefined : relay?.path,
+    async executeCore(argv) {
+      const result = await executePython(python, relayArguments(argv, workspace, workspace, relay), workspace);
+      return { code: result.details.exitCode, stdout: result.details.stdout, killed: result.isError };
+    },
+  });
+  registerFrameworkModeApproval(pi, () => {
+    if (!ready || fatal) fail("guard startup failed");
+    return workspace;
+  });
   function requireAnalysis(state) {
     if (state.mode !== "analysis") fail("diagnostic collaboration requires analysis mode", "framework_inactive");
   }
@@ -466,7 +480,7 @@ export default function isolationGuard(pi) {
       throw error;
     }
   });
-  pi.on("before_agent_start", (event, ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     if (!ready && !fatal) initialize(ctx);
     if (!ready || fatal) fail("guard startup failed");
     const state = frameworkState(workspace);
@@ -485,8 +499,10 @@ export default function isolationGuard(pi) {
       // this request and its continuations. Preserve every host policy block.
       return { systemPrompt: [...event.systemPrompt, frameworkInstructions(state)] };
     }
+    await lifecycle.before_agent_start(event, ctx);
   });
-  pi.on("tool_result", (_event, ctx) => {
+  pi.on("tool_result", (event, ctx) => {
+    lifecycle.tool_result(event, ctx);
     if (ctx.agent.kind !== "main" && childRole !== "diagnostic") return;
     try {
       const state = frameworkState(workspace);
@@ -552,9 +568,12 @@ export default function isolationGuard(pi) {
       requireLocalization(state);
       if (event.invocationKind !== "task") fail("use built-in task; eval agent/workpool/custom spawns and shared callbacks are forbidden", "spawn_origin_forbidden");
       if (ctx.agent.kind === "sub" && ctx.agent.depth !== 1) fail("worker delegation is forbidden");
+      return lifecycle.before_subagent_spawn(event, ctx);
     } catch (error) { return deny(ctx, "task", error); }
   });
-  pi.on("tool_call", (event, ctx) => {
+  pi.on("tool_call", async (event, ctx) => {
+    try { checkFrameworkToolCall(event, ctx, workspace ?? ctx.cwd); }
+    catch (error) { return { block: true, reason: error.message }; }
     try {
       if (!ready || fatal) fail("guard startup failed");
       const state = frameworkState(workspace);
@@ -590,10 +609,10 @@ export default function isolationGuard(pi) {
         const input = taskInput(event.input, true);
         for (const item of input.tasks ?? [input]) {
           const marker = `PARR0T_OMP_RELAY=${path.relative(workspace, relay.path).split(path.sep).join("/")}`;
-          if (typeof item.task === "string") item.task = `${marker}\n${item.task}`;
-          if (Array.isArray(item.steps)) item.steps = item.steps.map(step => `${marker}\n${step}`);
+          if (typeof item.task === "string" && !item.task.split(/\r?\n/).includes(marker)) item.task = `${marker}\n${item.task}`;
+          if (Array.isArray(item.steps)) item.steps = item.steps.map(step => step.split(/\r?\n/).includes(marker) ? step : `${marker}\n${step}`);
         }
-        return { input };
+        return await lifecycle.tool_call({ ...event, input }, ctx) ?? { input };
       }
       if (event.toolName === "wait") {
         if (ctx.agent.depth !== 1) fail("worker wait is forbidden");
@@ -606,7 +625,7 @@ export default function isolationGuard(pi) {
         if (ctx.agent.depth === 1) relayArguments(event.input.argv, cwd, workspace, relay);
         else if (ctx.agent.depth >= 2) workerArguments(event.input.argv, cwd, workspace, relay);
         else fail("unsupported subagent depth");
-        return;
+        return await lifecycle.tool_call(event, ctx);
       }
       if (ctx.agent.depth === 1) {
         if (event.toolName !== "read" || !relay || typeof event.input.path !== "string") fail("relay local tool is forbidden");
@@ -667,6 +686,10 @@ export default function isolationGuard(pi) {
       const state = frameworkState(workspace);
       if (childRole === "diagnostic") requireAnalysis(state);
       else if (ctx.agent.kind === "sub") requireLocalization(state);
+      if (ctx.agent.kind === "sub" && ctx.agent.depth === 1) {
+        const decision = await lifecycle.tool_call({ toolName: "parr0t_exec", input: params }, ctx);
+        if (decision?.block) fail(decision.reason);
+      }
       if (!Array.isArray(params.argv) || !params.argv.length || params.argv.some(arg => typeof arg !== "string" || arg.includes("\0"))) fail("Python argv is required");
       const cwd = resolvedLocal(params.cwd ?? workspace, ctx.cwd);
       if (!inside(workspace, cwd) && cwd !== CORE) fail("execution cwd must be inside workspace or the exact core root");
@@ -682,4 +705,5 @@ export default function isolationGuard(pi) {
       return await executePython(python, argv, cwd, signal);
     },
   });
+  pi.on("agent_end", lifecycle.agent_end);
 }
