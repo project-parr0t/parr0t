@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -948,6 +949,19 @@ def _sdk_runtime_binding(checkout: Path) -> dict[str, Any]:
     }
 
 
+def _sdk_reference_binding(repository: Path, commit: str) -> dict[str, Any]:
+    """Bind reference source data, not an executable historical checkout."""
+    repository = repository.resolve()
+    if not isinstance(commit, str) or not re.fullmatch(r"[a-fA-F0-9]{40}|[a-fA-F0-9]{64}", commit):
+        raise ConfigurationError("SDK reference requires an exact repository commit")
+    return {
+        "kind": "git-tree",
+        "path": str(repository),
+        "commit": commit,
+        **_git_tree_content_binding(repository, commit),
+    }
+
+
 def record_sdk_activation(
     work_dir: Path,
     *,
@@ -1012,27 +1026,13 @@ def record_sdk_activation(
                 + ", ".join(tools["default_pass_through_tools"])
             )
         if mode == "derive-new":
-            if candidate is None or reference_checkout is None:
-                raise ConfigurationError(
-                    "derive-new activation requires the selected reference SDK checkout"
-                )
-            reference = _sdk_runtime_binding(reference_checkout)
-            if reference["dirty"]:
-                raise ConfigurationError(
-                    "derive-new requires a clean checkout of the selected reference SDK"
-                )
-            if reference.get("content_fingerprint") != candidate.get("content_fingerprint"):
-                raise ConfigurationError(
-                    "Reference runtime does not match the inventoried SDK content"
-                )
-            if (
-                reference["kind"] == "git"
-                and reference["commit"] != candidate.get("commit")
-            ):
-                raise ConfigurationError(
-                    "Reference checkout does not match the inventoried SDK commit "
-                    f"({reference['commit']} != {candidate.get('commit')})"
-                )
+            if candidate is None:
+                raise ConfigurationError("derive-new activation requires selected SDK repository data")
+            reference = _sdk_reference_binding(
+                reference_checkout or configured_root, candidate["commit"],
+            )
+            if reference["content_fingerprint"] != candidate.get("content_fingerprint"):
+                raise ConfigurationError("Reference repository data does not match the inventoried SDK content")
         elif reference_checkout is not None:
             raise ConfigurationError("private-new activation does not accept a reference checkout")
 
@@ -1115,8 +1115,10 @@ def require_sdk_activation(
             raise ConfigurationError("Workspace SDK adapter changed after activation")
 
     reference = state.get("reference")
-    if reference is not None and _sdk_runtime_binding(Path(reference["path"])) != reference:
-        raise ConfigurationError("Selected SDK reference checkout changed after activation")
+    if reference is not None and _sdk_reference_binding(
+        Path(reference["path"]), reference["commit"],
+    ) != reference:
+        raise ConfigurationError("Selected SDK reference repository data changed after activation")
     return state
 
 
