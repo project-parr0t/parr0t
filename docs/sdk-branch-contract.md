@@ -6,6 +6,22 @@ An `sdk-<engine>-<version>` branch is a concrete data-plane implementation. It i
 
 The branch name is a compatibility claim, not a statement of code ancestry. `<version>` identifies the public engine/runtime compatibility line actually exercised and validated. Code taken from or inspired by another SDK branch does not authorize publishing the capability under that reference branch's version.
 
+## Checkpoint-only framework-version compatibility
+
+Parr0t supports earlier framework versions only through validated checkpoint data.
+Core and SDK execution always use current code for the selected engine/version.
+An engine compatibility line is not permission to retain an older Parr0t framework.
+
+Preserve checkpoint schemas, completed target identities, artifact hashes, selected
+language, authorization and actual model provenance through explicit data migration.
+Treat recorded runtime paths, argv and tool transports as historical evidence only.
+Do not restore old checkouts, recreate deleted paths, add aliases/shims, or execute
+an older framework to resume a job. After observed worker termination, close the
+old attempt and compile a fresh task/relay and isolation binding with current Core.
+Unknown or active workers still require real host-owner termination evidence;
+checkpoint migration must never fabricate completion or silently relabel launches.
+
+
 ## Dependency direction
 
 The allowed dependency direction is:
