@@ -119,14 +119,18 @@ def write_verified_inventory(work: Path) -> tuple[Path, dict]:
     return primary, save_inventory_attestation(work, primary, independent)
 
 
-def activate_workspace_adapter(work: Path, *, reference_checkout: Path | None = None) -> dict:
+def activate_workspace_adapter(
+    work: Path, *, reference_checkout: Path | None = None, runtime_root: Path | None = None,
+) -> dict:
     for name in ("pack.py", "unpack.py"):
         path = work / "tools" / name
         path.write_text(
             "# fixture adapter implementation\n" + path.read_text(encoding="utf-8"),
             encoding="utf-8",
         )
-    return record_sdk_activation(work, reference_checkout=reference_checkout)
+    return record_sdk_activation(
+        work, reference_checkout=reference_checkout, runtime_root=runtime_root,
+    )
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -1426,9 +1430,7 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(decision["mode"], "derive-new")
             self.assertEqual(decision["target"]["branch"], "sdk-fixture-2.0")
             self.assertEqual(require_sdk_selection(load_config(work)), decision)
-            reference_checkout = root / "reference"
-            git("worktree", "add", "--detach", str(reference_checkout), "sdk-fixture-1.0")
-            activate_workspace_adapter(work, reference_checkout=reference_checkout)
+            activate_workspace_adapter(work)
             derived_profile = prepare_sdk_profile(
                 work, "fixture", "2.0", user_confirmed_success=True
             )
@@ -2305,7 +2307,8 @@ class WorkspaceTests(unittest.TestCase):
                 target_engine="fixture-engine",
                 target_version="1.0",
             )
-            activate_workspace_adapter(work)
+            # This stage-routing case owns its adapter, not the shared Core checkout.
+            activate_workspace_adapter(work, runtime_root=work / "tools")
             primary, inventory_state = write_verified_inventory(work)
             state_root = work / ".game-l10n"
             inventory_fingerprint = inventory_state["primary_fingerprint"]

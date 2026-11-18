@@ -67,7 +67,7 @@ from .inventory_constraints import (
 )
 from .language_policy import language_binding
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext, Segment
-from .native_runtime import RUNTIME_ISSUES, native_launch_summary, native_runtime, require_native_workers_ended
+from .native_runtime import RUNTIME_ISSUES, native_launch_evidence, native_launch_summary, native_runtime, require_native_workers_ended
 from .omp_isolation import ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
 from .privacy import is_within
 from .store import exclusive_file_lock, stable_hash
@@ -4249,10 +4249,10 @@ def _close_failed_execution(work_dir: Path, relay: dict[str, Any]) -> dict[str, 
             "E_DATA_PLANE_RELAY_EXECUTION_INCOMPLETE: actual started workers must end before replacement"
         )
     if "launch_contract" in relay:
-        from .native_runtime import _load
+        from .native_runtime import _load_launch_evidence
 
         relay_path = (work_dir / relay["task_path"]).parent / "relay.json"
-        _, contract, ledger = _load(work_dir, relay_path)
+        _, contract, ledger = _load_launch_evidence(work_dir, relay_path)
         fingerprint = hashlib.sha256(relay_path.read_bytes()).hexdigest()
         for name in ledger["workers"]:
             if name not in contract["tasks"]:
@@ -4333,9 +4333,9 @@ def seal_data_plane_task(
             or type(failure.get("terminal")) is not bool
         ):
             raise ConfigurationError("E_DATA_PLANE_FAILURE_INVALID: failure binding changed")
-        from .native_runtime import _load
+        from .native_runtime import _load_launch_evidence
 
-        _, contract, ledger = _load(work_dir, relay_path)
+        _, contract, ledger = _load_launch_evidence(work_dir, relay_path)
         if contract.get("operational_failure_policy") != (
             "record_only_observed_provider_or_guard_errors; terminal_owner_cancellation_required_before_replacement"
         ):
@@ -4380,22 +4380,19 @@ def seal_data_plane_task(
             execution=execution,
             additional_issue_codes=[failure["failure_code"]],
         )
-    if "launch_contract" in relay:
-        launch = native_launch_summary(work_dir, relay_path)
+    launch = native_launch_evidence(work_dir, relay_path) if "launch_contract" in relay else None
+    if worker_ended and not execution["complete"]:
+        execution = _close_failed_execution(work_dir, relay)
+        if launch is None or not launch["issue_codes"] or launch["issue_codes"] == ["E_NATIVE_WORKER_NOT_STARTED"]:
+            return _seal_ended_data_plane_task(
+                work_dir, relay, task, issue_code="relay_execution_incomplete", execution=execution,
+            )
+    if launch is not None:
         if launch["issue_codes"]:
             return _seal_ended_data_plane_task(
                 work_dir, relay, task, issue_code=launch["issue_codes"][0], execution=execution,
             )
     if not execution["complete"]:
-        if worker_ended:
-            execution = _close_failed_execution(work_dir, relay)
-            return _seal_ended_data_plane_task(
-                work_dir,
-                relay,
-                task,
-                issue_code="relay_execution_incomplete",
-                execution=execution,
-            )
         raise ConfigurationError(
             "E_DATA_PLANE_RELAY_EXECUTION_INCOMPLETE: required worker slots or finalizer did not finish"
         )
