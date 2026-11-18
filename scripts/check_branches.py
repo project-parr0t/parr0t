@@ -372,7 +372,7 @@ def plan_branches(repo: Path, main_ref: str, refs: list[str] | None = None) -> l
             owned = main_files.keys() | base_files.keys()
             overrides = sorted(path for path in changed & owned if files.get(path) != main_files.get(path))
             additions = sorted(changed - owned)
-        overlay = sdk and not overrides
+        overlay = not overrides
         effective = dict(main_files if overlay else files)
         if overlay:
             effective.update({path: files[path] for path in additions})
@@ -387,13 +387,13 @@ def plan_branches(repo: Path, main_ref: str, refs: list[str] | None = None) -> l
                                and path.endswith(".py") and path not in main_files)
         impact_digest, impact_paths, impact_conservative = (
             adapter_impact(repo, effective, main_files, additions, adapter_tests)
-            if overlay else ("none", [], False)
+            if overlay and sdk else ("none", [], False)
         )
         plans.append({
             "ref": ref, "commit": commit, "main_commit": main_commit, "merge_base": base,
             "sdk": sdk, "core_overrides": overrides,
             "core_current": all(files.get(path) == main_files.get(path) for path in owned),
-            "snapshot_kind": "latest_core_with_sdk" if overlay else "branch_tree",
+            "snapshot_kind": ("latest_core_with_sdk" if sdk else "latest_core_with_branch") if overlay else "branch_tree",
             "source_commit": main_commit if overlay else commit,
             "additions": additions if overlay else [],
             "adapter_tests": adapter_tests,

@@ -12,10 +12,10 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from .control_plane import control_plane_state, require_control_plane_ready
+from .control_plane import control_plane_state, require_control_plane_ready, require_control_plane_entry
 from .store import exclusive_file_lock, stable_hash
 from .omp_isolation import ISOLATION_ENV, ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
-from .model_policy import apply_native_role_models, exact_native_model, model_selection_authorization, native_role_bindings
+from .model_policy import apply_native_role_models, exact_native_model, model_selection_authorization, native_role_bindings, native_role_models
 
 RUNTIME_PATH = ".game-l10n/native/runtime.json"
 RUNTIME_SCHEMA = "parr0t.native-runtime.v1"
@@ -27,6 +27,39 @@ RUNTIME_ISSUES = {
     "E_NATIVE_WORKER_MODEL_UNAVAILABLE",
     ISOLATION_ISSUE,
 }
+
+
+def active_execution_environment_policy(work_dir: Path) -> dict[str, Any] | None:
+    """Load the host-selected text-free policy for binding into newly created jobs."""
+    runtime = native_runtime(work_dir)
+    if runtime is None or runtime["host"] != "omp":
+        return None
+    selected = os.environ.get("PARR0T_EXECUTION_ENVIRONMENT_POLICY")
+    path = (Path(selected) if selected else
+            Path(os.environ.get("OMP_AGENT_DIR", str(Path.home() / ".omp/agent")))
+            / "parr0t-execution-environment.json")
+    if not path.is_file():
+        return None
+    try:
+        policy = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(policy, dict)
+            or set(policy) != {"schema", "host", "authorization", "fallback_on", "fallback_strategy",
+                               "preserve_successes", "preserve_isolation", "silent_model_switch_allowed"}
+            or policy["schema"] != "parr0t.execution-environment-policy.v1"
+            or policy["host"] != "omp" or policy["authorization"] != "user_requested"
+            or not isinstance(policy["fallback_on"], list) or not policy["fallback_on"]
+            or len(set(policy["fallback_on"])) != len(policy["fallback_on"])
+            or set(policy["fallback_on"]) - {"provider_operational_error", "execution_guard_denied"}
+            or policy["fallback_strategy"] != "next_configured_native_route"
+            or policy["preserve_successes"] is not True
+            or policy["preserve_isolation"] is not True
+            or policy["silent_model_switch_allowed"] is not False
+        ):
+            raise ValueError()
+    except (OSError, ValueError, TypeError, KeyError):
+        raise ValueError("E_EXECUTION_ENVIRONMENT_POLICY_INVALID") from None
+    return policy
 
 
 def _write(path: Path, value: dict[str, Any]) -> None:
@@ -41,7 +74,6 @@ def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str],
                              omp_isolation: str | None = None,
                              role_models: dict[str, str] | None = None,
                              user_requested_models: bool = False) -> dict[str, Any]:
-    require_control_plane_ready(work_dir)
     policy_config = {}
     config_path = work_dir / "game-l10n.json"
     if role_models:
@@ -58,23 +90,42 @@ def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str],
             stored = json.loads(config_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             stored = {}
-        if isinstance(stored, dict) and "model_policy" in stored:
+        if isinstance(stored, dict):
             policy_config = stored
     if host == "omp":
-        bindings = {"native-luna": "openai-codex/gpt-6-luna:high", "native-sol": "opencodex/gpt-6.1-sol:high"}
+        bindings = {"native-luna": "openai-codex/gpt-6-luna:high", "native-sol": "openai-codex/gpt-6.1-sol:high"}
     elif host == "codex":
         bindings = {"native-luna": "gpt-6-luna", "native-sol": "gpt-6.1-sol"}
     else:
         bindings = {}
+    routing = policy_config.get("routing", {})
+    routing = routing if isinstance(routing, dict) else {}
+    configured_routes = {
+        route for key in ("translators", "review_triagers", "reviewers", "rewriters", "context_analyzers")
+        if isinstance(routing.get(key), list)
+        for route in routing[key] if isinstance(route, str)
+    }
+    if configured_routes or models:
+        bindings = {route: model for route, model in bindings.items() if route in configured_routes}
     try:
         previous = native_runtime(work_dir, allow_stale_generation=True)
     except ValueError:
         previous = None  # An explicit bind may repair invalid runtime metadata.
     if previous is not None and previous["host"] == host:
+        if not configured_routes:
+            bindings = {}
         bindings.update(previous["models"])
         if transport is None:
             transport = previous.get("transport", "collaboration")
     transport = transport or "collaboration"
+    from .native_host import resolve_native_model
+    selector_host = host if transport == "collaboration" else ""
+    models = {route: resolve_native_model(work_dir, selector_host, model) for route, model in models.items()}
+    requested_roles = native_role_models(policy_config)
+    resolved_roles = {role: resolve_native_model(work_dir, selector_host, model) for role, model in requested_roles.items()}
+    policy_changed = bool(role_models) or resolved_roles != requested_roles
+    if resolved_roles != requested_roles:
+        policy_config = apply_native_role_models(policy_config, resolved_roles)
     if transport not in {"collaboration", "native-host-api"} or (transport == "collaboration" and host not in {"codex", "omp"}):
         raise ValueError("E_NATIVE_RUNTIME_INVALID: unsupported host or transport")
     if (
@@ -87,8 +138,6 @@ def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str],
     if any(route in models and models[route] != model for route, model in requested_bindings.items()):
         raise ValueError("E_MODEL_POLICY_BINDING_CONFLICT: explicit role models take precedence")
     bindings.update(requested_bindings)
-    if not {"native-luna", "native-sol"} <= bindings.keys():
-        raise ValueError("E_NATIVE_RUNTIME_INVALID: registered hosts require both exact model bindings")
     payload = {
         "schema": RUNTIME_SCHEMA, "host": host, "models": bindings,
         "control_generation": int(control_plane_state(work_dir).get("generation", 0)),
@@ -111,7 +160,7 @@ def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str],
         payload.update(transport=transport, host_profile_fingerprint=native_host_profile(work_dir, host)["fingerprint"])
     runtime_isolation(work_dir, payload)
     _write(work_dir / RUNTIME_PATH, {**payload, "fingerprint": stable_hash(payload)})
-    if role_models:
+    if policy_changed:
         from .workspace import _write_config
         _write_config(work_dir, policy_config)
     return {**payload, "runtime_path": RUNTIME_PATH}
@@ -145,7 +194,7 @@ def native_runtime(work_dir: Path, *, required: bool = False,
             ))
             and value["fingerprint"] == stable_hash(unsigned)
             and (allow_stale_generation or value["control_generation"] == int(control_plane_state(work_dir).get("generation", 0)))
-            and {"native-luna", "native-sol"} <= set(value["models"])
+            and isinstance(value["models"], dict)
             and all(re.fullmatch(r"native-[a-z0-9][a-z0-9._-]*", route) for route in value["models"])
             and all(exact_native_model(model) for model in value["models"].values())
         )
@@ -584,6 +633,7 @@ def record_native_launch(
     failure_code: str | None = None,
 ) -> dict[str, Any]:
     require_control_plane_ready(work_dir)
+    require_control_plane_entry(work_dir)
     with exclusive_file_lock(work_dir / ".game-l10n/native/launch.lock", issue_code="E_NATIVE_LAUNCH_BUSY", blocking=True):
         return _record_native_launch(
             work_dir, relay_path, event=event, task=task, worker_id=worker_id,
@@ -666,11 +716,29 @@ def native_launch_summary(work_dir: Path, relay_path: Path) -> dict[str, Any]:
         tasks = contract.get("tasks", [binding["task"] for binding in relay.get("task_bindings", [])])
         return {
             "expected_workers": len(tasks), "started_workers": 0,
+            "launch_observed": None,
             "unstarted_tasks": tasks, "issue_codes": [ISOLATION_ISSUE],
             "model": contract.get("model"), "host": contract.get("host"),
             "legacy_unverified_results": len(contract.get("legacy_results", [])),
             "observed_model_workers": 0, "model_evidence": "message_isolation_unverified",
         }
+    launch_observed = ledger["capability"] != "unknown" or bool(ledger["workers"])
+    if not launch_observed and contract.get("host") == "omp":
+        relay_digest = sha256(relay_path.read_bytes()).hexdigest()
+        for task in contract["tasks"]:
+            key = sha256(f"{relay_digest}\0{task}".encode()).hexdigest()
+            admission = work_dir / ".game-l10n/native/omp-launch-admissions" / f"{key}.json"
+            if not admission.exists():
+                continue
+            try:
+                record = json.loads(admission.read_text(encoding="utf-8"))
+                if (record.get("schema") != "parr0t.omp-native-admission.v1"
+                        or record.get("relay_sha256") != relay_digest or record.get("task") != task
+                        or record.get("state") not in {"reserved", "started", "ending", "ended", "failed"}):
+                    raise ValueError()
+            except (OSError, ValueError, TypeError, AttributeError):
+                raise ValueError("E_NATIVE_LAUNCH_INVALID: host admission changed") from None
+            launch_observed = True
     workers = ledger["workers"]
     valid = [task for task, row in workers.items() if (
         isinstance(row, dict) and row.get("worker_id") and row.get("model") == contract["model"]
@@ -683,6 +751,7 @@ def native_launch_summary(work_dir: Path, relay_path: Path) -> dict[str, Any]:
         issue = "E_NATIVE_WORKER_NOT_STARTED"
     return {
         "expected_workers": len(contract["tasks"]), "started_workers": len(valid),
+        "launch_observed": launch_observed,
         "unstarted_tasks": [task for task in contract["tasks"] if task not in valid],
         "issue_codes": [issue] if issue else [],
         "model_authorization": contract.get("model_authorization"),

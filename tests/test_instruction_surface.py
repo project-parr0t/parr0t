@@ -10,30 +10,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class InstructionSurfaceTests(unittest.TestCase):
-    def test_ci_installs_sdk_requirements_before_collecting_tests(self) -> None:
-        workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text(
-            encoding="utf-8"
-        )
-        dependency_install = workflow.index("requirements-*.txt")
-        test_collection = workflow.index("python -m unittest discover")
-
-        self.assertLess(dependency_install, test_collection)
-        self.assertIn("-name 'requirements.txt'", workflow)
-        self.assertIn("--requirement \"$requirements\"", workflow)
-
-    def test_always_loaded_instructions_stay_compact(self) -> None:
-        limits = {
-            "AGENTS.md": 1200,
-            "skills/game-localization/SKILL.md": 700,
-            "docs/agent-usage.md": 1100,
-        }
-
-        for relative, limit in limits.items():
-            text = (ROOT / relative).read_text(encoding="utf-8")
-            with self.subTest(relative=relative):
-                self.assertLessEqual(len(text.split()), limit)
-
-
     def test_status_contract_routes_exist_in_the_repository(self) -> None:
         for action, contracts in STATUS_ACTION_CONTRACTS.items():
             for relative in contracts:

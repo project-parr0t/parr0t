@@ -77,10 +77,28 @@ def _require_pack_input_binding(work_dir: Path, input_path: Path) -> str:
     if (
         not isinstance(completion, dict)
         or completion.get("schema") != COMPLETION_SCHEMA
-        or completion.get("target_completion") is not True
-        or completion.get("static_completion") is not True
+        or not (
+            completion.get("target_completion") is True
+            and (
+                completion.get("static_completion") is True
+                or completion.get("assurance_completion") is True
+            )
+            or completion.get("incomplete_artifact_authorized") is True
+        )
     ):
-        raise ToolExecutionError("Pack input has not passed static completion")
+        raise ToolExecutionError("Pack input has not passed the selected assurance policy")
+    complete = completion.get("target_completion") is True and (
+        completion.get("static_completion") is True
+        or completion.get("assurance_completion") is True
+    )
+    if not complete:
+        try:
+            config = json.loads((work_dir / "game-l10n.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ToolExecutionError("Pack input requires current explicit incomplete-artifact permission") from exc
+        policy = config.get("failure_queue") if isinstance(config, dict) else None
+        if not isinstance(policy, dict) or policy.get("allow_incomplete_artifact") is not True:
+            raise ToolExecutionError("Pack input requires current explicit incomplete-artifact permission")
     target_language = completion.get("target_language")
     policy = target_language_policy(work_dir)
     binding = target_language.get("binding") if isinstance(target_language, dict) else None
@@ -114,6 +132,60 @@ def _require_pack_input_binding(work_dir: Path, input_path: Path) -> str:
     if binding.get("size") != resolved_input.stat().st_size:
         raise ToolExecutionError("Pack input size changed after completion attestation")
     return input_hash
+
+
+def require_incomplete_artifact(
+    work_dir: Path, inventory: dict[str, Any], *, result_path: Path | None = None,
+) -> dict[str, Any]:
+    """Authorize only the exact current, honestly incomplete result artifact."""
+    from .language_policy import language_binding
+
+    try:
+        config = json.loads((work_dir / "game-l10n.json").read_text(encoding="utf-8"))
+        completion = json.loads(
+            (work_dir / ".game-l10n/completion-attestation.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as exc:
+        raise ToolExecutionError("Explicit incomplete artifact authorization is unavailable") from exc
+    if (
+        not isinstance(config, dict)
+        or not isinstance(config.get("failure_queue"), dict)
+        or config.get("failure_queue", {}).get("allow_incomplete_artifact") is not True
+        or not isinstance(completion, dict)
+        or completion.get("schema") != COMPLETION_SCHEMA
+        or completion.get("incomplete_artifact_authorized") is not True
+    ):
+        raise ToolExecutionError("Explicit incomplete artifact authorization is required")
+    alignment = completion.get("result_alignment", {})
+    scope = completion.get("target_scope", {})
+    review = completion.get("semantic_review", {})
+    source = completion.get("source_inventory", {})
+    artifact = completion.get("result_artifact", {})
+    if any(not isinstance(value, dict) for value in (alignment, scope, review, source, artifact)):
+        raise ToolExecutionError("Incomplete artifact authorization metadata is malformed")
+    if (
+        source.get("fingerprint") != inventory.get("primary_fingerprint")
+        or alignment.get("complete") is not True
+        or any(alignment.get(key) != 0 for key in (
+            "manifest_missing_count", "extra_count", "duplicate_count", "source_mismatch_count",
+        ))
+        or scope.get("full_inventory") is not True
+        or scope.get("target_count") != inventory.get("primary_segments")
+        or scope.get("inventory_count") != inventory.get("primary_segments")
+        or review.get("failed_count") != 0
+        or "SOURCE_PRESERVED_AFTER_INTEGRITY_REJECTION" in completion.get("issue_codes", [])
+        or completion.get("target_language", {}).get("binding") != language_binding(work_dir, config)
+        or not isinstance(artifact.get("path"), str)
+    ):
+        raise ToolExecutionError("Incomplete artifact is not aligned to the current safe inventory")
+    path = Path(artifact["path"]) if result_path is None else result_path
+    digest = _require_pack_input_binding(work_dir, path)
+    return {
+        "status": "explicit_incomplete",
+        "inventory_fingerprint": inventory["primary_fingerprint"],
+        "result_artifact": {"path": str(path.resolve()), "sha256": digest, "size": path.stat().st_size},
+        "independent_verified": source.get("independent_verified") is True,
+    }
 
 
 def _write_tool_state(path: Path, state: dict[str, Any]) -> None:

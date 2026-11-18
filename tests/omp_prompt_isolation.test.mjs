@@ -1,15 +1,20 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import promptIsolation from "../src/game_l10n/templates/omp-prompt-isolation.mjs";
 
 const temporary = [];
 const originalWorkspace = process.env.PARR0T_OMP_PROMPT_WORKSPACE;
+const originalControl = process.env.PARR0T_OMP_CONTROL_DIRECTORY;
+beforeEach(() => { delete process.env.PARR0T_OMP_CONTROL_DIRECTORY; });
 afterEach(() => {
   for (const directory of temporary.splice(0)) rmSync(directory, { recursive: true, force: true });
   if (originalWorkspace === undefined) delete process.env.PARR0T_OMP_PROMPT_WORKSPACE;
   else process.env.PARR0T_OMP_PROMPT_WORKSPACE = originalWorkspace;
+  if (originalControl === undefined) delete process.env.PARR0T_OMP_CONTROL_DIRECTORY;
+  else process.env.PARR0T_OMP_CONTROL_DIRECTORY = originalControl;
 });
 function writeJson(file, value) {
   mkdirSync(path.dirname(file), { recursive: true });
@@ -19,9 +24,9 @@ function writeJson(file, value) {
 function schema() {
   return { min() { return this; }, optional() { return this; }, describe() { return this; }, strict() { return this; } };
 }
-const fakeZod = { string: schema, array: schema, object: schema };
+const fakeZod = { string: schema, boolean: schema, array: schema, object: schema };
 fakeZod.z = fakeZod;
-function host(workspace, kind = "sub", depth = kind === "main" ? 0 : 2) {
+function host(workspace, kind = "sub", depth = kind === "main" ? 0 : 2, api = {}) {
   const handlers = new Map();
   const flags = new Map();
   const tools = new Map();
@@ -33,12 +38,18 @@ function host(workspace, kind = "sub", depth = kind === "main" ? 0 : 2) {
     getFlag() { return kind === "main" ? workspace : undefined; },
     on(name, handler) { handlers.set(name, handler); },
     registerTool(tool) { tools.set(tool.name, tool); },
+    getAllTools() { return [...tools.values()]; },
+    getActiveTools() { return [...tools.keys()]; },
     async exec(command, args, options) {
       executions.push({ command, args, options });
       return executionResult;
     },
+    ...api,
   });
-  const ctx = { cwd: workspace, agent: { kind, depth, id: kind === "main" ? "SyntheticRoot" : "SyntheticChild" } };
+  const ctx = {
+    cwd: workspace, agent: { kind, depth, id: kind === "main" ? "SyntheticRoot" : "SyntheticChild" },
+    sessionManager: { getSessionId: () => "synthetic-host-session" },
+  };
   return {
     handlers, flags, tools, executions, executionResult, ctx,
     emit: async (name, event = {}) => handlers.get(name)?.(event, ctx),
@@ -74,7 +85,117 @@ async function deniedWithoutDelivery(session, tool, input) {
   return denial;
 }
 
+function controlLaunch(workspace) {
+  const directory = path.join(workspace, ".game-l10n", "omp-control", "a".repeat(32));
+  mkdirSync(directory, { recursive: true });
+  process.env.PARR0T_OMP_CONTROL_DIRECTORY = directory;
+  return directory;
+}
+
+describe("OMP prompt helper readiness", () => {
+  test("direct-loaded operation does not require readiness APIs or write a receipt", async () => {
+    const f = fixture();
+    const session = host(f.workspace, "main", 0, { getAllTools: undefined, getActiveTools: undefined });
+    await session.emit("session_start");
+    expect(existsSync(path.join(f.workspace, ".game-l10n", "omp-control"))).toBe(false);
+  });
+
+  test("proves the actual main session, native PID, loaded helper hash and active process tool", async () => {
+    const f = fixture();
+    const directory = controlLaunch(f.workspace);
+    const root = host(f.workspace, "main");
+    await root.emit("session_start");
+    const file = path.join(directory, "ready.json");
+    const receipt = readFileSync(file, "utf8");
+    expect(JSON.parse(receipt)).toEqual({
+      schema: "parr0t.omp-control-ready.v1", launch_id: "a".repeat(32),
+      session_id: root.ctx.sessionManager.getSessionId(), process_id: process.pid,
+      helper_sha256: createHash("sha256").update(readFileSync(new URL("../src/game_l10n/templates/omp-prompt-isolation.mjs", import.meta.url))).digest("hex"),
+      process_tool: "parr0t_process",
+    });
+    expect(JSON.parse(receipt).session_id).not.toBe(root.ctx.agent.id);
+    await root.emit("session_start");
+    const descendant = host(f.workspace);
+    descendant.ctx.sessionManager.getSessionId = () => "synthetic-descendant-session";
+    await descendant.emit("session_start");
+    expect(readFileSync(file, "utf8")).toBe(receipt);
+    const otherRoot = host(f.workspace, "main");
+    otherRoot.ctx.sessionManager.getSessionId = () => "synthetic-other-root-session";
+    await expect(otherRoot.emit("session_start")).rejects.toThrow("already registered to another host session");
+    expect(readFileSync(file, "utf8")).toBe(receipt);
+    expect(readdirSync(directory)).toEqual(["ready.json"]);
+  });
+
+  test("unavailable, unregistered and excluded tools never produce readiness or activate tools", async () => {
+    const f = fixture();
+    const directory = controlLaunch(f.workspace);
+    for (const [api, reason] of [
+      [{ getAllTools: undefined }, "host tool availability API required"],
+      [{ getAllTools: () => [] }, "parr0t_process is not registered"],
+      [{ getActiveTools: () => [] }, "parr0t_process is not active"],
+    ]) {
+      const session = host(f.workspace, "main", 0, {
+        ...api, setActiveTools() { throw new Error("must not activate an excluded tool"); },
+      });
+      await expect(session.emit("session_start")).rejects.toThrow(reason);
+      expect(readdirSync(directory)).toEqual([]);
+    }
+  });
+
+  test("invalid host identity or another workspace cannot claim launch readiness", async () => {
+    const f = fixture();
+    const directory = controlLaunch(f.workspace);
+    for (const sessionId of [undefined, "", "invalid/session", "x".repeat(129)]) {
+      const session = host(f.workspace, "main");
+      session.ctx.sessionManager.getSessionId = () => sessionId;
+      await expect(session.emit("session_start")).rejects.toThrow("host root session ID is unavailable");
+    }
+    const other = fixture();
+    await expect(host(other.workspace, "main").emit("session_start")).rejects.toThrow("workspace binding");
+    const wrongCwd = host(f.workspace, "main");
+    wrongCwd.ctx.cwd = other.workspace;
+    await expect(wrongCwd.emit("session_start")).rejects.toThrow("workspace binding");
+    for (const invalid of [path.join(f.workspace, "a".repeat(32)), path.join(directory, ".."), "relative-control"]) {
+      process.env.PARR0T_OMP_CONTROL_DIRECTORY = invalid;
+      await expect(host(f.workspace, "main").emit("session_start")).rejects.toThrow("invalid control launch");
+    }
+    expect(readdirSync(directory)).toEqual([]);
+  });
+});
+
 describe("OMP descendant communication boundary", () => {
+  test("only host-attested direct children can be cancelled, without exposing process inspection", async () => {
+    const f = fixture();
+    const parent = host(f.workspace, "sub", 1);
+    const other = host(f.workspace, "sub", 1);
+    const kill = { path: "proc://OwnedChild/kill", content: "" };
+    await deniedWithoutDelivery(parent, "write", kill);
+    await parent.emit("before_subagent_spawn", { invocationKind: "task", spawnKey: "UnownedChild" });
+    await deniedWithoutDelivery(parent, "write", { path: "proc://UnownedChild/kill", content: "" });
+    await parent.emit("tool_result", {
+      toolName: "task", input: { tasks: [{ task: "Synthetic owned child" }] }, isError: true,
+      details: { async: { type: "task", state: "running", jobId: "OwnedChild" },
+        progress: [{ id: "OwnedChild", status: "running" }] },
+    });
+    let cancellations = 0;
+    expect((await parent.call("write", kill, () => cancellations++))?.block).not.toBe(true);
+    const wrapped = { tool_uses: [{ recipient_name: "functions.write", parameters: kill }] };
+    expect((await parent.call("multi_tool_use.parallel", wrapped))?.block).not.toBe(true);
+    for (const [tool, input] of [
+      ["read", { path: "proc://OwnedChild" }],
+      ["read", { path: "proc://OwnedChild/streams" }],
+      ["write", { path: "proc://UnownedChild/kill", content: "" }],
+      ["write", { path: "proc://ownedchild/kill", content: "" }],
+      ["write", { path: kill.path, content: "not empty" }],
+      ["write", { ...kill, recipient: "Main" }],
+      ["write", { ...kill, target: "history://Main" }],
+    ]) await deniedWithoutDelivery(parent, tool, input);
+    await deniedWithoutDelivery(other, "write", kill);
+    expect(cancellations).toBe(1);
+    await parent.emit("tool_result", { toolName: "write", input: kill, isError: false });
+    await deniedWithoutDelivery(parent, "write", kill);
+  });
+
   test("restricts every fresh descendant before session_start or the first user prompt", async () => {
     const f = fixture();
     for (const depth of [1, 2, 3, 8]) {
@@ -135,9 +256,19 @@ describe("OMP descendant communication boundary", () => {
       ["multi_tool_use.parallel", { tool_uses: [{ recipient_name: "functions.bash", parameters: { command: "printf synthetic > agent://Main" } }] }],
       ["invoke_tool", { tool: "bash", input: JSON.stringify({ command: "printf synthetic > agent://Main" }) }],
       ["edit", { input: "[agent://Main#ABCD]\nPUT >1:\n+synthetic" }],
-      ["call_tool", { name: "unknown_extension", arguments: "{}" }],
+      ["call_tool", { name: "unknown_extension", arguments: JSON.stringify({ command: "write agent://Main" }) }],
     ];
     for (const [name, input] of calls) await deniedWithoutDelivery(session, name, input);
+  });
+
+  test("harmless supported local helpers are not denied by an unknown name", async () => {
+    const session = host(fixture().workspace);
+    for (const [tool, input] of [
+      ["calculator", { expression: "1 + 2" }],
+      ["local_metadata", { path: "synthetic.json" }],
+      ["call_tool", { name: "local_metadata", arguments: JSON.stringify({ path: "synthetic.json" }) }],
+    ]) expect((await session.call(tool, input))?.block).not.toBe(true);
+    await deniedWithoutDelivery(session, "local_metadata", { path: "history://Main" });
   });
 
   test("denies parent-history task selectors even when they are not virtual URLs", async () => {

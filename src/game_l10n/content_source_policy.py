@@ -154,10 +154,6 @@ def create_content_source_grant(
     if _SCOPE.fullmatch(scope) is None:
         raise ValueError("E_CONTENT_SOURCE_GRANT_INVALID: scope_id is not exact")
     kinds = _task_kinds(task_kinds)
-    if "review" in kinds:
-        raise ValueError(
-            "E_CONTENT_SOURCE_GRANT_INVALID: use exact triage or strong_review scope"
-        )
     bound_routes = _routes(routes)
     sources = _sources(external_sources)
     if authority == "validation_session" and any(
@@ -243,10 +239,6 @@ def load_content_source_grant(work_dir: Path, path: Path) -> dict[str, Any]:
         or grant.get("external_sources") != _sources(grant.get("external_sources", []))
     ):
         raise ValueError("E_CONTENT_SOURCE_GRANT_INVALID: grant binding changed")
-    if "review" in grant["task_kinds"]:
-        raise ValueError(
-            "E_CONTENT_SOURCE_GRANT_SCOPE_MISMATCH: ambiguous review grants are invalid"
-        )
     if grant["authority"] == "explicit_user":
         if grant.get("evidence") != {"user_confirmed": True}:
             raise ValueError("E_CONTENT_SOURCE_GRANT_INVALID: user evidence changed")
@@ -289,9 +281,31 @@ def content_source_policy(
     grant_id = ""
     allowed_sources: list[str] = []
     bound_scope = ""
+    if grant_path is None and scope_id:
+        matches = []
+        for candidate in sorted((work_dir / GRANT_DIRECTORY).glob("*.json")):
+            if candidate.resolve().parent != (work_dir / GRANT_DIRECTORY).resolve():
+                continue
+            try:
+                candidate_scope = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(candidate_scope, dict) or candidate_scope.get("scope_id") != scope_id:
+                continue
+            grant = load_content_source_grant(work_dir, candidate)
+            if (
+                grant["scope_id"] == scope_id
+                and task_kind in grant["task_kinds"]
+                and route in grant["routes"]
+            ):
+                matches.append((candidate, grant))
+        if len(matches) > 1:
+            raise ValueError(
+                "E_CONTENT_SOURCE_GRANT_AMBIGUOUS: select the exact versioned grant"
+            )
+        if matches:
+            grant_path = matches[0][0]
     if grant_path is not None:
-        if not semantic:
-            raise ValueError("E_CONTENT_SOURCE_GRANT_SCOPE_MISMATCH")
         grant = load_content_source_grant(work_dir, grant_path)
         if (
             not scope_id

@@ -9,7 +9,7 @@ from typing import Any
 from .errors import GameL10nError
 from .formats import write_results
 from .models import AttemptRecord, Segment, TranslationResult
-from .release_checkpoint import canonical_checkpoint_bytes
+from .release_checkpoint import CHECKPOINT_SCHEMA, canonical_checkpoint_bytes
 from .store import stable_hash
 from .validators import validate_integrity
 
@@ -127,6 +127,10 @@ def apply_user_corrections(
         raise CorrectionError("Correction output must use JSON or JSONL to retain audit metadata")
 
     checkpoint, checkpoint_bytes = canonical_checkpoint_bytes(checkpoint_path)
+    if checkpoint["schema"] != CHECKPOINT_SCHEMA:
+        raise CorrectionError(
+            "Dependency-based corrections require a full release checkpoint; local integrity records contain no dependency evidence"
+        )
     if checkpoint["source_inventory"]["fingerprint"] != expected_inventory_fingerprint:
         raise CorrectionError("Release checkpoint does not match the verified source inventory")
 

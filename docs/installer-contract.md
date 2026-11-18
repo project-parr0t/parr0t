@@ -23,7 +23,7 @@ README.txt
 payload/**
 ```
 
-`parr0t-release-checkpoint.json` is required but is never installed into the game. It is a machine-readable continuation point governed by `docs/release-checkpoint.md`; it may contain the target strings already present in the distribution, but no separate raw-source copy, prompts, provider output, credentials, logs, private paths, or unpublished candidates. A target that intentionally preserves its source remains marked `source_preserved`.
+`parr0t-release-checkpoint.json` is required in a distributable ZIP and is never installed into the game. A publication checkpoint is a machine-readable continuation point governed by `docs/release-checkpoint.md`; it may contain the target strings already present in the distribution, but no separate raw-source copy, prompts, provider output, credentials, logs, private paths, or unpublished candidates. Local integrity-only package workflows may carry `parr0t.local-release-integrity/v1` instead when `required_for_distribution` is false; this proves ownership/source/result integrity, not future-update or publication readiness. A target that intentionally preserves its source remains marked `source_preserved`.
 
 Do not add `AGENTS.md`, prompts, runtime approvals, `.game-l10n`, task state, logs, source game data, translation work files, SDK documentation, or build-host paths. Title-specific values belong only in the generated manifest, README, checkpoint, payload, and explicitly approved custom error registry.
 

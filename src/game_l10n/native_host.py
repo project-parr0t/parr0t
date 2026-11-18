@@ -10,7 +10,6 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .control_plane import require_control_plane_ready
 from .store import stable_hash
 
 PROFILE_SCHEMA = "parr0t.native-host-profile.v1"
@@ -18,6 +17,72 @@ HOST_PROTOCOL = "parr0t.native-host-api.v1"
 PROBE_SCHEMA = "parr0t.native-host-probe.v1"
 HOST_ID = re.compile(r"[a-z][a-z0-9_-]{0,47}")
 OPAQUE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
+MODEL_SNAPSHOT_PATH = ".game-l10n/native/host-models.json"
+MODEL_SNAPSHOT_SCHEMA = "parr0t.native-host-models.v1"
+
+
+def host_model_snapshot(work_dir: Path) -> dict | None:
+    """Read public host identities only; availability never grants authorization."""
+    from .model_policy import exact_native_model
+    path = work_dir / MODEL_SNAPSHOT_PATH
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(value, dict)
+            or set(value) - {"schema", "host", "session_id", "process_id", "models", "current_model"}
+            or value["schema"] != MODEL_SNAPSHOT_SCHEMA or value["host"] != "omp"
+            or not isinstance(value["session_id"], str) or not value["session_id"].strip()
+            or type(value["process_id"]) is not int or value["process_id"] < 1
+            or not isinstance(value["models"], list)
+            or any(
+                not isinstance(row, dict) or set(row) != {"provider", "id", "selector"}
+                or not exact_native_model(row["provider"]) or "/" in row["provider"]
+                or not exact_native_model(row["id"])
+                or row["selector"] != row["provider"] + "/" + row["id"]
+                for row in value["models"]
+            )
+            or ("current_model" in value and not exact_native_model(value["current_model"]))
+        ):
+            raise ValueError()
+    except (OSError, ValueError, TypeError, KeyError):
+        raise ValueError("E_NATIVE_HOST_MODELS_INVALID") from None
+    return value
+
+
+def resolve_native_model(work_dir: Path, host: str, model: str) -> str:
+    """Resolve bare OMP IDs by one exact catalog match, never by provider guessing."""
+    from .model_policy import exact_native_model
+    if not exact_native_model(model):
+        raise ValueError("E_NATIVE_RUNTIME_INVALID: exact model selector required")
+    if host != "omp":
+        return model
+    try:
+        snapshot = host_model_snapshot(work_dir)
+    except ValueError:
+        if "/" in model:
+            return model
+        raise
+    rows = snapshot["models"] if snapshot else []
+    if any(row["selector"] == model or model.startswith(row["provider"] + "/") for row in rows):
+        return model
+    matches = {row["selector"] for row in rows if row["id"] == model}
+    if not matches:
+        # Host qualifiers decorate an exact identity; they are not a provider prefix hint.
+        identity = model.split("@", 1)[0]
+        if "@" not in model and ":" in identity:
+            identity = identity.rsplit(":", 1)[0]
+        suffix = model[len(identity):]
+        if suffix:
+            matches = {row["selector"] + suffix for row in rows if row["id"] == identity}
+    if len(matches) > 1:
+        raise ValueError("E_NATIVE_MODEL_AMBIGUOUS: select the exact provider-qualified model")
+    if matches:
+        return matches.pop()
+    if "/" in model:
+        return model  # Explicit qualified choices do not require catalog membership.
+    raise ValueError("E_NATIVE_MODEL_METADATA_REQUIRED: no exact host model identity match")
 
 
 def _write(path: Path, value: dict) -> None:
@@ -52,7 +117,6 @@ def _validate_endpoint(endpoint: str, api_key_env: str | None) -> None:
 
 def configure_native_host(work_dir: Path, host: str, endpoint: str,
                           api_key_env: str | None = None) -> dict:
-    require_control_plane_ready(work_dir)
     _validate_endpoint(endpoint, api_key_env)
     payload = {"schema": PROFILE_SCHEMA, "host": host, "endpoint": endpoint.rstrip("/"),
                "api_key_env": api_key_env, "protocol": HOST_PROTOCOL}

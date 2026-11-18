@@ -27,6 +27,400 @@ def _digest(value: str) -> str:
 
 
 class TranslationExchangeTests(unittest.TestCase):
+    def test_completed_external_scope_issues_collection_not_job_completion(self):
+        from game_l10n.control_plane import establish_control_plane_entry
+        from game_l10n.formats import read_segments
+        from game_l10n.native_followup import collect_translation_exchange_candidates
+        with tempfile.TemporaryDirectory() as directory:
+            root, bundle = Path(directory), Path(directory) / "exchange"
+            establish_control_plane_entry(root)
+            prepare_translation_exchange(
+                root, [Segment("a", "SOURCE_A"), Segment("b", "SOURCE_B")], bundle,
+                exchange_id="standalone", mode="fallback", source_queue="translation_fallback_pending",
+            )
+            processed = process_translation_exchange(
+                root, bundle, lambda rows: [
+                    TranslationResult(row.id, row.source, "TARGET_" + row.id.upper(), "translated",
+                        translator="configured-api", attempts=[AttemptRecord(
+                            "translate", "configured-api", "success", ordinal=1, model="fixture/api",
+                        )]) for row in rows
+                ], route="configured-api", route_models={"configured-api": "fixture/api"},
+            )
+            self.assertEqual(processed["next_action"], "collect_translation_exchange_candidates")
+            request = processed["collection"]
+            self.assertEqual(request["command"], "collect-translation-exchange-candidates")
+            self.assertIn("--bundle", request["argv"])
+            before = (bundle / SUCCESS_NAME).read_bytes()
+            collected = collect_translation_exchange_candidates(
+                root, read_segments(root / request["input"]), bundle,
+                root / "review.jsonl", root / "unresolved.jsonl",
+            )
+            self.assertEqual((collected["candidate_count"], collected["unresolved_count"]), (2, 0))
+            self.assertEqual((bundle / SUCCESS_NAME).read_bytes(), before)
+
+    def test_partial_multi_adapter_block_keeps_known_operational_attempt_before_next_route(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, bundle = Path(directory), Path(directory) / "exchange"
+            graph = [
+                {"provider": route, "model": "fixture/" + route, "max_retries": 0, "transport": transport}
+                for route, transport in [("a", "external"), ("b", "external"), ("native-c", "native")]
+            ]
+            prepare_translation_exchange(root, [Segment("one", "S")], bundle,
+                exchange_id="partial-block", mode="fallback", source_queue="translation_fallback_pending")
+            first = AttemptRecord("translate", "a", "error", ordinal=1, model="fixture/a",
+                issue_code="quota_exhausted", operational=True, provider_fingerprint="a" * 64)
+            initial = process_translation_exchange(
+                root, bundle, lambda rows: [TranslationResult("one", "S", "", "failed", attempts=[first])],
+                route="a", route_models={"a": "fixture/a", "b": "fixture/b"}, full_route_plan=graph,
+            )
+            self.assertIsNone(initial["native_continuation"])
+            self.assertEqual(initial["issue_code"], "E_FALLBACK_ADAPTER_ATTEMPT_POLICY_INCOMPLETE")
+            def resume(rows, prior):
+                self.assertEqual([item.provider for item in prior[0].attempts], ["a"])
+                return [TranslationResult("one", "S", "", "failed", attempts=[
+                    *prior[0].attempts, AttemptRecord("translate", "b", "refused", ordinal=1,
+                        model="fixture/b", issue_code="explicit_provider_refusal", operational=False),
+                ])]
+            finished = process_translation_exchange(
+                root, bundle, lambda rows: self.fail("Do not restart adapter a"),
+                route="a", route_models={"a": "fixture/a", "b": "fixture/b"}, full_route_plan=graph,
+                retry_failures=True, resume_translator=resume,
+                continuation_status=lambda segment, prior: {"eligible": True},
+            )
+            self.assertEqual(finished["native_continuation"]["native_route_plan"][0]["provider"], "native-c")
+            failure = json.loads((bundle / FAILURE_NAME).read_text())
+            self.assertEqual([(item["provider"], item["ordinal"]) for item in failure["attempt_lineage"]],
+                             [("a", 1), ("b", 1)])
+
+    def test_capacity_failure_reports_specific_repair_not_user_budget_exhaustion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, bundle = Path(directory), Path(directory) / "exchange"
+            prepare_translation_exchange(root, [Segment("one", "SYNTHETIC_PRIVATE_SOURCE")], bundle,
+                exchange_id="capacity", mode="fallback", source_queue="translation_fallback_pending")
+            result = process_translation_exchange(
+                root, bundle, lambda rows: [TranslationResult(
+                    "one", rows[0].source, "", "failed",
+                    attempts=[AttemptRecord("translate", "adapter", "error", ordinal=1,
+                        model="fixture/model", issue_code="input_capacity_exceeded", operational=True)],
+                )], route="adapter", route_models={"adapter": "fixture/model"},
+            )
+            self.assertEqual(result["issue_code"], "E_FALLBACK_INPUT_CAPACITY_EXCEEDED")
+            self.assertFalse(result["capacity_repair"]["user_budget_exhausted"])
+            self.assertIn("max_input_chars", result["capacity_repair"]["next_action"])
+            self.assertNotIn("SYNTHETIC_PRIVATE_SOURCE", json.dumps(result))
+
+    def test_configured_plan_resolves_host_identity_without_overwriting_it_with_bare_role(self):
+        from game_l10n.translation_exchange import configured_translation_route_plan
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / ".game-l10n/native/host-models.json"
+            snapshot.parent.mkdir(parents=True)
+            snapshot.write_text(json.dumps({
+                "schema": "parr0t.native-host-models.v1", "host": "omp",
+                "session_id": "fixture-session", "process_id": 1,
+                "models": [{"provider": "publisher", "id": "literal:identity",
+                            "selector": "publisher/literal:identity"}],
+            }), encoding="utf-8")
+            config = {
+                "routing": {"translators": ["native-translation"]}, "providers": [],
+                "model_policy": {"source": "user_prompt",
+                                 "native_roles": {"translation": "literal:identity@upstream"}},
+            }
+            runtime = {"host": "omp", "models": {"native-translation": "publisher/literal:identity@upstream"}}
+            with patch("game_l10n.native_runtime.native_runtime", return_value=runtime):
+                plan = configured_translation_route_plan(root, config)
+                self.assertEqual(plan[0]["model"], "publisher/literal:identity@upstream")
+                config["model_policy"]["native_roles"]["translation"] = "publisher/changed"
+                with self.assertRaisesRegex(TranslationExchangeError, "E_MODEL_POLICY_BINDING_CONFLICT"):
+                    configured_translation_route_plan(root, config)
+
+    def test_external_first_handoff_requires_receipt_and_selects_actual_native_successor(self):
+        from dataclasses import replace
+        from game_l10n.formats import read_segments
+        from game_l10n.native_pass import prepare_native_tasks
+        from game_l10n.native_runtime import configure_native_runtime
+        from game_l10n.translation_exchange import configured_translation_route_plan
+        with tempfile.TemporaryDirectory() as directory:
+            root, bundle = Path(directory), Path(directory) / "exchange"
+            configure_native_runtime(root, "codex", {"native-middle": "fixture/native"})
+            config = {
+                "routing": {"translators": ["external-a", "native-middle", "external-b"]},
+                "providers": [{"name": name, "type": "command", "command": ["not-executed"],
+                               "model": "fixture/" + name} for name in ("external-a", "external-b")],
+            }
+            (root / "game-l10n.json").write_text(json.dumps(config), encoding="utf-8")
+            graph = configured_translation_route_plan(root, config)
+            prepare_translation_exchange(root, [Segment("remaining", "S")], bundle,
+                exchange_id="external-first", mode="fallback", source_queue="translation_fallback_pending")
+            result = process_translation_exchange(
+                root, bundle, lambda rows: [TranslationResult(
+                    "remaining", "S", "", "failed", attempts=[AttemptRecord(
+                        "translate", "external-a", "refused", ordinal=1,
+                        model="fixture/external-a", issue_code="explicit_provider_refusal", operational=False,
+                    )],
+                )], route="external-a", route_models={"external-a": "fixture/external-a"}, full_route_plan=graph,
+            )
+            continuation = result["native_continuation"]
+            source = root / continuation["source"]
+            segments = read_segments(source)
+            with self.assertRaisesRegex(ValueError, "E_TRANSLATION_PREDECESSOR_REQUIRED"):
+                prepare_native_tasks(root, source, segments, root / "missing",
+                    route_binding={"provider": "native-middle", "model": "fixture/native", "attempt": 1})
+            prepare_native_tasks(root, source, segments, root / "native",
+                predecessor_receipt=root / continuation["receipt"])
+            manifest = json.loads((root / "native/manifest.json").read_text())
+            self.assertEqual(manifest["route_binding"],
+                {"provider": "native-middle", "model": "fixture/native", "attempt": 1})
+            with self.assertRaisesRegex(ValueError, "E_TRANSLATION_PREDECESSOR_INVALID"):
+                prepare_native_tasks(root, source, [replace(segments[0], source="CHANGED")], root / "changed",
+                    predecessor_receipt=root / continuation["receipt"])
+            replay = process_translation_exchange(
+                root, bundle, lambda rows: self.fail("Consumed external phase cannot restart"),
+                route="external-a", route_models={"external-a": "fixture/external-a"},
+                full_route_plan=graph, retry_failures=True,
+            )
+            self.assertEqual(replay["native_continuation"], continuation)
+
+    def test_partial_external_budget_resumes_with_bound_history_instead_of_resetting_ordinal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, bundle = Path(directory), Path(directory) / "exchange"
+            graph = [
+                {"provider": "external-a", "model": "fixture/a", "max_retries": 1, "transport": "external"},
+                {"provider": "native-b", "model": "fixture/b", "max_retries": 0, "transport": "native"},
+            ]
+            prepare_translation_exchange(root, [Segment("one", "S")], bundle,
+                exchange_id="partial", mode="fallback", source_queue="translation_fallback_pending")
+            first = AttemptRecord("translate", "external-a", "refused", ordinal=1,
+                model="fixture/a", issue_code="explicit_provider_refusal", operational=False)
+            initial = process_translation_exchange(
+                root, bundle, lambda rows: [TranslationResult("one", "S", "", "failed", attempts=[first])],
+                route="external-a", route_models={"external-a": "fixture/a"}, full_route_plan=graph,
+            )
+            self.assertIsNone(initial["native_continuation"])
+            self.assertEqual(initial["continuation_repair_target_ids"], ["one"])
+            def resume(rows, prior):
+                self.assertEqual([(a.model, a.ordinal) for a in prior[0].attempts], [("fixture/a", 1)])
+                return [TranslationResult("one", "S", "", "failed", attempts=[
+                    *prior[0].attempts,
+                    AttemptRecord("translate", "external-a", "refused", ordinal=2,
+                        model="fixture/a", issue_code="explicit_provider_refusal", operational=False),
+                ])]
+            resumed = process_translation_exchange(
+                root, bundle, lambda rows: self.fail("Fresh translator must not replace a continuation"),
+                route="external-a", route_models={"external-a": "fixture/a"}, full_route_plan=graph,
+                retry_failures=True, resume_translator=resume,
+                continuation_status=lambda segment, prior: {"eligible": True},
+            )
+            self.assertIsNotNone(resumed["native_continuation"])
+            outcome = json.loads((bundle / FAILURE_NAME).read_text())
+            self.assertEqual([item["ordinal"] for item in outcome["attempt_lineage"]], [1, 2])
+
+    def test_invalid_adapter_sibling_does_not_discard_a_valid_independent_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, bundle = Path(directory), Path(directory) / "exchange"
+            prepare_translation_exchange(
+                root, [Segment("ready", "S"), Segment("invalid", "S")], bundle,
+                exchange_id="partial-adapter", mode="fallback",
+                source_queue="translation_fallback_pending",
+            )
+            with self.assertRaisesRegex(TranslationExchangeError, "ADAPTER_RESULT_BINDING_INVALID"):
+                process_translation_exchange(
+                    root, bundle, lambda rows: [
+                        TranslationResult("ready", "S", "T", "translated", translator="first",
+                            attempts=[AttemptRecord("translate", "first", "success", ordinal=1, model="exact")]),
+                        TranslationResult("invalid", "S", "T", "translated", translator="first",
+                            attempts=[AttemptRecord("translate", "first", "success", ordinal=1, model="wrong")]),
+                    ], route="first", route_models={"first": "exact"},
+                )
+            successes = [json.loads(line) for line in (bundle / SUCCESS_NAME).read_text().splitlines()]
+            self.assertEqual([row["target_id"] for row in successes], ["ready"])
+            summary = seal_translation_exchange(root, bundle)
+            self.assertEqual((summary["success_count"], summary["pending_count"]), (1, 1))
+            with self.assertRaisesRegex(TranslationExchangeError, "ADAPTER_ATTEMPT_UNCERTAIN"):
+                process_translation_exchange(
+                    root, bundle, lambda rows: self.fail("Neither a success nor unknown attempt may repeat"),
+                    route="first", route_models={"first": "exact"}, retry_failures=True,
+                )
+
+    def test_multi_adapter_plan_records_actual_success_and_exhausted_failure_models(self) -> None:
+        from game_l10n.content_source_policy import content_source_policy
+        from game_l10n.translation_exchange import ADAPTER_LEDGER_NAME
+        plan = {"first": "publisher/first:high", "second": "publisher/second@configured"}
+        with tempfile.TemporaryDirectory() as directory:
+            root, calls = Path(directory), []
+            bundle = root / "exchange"
+            policy = content_source_policy(root, task_kind="translation", route="native-pass:translation")
+            prepare_translation_exchange(
+                root, [Segment(name, "S") for name in ("fallback", "primary", "failed")], bundle,
+                exchange_id="multi-adapter", mode="fallback", source_queue="translation_fallback_pending",
+                content_source_policy=policy,
+            )
+            def translate(rows):
+                results = []
+                for row in rows:
+                    calls.append(row.id)
+                    if row.id == "primary":
+                        attempts = [AttemptRecord("translate", "first", "success", ordinal=1, model=plan["first"])]
+                        provider, status, text = "first", "translated", "T"
+                    elif row.id == "fallback":
+                        attempts = [
+                            AttemptRecord("translate", "first", "refused", ordinal=1, model=plan["first"],
+                                          issue_code="explicit_provider_refusal"),
+                            AttemptRecord("translate", "second", "success", ordinal=1, model=plan["second"]),
+                        ]
+                        provider, status, text = "second", "translated", "T"
+                    else:
+                        attempts = [
+                            AttemptRecord("translate", "first", "error", ordinal=1, model=plan["first"],
+                                          issue_code="timeout", operational=True),
+                            AttemptRecord("translate", "second", "error", ordinal=1, model=plan["second"],
+                                          issue_code="quota_exhausted", operational=True),
+                        ]
+                        provider, status, text = "", "failed", ""
+                    results.append(TranslationResult(
+                        row.id, row.source, text, status, translator=provider, attempts=attempts
+                    ))
+                return results
+            result = process_translation_exchange(
+                root, bundle, translate, route="first", model=plan["first"], route_models=plan, wave_size=1,
+            )
+            successes = [json.loads(line) for line in (bundle / SUCCESS_NAME).read_text().splitlines()]
+            failure = json.loads((bundle / FAILURE_NAME).read_text())
+            self.assertEqual([(row["route"], row["model"]) for row in successes],
+                             [("second", plan["second"]), ("first", plan["first"])])
+            self.assertEqual(successes[0]["content_provenance"]["model"], plan["second"])
+            self.assertEqual([a["provider"] for a in successes[0]["attempt_lineage"]], ["first", "second"])
+            self.assertEqual((failure["route"], failure["model"]), ("second", plan["second"]))
+            self.assertFalse(failure["retryable"])
+            self.assertEqual(result["issue_code"], "E_FALLBACK_OPERATIONAL_ROUTES_EXHAUSTED")
+            from game_l10n.formats import read_segments
+            from game_l10n.native_followup import collect_translation_exchange_candidates, CANDIDATE_METADATA_KEY
+            collected = collect_translation_exchange_candidates(
+                root, [Segment(name, "S") for name in ("fallback", "primary", "failed")],
+                bundle, root / "review.jsonl", root / "unresolved.jsonl",
+            )
+            candidate = read_segments(root / "review.jsonl")[0].metadata[CANDIDATE_METADATA_KEY]
+            self.assertEqual(collected["candidate_count"], 2)
+            self.assertEqual(candidate["model"], plan["second"])
+            self.assertEqual([a["provider"] for a in candidate["adapter_attempt_lineage"]], ["first", "second"])
+            checkpoint = (bundle / SUCCESS_NAME).read_bytes()
+            ledger = (bundle / ADAPTER_LEDGER_NAME).read_bytes()
+            resumed = process_translation_exchange(
+                root, bundle, lambda rows: self.fail("Locked successes and exhausted operational routes cannot repeat"),
+                route="first", model=plan["first"], route_models=plan, retry_failures=True,
+            )
+            self.assertEqual(resumed["processed"], 0)
+            self.assertEqual((bundle / SUCCESS_NAME).read_bytes(), checkpoint)
+            with self.assertRaisesRegex(TranslationExchangeError, "ADAPTER_PLAN_IMMUTABLE"):
+                process_translation_exchange(
+                    root, bundle, lambda rows: self.fail("Changed plan must not execute"),
+                    route="second", model=plan["second"],
+                    route_models={"second": plan["second"], "first": plan["first"]},
+                )
+            self.assertEqual((bundle / ADAPTER_LEDGER_NAME).read_bytes(), ledger)
+            self.assertEqual(calls, ["fallback", "primary", "failed"])
+            successes[0]["text"] = "CHANGED"
+            (bundle / SUCCESS_NAME).write_text("".join(json.dumps(row) + "\n" for row in successes))
+            with self.assertRaisesRegex(TranslationExchangeError, "E_FALLBACK_SUCCESS_CHANGED"):
+                seal_translation_exchange(root, bundle)
+
+    def test_multi_adapter_rejects_wrong_model_and_does_not_replay_unknown_attempt(self) -> None:
+        from game_l10n.translation_exchange import ADAPTER_LEDGER_NAME
+        with tempfile.TemporaryDirectory() as directory:
+            root, bundle = Path(directory), Path(directory) / "exchange"
+            prepare_translation_exchange(
+                root, [Segment("line", "S")], bundle, exchange_id="wrong-model",
+                mode="fallback", source_queue="translation_fallback_pending",
+            )
+            with self.assertRaisesRegex(TranslationExchangeError, "RESULT_BINDING_INVALID"):
+                process_translation_exchange(
+                    root, bundle, lambda rows: [TranslationResult(
+                        "line", "S", "T", "translated", translator="first",
+                        attempts=[AttemptRecord("translate", "first", "success", ordinal=1, model="different-model")],
+                    )], route="first", route_models={"first": "exact-first", "second": "exact-second"},
+                )
+            self.assertEqual((bundle / SUCCESS_NAME).read_bytes(), b"")
+            self.assertIsNotNone(json.loads((bundle / ADAPTER_LEDGER_NAME).read_text())["active_event"])
+            with self.assertRaisesRegex(TranslationExchangeError, "ADAPTER_ATTEMPT_UNCERTAIN"):
+                process_translation_exchange(
+                    root, bundle, lambda rows: self.fail("Unknown execution must not repeat"),
+                    route="first", route_models={"first": "exact-first", "second": "exact-second"},
+                )
+
+    def test_binding_new_plan_preserves_legacy_success_without_inventing_its_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, bundle = Path(directory), Path(directory) / "exchange"
+            prepare_translation_exchange(
+                root, [Segment("old", "S"), Segment("new", "S")], bundle,
+                exchange_id="inherited-success", mode="fallback",
+                source_queue="translation_fallback_pending",
+            )
+            requests = [json.loads(line) for line in (bundle / REQUESTS_NAME).read_text().splitlines()]
+            old = {"target_id": "old", "status": "success", "text": "OLD", "route": "historical",
+                   "attempt": 1, "source_sha256": requests[0]["source_sha256"],
+                   "context_sha256": requests[0]["context_sha256"]}
+            (bundle / SUCCESS_NAME).write_text(json.dumps(old) + "\n")
+            def translate(rows):
+                self.assertEqual([row.id for row in rows], ["new"])
+                return [TranslationResult("new", "S", "NEW", "translated", translator="first",
+                    attempts=[AttemptRecord("translate", "first", "success", ordinal=1, model="exact-first")])]
+            result = process_translation_exchange(
+                root, bundle, translate, route="first", route_models={"first": "exact-first"},
+            )
+            successes = [json.loads(line) for line in (bundle / SUCCESS_NAME).read_text().splitlines()]
+            self.assertEqual(successes[0], old)
+            self.assertNotIn("model", successes[0])
+            self.assertEqual(result["success_count"], 2)
+
+    def test_elapsed_budget_does_not_require_a_token_ceiling_or_metered_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "exchange"
+            prepare_translation_exchange(
+                root, [Segment("one", "S"), Segment("two", "S")], bundle,
+                exchange_id="elapsed-only", mode="fallback",
+                source_queue="translation_fallback_pending",
+            )
+            result = process_translation_exchange(
+                root, bundle,
+                lambda rows: [TranslationResult(s.id, s.source, "T", "translated") for s in rows],
+                route="configured", max_elapsed_minutes=1, wave_size=1,
+            )
+            self.assertEqual(result["success_count"], 2)
+            self.assertEqual(result["issue_code"], "")
+            self.assertIsNone(result["budget"]["max_input_tokens"])
+            self.assertFalse(result["budget"]["input_tokens_known"])
+            state = json.loads((root / FALLBACK_USAGE_RELATIVE).read_text())
+            self.assertEqual([event["accounting"] for event in state["events"]],
+                             ["unmeasured", "unmeasured"])
+
+    def test_unlimited_input_does_not_invent_a_time_budget_or_wave_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "exchange"
+            prepare_translation_exchange(
+                root, [Segment("line", "S")], bundle,
+                exchange_id="unlimited", mode="fallback",
+                source_queue="translation_fallback_pending",
+            )
+            result = process_translation_exchange(
+                root, bundle, lambda rows: [TranslationResult("line", "S", "T", "translated")],
+                route="configured", input_tokens_unlimited=True, wave_size=1024,
+            )
+            self.assertEqual(result["processed"], 1)
+            self.assertFalse((root / FALLBACK_USAGE_RELATIVE).exists())
+
+    def test_exchange_can_exceed_previous_bundle_record_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prepared = prepare_translation_exchange(
+                root, [Segment(str(i), "S") for i in range(2001)], root / "exchange",
+                exchange_id="large-exchange", mode="fallback",
+                source_queue="translation_fallback_pending",
+            )
+            self.assertEqual(prepared["target_count"], 2001)
+            self.assertEqual(seal_translation_exchange(root, root / "exchange")["pending_count"], 2001)
+
     def test_network_error_without_reported_usage_is_not_assumed_free(self) -> None:
         for code in ("authentication_error", "quota_exhausted", "rate_limited"):
             with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
@@ -88,7 +482,7 @@ class TranslationExchangeTests(unittest.TestCase):
                     exchange_id="invalid-unlimited-deadline", mode="fallback",
                     source_queue="translation_fallback_pending",
                 )
-                with self.assertRaisesRegex(TranslationExchangeError, "UNLIMITED_POLICY_INVALID"):
+                with self.assertRaisesRegex(TranslationExchangeError, "ELAPSED_BUDGET_INVALID"):
                     process_translation_exchange(
                         root, bundle, lambda segments: self.fail("Invalid deadline must not call provider"),
                         route="fallback", input_tokens_unlimited=True,
@@ -298,11 +692,11 @@ class TranslationExchangeTests(unittest.TestCase):
                 resolve_uncertain_input_tokens=None,
             )
             original = ledger.read_bytes()
-            with self.assertRaisesRegex(TranslationExchangeError, "E_FALLBACK_BUDGET_REQUIRED"):
-                process_translation_exchange(
-                    root, bundle, lambda segments: self.fail("User limit must remain bound"),
-                    route="fallback",
-                )
+            result = process_translation_exchange(
+                root, bundle, lambda segments: self.fail("User limit must remain bound"),
+                route="fallback",
+            )
+            self.assertEqual(result["issue_code"], "E_FALLBACK_INPUT_BUDGET_EXHAUSTED")
             self.assertEqual(ledger.read_bytes(), original)
 
     def test_usage_limits_reject_invalid_types_and_nonfinite_deadlines(self) -> None:
@@ -315,7 +709,6 @@ class TranslationExchangeTests(unittest.TestCase):
             {"baseline_input_tokens": 1.5},
             {"max_elapsed_minutes": True},
             {"max_elapsed_minutes": 1.5},
-            {"max_elapsed_minutes": 1},
             {"started_at_epoch": float("nan")},
             {"started_at_epoch": float("inf")},
             {"started_at_epoch": 0},

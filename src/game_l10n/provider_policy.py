@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .errors import ConfigurationError
-from .model_policy import codex_app_routes, codex_app_translation_retries, native_role_models
+from .model_policy import native_role_models
 
 
 CODEX_APP_PRESET = "codex-app-deepseek"
@@ -125,8 +125,7 @@ def validate_provider_policy(
         return
 
     if not policy:
-        _mode_drift("codex-app-deepseek requires an explicit provider_policy")
-
+        _mode_drift("native mode requires an explicit provider_policy")
     native = config.get("native_workflow", {})
     if native.get("required") is not True:
         _mode_drift("Codex App mode requires native workers")
@@ -136,47 +135,65 @@ def validate_provider_policy(
         _mode_drift("child model CLIs are forbidden in Codex App mode")
     if native.get("external_provider_primary_allowed") is not False:
         _mode_drift("an external provider cannot become primary in Codex App mode")
-    if set(native.get("external_provider_roles", [])) != CODEX_APP_EXTERNAL_ROLES:
-        _mode_drift("external providers are limited to the declared fallback roles")
-
+    declared_roles = native.get("external_provider_roles", [])
+    if not isinstance(declared_roles, list) or set(declared_roles) - CODEX_APP_EXTERNAL_ROLES:
+        _mode_drift("external providers require declared consent-scoped roles")
     providers = config.get("providers", [])
-    if len(providers) != 1:
-        _mode_drift("Codex App mode permits only its declared DeepSeek fallback adapter")
-    provider = providers[0]
-    if provider.get("name") != "deepseek" or provider.get("type") != "compatible_chat":
-        _mode_drift("Codex App mode permits only the DeepSeek compatible-chat adapter")
-    if provider.get("api_key_env") != "DEEPSEEK_API_KEY":
-        _mode_drift("Codex App mode may read only DEEPSEEK_API_KEY")
-    if set(provider.get("allowed_roles", [])) != CODEX_APP_EXTERNAL_ROLES:
-        _mode_drift("the DeepSeek adapter must remain scoped to fallback roles")
+    if not isinstance(providers, list):
+        _mode_drift("providers must be an explicit adapter list")
+    names = set()
+    for provider in providers:
+        name = provider.get("name")
+        if not isinstance(name, str) or not name or name in names:
+            _mode_drift("providers require unique explicit names")
+        names.add(name)
+        roles = provider.get("allowed_roles")
+        if not isinstance(roles, list) or not roles or set(roles) - set(declared_roles):
+            _mode_drift("external adapters require explicit consent-scoped fallback roles")
+        if provider.get("type") != "compatible_chat":
+            _mode_drift("native workflows permit only explicitly configured compatible-chat fallback adapters")
+        if not isinstance(provider.get("api_key_env"), str) or not provider["api_key_env"]:
+            _mode_drift("each external adapter requires its explicit credential binding")
 
     routing = config.get("routing", {})
-    sample_percent = routing.get("strong_review_sample_percent")
+    sample_percent = routing.get("strong_review_sample_percent", 0)
     if (
         not isinstance(sample_percent, (int, float))
         or isinstance(sample_percent, bool)
         or not 0 <= sample_percent <= 100
     ):
         _mode_drift("strong_review_sample_percent must be between 0 and 100")
-    high_risk_categories = routing.get("strong_review_high_risk_categories")
+    high_risk_categories = routing.get("strong_review_high_risk_categories", [])
     if (
         not isinstance(high_risk_categories, list)
         or not all(isinstance(item, str) and item.strip() for item in high_risk_categories)
         or len(high_risk_categories) != len(set(high_risk_categories))
     ):
         _mode_drift("strong-review categories must be unique non-empty strings")
-    required_routes = codex_app_routes(config)
-    for role, expected in required_routes.items():
-        if routing.get(role) != expected:
-            _mode_drift(f"Codex App route {role!r} must remain {expected!r}")
-    if routing.get("translator_retries") != codex_app_translation_retries(config):
-        _mode_drift(
-            "Codex App translation retries must retain the configured primary=5 and native-sol=3"
-        )
-    if routing.get("defer_fallbacks_until_primary_complete") is not True:
-        _mode_drift("fallback cannot start before the complete native primary barrier")
-    if routing.get("review_refusal_policy") != "fallback":
-        _mode_drift("native review refusal must route to the configured fallback")
+    role_permissions = {
+        "translators": "translation_fallback", "rewriters": "selective_rewrite",
+        "reviewers": "judge_fallback",
+    }
+    adapters = {provider["name"]: provider for provider in providers}
+    for role in ("translators", "review_triagers", "reviewers", "rewriters", "context_analyzers"):
+        routes = routing.get(role, [])
+        if not isinstance(routes, list) or any(not isinstance(route, str) or not route for route in routes):
+            _mode_drift("routing roles require explicit route lists")
+        for index, route in enumerate(routes):
+            if route.startswith("native-"):
+                continue
+            adapter = adapters.get(route)
+            permission = role_permissions.get(role)
+            if adapter is None or permission not in adapter["allowed_roles"]:
+                _mode_drift("external route is not authorized for this explicit role")
+            if role in {"translators", "reviewers"} and index == 0:
+                _mode_drift("an external adapter cannot become native translation or review primary")
+    retries = routing.get("translator_retries", {})
+    if not isinstance(retries, dict) or any(
+        route not in routing.get("translators", []) or type(count) is not int or count < 0
+        for route, count in retries.items()
+    ):
+        _mode_drift("translation retries require nonnegative counts for configured routes")
 
 
 def require_direct_provider_pipeline(config: dict[str, Any], operation: str) -> None:

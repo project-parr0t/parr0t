@@ -253,5 +253,44 @@ class FilesystemPackageTests(unittest.TestCase):
         self.assertEqual(approval["artifact"]["fingerprint"], expected["artifact_fingerprint"])
         self.assertEqual(approval["artifact"]["installer_sha256"], expected["installer_sha256"])
 
+    def test_minimal_local_package_preserves_integrity_without_update_checkpoint(self) -> None:
+        from game_l10n.release_checkpoint import LOCAL_INTEGRITY_SCHEMA
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = root / "payload"
+            payload.mkdir()
+            (payload / "localized.dat").write_bytes(b"synthetic")
+            checkpoint = _checkpoint(root)
+            full = json.loads(checkpoint.read_text(encoding="utf-8"))
+            entry = full["entries"][0]
+            local = {
+                "schema": LOCAL_INTEGRITY_SCHEMA,
+                "patch_id": full["patch_id"], "release_id": full["release_id"],
+                "ownership": {"owner": "Fixture owner", "license": "MIT"},
+                "source_inventory": full["source_inventory"],
+                "language": {"source": "en", "target": "ko"},
+                "entries": [{
+                    key: entry[key] for key in ("id", "source_sha256", "target", "target_sha256", "status")
+                } | {"integrity_evidence_sha256": _digest("integrity")}],
+            }
+            checkpoint.write_text(json.dumps(local), encoding="utf-8")
+            spec = root / "spec.json"
+            spec.write_text(json.dumps({
+                "patch_id": full["patch_id"], "release_id": full["release_id"],
+                "display_name": "Fixture", "checkpoint_file": checkpoint.name,
+                "target": {"required_files": ["fixture-game.exe"]},
+            }), encoding="utf-8")
+            package = root / "local.zip"
+            with self.assertRaisesRegex(SteamPackageError, "full future-update"):
+                build_filesystem_package(payload, spec, package)
+            result = build_filesystem_package(
+                payload, spec, package, required_for_distribution=False,
+            )
+            self.assertEqual(result["checkpoint_schema"], LOCAL_INTEGRITY_SCHEMA)
+            self.assertEqual(validate_filesystem_package(package)["status"], "valid")
+            with zipfile.ZipFile(package) as archive:
+                self.assertEqual(json.loads(archive.read(CHECKPOINT_NAME)), local)
+
 if __name__ == "__main__":
     unittest.main()

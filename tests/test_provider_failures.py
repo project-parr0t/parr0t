@@ -71,5 +71,60 @@ class ProviderFailureTests(unittest.TestCase):
                 self.assertEqual(result.attempts[1].usage, {})
 
 
+    def test_confirmed_operational_failures_advance_once_with_original_usage(self) -> None:
+        for code in (
+            "provider_error", "timeout", "rate_limited",
+            "authentication_error", "quota_exhausted",
+        ):
+            for deferred in (False, True):
+                with self.subTest(code=code, deferred=deferred), tempfile.TemporaryDirectory() as directory:
+                    def fail(**_):
+                        raise ProviderFailure(code, retryable=True, usage={"input_tokens": 9})
+
+                    first = ScriptedProvider("first", fail)
+                    successor = ScriptedProvider(
+                        "successor", lambda **_: {"status": "success", "text": "TARGET"},
+                    )
+                    orchestrator = LocalizationOrchestrator(
+                        registry=ProviderRegistry({p.name: p for p in (first, successor)}),
+                        config=OrchestratorConfig(
+                            ["first", "successor"], [], require_review=False,
+                            translator_retries={"first": 5}, grace_retries=3,
+                            defer_fallbacks_until_primary_complete=deferred,
+                        ),
+                        project=ProjectContext("SYNTHETIC", "src", "dst"), work_dir=Path(directory),
+                    )
+                    result = orchestrator.translate_many([Segment("one", "SOURCE")])[0]
+                    self.assertEqual((first.call_count, successor.call_count), (1, 1))
+                    self.assertEqual(result.status, "translated")
+                    attempt = result.attempts[0]
+                    self.assertEqual(attempt.issue_code, code)
+                    self.assertEqual(attempt.usage, {"input_tokens": 9})
+                    self.assertIs(attempt.operational, True)
+                    self.assertTrue(attempt.provider_fingerprint)
+
+    def test_malformed_semantic_response_keeps_configured_retry_count(self) -> None:
+        def malformed(**_):
+            raise ProviderFailure("malformed_response", retryable=True)
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = ScriptedProvider("first", malformed)
+            successor = ScriptedProvider(
+                "successor", lambda **_: {"status": "success", "text": "TARGET"},
+            )
+            result = LocalizationOrchestrator(
+                registry=ProviderRegistry({p.name: p for p in (first, successor)}),
+                config=OrchestratorConfig(
+                    ["first", "successor"], [], require_review=False,
+                    translator_retries={"first": 3},
+                ),
+                project=ProjectContext("SYNTHETIC", "src", "dst"), work_dir=Path(directory),
+            ).translate_one(Segment("one", "SOURCE"))
+            self.assertEqual(first.call_count, 4)
+            self.assertEqual(successor.call_count, 1)
+            self.assertEqual([a.ordinal for a in result.attempts[:4]], [1, 2, 3, 4])
+            self.assertTrue(all(a.operational is False for a in result.attempts[:4]))
+
+
 if __name__ == "__main__":
     unittest.main()
