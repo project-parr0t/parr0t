@@ -2864,7 +2864,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
         if failed_inventory_action is not None:
             action = failed_inventory_action
-        elif not any((work_dir / "inputs").glob("*")):
+        elif not (
+            primary_inventory_path.is_file()
+            or independent_inventory_path.is_file()
+            or inventory_state_path.is_file()
+        ):
             action = "unpack_and_extract_ordered_script"
         elif (
             primary_inventory_path.is_file()
