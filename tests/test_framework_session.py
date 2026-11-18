@@ -18,6 +18,7 @@ from game_l10n.native_pass import prepare_native_tasks
 from game_l10n.orchestrator import LocalizationOrchestrator, OrchestratorConfig
 from game_l10n.providers import ProviderRegistry, ScriptedProvider
 from game_l10n.workspace import initialize_workspace
+from tests.framework_approval_fixture import issue_approval
 
 
 class FrameworkSessionTests(unittest.TestCase):
@@ -36,6 +37,7 @@ class FrameworkSessionTests(unittest.TestCase):
     def change(self, mode: str = "analysis", logs: list[Path] | None = None) -> dict:
         return framework_session.change_framework_mode(
             self.workspace, mode, user_requested=True, logs=logs,
+            approval=issue_approval(self.workspace, mode, logs=logs),
         )
 
     def call(self, *arguments: str) -> tuple[int, str, str]:
@@ -95,7 +97,11 @@ class FrameworkSessionTests(unittest.TestCase):
             control_plane.require_control_plane_ready(self.workspace)
 
     def test_reported_cli_stays_bound_despite_stale_import_paths(self) -> None:
-        code, output, error = self.call("framework-mode", "--mode", "analysis", "--user-requested")
+        proof = issue_approval(self.workspace, "analysis")
+        with patch("sys.stdin", io.StringIO(json.dumps(proof))):
+            code, output, error = self.call(
+                "framework-mode", "--mode", "analysis", "--user-requested", "--approval-stdin",
+            )
         self.assertEqual((code, error), (0, ""))
         command = json.loads(output)["core_runtime"]["cli_argv"]
         shadow = self.workspace.parent / "stale core \ud55c\uae00 & $"
@@ -105,10 +111,11 @@ class FrameworkSessionTests(unittest.TestCase):
             "raise RuntimeError('SYNTHETIC_STALE_CORE_IMPORTED')\n", encoding="utf-8",
         )
         environment = {**os.environ, "PYTHONPATH": str(shadow)}
+        proof = issue_approval(self.workspace, "shutdown")
         result = subprocess.run(
             [*command, "framework-mode", "--workspace", str(self.workspace),
-             "--mode", "shutdown", "--user-requested"],
-            cwd=shadow, env=environment, capture_output=True, text=True, check=True,
+             "--mode", "shutdown", "--user-requested", "--approval-stdin"],
+            cwd=shadow, env=environment, input=json.dumps(proof), capture_output=True, text=True, check=True,
         )
         state = json.loads(result.stdout)
         self.assertEqual(state["framework_session"]["mode"], "shutdown")
