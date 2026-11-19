@@ -53,13 +53,33 @@ async function publicHostModules(root) {
 // Cold SDK construction owns the canonical registry, mounted-device state and
 // dynamic activation queue; the wrapper fixture below cannot establish those.
 async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
-  const { createAgentSession, initializeExtensions, ModelRegistry, AuthStorage, Settings, SessionManager, AgentRegistry, ExtensionToolWrapper } = host;
+  const { createAgentSession, initializeExtensions, loadExtensions, ModelRegistry, AuthStorage, Settings, SessionManager, AgentRegistry, ExtensionToolWrapper } = host;
   const agentDir = process.env.PI_CODING_AGENT_DIR;
   assert.ok(agentDir && path.isAbsolute(agentDir), "The SDK proof requires an isolated agent directory");
-  const extensionDirectory = path.join(agentDir, "extensions");
-  mkdirSync(extensionDirectory, { recursive: true });
-  writeFileSync(path.join(extensionDirectory, "parr0t-native-process.ts"),
-    `export { default } from ${JSON.stringify(pathToFileURL(bootstrapPath).href)};\n`);
+  const entry = path.join(agentDir, "extensions", "parr0t-native-process.ts");
+  const python = process.env.PARR0T_OMP_PYTHON ?? "python";
+  function bootstrap(...args) {
+    const result = Bun.spawnSync([python, "-I", "-B",
+      fileURLToPath(new URL("../src/game_l10n/templates/native-python.py", import.meta.url)), "omp-bootstrap", ...args],
+    { cwd: workspace });
+    assert.equal(result.exitCode, 0, result.stderr.toString());
+    return JSON.parse(result.stdout.toString());
+  }
+  function ompConfig(...args) {
+    const result = Bun.spawnSync(["omp", "config", ...args, "--json"], { cwd: workspace });
+    assert.equal(result.exitCode, 0, result.stderr.toString());
+    return JSON.parse(result.stdout.toString()).value;
+  }
+  const unrelated = "extension-module:synthetic-unrelated";
+  ompConfig("set", "disabledExtensions", JSON.stringify([unrelated, "extension-module:parr0t-native-process"]));
+  const pending = bootstrap();
+  assert.equal(pending.status, "consent_required");
+  assert.deepEqual(pending.actions, ["install", "enable_globally"]);
+  assert.equal(existsSync(entry), false);
+  const installed = bootstrap("--user-approved");
+  assert.equal(installed.status, "configured");
+  assert.equal(realpathSync(installed.path), realpathSync(entry));
+  assert.deepEqual(ompConfig("get", "disabledExtensions"), [unrelated]);
   const originalControl = process.env.PARR0T_OMP_CONTROL_DIRECTORY;
   const originalWorkspace = process.env.PARR0T_OMP_PROMPT_WORKSPACE;
   delete process.env.PARR0T_OMP_CONTROL_DIRECTORY;
@@ -72,8 +92,10 @@ async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = denyNetwork;
   try {
-    for (const explicitHelper of [false, true]) {
-      const cwd = path.join(workspace, explicitHelper ? "sdk-helper" : "sdk-ambient");
+    for (const scenario of ["ambient", "helper", "live"]) {
+      const explicitHelper = scenario === "helper";
+      const liveBootstrap = scenario === "live";
+      const cwd = path.join(workspace, `sdk-${scenario}`);
       mkdirSync(cwd);
       const settings = await Settings.loadIsolated({
         cwd, agentDir, inMemory: true,
@@ -81,6 +103,7 @@ async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
           "tools.approvalMode": "yolo", "tools.xdev": true, "lsp.enabled": false,
           "secrets.enabled": false, "enabledModels": ["synthetic-no-provider/no-model"],
           "disabledProviders": ["ollama", "llama.cpp", "lm-studio", "apple"],
+          ...(liveBootstrap ? { disabledExtensions: ["extension-module:parr0t-native-process"] } : {}),
         },
       });
       const auth = await AuthStorage.create(":memory:", { usageFetch: denyNetwork });
@@ -96,7 +119,7 @@ async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
       try {
         const created = await createAgentSession({
           cwd, agentDir, settings, sessionManager: manager, modelRegistry,
-          agentRegistry: new AgentRegistry(), agentId: explicitHelper ? "SdkHelper" : "SdkAmbient",
+          agentRegistry: new AgentRegistry(), agentId: `Sdk-${scenario}`,
           additionalExtensionPaths: explicitHelper ? [helperPath] : [],
           noContextFiles: true, contextFiles: [], skills: [], rules: [], promptTemplates: [], slashCommands: [],
           preloadedCustomToolPaths: [], enableMCP: false, enableLsp: false, enableIrc: false,
@@ -114,8 +137,8 @@ async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
         session = created.session;
         assert.deepEqual(created.extensionsResult.errors, []);
         assert.equal(session.model, undefined, "The SDK must stay model-less, not select a credentialed fallback");
-        assert.ok(created.extensionsResult.extensions.some(extension =>
-          path.basename(extension.path) === "parr0t-native-process.ts"), "Discover the isolated global-style bootstrap");
+        assert.equal(created.extensionsResult.extensions.some(extension =>
+          path.basename(extension.path) === "parr0t-native-process.ts"), !liveBootstrap);
         if (explicitHelper) created.extensionsResult.runtime.flagValues.set("parr0t-workspace", cwd);
         startingExtensions = true;
         try {
@@ -125,6 +148,16 @@ async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
           });
         } finally {
           startingExtensions = false;
+        }
+        if (liveBootstrap) {
+          const names = ["parr0t_process", "parr0t_framework_mode", "parr0t_session"];
+          assert.ok(names.every(name => !session.getToolByName(name)));
+          // OMP's live source reconciler loads a new factory, activates the
+          // registered tools, and then replays session_start for that source.
+          const bootstrap = await loadExtensions(
+            [bootstrapPath], cwd, created.extensionsResult.runtime.eventBus, created.extensionsResult.runtime);
+          assert.deepEqual(bootstrap.errors, []);
+          await session.extensionRunner.addExtensions(bootstrap.extensions);
         }
         const context = { autoApprove: true, cwd, settings, sessionManager: manager };
         let sequence = 0;
@@ -551,8 +584,14 @@ print(json.dumps(result))
 `);
     const compiledRelay = JSON.parse(readFileSync(path.join(workspace, prepared.relay_path), "utf8"));
     const controlledRelay = await makeSession("CompiledRelay", "sub", 1, parent.id);
-    await controlledRelay.runner.emitBeforeAgentStart(`PARR0T_OMP_RELAY=${prepared.relay_path}\nSynthetic relay`, undefined, []);
-    await controlledRelay.task({ tasks: [{ task: "Synthetic dispatch" }] });
+    const firstTurn = await controlledRelay.runner.emitBeforeAgentStart(
+      `PARR0T_OMP_RELAY=${prepared.relay_path}\nSynthetic relay`, undefined, [],
+    );
+    const firstCall = firstTurn.systemPrompt.flatMap(block => block.split("\n"))
+      .find(line => line.startsWith("Your first tool call is the built-in task with "));
+    assert.ok(firstCall, "the relay must be able to dispatch before reading any contract with a tool");
+    const args = JSON.parse(firstCall.slice(firstCall.indexOf("{"), firstCall.lastIndexOf("}") + 1));
+    await controlledRelay.task(args);
     const delivered = controlledRelay.dispatchedTasks[0].tasks[0];
     const dispatch = compiledRelay.launch_contract.worker_dispatches["worker-0"];
     assert.equal(delivered.task, dispatch.worker_prompt);

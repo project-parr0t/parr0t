@@ -33,6 +33,7 @@ from game_l10n.control_plane import (
     record_control_plane_leak,
 )
 from game_l10n.coverage import save_inventory_attestation
+from game_l10n.data_plane_task import prepare_data_plane_task
 from game_l10n.errors import ConfigurationError, ToolExecutionError
 from game_l10n.privacy import PrivacyViolation
 from game_l10n.providers import ProviderRegistry
@@ -2241,6 +2242,79 @@ class WorkspaceTests(unittest.TestCase):
             status["data_plane_task"]["unchanged_progress_limit_scope"],
             "native_pass_wave_only",
         )
+
+    def test_legacy_active_control_storage_routes_to_isolated_inventory_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk, game, work = root / "sdk", root / "game", root / "work"
+            sdk.mkdir()
+            game.mkdir()
+            initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+            establish_control_plane_entry(work)
+            record_sdk_selection(
+                work, "private-new", target_engine="fixture-engine", target_version="1.0",
+            )
+            activation = activate_workspace_adapter(work)
+            primary, state = write_verified_inventory(work)
+            independent = Path(state["independent_path"])
+            source = "SYNTHETIC_CONTROL_TOKEN"
+            for path in (primary, independent):
+                inventory = json.loads(path.read_text(encoding="utf-8"))
+                inventory["segments"][0].update(source=source, metadata={
+                    "storage_role": "lookup_key",
+                    "display_projection_required": True,
+                    "display_binding_id": "fixture-render",
+                    "display_scope_evidence": {
+                        "kind": "positive_display_binding",
+                        "evidence_fingerprint": "a" * 64,
+                        "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                    },
+                })
+                inventory["coverage"]["display_scope"] = {
+                    "schema": "parr0t.display-scope.v1", "raw_occurrence_count": 1,
+                    "display_candidate_count": 1, "control_only_count": 0,
+                    "unclassified_count": 0, "evidence_fingerprint": "b" * 64,
+                }
+                path.write_text(json.dumps(inventory), encoding="utf-8")
+            # Simulate an older validator accepting control storage with a projection flag.
+            with patch("game_l10n.coverage._validate_active_display_scope"):
+                legacy = save_inventory_attestation(work, primary, independent)
+            self.assertTrue(legacy["static_complete"])
+            legacy.pop("display_scope_validation_version")
+            state_path = work / ".game-l10n/inventory-attestation.json"
+            state_path.write_text(json.dumps(legacy), encoding="utf-8")
+            identity_path = work / ".game-l10n/inventory-primary-identity.json"
+            preserved = {path: path.read_bytes() for path in (primary, independent, state_path, identity_path)}
+
+            with redirect_stdout(output := StringIO()):
+                self.assertEqual(cmd_status(SimpleNamespace(workspace=str(work))), 0)
+            status = json.loads(output.getvalue())
+            self.assertNotIn(source, output.getvalue())
+            self.assertEqual(status["next_actions"], ["resolve_source_inventory_gaps"])
+            self.assertEqual(status["inventory_gate"]["status"], "incomplete")
+            self.assertFalse(status["inventory_gate"]["assurance_complete"])
+            code = "INVENTORY_ACTIVE_CONTROL_STORAGE"
+            self.assertEqual(status["inventory_gate"]["issue_codes"], [code])
+            role = status["data_plane_task"]["worker_role"]
+            self.assertEqual(role, "inventory_reconciler")
+
+            config = load_config(work)
+            with self.assertRaisesRegex(ConfigurationError, code):
+                prepare_data_plane_task(
+                    work, work / "context-task", worker_role="context_analyzer",
+                    config=config, sdk_activation=activation,
+                )
+            prepared = prepare_data_plane_task(
+                work, work / ".game-l10n" / "data-plane" / role, worker_role=role,
+                config=config, sdk_activation=activation,
+            )
+            relay = json.loads((work / prepared["relay_path"]).read_text(encoding="utf-8"))
+            task = json.loads((work / relay["task_path"]).read_text(encoding="utf-8"))
+            gate = task["inventory_gate"]
+            self.assertEqual(gate["issue_codes"], [code])
+            self.assertEqual(gate["primary_identity_binding"], legacy["primary_identity_binding"])
+            self.assertNotIn("inventory_constraint_baseline", task)
+            self.assertEqual({path: path.read_bytes() for path in preserved}, preserved)
 
     def test_status_exit_code_matches_the_immediate_action(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

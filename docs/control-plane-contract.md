@@ -133,6 +133,43 @@ Discovery/context relays have the same protection. Re-preparing a blocked task m
 
 Data-plane launch ledgers are keyed by the immutable task ID, so a completed attempt's recorded worker cannot satisfy or block the next attempt. Matching legacy ledgers remain authoritative; an obsolete legacy ledger is preserved and a fresh task receives its own ledger only when a sealed earlier-task receipt proves the prior lifecycle ended. Neither path clears or relabels a started worker's evidence.
 
+An unsubmitted inventory reconciler can outlive an OMP binding change. Core
+may rebuild an obsolete durable single-worker OMP relay at a new address
+only if that exact relay has no launch ledger, host reservation/admission,
+failure record, or envelope. This works without a receipt and after a
+sealed earlier attempt, including a partial result. The earlier receipt
+stays bound to its own attempt. Core keeps the old task and relay, rejects
+late lifecycle calls to their address, and uses the current SDK and runtime
+without consuming a semantic attempt.
+
+An incomplete error receipt for the obsolete task itself may be retired
+only when it records no successes, artifacts, or queue transitions. When
+preparation reports `discard_unverified_relay_receipt`, an explicit user
+decision may authorize this exact task:
+
+```text
+game-l10n prepare-data-plane-task --workspace <workspace> --worker-role inventory_reconciler --discard-unverified-receipt <task-id>
+```
+
+Core rechecks the same relay, unchanged receipt, and absence of admission
+evidence under the launch lock. It removes the receipt from the active slot
+and retains its bytes as a digest-named archive beside the obsolete relay.
+This is not a terminal seal or a successful result. A missing end event
+alone never permits retirement: a reservation, start, or other launch
+evidence still requires the normal lifecycle and terminal-evidence rules.
+
+Control-generation rotation does not end earlier workers. Before rebinding
+an earlier-generation relay, Core checks the original admission and launch
+evidence. A live reservation or worker, or a recorded start with no verified
+end or sealed receipt, blocks replacement. A valid rebound uses a different
+relay address and keeps the previous task, receipt, and execution evidence.
+
+Inventory reconciliation uses one canonical stage directory per workspace.
+Each replacement uses a new relay address, including ordinary retries after
+a seal. Core checks the exact current relay binding and receipt generation
+under the launch lock before publishing any data-plane receipt. A stale seal
+cannot publish to its successor's receipt slot.
+
 Every newly dispatched relay carries `launch_contract`. Before any worker starts, verify nested dispatch capability and record `record-native-launch --workspace <workspace> --relay <relay-path> --event capability-available`, then attempt the bound exact model. Missing nested dispatch records `capability-unavailable`. Only an observed execution-layer denial or model-availability result may record `model-unavailable`, using the bound command with `--failure-code host_dispatch_denied|host_model_not_found|host_model_unavailable`. The code is categorical evidence of the observed result, never a guess from an advertisement or allowlist. New contracts reject a model-unavailable event without it. Seal normally and return only the receipt path; never change models or fabricate per-target failures. Existing immutable contracts remain readable without rewriting started-worker evidence.
 
 Capability preflight belongs to the current relay's own callable tool namespace.
@@ -186,6 +223,8 @@ The ordinary first-party bootstrap registers complete root entry/lifecycle tools
 
 Ordinary bootstrap tools register synchronously in the extension factory, before OMP constructs its initial tool registry and prompt. `session_start` must not add these tools: OMP waits for late registrations to activate and rediscover prompt resources within that handler's timeout. The official bound launcher's `--parr0t-workspace` flag delegates initial registration to its selected helper/guard, so the ambient bootstrap does not introduce an unrestricted native tool into guarded sessions. Do not extend the handler timeout or detach registration in the background to conceal incomplete readiness.
 
+If an ordinary host cannot call the bootstrap tools (including deferred `xd://` devices), run the current Core's `omp-bootstrap` as a read-only preflight rather than stopping the job. For `consent_required`, show the proposed actions and the exact local source and target to the user. Only explicit consent authorizes `omp-bootstrap --user-approved` (or an interactive `omp-bootstrap --prompt`). This installs the bundled first-party entry file in the active OMP profile and removes just its global disable entry. It never downloads code, replaces a custom entry, rewrites project policy, or proves active tool registration. Check the real tool surface after OMP loads it. Decline, conflict, or an effective project/CLI restriction leaves the request and checkpoints intact; use the official `omp-session` path for the authorized workspace if no live/pending controller exists. Its explicit trusted helper does not depend on the ambient installation.
+
 For the user's already-requested automation, call root `parr0t_session` with an absolute `workspace` and `user_requested: true`; no second confirmation dialog is required. Omitted `model` means the actual current host root model and thinking, never an inferred prefix/default or worker-role substitution. An explicit model remains exact. The tool invokes the current Core's `omp-session` command and returns real startup/registration evidence. Inside a bound registered root it returns that same session's verified readiness instead of launching another controller. General-root lifecycle calls require an explicit absolute workspace; dedicated helpers reject a foreign workspace. Source/history exposure still requires canonical fresh handoff, and a live/pending controller is never a reason to start a duplicate.
 
 OMP catalog membership and credentials do not grant nested dispatch. Read the actual operator policy (`cfg://modelRoles`, `cfg://task/perCallModelAllow`, `cfg://task/agentModelOverrides`) before binding; a project/job declaration cannot promote itself into operator approval. The prompt composer's executable OMP command stages only the user's explicitly selected exact models as additive command-scoped operator `--config` roles. It does not replace the default model or edit global settings. The official controller inherits the operator config files actually supplied to its caller, and those files remain available for its lifetime.
@@ -221,6 +260,8 @@ Registration belongs to the **new** host process/session, not to the caller. The
 The launcher's `--model` selects only the root model. Native worker routes remain separately bound through `native-runtime` and explicit exact role/route selections. User/template selection is Parr0t approval; syntax validation alone is not execution-availability evidence. Resolve exact host identifiers from authoritative metadata, never guess a provider prefix, substitute a model, or overwrite global host configuration.
 
 The actual host must permit nested built-in `task` dispatch and exact per-call models. OMP's operator model gate, agent overrides, recursion depth and concurrency still apply. Root-to-relay success does not prove relay-to-worker availability. Relays use explicit `tasks[].model` and the core `relay_prompt_line`; their lifecycle arrays use `parr0t_process` in prompt mode and `parr0t_exec` in guarded mode. Workers neither delegate nor send agent messages. Prompt mode's loaded helper enforces the host tool-call communication boundary, not an OS sandbox or semantic-output guarantee. Follow the existing capability/seal/repair path on a missing permission or tool; never remove the relay.
+
+Current OMP helpers give a fresh single-worker data-plane relay its exact first `task` call before the first model request. The relay need not open the metadata or separately invoke capability and start commands before dispatch. Built-in `task`, live operator model approval, actual start and terminal evidence, and the Core sealer remain authoritative. On an error or after the worker ends, the relay follows the original bound lifecycle commands. This reduces preparatory tool round trips; it does not remove the relay's model turn or change context, native-wave, or already admitted worker bindings.
 
 OMP hook tests run separately from Python/Codex acceptance: `bun test tests/omp_prompt_isolation.test.mjs tests/omp_isolation_guard.test.mjs`. For real-host integration, explicitly set `PARR0T_OMP_HOST_PACKAGE` to an already selected installed host package root, then run `bun test tests/omp_prompt_isolation_host.test.mjs`; `PARR0T_OMP_PYTHON` optionally selects its Python executable. That subprocess-isolated test uses the selected host's real extension runner, tool wrappers, write/bash implementations and native exec API with controlled in-memory recipients and nested sessions, without model/network calls or package acquisition. No host path is embedded in the test. Neither loading a hook nor passing synthetic checks claims real game execution or semantic translation quality.
 
@@ -265,6 +306,8 @@ Context claim and commit commands revalidate the exact task against its core rel
 ## Control-plane observation boundary
 
 The top-level agent may observe only core CLI metadata, a validated control-envelope path, a sealed relay-receipt path, and the categorical lifecycle of its direct relay. It may perform one bounded wait at a time on that relay, continuing bounded waits while it remains active and returning to the core state machine when new terminal evidence arrives. A wait interval is not a lifetime limit. It must not inspect `.codex/sessions`, chat transcripts, agent trees, nested-worker status or output, semantic-worker logs, terminal previews of semantic work, or another session to reconstruct progress. It must not query a nested worker even when the worker is visible to the host.
+
+A `parr0t_session` result reports controller startup or registration metadata, not session history. A readiness receipt does not trigger rotation.
 
 Usage accounting comes only from the core-owned usage ledger or a sealed relay receipt populated at the event boundary. Missing telemetry is unknown, not permission to scrape host/session logs. The relay may observe only bound task lifecycle categories needed to seal an ended task and must never forward child output. Any forbidden detail that reaches root is a control-plane leak: do not interpret it; record the fixed incident. Default recovery is rotation; only the explicit incident-scoped acceptance below provides a same-session alternative.
 
@@ -313,7 +356,7 @@ or provider failure. Status exposes that fixed code and a cached-inventory
 repair action; the next task binds the cached artifact digest and repairs its
 display-binding evidence without rescanning the source.
 
-Inventory constraints have an explicit nonterminal repair state. An `inventory_reconciler` envelope containing `constraint_unsatisfiable`, optionally alongside inventory incompleteness, membership, order or composition diagnostics, requests deterministic checking; it is not itself proof. Mixed provider, transport, malformed-output or operational failure categories cannot establish this hold. At preparation and seal, core verifies both complete inventory documents, validates every correction proposal against accepted canonical history, and independently checks protected-token/UI character-limit impossibility. The other supported classes are `INVENTORY_SCOPE_CORRECTION_MISMATCH` from independently validated, content-bound scope-correction declarations and `INVENTORY_SCOPE_PROJECTION_REQUIRED` from a fully validated pair lacking a separate display projection. Legacy SDK capability claims, arbitrary failures and worker prose cannot establish a constraint. Malformed or stale evidence on either side cannot establish readiness or a certified hold.
+Inventory constraints have an explicit nonterminal repair state. An `inventory_reconciler` envelope containing `constraint_unsatisfiable`, optionally alongside inventory incompleteness, membership, order or composition diagnostics, requests deterministic checking; it is not itself proof. Mixed provider, transport, malformed-output or operational failure categories cannot establish this hold. Core validates both inventory documents and correction proposals against accepted canonical history, and checks protected-token/UI character-limit impossibility where applicable. The other supported classes are `INVENTORY_SCOPE_CORRECTION_MISMATCH` from independently validated, content-bound scope-correction declarations and `INVENTORY_SCOPE_PROJECTION_REQUIRED` from a fully validated pair lacking a separate display projection. For a preparation baseline only, Core may reuse a current projection observation when both documents and every referenced basis match the SHA-256 digests recorded by pair verification. Changed bytes or absent digests require full validation. A reused baseline cannot establish a hold or readiness. Legacy SDK capability claims, arbitrary failures, worker prose, and malformed or stale evidence cannot establish a constraint.
 
 Only a concrete constraint that persists with identical input/evidence/capability bindings and no verified progress may produce a core-owned `parr0t.inventory-constraint-pending.v1` seal. Ordinary partial progress continues with another bounded attempt, even if a constraint remains. Every class requires a fresh complete-pair attestation with unchanged progress; an early projection exception or older attestation cannot substitute for it. The seal binds the immutable task and relay, exact receipt and output envelope, control generation, current attestation, both inventory fingerprints and byte digests, every referenced scope-basis artifact's bytes, SDK activation/tools, configuration and native-runtime capability binding. It never modifies the receipt schema or relabels a worker result.
 
@@ -501,6 +544,8 @@ After consuming valid approval, core atomically writes `.game-l10n/framework-ses
 Only a genuinely absent metadata entry receives a legacy initial state. Existing directories, dangling symlinks/junctions, denied lookups, and entries that disappear after lookup fail closed in the control-state, entry-gate, and lifecycle readers. The OMP lifecycle guard follows the same distinction; an `ENOENT` from following an existing link must never reactivate localization. These checks detect malformed metadata, not adversarial filesystem tampering or an OS sandbox boundary.
 
 Only Parr0t's localization-specific obligations are withdrawn: metadata-only controller observations, translation/review routing, mandatory translation relays, repeated continuation until `local_patch_ready`, and the ban on explicitly approved diagnostic log reads. Repository privacy, read-only game sources, user scope, provider/model permissions, existing localization-child isolation, and host/system instructions remain binding. Diagnose reusable code directly by default; ordinary code-review agents are optional, never a prerequisite. Do not delete prior messages or claim withdrawal cleans history. This transition authorizes no game translation, semantic translation review, packaging, installation, or game execution.
+
+The analysis manager and any diagnostic or improvement agents must apply [`framework-analysis`](../skills/framework-analysis/SKILL.md). Core reports the skill on entry and when status routes to analysis. The manager passes the skill and the exact authorized evidence scope to any diagnostic assignment; the skill adds no permissions.
 
 The installed OMP helper/guard rereads lifecycle metadata at turn, tool, spawn and executor boundaries, preserves host system policy, and emits supported `additionalContext` mode notices. New localization remains denied while inactive; ordinary diagnostic collaboration is optional in analysis. Clean reentry belongs to the root user-request-bound lifecycle tool; contaminated reentry belongs to canonical handoff/freshness gates. Neither path may be replaced by lifecycle-file edits or false freshness assertions. These are host instruction/tool boundaries, not an OS sandbox.
 
