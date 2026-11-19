@@ -73,6 +73,8 @@ The metadata-only `agreed_target_count` counts active comparison keys whose sour
 
 Canonical occurrence identity and current translation eligibility are separate. A proven correction never deletes, renames, reorders, or changes the source of a checkpoint-bound primary occurrence. Keep historical primary rows in `segments`; the core compares and loads only eligible display rows after validating `coverage.scope_correction`.
 
+An attestation from an older display validator is rechecked against both cached inventories before semantic work. If a control-storage row is still active, status reports `INVENTORY_ACTIVE_CONTROL_STORAGE` and routes `resolve_source_inventory_gaps` to the isolated reconciler. This does not rewrite the historical attestation or authorize a fresh scan. Use each method's cached evidence to determine whether the occurrence is proven non-display or needs a separate display projection, then run pair verification again. A valid unchanged checkpoint acquires the current validation binding without changing its identity or reconciliation generation.
+
 This optional object uses `schema: parr0t.inventory-scope-correction.v1`, `basis`, and `records` only:
 
 - `basis.file` names an immutable pre-correction canonical inventory snapshot in the inventory's own directory. It is a safe ASCII basename ending in `.json`, not an absolute path or traversal. `basis.sha256` binds its complete bytes. Both inventories name the same content-bound basis. On the first correction, its semantic fingerprint must match the prior primary attestation; later corrections either retain that basis or roll forward from the prior attested primary. The basis retains earlier correction history on a rollover.

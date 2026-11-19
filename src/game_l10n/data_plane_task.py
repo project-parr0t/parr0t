@@ -65,6 +65,7 @@ from .inventory_constraints import (
     observe_inventory_constraints,
     persistent_inventory_constraint,
 )
+from .inventory_scope import ActiveControlStorageError
 from .language_policy import language_binding
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext, Segment
 from .native_runtime import RUNTIME_ISSUES, native_launch_evidence, native_launch_summary, native_runtime, require_native_workers_ended
@@ -2548,6 +2549,17 @@ def prepare_data_plane_task(
             )
         attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
         reconciliation = attestation.get("reconciliation", {})
+        issue_codes = list(attestation.get("issue_codes", []))
+        try:
+            private_payload["inventory_constraint_baseline"] = observe_inventory_constraints(
+                work_dir, attestation, config, sdk_activation or {}, runtime
+            )
+        except ActiveControlStorageError as exc:
+            # A rejected active row is a repair input, not a verified constraint baseline.
+            issue_codes.append(exc.code)
+        except (ConfigurationError, OSError, ValueError, TypeError, AttributeError, KeyError):
+            # Legacy or stale attestations remain executable, not blocked.
+            pass
         private_payload["inventory_gate"] = {
             "primary_path": attestation.get("primary_path"),
             "independent_path": attestation.get("independent_path"),
@@ -2562,16 +2574,9 @@ def prepare_data_plane_task(
             ),
             "identity_gate": attestation.get("identity_gate", {}),
             "gap_score": attestation.get("gap_score"),
-            "issue_codes": attestation.get("issue_codes", []),
+            "issue_codes": issue_codes,
             "reconciliation_generation": reconciliation.get("generation", 0),
         }
-        try:
-            private_payload["inventory_constraint_baseline"] = observe_inventory_constraints(
-                work_dir, attestation, config, sdk_activation or {}, runtime
-            )
-        except (ConfigurationError, OSError, ValueError, TypeError, AttributeError, KeyError):
-            # Legacy or stale attestations remain executable, not blocked.
-            pass
     if worker_role == "context_analyzer":
         attestation_path = work_dir / ".game-l10n" / "inventory-attestation.json"
         if not attestation_path.is_file():

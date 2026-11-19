@@ -49,6 +49,7 @@ from .coverage import (
     save_inventory_attestation,
     verify_inventory_pair,
 )
+from .inventory_scope import ActiveControlStorageError
 from .context_analysis import CONTEXT_STATE_SCHEMA, ContextAnalyzer, analyze_with_cache
 from .corrections import apply_user_corrections
 from .correction_ui import CorrectionWorkspace, serve_correction_ui
@@ -3166,6 +3167,17 @@ def cmd_status(args: argparse.Namespace) -> int:
                         inventory_state = require_inventory_attestation(
                             work_dir, Path(inventory_state["primary_path"]), config=config,
                         )
+                    except ActiveControlStorageError:
+                        inventory_verified = False
+                        inventory_gate.update(
+                            status="incomplete",
+                            static_complete=False,
+                            assurance_complete=False,
+                            independent_verified=False,
+                            continuation_required=True,
+                        )
+                        inventory_gate["issue_codes"].append(ActiveControlStorageError.code)
+                        action = "resolve_source_inventory_gaps"
                     except (GameL10nError, OSError, ValueError, json.JSONDecodeError):
                         inventory_verified = False
                         state_issue_codes.append("INVENTORY_ATTESTATION_STALE")

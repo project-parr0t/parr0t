@@ -34,6 +34,8 @@ UI_COMPOSITION_FIELDS = (
 UI_SLOT_ROLES = {"standalone", "label", "value", "state_value", "template_fragment"}
 INVENTORY_COMPARISON_KEY = "inventory_comparison_key"
 PRIMARY_IDENTITY_SCHEMA = "parr0t.primary-inventory-identity.v1"
+# Bump when a stricter active display rule requires revalidating saved attestations.
+_DISPLAY_SCOPE_VALIDATION_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -920,6 +922,7 @@ def save_inventory_attestation(
         "continuation_required": attestation["continuation_required"],
         "terminal": False,
     }
+    attestation["display_scope_validation_version"] = _DISPLAY_SCOPE_VALIDATION_VERSION
     _atomic_json(state_path, attestation)
     return attestation
 
@@ -982,13 +985,17 @@ def require_inventory_attestation(
         raise ConfigurationError("Independent source inventory is incomplete")
     if state.get("primary_path") != str(primary_path.resolve()):
         raise ConfigurationError("Verified primary inventory does not match this context input")
+    independent_path_value = state.get("independent_path")
+    if not isinstance(independent_path_value, str) or not independent_path_value:
+        raise ConfigurationError("Verified independent inventory path is missing")
+    independent_path = Path(independent_path_value)
     correction = state.get("scope_correction")
     if correction is not None:
         basis_file = correction.get("basis_file") if isinstance(correction, dict) else None
         if (not isinstance(basis_file, str)
                 or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.json", basis_file) is None):
             raise ConfigurationError("E_INVENTORY_SCOPE_CORRECTION_BASIS_STALE")
-        independent_path = Path(str(state.get("independent_path", "")))
+        # A correction basis is separately mutable even when both inventories are unchanged.
         try:
             for directory in {primary_path.parent.resolve(), independent_path.parent.resolve()}:
                 basis_path = directory / basis_file
@@ -997,29 +1004,31 @@ def require_inventory_attestation(
                 with basis_path.open("rb") as handle:
                     if file_digest(handle, "sha256").hexdigest() != correction.get("basis_sha256"):
                         raise ConfigurationError("E_INVENTORY_SCOPE_CORRECTION_BASIS_STALE")
-            independent_binding = _file_binding(independent_path)
         except OSError as exc:
             raise ConfigurationError("E_INVENTORY_SCOPE_CORRECTION_BASIS_STALE") from exc
-        if state.get("file_bindings", {}).get("independent") != independent_binding:
-            independent_payload = _inventory_document(independent_path)
-            if inventory_fingerprint(independent_payload.payload) != state.get("independent_fingerprint"):
-                raise ConfigurationError("Independent inventory changed after scope correction verification")
-    bindings = state.get("file_bindings")
-    if (
-        isinstance(bindings, dict)
-        and bindings.get("primary") == _file_binding(primary_path)
-    ):
-        return state
-    payload = _inventory_document(primary_path)
-    if state.get("primary_fingerprint") != inventory_fingerprint(payload.payload):
-        raise ConfigurationError("Primary inventory changed after independent verification")
-    independent_path = Path(str(state.get("independent_path", "")))
-    state["file_bindings"] = {
+    bindings = {
         "primary": _file_binding(primary_path),
-        "independent": (
-            _file_binding(independent_path) if independent_path.is_file() else None
-        ),
+        "independent": _file_binding(independent_path),
     }
+    saved_bindings = state.get("file_bindings")
+    current_validation = (
+        isinstance(saved_bindings, dict)
+        and state.get("display_scope_validation_version") == _DISPLAY_SCOPE_VALIDATION_VERSION
+    )
+    if current_validation and saved_bindings == bindings:
+        return state
+
+    # Revalidate legacy checkpoints in place, without advancing the reconciliation
+    # generation or replacing the attested scope and identity history.
+    basis_cache: dict[Path, _BasisSnapshot] = {}
+    for role, path in (("primary", primary_path), ("independent", independent_path)):
+        if current_validation and saved_bindings.get(role) == bindings[role]:
+            continue
+        document = _inventory_document(path, _basis_cache=basis_cache)
+        if state.get(f"{role}_fingerprint") != inventory_fingerprint(document.payload):
+            raise ConfigurationError(f"{role.capitalize()} inventory changed after independent verification")
+    state["display_scope_validation_version"] = _DISPLAY_SCOPE_VALIDATION_VERSION
+    state["file_bindings"] = bindings
     _atomic_json(state_path, state)
     return state
 
