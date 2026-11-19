@@ -197,6 +197,15 @@ def _core_runtime() -> dict[str, Any]:
     }
 
 
+def _analysis_contracts() -> dict[str, Any]:
+    return {
+        "contract_base": str(Path(__file__).resolve().parents[2]),
+        "required_contracts": [
+            "docs/control-plane-contract.md", "skills/framework-analysis/SKILL.md",
+        ],
+    }
+
+
 STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
     "stop_current_control_plane": ("docs/control-plane-contract.md",),
     "establish_text_free_control_plane": (
@@ -1948,6 +1957,8 @@ def cmd_framework_mode(args: argparse.Namespace) -> int:
         approval=approval,
     )
     result["core_runtime"] = _core_runtime()
+    if args.mode == "analysis":
+        result.update(_analysis_contracts())
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -2955,7 +2966,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             "next_actions": [
                 {"analysis": "analyze_framework_logs", "pause": "framework_paused", "shutdown": "framework_shutdown"}[session["mode"]]
             ],
-            "required_contracts": ["docs/control-plane-contract.md"],
+            **(_analysis_contracts() if session["mode"] == "analysis"
+               else {"required_contracts": ["docs/control-plane-contract.md"]}),
         }, ensure_ascii=False))
         return 0
     config = load_config(work_dir)

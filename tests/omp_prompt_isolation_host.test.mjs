@@ -551,8 +551,14 @@ print(json.dumps(result))
 `);
     const compiledRelay = JSON.parse(readFileSync(path.join(workspace, prepared.relay_path), "utf8"));
     const controlledRelay = await makeSession("CompiledRelay", "sub", 1, parent.id);
-    await controlledRelay.runner.emitBeforeAgentStart(`PARR0T_OMP_RELAY=${prepared.relay_path}\nSynthetic relay`, undefined, []);
-    await controlledRelay.task({ tasks: [{ task: "Synthetic dispatch" }] });
+    const firstTurn = await controlledRelay.runner.emitBeforeAgentStart(
+      `PARR0T_OMP_RELAY=${prepared.relay_path}\nSynthetic relay`, undefined, [],
+    );
+    const firstCall = firstTurn.systemPrompt.flatMap(block => block.split("\n"))
+      .find(line => line.startsWith("Your first tool call is the built-in task with "));
+    assert.ok(firstCall, "the relay must be able to dispatch before reading any contract with a tool");
+    const args = JSON.parse(firstCall.slice(firstCall.indexOf("{"), firstCall.lastIndexOf("}") + 1));
+    await controlledRelay.task(args);
     const delivered = controlledRelay.dispatchedTasks[0].tasks[0];
     const dispatch = compiledRelay.launch_contract.worker_dispatches["worker-0"];
     assert.equal(delivered.task, dispatch.worker_prompt);
