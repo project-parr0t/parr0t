@@ -10,7 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from . import omp_session
+from . import omp_bootstrap, omp_session
 
 from .content_source_policy import create_content_source_grant
 from .control_plane import (
@@ -3945,6 +3945,10 @@ def build_parser() -> argparse.ArgumentParser:
     omp_entry = sub.add_parser("omp-session", help="Start the official request-bound OMP controller")
     omp_session.add_session_arguments(omp_entry)
     omp_entry.set_defaults(func=cmd_omp_session)
+
+    bootstrap = sub.add_parser("omp-bootstrap", help="Check or, with consent, install the first-party OMP entry tools")
+    omp_bootstrap.add_bootstrap_arguments(bootstrap)
+    bootstrap.set_defaults(func=omp_bootstrap.run_bootstrap)
 
     init = sub.add_parser("init-workspace", help="Create a private workspace outside the SDK repository")
     init.add_argument("workspace")

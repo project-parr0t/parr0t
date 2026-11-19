@@ -56,10 +56,30 @@ async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
   const { createAgentSession, initializeExtensions, loadExtensions, ModelRegistry, AuthStorage, Settings, SessionManager, AgentRegistry, ExtensionToolWrapper } = host;
   const agentDir = process.env.PI_CODING_AGENT_DIR;
   assert.ok(agentDir && path.isAbsolute(agentDir), "The SDK proof requires an isolated agent directory");
-  const extensionDirectory = path.join(agentDir, "extensions");
-  mkdirSync(extensionDirectory, { recursive: true });
-  writeFileSync(path.join(extensionDirectory, "parr0t-native-process.ts"),
-    `export { default } from ${JSON.stringify(pathToFileURL(bootstrapPath).href)};\n`);
+  const entry = path.join(agentDir, "extensions", "parr0t-native-process.ts");
+  const python = process.env.PARR0T_OMP_PYTHON ?? "python";
+  function bootstrap(...args) {
+    const result = Bun.spawnSync([python, "-I", "-B",
+      fileURLToPath(new URL("../src/game_l10n/templates/native-python.py", import.meta.url)), "omp-bootstrap", ...args],
+    { cwd: workspace });
+    assert.equal(result.exitCode, 0, result.stderr.toString());
+    return JSON.parse(result.stdout.toString());
+  }
+  function ompConfig(...args) {
+    const result = Bun.spawnSync(["omp", "config", ...args, "--json"], { cwd: workspace });
+    assert.equal(result.exitCode, 0, result.stderr.toString());
+    return JSON.parse(result.stdout.toString()).value;
+  }
+  const unrelated = "extension-module:synthetic-unrelated";
+  ompConfig("set", "disabledExtensions", JSON.stringify([unrelated, "extension-module:parr0t-native-process"]));
+  const pending = bootstrap();
+  assert.equal(pending.status, "consent_required");
+  assert.deepEqual(pending.actions, ["install", "enable_globally"]);
+  assert.equal(existsSync(entry), false);
+  const installed = bootstrap("--user-approved");
+  assert.equal(installed.status, "configured");
+  assert.equal(realpathSync(installed.path), realpathSync(entry));
+  assert.deepEqual(ompConfig("get", "disabledExtensions"), [unrelated]);
   const originalControl = process.env.PARR0T_OMP_CONTROL_DIRECTORY;
   const originalWorkspace = process.env.PARR0T_OMP_PROMPT_WORKSPACE;
   delete process.env.PARR0T_OMP_CONTROL_DIRECTORY;

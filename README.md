@@ -23,18 +23,20 @@ Codex에서 요청 프롬프트로 시작하거나, OMP에서 프롬프트·통�
 
 Python 3.11 이상과 OMP가 설치되어 있어야 합니다. 전체 코어 저장소를 내려받고 아래처럼 **게임 폴더를 열지 않은 상태에서 외부 작업 폴더부터** 초기화합니다.
 
-일반 OMP에서도 Parr0t 진입·생명주기·네이티브 실행 도구가 자동 등록되도록
-`~/.omp/agent/extensions/parr0t-native-process.ts`에 아래 한 줄을 둡니다.
-파일 URL은 실제 현재 코어 위치로 바꿉니다.
-OMP의 자동 탐색은 `.ts`/`.js` 진입 파일을 대상으로 하므로 이 파일을 `.mjs`로 만들지 않습니다.
+일반 OMP에서 Parr0t 도구가 없거나 비활성화되어 있으면, 현재 Core 체크아웃에서 다음 명령을 실행합니다.
 
-```javascript
-export { default } from "file:///C:/path/to/parr0t/src/game_l10n/templates/omp-native-process.mjs";
+```text
+python -I -B src/game_l10n/templates/native-python.py omp-bootstrap --prompt
 ```
 
-이 확장은 `parr0t_session`, `parr0t_framework_mode`, `parr0t_process`를 제공합니다.
-진입·생명주기 변경은 실제 루트만 호출할 수 있으며, 관련 없는 작업의
-모델·권한·통신 정책은 변경하지 않습니다. 이미 등록된 전용 도우미·가드는 우선합니다.
+승인하면 `omp config path`가 가리키는 프로필에 현재 Core의 공식 부트스트랩을 등록하고,
+전역 `disabledExtensions`에 있는 Parr0t 부트스트랩 항목만 제거합니다. 무응답·거부 시 변경하지 않습니다.
+비대화형 호스트에서는 `--prompt` 없이 상태를 조회하고, 사용자에게 경로와 변경 범위를 보여 준 뒤
+명시적으로 승인받았을 때만 `--user-approved`로 다시 실행합니다.
+별도 OMP 프로필을 쓰면 이 명령에도 같은 프로필을 `OMP_PROFILE`로 지정합니다.
+기존 사용자 정의 진입 파일이나 프로젝트·실행 옵션의 비활성화 정책은 덮어쓰지 않습니다.
+다음 OMP 시작에서 `parr0t_session`, `parr0t_framework_mode`, `parr0t_process`의 실제 등록을 확인하세요.
+진입·생명주기 변경은 실제 루트만 호출할 수 있으며, 전용 도우미·가드는 우선합니다.
 도구 존재만으로 워커 격리가 증명되지는 않습니다. 요청된 자동 작업의 루트는
 `parr0t_session`에 절대 `workspace`와 `user_requested: true`를 전달해 정식 도우미를
 연결합니다. 모델을 생략하면 실제 현재 루트 모델·thinking을 그대로 사용하며 추측하거나
@@ -52,6 +54,8 @@ export { default } from "file:///C:/path/to/parr0t/src/game_l10n/templates/omp-n
 열리는지 확인하세요. 설정에 경로가 표시되는 것만으로는 등록이 확인된 것이 아닙니다.
 필요한 첫 진입은 현재 Core의 `omp-session` 명령으로 수행할 수 있습니다.
 실행 중이거나 `startup_pending`인 제어 세션은 중복 시작하지 않습니다.
+설치에 동의하지 않아도 체크포인트는 유지됩니다. 현재 세션에서 도구를 쓸 수 없다면
+전역 설치와 무관하게 공식 `omp-session`이 해당 작업 세션에만 번들 확장을 로드할 수 있습니다.
 
 외부 작업 초기화와 정식 제어 세션 실행:
 
