@@ -43,6 +43,7 @@ class _InventoryDocument:
     payload: dict[str, Any]
     active_rows: list[dict[str, Any]]
     scope_correction: dict[str, Any] | None
+    sha256: str
 
 
 def validate_inventory_display_scope(
@@ -181,7 +182,12 @@ def _inventory_document(
     _basis_cache: dict[Path, _BasisSnapshot] | None = None,
 ) -> _InventoryDocument:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        raw = path.read_bytes()
+        digest = sha256(raw).hexdigest()
+        text = raw.decode("utf-8-sig")
+        del raw
+        payload = json.loads(text)
+        del text
     except UnicodeDecodeError as exc:
         raise ConfigurationError(
             "E_INVENTORY_INVALID_UNICODE: inventory must be valid UTF-8"
@@ -223,7 +229,7 @@ def _inventory_document(
     if tracking is not None and tracking["included_count"] != len(active_rows):
         raise ConfigurationError("Inventory static scope included count does not match eligible segments")
     _validate_active_display_scope(payload, active_rows, required=required_display_scope)
-    return _InventoryDocument(payload, active_rows, correction)
+    return _InventoryDocument(payload, active_rows, correction, digest)
 
 
 def _segment_map(
@@ -587,15 +593,17 @@ def _verify_inventory_payloads(
         correction["projection_constraint_count"]
         for correction in (primary_correction, independent_correction) if correction is not None
     )
-    scope_correction = None
-    if primary_correction is not None:
-        scope_correction = {**primary_correction, "basis_files": [
-            {"path": str((path.parent / correction["basis_file"]).resolve()),
-             "sha256": correction["basis_sha256"]}
-            for path, correction in ((primary_path, primary_correction),
-                                     (independent_path, independent_correction))
-            if correction is not None
-        ]}
+    basis_files = [
+        {"path": str((path.parent / correction["basis_file"]).resolve()),
+         "sha256": correction["basis_sha256"]}
+        for path, correction in ((primary_path, primary_correction),
+                                 (independent_path, independent_correction))
+        if correction is not None
+    ]
+    scope_correction = (
+        {**primary_correction, "basis_files": basis_files}
+        if primary_correction is not None else None
+    )
 
     primary_rows = _segment_map(primary_targets, use_comparison_key=True)
     independent_rows = _segment_map(independent_targets, use_comparison_key=True)
@@ -634,26 +642,17 @@ def _verify_inventory_payloads(
     )
     missing_from_primary = independent_ids - primary_ids
     missing_from_independent = primary_ids - independent_ids
-    source_mismatches = {
-        target_id
-        for target_id in primary_ids & independent_ids
-        if primary_rows[target_id] != independent_rows[target_id]
-    }
-    ui_contract_mismatches = {
-        target_id
-        for target_id in primary_ids & independent_ids
-        if primary_ui_contracts[target_id] != independent_ui_contracts[target_id]
-    }
-    authority_contract_mismatches = {
-        target_id
-        for target_id in primary_ids & independent_ids
-        if primary_authority_contracts[target_id]
-        != independent_authority_contracts[target_id]
-    }
-    agreed_target_count = len(
-        (primary_ids & independent_ids)
-        - source_mismatches - ui_contract_mismatches - authority_contract_mismatches
-    )
+    shared_ids = primary_ids & independent_ids
+    source_mismatches = ui_contract_mismatches = authority_contract_mismatches = 0
+    agreed_target_count = 0
+    for target_id in shared_ids:
+        source_differs = primary_rows[target_id] != independent_rows[target_id]
+        ui_differs = primary_ui_contracts[target_id] != independent_ui_contracts[target_id]
+        authority_differs = primary_authority_contracts[target_id] != independent_authority_contracts[target_id]
+        source_mismatches += source_differs
+        ui_contract_mismatches += ui_differs
+        authority_contract_mismatches += authority_differs
+        agreed_target_count += not (source_differs or ui_differs or authority_differs)
     order_mismatch = primary_order != independent_order
     visible_exclusions = [
         item
@@ -664,7 +663,7 @@ def _verify_inventory_payloads(
     primary_scope = _static_scope_tracking(primary["coverage"])
     independent_scope = _static_scope_tracking(independent["coverage"])
     scope_tracking_mismatch = primary_scope != independent_scope
-    comparison_key_overlap_ratio = len(primary_ids & independent_ids) / max(
+    comparison_key_overlap_ratio = len(shared_ids) / max(
         1, min(len(primary_ids), len(independent_ids))
     )
     namespace_mismatch = bool(
@@ -723,9 +722,9 @@ def _verify_inventory_payloads(
     )
     gap_score = (
         missing_gap_score
-        + len(source_mismatches)
-        + len(ui_contract_mismatches)
-        + len(authority_contract_mismatches)
+        + source_mismatches
+        + ui_contract_mismatches
+        + authority_contract_mismatches
         + len(visible_exclusions)
         + int(order_mismatch)
         + int(scope_tracking_mismatch)
@@ -759,9 +758,9 @@ def _verify_inventory_payloads(
         "projection_constraint_count": projection_constraints,
         "missing_from_primary_count": len(missing_from_primary),
         "missing_from_independent_count": len(missing_from_independent),
-        "source_mismatch_count": len(source_mismatches),
-        "ui_composition_mismatch_count": len(ui_contract_mismatches),
-        "localization_authority_mismatch_count": len(authority_contract_mismatches),
+        "source_mismatch_count": source_mismatches,
+        "ui_composition_mismatch_count": ui_contract_mismatches,
+        "localization_authority_mismatch_count": authority_contract_mismatches,
         "order_mismatch": order_mismatch,
         "user_visible_exclusion_count": len(visible_exclusions),
         "static_scope": primary_scope,
@@ -793,6 +792,11 @@ def _verify_inventory_payloads(
             "primary": _file_binding(primary_path),
             "independent": _file_binding(independent_path),
         },
+        "constraint_inputs": [
+            {"path": str(primary_path.resolve()), "sha256": primary_document.sha256},
+            {"path": str(independent_path.resolve()), "sha256": independent_document.sha256},
+            *basis_files,
+        ],
     }
 
 

@@ -2085,11 +2085,13 @@ def _seal_inventory_constraint(
     from .workspace import load_config, require_sdk_activation
 
     try:
-        config = load_config(work_dir)
-        activation = require_sdk_activation(work_dir, config)
         attestation = json.loads(
             (work_dir / ".game-l10n/inventory-attestation.json").read_text(encoding="utf-8")
         )
+        if attestation.get("reconciliation", {}).get("progress_state") != "unchanged":
+            return
+        config = load_config(work_dir)
+        activation = require_sdk_activation(work_dir, config)
         current = observe_inventory_constraints(
             work_dir, attestation, config, activation, native_runtime(work_dir)
         )
@@ -2101,6 +2103,8 @@ def _seal_inventory_constraint(
         state = _inventory_constraint_state(
             work_dir, task_dir, task, receipt, attestation, config, activation
         )
+        if state["input_binding"] != current["input_binding"]:
+            return
         _atomic_json(task_dir / f"inventory-constraint.{task['task_id']}.json", state)
         _inventory_constraint_locator(work_dir, task_dir, task["task_id"])
     except (ConfigurationError, OSError, ValueError, TypeError, AttributeError, KeyError):
@@ -2622,7 +2626,8 @@ def prepare_data_plane_task(
         issue_codes = list(attestation.get("issue_codes", []))
         try:
             private_payload["inventory_constraint_baseline"] = observe_inventory_constraints(
-                work_dir, attestation, config, sdk_activation or {}, runtime
+                work_dir, attestation, config, sdk_activation or {}, runtime,
+                reuse_projection_baseline=True,
             )
         except ActiveControlStorageError as exc:
             # A rejected active row is a repair input, not a verified constraint baseline.

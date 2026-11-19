@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import unittest
+from collections import Counter
 from contextlib import redirect_stdout
 from copy import deepcopy
 from hashlib import sha256
@@ -393,12 +395,61 @@ class InventoryConstraintTests(unittest.TestCase):
         self.assertFalse(pending["job_terminal"])
         self.assertEqual(self._prepare()["status"], "pending")
 
+    def test_shared_projection_basis_prepares_with_one_read_per_verified_file(self) -> None:
+        primary, basis = self._scope_correction(projection=True)
+        independent = json.loads(self.independent.read_bytes())
+        independent["coverage"] = deepcopy(primary["coverage"])
+        self._write(self.independent, independent)
+        self._verify()
+        watched = {path.name: path.resolve() for path in (self.primary, self.independent, basis)}
+        reads: Counter[Path] = Counter()
+        original_open = Path.open
+
+        def count_reads(path: Path, *args, **kwargs):
+            if path.name in watched and (resolved := path.resolve()) == watched[path.name]:
+                reads[resolved] += 1
+            return original_open(path, *args, **kwargs)
+
+        with patch.object(Path, "open", count_reads):
+            self.assertEqual(self._prepare()["status"], "ready")
+        self.assertEqual(reads, Counter(watched.values()))
+        self._seal()
+        self.assertIsNotNone(self._pending())
+
+    def test_projection_baseline_without_byte_binding_falls_back_to_verification(self) -> None:
+        self._scope_correction(projection=True)
+        state = self._verify()
+        state.pop("constraint_inputs")
+        self._write(self.work / ".game-l10n/inventory-attestation.json", state)
+        self._block()
+
+    def test_projection_baseline_rejects_inventory_edit_with_same_size_and_mtime(self) -> None:
+        self._scope_correction(projection=True)
+        state = self._verify()
+        original = self.independent.read_bytes()
+        changed = original.replace(b"SYNTHETIC_DISPLAY", b"SYNTHETIC_DISPLAX")
+        self.assertNotEqual(original, changed)
+        stat = self.independent.stat()
+        self.independent.write_bytes(changed)
+        os.utime(self.independent, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        with self.assertRaisesRegex(ValueError, "inventory attestation"):
+            observe_inventory_constraints(
+                self.work, state, self.config, self.activation, {}, reuse_projection_baseline=True,
+            )
+
     def test_tampered_basis_never_becomes_constraint_evidence(self) -> None:
         _, basis = self._scope_correction(projection=True)
-        basis.write_bytes(basis.read_bytes() + b" ")
+        original = basis.read_bytes()
+        changed = original.replace(b'": "', b'":\t"', 1)
+        self.assertNotEqual(original, changed)
+        stat = basis.stat()
+        basis.write_bytes(changed)
+        os.utime(basis, ns=(stat.st_atime_ns, stat.st_mtime_ns))
         state = json.loads((self.work / ".game-l10n/inventory-attestation.json").read_text())
         with self.assertRaises(ConfigurationError):
-            observe_inventory_constraints(self.work, state, self.config, self.activation, {})
+            observe_inventory_constraints(
+                self.work, state, self.config, self.activation, {}, reuse_projection_baseline=True,
+            )
         self._prepare()
         self._seal(verify=False)
         self.assertIsNone(self._pending())
