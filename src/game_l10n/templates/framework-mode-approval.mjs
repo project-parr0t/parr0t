@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 const ENTRY = fileURLToPath(new URL("./native-python.py", import.meta.url));
 const LIMIT = 1024 * 1024;
 const TOOL = "parr0t_framework_mode";
+const SESSION_TOOL = "parr0t_session";
 const PREFIX = "PARR0T_FRAMEWORK_APPROVAL: ";
 const WRAPPERS = new Set(["parallel", "multi_tool_use", "tool_call", "call_tool", "invoke_tool"]);
 const MUTATORS = new Set(["write", "edit", "ast_edit", "rename", "move", "mv", "remove", "delete", "rm", "unlink", "rmdir"]);
@@ -66,13 +67,40 @@ function authority(ctx) {
   if (typeof session !== "string" || !session.trim()) fail("actual root session required");
   return { agent: ctx.agent.id, session };
 }
+function workspaceFor(input, ctx, getWorkspace) {
+  const supplied = input.workspace;
+  if (supplied !== undefined && (typeof supplied !== "string" || !path.isAbsolute(supplied) || supplied.includes("\0"))) fail("absolute workspace required");
+  const bound = getWorkspace?.(ctx);
+  if (bound !== undefined && (typeof bound !== "string" || !path.isAbsolute(bound))) fail("absolute bound workspace required");
+  if (bound === undefined && supplied === undefined) fail("explicit absolute workspace required");
+  const workspace = realpathSync(bound ?? supplied);
+  if (!statSync(workspace).isDirectory()) fail("workspace directory required");
+  if (supplied !== undefined && realpathSync(supplied) !== workspace) fail("workspace does not match bound helper");
+  return workspace;
+}
 function parameters(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)
-      || Object.keys(input).some(key => !["mode", "logs", "user_requested"].includes(key))
+      || Object.keys(input).some(key => !["mode", "logs", "user_requested", "workspace"].includes(key))
       || !["localization", "pause", "analysis", "shutdown"].includes(input.mode)
       || input.user_requested !== true
       || (input.logs !== undefined && (!Array.isArray(input.logs) || input.logs.some(log => typeof log !== "string" || !log.trim() || log.includes("\0"))))
       || (input.mode !== "analysis" && input.logs?.length)) fail("invalid lifecycle request: explicit user_requested assertion required");
+}
+function sessionParameters(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)
+      || Object.keys(input).some(key => !["workspace", "model", "mode", "user_requested"].includes(key))
+      || input.user_requested !== true
+      || (input.mode !== undefined && !["auto", "workspace", "rotation"].includes(input.mode))
+      || (input.model !== undefined && !exactModel(input.model))) fail("invalid session request: exact model and explicit user_requested assertion required");
+}
+function exactModel(value) {
+  return typeof value === "string" && /^[^\s\0/]+\/[^\s\0]+$/.test(value) && !/[*?]/.test(value);
+}
+function checkRequest(tool, input, ctx, workspace) {
+  authority(ctx);
+  if (tool === TOOL) parameters(input);
+  else sessionParameters(input);
+  workspaceFor(input, ctx, workspace === undefined ? undefined : () => workspace);
 }
 // Called before either extension's role-specific tool policy, including root.
 export function checkFrameworkToolCall(event, ctx, workspace, depth = 0) {
@@ -81,9 +109,9 @@ export function checkFrameworkToolCall(event, ctx, workspace, depth = 0) {
   let input = event.input;
   if (typeof input === "string") {
     if (tool === "edit") input = { input };
-    else { try { input = JSON.parse(input); } catch { if (WRAPPERS.has(tool) || MUTATORS.has(tool) || tool === TOOL) fail("uninspectable mutation denied"); return; } }
+    else { try { input = JSON.parse(input); } catch { if (WRAPPERS.has(tool) || MUTATORS.has(tool) || tool === TOOL || tool === SESSION_TOOL) fail("uninspectable mutation denied"); return; } }
   }
-  if (tool === TOOL) { authority(ctx); parameters(input); return; }
+  if (tool === TOOL || tool === SESSION_TOOL) { checkRequest(tool, input, ctx, workspace); return; }
   if (WRAPPERS.has(tool)) {
     const calls = input?.tool_uses ?? input?.calls ?? input?.tools;
     for (const call of Array.isArray(calls) ? calls : [input]) {
@@ -114,7 +142,11 @@ export function checkFrameworkToolCall(event, ctx, workspace, depth = 0) {
   }
   if (tool === "write" && typeof input.path === "string" && /^xd:\/\//i.test(decode(input.path))) {
     const device = name(input.path);
-    if (device === TOOL) fail("lifecycle changes require the registered root tool, not a writable device");
+    if (device === TOOL || device === SESSION_TOOL) {
+      if (decode(input.path).toLowerCase() !== `xd://${device}`) fail("invalid lifecycle device target");
+      checkFrameworkToolCall({ toolName: device, input: input.content }, ctx, workspace, depth + 1);
+      return;
+    }
     if (MUTATORS.has(device) || WRAPPERS.has(device)) {
       checkFrameworkToolCall({ toolName: device, input: input.content }, ctx, workspace, depth + 1);
     }
@@ -243,18 +275,19 @@ export default function registerFrameworkModeApproval(pi, getWorkspace) {
   pi.registerTool({
     name: TOOL,
     label: "Parr0t Framework Mode (Root User Request)",
-    description: "Root-only lifecycle change bound to an explicit user request. Set user_requested:true only for the user's requested pause, analysis, shutdown or clean localization resume; no additional interactive dialog.",
-    parameters: z.object({ mode: z.string(), user_requested: z.boolean(), logs: z.array(z.string()).optional() }).strict(),
+    description: "Root-only lifecycle change bound to an explicit user request. Supply an absolute workspace in ordinary sessions; bound helpers default to their workspace and reject another workspace. Set user_requested:true only for the user's requested pause, analysis, shutdown or clean localization resume; no additional interactive dialog.",
+    loadMode: "essential",
+    parameters: z.object({ workspace: z.string().optional(), mode: z.string(), user_requested: z.boolean(), logs: z.array(z.string()).optional() }).strict(),
     async execute(_id, input, signal, _onUpdate, ctx) {
       const identity = authority(ctx);
       parameters(input);
       if (signal?.aborted) fail("request cancelled");
-      const workspace = realpathSync(getWorkspace(ctx));
+      const workspace = workspaceFor(input, ctx, getWorkspace);
       const logs = (input.logs ?? []).map(log => path.resolve(workspace, log));
       const current = revision(workspace);
       const request = { mode: input.mode };
       const after = authority(ctx);
-      if (identity.agent !== after.agent || identity.session !== after.session || realpathSync(getWorkspace(ctx)) !== workspace || revision(workspace) !== current) fail("host session or lifecycle changed during authorization");
+      if (identity.agent !== after.agent || identity.session !== after.session || workspaceFor(input, ctx, getWorkspace) !== workspace || revision(workspace) !== current) fail("host session or lifecycle changed during authorization");
       if (signal?.aborted) fail("request cancelled");
       const python = pythonFromPath();
       const id = randomBytes(16).toString("hex");
@@ -268,6 +301,65 @@ export default function registerFrameworkModeApproval(pi, getWorkspace) {
       for (const log of logs) argv.push("--log", log);
       try { return await invoke(python, argv, workspace, { id, token }, signal); }
       finally { try { unlinkSync(file); } catch (error) { if (error.code !== "ENOENT") throw error; } }
+    },
+  });
+}
+
+function currentRegistration(pi, ctx, workspace, identity, model, bound) {
+  const launch = process.env.PARR0T_OMP_CONTROL_DIRECTORY;
+  if (!bound || launch === undefined) return;
+  if (!path.isAbsolute(launch)) fail("invalid current control launch");
+  const directory = realpathSync(launch);
+  if (path.dirname(directory) !== path.join(workspace, ".game-l10n", "omp-control")
+      || !/^[a-f0-9]{32}$/.test(path.basename(directory))
+      || realpathSync(ctx.cwd) !== workspace) fail("current control launch workspace mismatch");
+  const receipt = JSON.parse(readFileSync(path.join(directory, "ready.json"), "utf8"));
+  const registered = pi.getAllTools?.();
+  const active = pi.getActiveTools?.();
+  const guarded = typeof receipt?.guard_sha256 === "string";
+  const resource = new URL(guarded ? "./omp-isolation-guard.mjs" : "./omp-prompt-isolation.mjs", import.meta.url);
+  const digest = createHash("sha256").update(readFileSync(resource)).digest("hex");
+  if (receipt.schema !== "parr0t.omp-control-ready.v1" || receipt.launch_id !== path.basename(directory)
+      || receipt.session_id !== identity.session || receipt.process_id !== process.pid
+      || receipt.framework_tool !== TOOL || receipt.process_tool !== (guarded ? "parr0t_exec" : "parr0t_process")
+      || (guarded ? receipt.guard_sha256 : receipt.helper_sha256) !== digest
+      || !Array.isArray(registered) || !Array.isArray(active)
+      || ![receipt.process_tool, TOOL].every(tool => registered.some(item => item.name === tool) && active.includes(tool))) fail("current root readiness is unavailable; refusing duplicate controller launch");
+  if (model !== `${ctx.model?.provider}/${ctx.model?.id}`) fail("current root already registered with a different model");
+  const details = { status: guarded ? "guard_registered" : "helper_registered", existing: true, workspace, registration: receipt };
+  return { content: [{ type: "text", text: JSON.stringify(details) }], details, isError: false };
+}
+
+export function registerParr0tSession(pi, getWorkspace) {
+  const z = pi.zod;
+  pi.registerTool({
+    name: SESSION_TOOL,
+    label: "Parr0t Session (Root User Request)",
+    description: "Launch the official fresh Parr0t controller for the user's requested automation, preserving its request, checkpoints and actual readiness/error result. Requires an explicit absolute workspace in ordinary sessions. Defaults to this root's exact provider/model and thinking; when the host model is unavailable supply an exact model. Never launches a semantic worker from this caller.",
+    loadMode: "essential",
+    parameters: z.object({ workspace: z.string().optional(), model: z.string().optional(), mode: z.string().optional(), user_requested: z.boolean() }).strict(),
+    async execute(_id, input, signal, _onUpdate, ctx) {
+      const identity = authority(ctx);
+      sessionParameters(input);
+      const workspace = workspaceFor(input, ctx, getWorkspace);
+      const currentModel = ctx.model;
+      const model = input.model ?? (typeof currentModel?.provider === "string" && typeof currentModel?.id === "string"
+        ? `${currentModel.provider}/${currentModel.id}` : undefined);
+      if (!exactModel(model)) fail("host model unavailable: explicit exact model required");
+      if (signal?.aborted) fail("request cancelled");
+      const existing = currentRegistration(pi, ctx, workspace, identity, model, getWorkspace !== undefined);
+      if (existing) return existing;
+      const argv = ["omp-session", "--workspace", workspace, "--model", model, "--mode", input.mode ?? "auto"];
+      if (input.model === undefined) {
+        const thinking = pi.getThinkingLevel?.();
+        if (thinking !== undefined) {
+          if (typeof thinking !== "string" || !thinking.trim() || thinking.includes("\0")) fail("invalid host thinking level");
+          argv.push("--thinking", thinking);
+        }
+      }
+      const after = authority(ctx);
+      if (identity.agent !== after.agent || identity.session !== after.session || workspaceFor(input, ctx, getWorkspace) !== workspace) fail("host session changed during authorization");
+      return await invoke(pythonFromPath(), argv, workspace, undefined, signal);
     },
   });
 }

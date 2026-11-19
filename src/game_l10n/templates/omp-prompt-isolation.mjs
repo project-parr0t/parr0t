@@ -2,9 +2,10 @@ import { createHash } from "node:crypto";
 import { linkSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import registerFrameworkModeApproval, { checkFrameworkToolCall, recordFrameworkExposure } from "./framework-mode-approval.mjs";
+import registerFrameworkModeApproval, { checkFrameworkToolCall, recordFrameworkExposure, registerParr0tSession } from "./framework-mode-approval.mjs";
 import createNativeRelayLifecycle, { publishHostModels } from "./native-relay-lifecycle.mjs";
 import { registerNativeProcess } from "./omp-native-process.mjs";
+import { captureOperatorConfigs, observeOperatorPolicy } from "./omp-host-policy.mjs";
 
 // Enforce child host-tool communication boundaries without an OS sandbox.
 // Native processes use the public exec API, never the embedded URL filesystem.
@@ -205,10 +206,13 @@ export default function promptIsolation(pi) {
     const active = pi.getActiveTools();
     if (!Array.isArray(registered) || !registered.some(tool => tool.name === "parr0t_process")) fail("parr0t_process is not registered in this host session");
     if (!Array.isArray(active) || !active.includes("parr0t_process")) fail("parr0t_process is not active in this host session");
+    if (!registered.some(tool => tool.name === "parr0t_framework_mode")) fail("parr0t_framework_mode is not registered in this host session");
+    if (!active.includes("parr0t_framework_mode")) fail("parr0t_framework_mode is not active in this host session");
     const receiptPath = path.join(directory, "ready.json");
     const receipt = `${JSON.stringify({
       schema: "parr0t.omp-control-ready.v1", launch_id: launchId, session_id: sessionId,
       process_id: process.pid, helper_sha256: HELPER_SHA256, process_tool: "parr0t_process",
+      framework_tool: "parr0t_framework_mode",
     })}\n`;
     let previous;
     try { previous = readFileSync(receiptPath, "utf8"); }
@@ -222,8 +226,10 @@ export default function promptIsolation(pi) {
     finally { rmSync(temporary, { force: true }); }
   }
   registerFrameworkModeApproval(pi, workspace);
+  registerParr0tSession(pi, workspace);
   pi.on("session_start", (_event, ctx) => {
     if (ctx.agent?.kind === "main") {
+      captureOperatorConfigs(ctx);
       registerReadiness(ctx);
       publishHostModels(ctx, workspace(ctx));
       process.env[WORKSPACE_ENV] = workspace(ctx);
@@ -264,6 +270,7 @@ export default function promptIsolation(pi) {
   });
   pi.on("before_subagent_spawn", lifecycle.before_subagent_spawn);
   pi.on("tool_result", async (event, ctx) => {
+    observeOperatorPolicy(event, ctx);
     if (toolName(event.toolName) === "task") {
       // Public task-result IDs attest actual caller-owned processes. A
       // before_subagent_spawn selection key is not a process ownership proof.
