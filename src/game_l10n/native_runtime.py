@@ -73,7 +73,8 @@ def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str],
                              *, transport: str | None = None,
                              omp_isolation: str | None = None,
                              role_models: dict[str, str] | None = None,
-                             user_requested_models: bool = False) -> dict[str, Any]:
+                             user_requested_models: bool = False,
+                             host_policy_fingerprint: str | None = None) -> dict[str, Any]:
     policy_config = {}
     config_path = work_dir / "game-l10n.json"
     if role_models:
@@ -153,8 +154,16 @@ def configure_native_runtime(work_dir: Path, host: str, models: dict[str, str],
         if omp_isolation not in {"prompt", "guarded"}:
             raise ValueError("E_NATIVE_RUNTIME_INVALID: unsupported OMP isolation mode")
         payload["omp_isolation"] = omp_isolation
+        from .omp_host_policy import host_policy_fingerprint as policy_identity
+        observed_policy = policy_identity(host_policy_fingerprint)
+        if observed_policy is None and previous is not None and previous["host"] == host:
+            observed_policy = previous.get("host_policy_fingerprint")
+        if observed_policy is not None:
+            payload["host_policy_fingerprint"] = observed_policy
     elif omp_isolation is not None:
         raise ValueError("E_NATIVE_RUNTIME_INVALID: OMP isolation requires OMP collaboration")
+    if host_policy_fingerprint is not None and (host != "omp" or transport != "collaboration"):
+        raise ValueError("E_NATIVE_HOST_POLICY_FINGERPRINT_INVALID")
     if transport == "native-host-api":
         from .native_host import native_host_profile
         payload.update(transport=transport, host_profile_fingerprint=native_host_profile(work_dir, host)["fingerprint"])
@@ -184,6 +193,8 @@ def native_runtime(work_dir: Path, *, required: bool = False,
             profile = native_host_profile(work_dir, value["host"])
         if "omp_isolation" in value:
             required_keys.add("omp_isolation")
+        if "host_policy_fingerprint" in value:
+            required_keys.add("host_policy_fingerprint")
         valid = (
             set(value) == required_keys
             and value["schema"] == RUNTIME_SCHEMA
@@ -191,6 +202,11 @@ def native_runtime(work_dir: Path, *, required: bool = False,
             and ("omp_isolation" not in value or (
                 value["host"] == "omp" and not broker
                 and value["omp_isolation"] in {"prompt", "guarded"}
+            ))
+            and ("host_policy_fingerprint" not in value or (
+                value["host"] == "omp" and not broker
+                and isinstance(value["host_policy_fingerprint"], str)
+                and re.fullmatch(r"[a-f0-9]{64}", value["host_policy_fingerprint"]) is not None
             ))
             and value["fingerprint"] == stable_hash(unsigned)
             and (allow_stale_generation or value["control_generation"] == int(control_plane_state(work_dir).get("generation", 0)))
@@ -248,7 +264,7 @@ def launch_contract(work_dir: Path, route: str, tasks: list[str]) -> dict[str, A
         ),
         "capability_preflight_required": True,
         "spawn_model_parameter": "tasks[].model" if runtime["host"] == "omp" else "model",
-        "preflight": "verify_dispatch_tool_then_attempt_bound_model_without_an_additional_model_allowlist",
+        "preflight": "verify_dispatch_and_live_host_operator_grants_then_attempt_only_exact_bound_model",
         "launch_policy": "pass_model_explicitly_then_record_returned_worker_id; skip_already_started_tasks",
         "unavailable_action": "record_capability_unavailable_or_model_unavailable_then_seal_without_results",
         "record_command": "game-l10n record-native-launch --workspace <workspace> --relay <relay-path>",
@@ -259,6 +275,16 @@ def launch_contract(work_dir: Path, route: str, tasks: list[str]) -> dict[str, A
         "cancellation_priority": "cancel_owned_child_promptly_on_observed_operational_error_before_replacement",
         "operational_failure_policy": "record_only_observed_provider_or_guard_errors; terminal_owner_cancellation_required_before_replacement",
     }
+    if runtime["host"] == "omp" and runtime.get("transport", "collaboration") == "collaboration":
+        contract.update(
+            host_policy_fingerprint=runtime.get("host_policy_fingerprint"),
+            host_policy_repair=(
+                "Read the actual host model-role, per-call allowlist and agent-override settings. "
+                "An available catalog model is not an operator grant. After a genuine policy repair, "
+                "bind its changed host-policy fingerprint through native-runtime and prepare a fresh task; "
+                "preserve exact models and old terminal evidence. Never repeat an unchanged denied binding."
+            ),
+        )
     isolation = runtime_isolation(work_dir, runtime)
     if isolation is not None:
         contract.update(message_isolation=isolation,

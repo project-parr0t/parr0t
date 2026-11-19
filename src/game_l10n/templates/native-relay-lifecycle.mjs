@@ -177,7 +177,8 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
         if (["sourceSession", "history", "parentHistory", "inheritHistory", "session", "sessionId"].some(key => item[key] !== undefined)
             || item.tools?.length) throw new Error("worker history and callback tools are forbidden");
         const name = `Parr0t${sha256(`${bound.fingerprint}\0${task}`).slice(0, 20)}`;
-        Object.assign(item, { agent: "task", model: dispatch.model, name, task: dispatch.worker_prompt });
+        Object.assign(item, { model: dispatch.model, name, task: dispatch.worker_prompt });
+        delete item.agent;
         delete item.steps;
         return { task, file: admissionPath(bound.workspace, bound.fingerprint, task) };
       });
