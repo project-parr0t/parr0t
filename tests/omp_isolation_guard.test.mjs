@@ -664,6 +664,7 @@ describe("file-backed OMP host/message isolation", () => {
       writeFileSync(guardPath, readFileSync(template));
       writeFileSync(path.join(path.dirname(guardPath), "framework-mode-approval.mjs"), readFileSync(path.join(path.dirname(template), "framework-mode-approval.mjs")));
       writeFileSync(path.join(packageRoot, "templates/native-relay-lifecycle.mjs"), readFileSync(path.join(path.dirname(template), "native-relay-lifecycle.mjs")));
+      writeFileSync(path.join(packageRoot, "templates/omp-host-policy.mjs"), readFileSync(path.join(path.dirname(template), "omp-host-policy.mjs")));
       writeFileSync(path.join(packageRoot, "templates/omp-prompt-isolation.mjs"), readFileSync(path.join(path.dirname(template), "omp-prompt-isolation.mjs")));
       writeFileSync(path.join(packageRoot, "templates/omp-native-process.mjs"), readFileSync(path.join(path.dirname(template), "omp-native-process.mjs")));
       writeFileSync(path.join(packageRoot, "templates/native-python.py"), readFileSync(path.join(path.dirname(template), "native-python.py")));
@@ -783,6 +784,7 @@ describe("file-backed OMP host/message isolation", () => {
     writeFileSync(copied, original);
     writeFileSync(path.join(path.dirname(copied), "framework-mode-approval.mjs"), readFileSync(path.join(path.dirname(template), "framework-mode-approval.mjs")));
     writeFileSync(path.join(path.dirname(copied), "native-relay-lifecycle.mjs"), readFileSync(path.join(path.dirname(template), "native-relay-lifecycle.mjs")));
+    writeFileSync(path.join(path.dirname(copied), "omp-host-policy.mjs"), readFileSync(path.join(path.dirname(template), "omp-host-policy.mjs")));
     writeFileSync(path.join(path.dirname(copied), "omp-prompt-isolation.mjs"), readFileSync(path.join(path.dirname(template), "omp-prompt-isolation.mjs")));
     writeFileSync(path.join(path.dirname(copied), "omp-native-process.mjs"), readFileSync(path.join(path.dirname(template), "omp-native-process.mjs")));
     const loaded = (await import(pathToFileURL(copied).href)).default;

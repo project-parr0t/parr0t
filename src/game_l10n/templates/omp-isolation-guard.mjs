@@ -3,9 +3,10 @@ import { createHash } from "node:crypto";
 import { accessSync, appendFileSync, closeSync, constants, existsSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import registerFrameworkModeApproval, { checkFrameworkToolCall, recordFrameworkExposure } from "./framework-mode-approval.mjs";
+import registerFrameworkModeApproval, { checkFrameworkToolCall, recordFrameworkExposure, registerParr0tSession } from "./framework-mode-approval.mjs";
 import createNativeRelayLifecycle, { publishHostModels } from "./native-relay-lifecycle.mjs";
 import { deniedCall } from "./omp-prompt-isolation.mjs";
+import { captureOperatorConfigs, observeOperatorPolicy } from "./omp-host-policy.mjs";
 
 const TEMPLATE = fileURLToPath(import.meta.url);
 const GUARD_SHA256 = createHash("sha256").update(readFileSync(TEMPLATE)).digest("hex");
@@ -429,10 +430,12 @@ export default function isolationGuard(pi) {
       return { code: result.details.exitCode, stdout: result.details.stdout, killed: result.isError };
     },
   });
-  registerFrameworkModeApproval(pi, () => {
+  const boundWorkspace = () => {
     if (!ready || fatal) fail("guard startup failed");
     return workspace;
-  });
+  };
+  registerFrameworkModeApproval(pi, boundWorkspace);
+  registerParr0tSession(pi, boundWorkspace);
   function requireAnalysis(state) {
     if (state.mode !== "analysis") fail("diagnostic collaboration requires analysis mode", "framework_inactive");
   }
@@ -488,6 +491,7 @@ export default function isolationGuard(pi) {
     if (typeof configured !== "string" || !path.isAbsolute(configured)) fail("--parr0t-workspace must be absolute");
     workspace = realpathSync(configured);
     if (ctx.agent.kind === "main") {
+      captureOperatorConfigs(ctx);
       const sessionId = ctx.sessionManager.getSessionId();
       if (typeof sessionId !== "string" || !sessionId) fail("host root session ID is unavailable");
       process.env[SESSION_ENV] = sessionId;
@@ -516,8 +520,10 @@ export default function isolationGuard(pi) {
         if (typeof pi.getAllTools !== "function" || typeof pi.getActiveTools !== "function"
             || !pi.getAllTools().some(tool => tool.name === "parr0t_exec")
             || !pi.getActiveTools().includes("parr0t_exec")) fail("active native process tool unavailable");
+        if (!pi.getAllTools().some(tool => tool.name === "parr0t_framework_mode")
+            || !pi.getActiveTools().includes("parr0t_framework_mode")) fail("active lifecycle tool unavailable");
         const receiptPath = path.join(directory, "ready.json");
-        const receipt = `${JSON.stringify({ schema: "parr0t.omp-control-ready.v1", launch_id: path.basename(directory), session_id: sessionId, process_id: process.pid, guard_sha256: registration.guard_sha256 })}\n`;
+        const receipt = `${JSON.stringify({ schema: "parr0t.omp-control-ready.v1", launch_id: path.basename(directory), session_id: sessionId, process_id: process.pid, guard_sha256: registration.guard_sha256, process_tool: "parr0t_exec", framework_tool: "parr0t_framework_mode" })}\n`;
         let previous;
         try { previous = readFileSync(receiptPath, "utf8"); } catch (error) { if (error.code !== "ENOENT") throw error; }
         if (previous !== receipt) {
@@ -570,6 +576,7 @@ export default function isolationGuard(pi) {
     await lifecycle.before_agent_start(event, ctx);
   });
   pi.on("tool_result", async (event, ctx) => {
+    observeOperatorPolicy(event, ctx);
     await lifecycle.tool_result(event, ctx);
     await recordFrameworkExposure(event, ctx, workspace);
     if (ctx.agent.kind !== "main" && childRole !== "diagnostic") return;
