@@ -22,13 +22,13 @@ Semantic localization is content-network deny by default. Apply `skills/translat
 For a new job:
 
 1. Confirm repository/workspace access and only that the source path exists; do not inspect its contents.
-2. Initialize; bind `user-request`; follow status. `enter-control-plane --workspace <workspace> --contracts-read --source-unopened`. Exposure/recovery: `control-plane-contract.md`. Never auto-launch replacements.
+2. Initialize; bind `user-request`; follow status. `enter-control-plane --workspace <workspace> --contracts-read --source-unopened`. Exposure/recovery: `control-plane-contract.md`. Requested OMP automation may establish its first official controller without an extra confirmation dialog; never duplicate or replace a live/pending controller.
 3. Git is disabled by default; enable only on explicit user choice. Disabled forbids game-workspace Git mutation/publication, not already-authorized SDK access, download, inventory, or activation. Never infer consent from transport or missing `.git`.
 4. Bind `native-runtime --host codex|omp` before dispatch. Model overrides use `--role-model role=exact-id --user-requested-models`. Preserve host/isolation and started bindings; see `codex-app-deepseek.md`.
 
 For an existing job, start with status and reuse valid checkpoints. Never repeat locked successes; only core-owned unfinished-target retry or changed-binding repair may reissue work.
 
-Continuation/diagnosis: `control-plane-contract.md`. The root host's `parr0t_framework_mode` requires an explicit current user request (`user_requested: true`), not a compulsory interactive dialog. Clean pause/analysis/shutdown can resume in the same clean session with `mode: "localization"`; actual semantic/history exposure requires canonical fresh recovery. Children cannot authorize mode changes.
+Continuation/diagnosis: `control-plane-contract.md`. The ordinary OMP bootstrap supplies root `parr0t_session` and `parr0t_framework_mode` as well as native process execution. Entry/lifecycle requires the user's requested action (`user_requested: true`), not a compulsory interactive dialog. Ordinary roots supply an absolute `workspace`; dedicated helpers retain their exact bound workspace. `parr0t_session` preserves the actual current root model/thinking unless an explicit exact model is selected. Clean pause/analysis/shutdown can resume with `mode: "localization"`; actual semantic/history exposure requires canonical fresh recovery. Children cannot authorize entry or mode changes. Do not confuse a missing caller tool with the registered child controller's tool state.
 
 ## State machine
 
@@ -65,7 +65,7 @@ These are per-cohort dependencies, not mandatory whole-job barriers. Core advanc
 - Apply proportional verification and stop after the changed layer passes. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.
 - Native uses `native-pass-step` and terminal core seals. Only explicit user time/token/cost limits constrain the whole job; per-request capacity is separate and routes to safe sharding/compaction or actionable repair.
 - Observe finitely and interruptibly. Operational/admission errors are not semantic refusal/exhaustion: the owner ends started children and seals, then core creates a fresh manifest for only unfinished targets on the next approved configured route. Preserve successes/evidence; no successor means actionable repair, not source preservation or unchanged retry loops.
-- Prompt OMP needs its loaded helper and `parr0t_process` (deferred: `xd://parr0t_process`); guarded mode additionally needs guard evidence and `parr0t_exec`. Unknown harmless local tools are not blanket forbidden; messaging, private history, content/network scope and exact bound assets remain protected.
+- Prompt OMP needs its loaded helper and `parr0t_process`; guarded mode additionally needs guard evidence and `parr0t_exec`. Actual readiness checks both the mode-specific native tool and root `parr0t_framework_mode`. Top-level catalog absence alone is not missing registration: check the `xd://` device when deferred. Registered lifecycle devices enforce the same actual root authority as direct calls; they are not writable lifecycle metadata. Unknown harmless local tools are not blanket forbidden; messaging, private history, content/network scope and exact bound assets remain protected.
 - Local packaging may use a validated minimal integrity checkpoint. Full publication retains full release/coverage gates; a lower assurance or explicitly incomplete artifact must remain honestly labeled.
 
 

@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from game_l10n import omp_session
+from game_l10n.cli import main as core_main
 from game_l10n.errors import ConfigurationError
 from game_l10n.control_plane import (
     CONTROL_STATE_PATH, initial_control_plane_state, suspend_control_plane, control_plane_state,
@@ -16,6 +17,8 @@ from game_l10n.control_plane import (
 from game_l10n.framework_session import change_framework_mode, framework_session_state
 from game_l10n.user_request import record_user_request, user_request_binding, USER_REQUEST_PATH
 from tests.framework_approval_fixture import issue_approval
+from game_l10n.native_runtime import RUNTIME_PATH, RUNTIME_SCHEMA
+from game_l10n.store import stable_hash
 
 
 class OmpSessionTests(unittest.TestCase):
@@ -55,9 +58,9 @@ class OmpSessionTests(unittest.TestCase):
             "process_id": 456, "session_id": "fresh-session:1",
             "guard_sha256" if guarded else "helper_sha256":
                 omp_session.sha256(extension.read_bytes()).hexdigest(),
+            "framework_tool": "parr0t_framework_mode",
+            "process_tool": "parr0t_exec" if guarded else "parr0t_process",
         }
-        if not guarded:
-            proof["process_tool"] = "parr0t_process"
         proof.update(overrides or {})
         (directory / "ready.json").write_text(json.dumps(proof), encoding="utf-8")
 
@@ -120,6 +123,74 @@ class OmpSessionTests(unittest.TestCase):
         self.assertEqual(Path(command[10]).name, "omp-isolation-guard.mjs")
         self.assertEqual(command.count("--trusted-extension"), 1)
         self.assertEqual(command[11:13], ["--parr0t-workspace", str(self.workspace.resolve())])
+
+    def test_core_entry_cli_is_available_before_entry_and_preserves_exact_thinking(self):
+        before = set(self.workspace.rglob("*"))
+        for guarded in (False, True):
+            output = io.StringIO()
+            with patch.object(omp_session.subprocess, "Popen") as spawn, redirect_stdout(output):
+                code = core_main([
+                    "omp-session", "--workspace", str(self.workspace), "--model", self.model,
+                    "--thinking", "high", "--print-command",
+                ] + (["--guarded"] if guarded else []))
+            self.assertEqual(code, 0)
+            command = json.loads(output.getvalue())
+            self.assertEqual(command[command.index("--model") + 1], self.model)
+            self.assertEqual(command[command.index("--thinking") + 1], "high")
+            self.assertEqual(Path(command[-1][1:]).read_bytes(), self.original_request)
+            spawn.assert_not_called()
+        self.assertEqual(before, set(self.workspace.rglob("*")))
+
+    def test_core_entry_does_not_spawn_without_original_request(self):
+        (self.workspace / USER_REQUEST_PATH).unlink()
+        with patch.object(omp_session.subprocess, "Popen") as spawn, redirect_stderr(io.StringIO()):
+            self.assertEqual(core_main([
+                "omp-session", "--workspace", str(self.workspace),
+                "--model", self.model, "--foreground",
+            ]), 2)
+        spawn.assert_not_called()
+
+    def test_operator_cli_config_survives_official_controller_entry_without_global_mutation(self):
+        selected = self.workspace / "operator-models.json"
+        selected.write_text(json.dumps({"modelRoles": {"synthetic-selected": self.model}}), encoding="utf-8")
+        original = selected.read_bytes()
+        with patch.dict(os.environ, {"PARR0T_OMP_OPERATOR_CONFIGS": json.dumps([str(selected)])}):
+            command, _, _ = self.plan()
+        self.assertEqual(command[command.index("--config") + 1], str(selected.resolve()))
+        self.assertEqual(selected.read_bytes(), original)
+        selected.unlink()
+        with patch.dict(os.environ, {"PARR0T_OMP_OPERATOR_CONFIGS": json.dumps([str(selected)])}), \
+                patch.object(omp_session.subprocess, "Popen") as spawn:
+            with self.assertRaisesRegex(ValueError, "E_OMP_OPERATOR_CONFIG_INVALID"):
+                omp_session._launch(self.workspace, self.model, foreground=True)
+            spawn.assert_not_called()
+
+    def test_default_entry_preserves_checkpoint_isolation_without_old_host_registration(self):
+        target = self.workspace / RUNTIME_PATH
+        target.parent.mkdir(parents=True, exist_ok=True)
+        for isolation in ("guarded", "prompt", None):
+            with self.subTest(isolation=isolation):
+                checkpoint = {
+                    "schema": RUNTIME_SCHEMA, "host": "omp", "models": {},
+                    "control_generation": 0,
+                }
+                if isolation is not None:
+                    checkpoint["omp_isolation"] = isolation
+                checkpoint["fingerprint"] = stable_hash(checkpoint)
+                target.write_text(json.dumps(checkpoint), encoding="utf-8")
+                before = target.read_bytes()
+                output = io.StringIO()
+                with patch.object(omp_session.subprocess, "Popen") as spawn, redirect_stdout(output):
+                    code = core_main([
+                        "omp-session", "--workspace", str(self.workspace),
+                        "--model", self.model, "--print-command",
+                    ])
+                self.assertEqual(code, 0)
+                command = json.loads(output.getvalue())
+                expected = "omp-prompt-isolation.mjs" if isolation == "prompt" else "omp-isolation-guard.mjs"
+                self.assertEqual(Path(command[command.index("--trusted-extension") + 1]).name, expected)
+                self.assertEqual(target.read_bytes(), before)
+                spawn.assert_not_called()
 
     def test_model_and_guard_prerequisites(self):
         for model in ("", "../model", "provider/model\nextra", "provider/*", "C:\\models\\fixture"):
@@ -232,10 +303,10 @@ class OmpSessionTests(unittest.TestCase):
                 None, {"schema": "other"}, {"launch_id": "0" * 32}, {digest_field: "wrong"},
                 {"process_id": True}, {"process_id": 0}, {"process_id": -1}, {"process_id": "456"},
                 {"session_id": None}, {"session_id": ""}, {"session_id": "invalid/session"},
+                {"framework_tool": None}, {"framework_tool": "other"},
                 {"session_id": "s" * 129},
+                {"process_tool": None}, {"process_tool": "other"},
             ]
-            if not guarded:
-                invalid_proofs.extend([{"process_tool": None}, {"process_tool": "other"}])
             for invalid in invalid_proofs:
                 with self.subTest(guarded=guarded, invalid=invalid):
                     child = Mock(pid=123)

@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import promptIsolation from "../src/game_l10n/templates/omp-prompt-isolation.mjs";
+import { registerParr0tSession } from "../src/game_l10n/templates/framework-mode-approval.mjs";
 
 const temporary = [];
 const originalWorkspace = process.env.PARR0T_OMP_PROMPT_WORKSPACE;
@@ -92,6 +93,70 @@ function controlLaunch(workspace) {
   return directory;
 }
 
+
+describe("OMP ambient root entry", () => {
+
+  test("bound roots can use deferred lifecycle device, while mismatches, forged requests and metadata writes stay denied", async () => {
+    const f = fixture();
+    const other = fixture();
+    const root = host(f.workspace, "main");
+    const request = { mode: "pause", user_requested: true };
+    for (const input of [request, { ...request, workspace: f.workspace }]) {
+      let deliveries = 0;
+      expect(await root.call("write", { path: "xd://parr0t_framework_mode", content: JSON.stringify(input) }, () => { deliveries++; })).toBeUndefined();
+      expect(deliveries).toBe(1);
+    }
+    for (const content of ["{", JSON.stringify({ ...request, workspace: other.workspace }), JSON.stringify({ mode: "pause" }), JSON.stringify({ ...request, argv: [] })]) {
+      await deniedWithoutDelivery(root, "write", { path: "xd://parr0t_framework_mode", content });
+    }
+    await expect(root.tools.get("parr0t_framework_mode").execute("mismatch", { ...request, workspace: other.workspace }, undefined, undefined, root.ctx)).rejects.toThrow("bound helper");
+    await deniedWithoutDelivery(root, "write", { path: ".game-l10n/framework-session.json", content: "{}" });
+    for (const agent of [{ kind: "sub", depth: 1, id: "Child" }, { kind: "main", depth: 2, id: "ForgedRoot" }]) {
+      root.ctx.agent = agent;
+      await deniedWithoutDelivery(root, "write", { path: "xd://parr0t_framework_mode", content: JSON.stringify(request) });
+      await deniedWithoutDelivery(root, "multi_tool_use.parallel", { tool_uses: [{ recipient_name: "write", parameters: { path: "xd://parr0t_framework_mode", content: JSON.stringify(request) } }] });
+    }
+  });
+
+  test("a bound ready root returns its actual registration and never launches a duplicate controller", async () => {
+    const f = fixture();
+    const directory = controlLaunch(f.workspace);
+    const tools = new Map([["parr0t_process", { name: "parr0t_process" }], ["parr0t_framework_mode", { name: "parr0t_framework_mode" }]]);
+    let active = [...tools.keys()];
+    registerParr0tSession({
+      zod: fakeZod, registerTool(tool) { tools.set(tool.name, tool); },
+      getAllTools: () => [...tools.values()], getActiveTools: () => active,
+    }, () => f.workspace);
+    const ctx = {
+      cwd: f.workspace, agent: { kind: "main", depth: 0, id: "SyntheticRoot" },
+      sessionManager: { getSessionId: () => "synthetic-current-root" },
+      model: { provider: "synthetic-provider", id: "exact-current-model" },
+    };
+    const receipt = {
+      schema: "parr0t.omp-control-ready.v1", launch_id: "a".repeat(32), session_id: "synthetic-current-root",
+      process_id: process.pid, process_tool: "parr0t_process", framework_tool: "parr0t_framework_mode",
+      helper_sha256: createHash("sha256").update(readFileSync(new URL("../src/game_l10n/templates/omp-prompt-isolation.mjs", import.meta.url))).digest("hex"),
+    };
+    const file = path.join(directory, "ready.json");
+    writeJson(file, receipt);
+    const request = { user_requested: true };
+    const execute = input => tools.get("parr0t_session").execute("current-root", input, undefined, undefined, ctx);
+    const result = await execute(request);
+    expect(result.isError).toBe(false);
+    expect(result.details.existing).toBe(true);
+    expect(result.details.registration).toEqual(receipt);
+    expect(JSON.parse(readFileSync(file, "utf8"))).toEqual(receipt);
+    await expect(execute({ ...request, model: "other-provider/exact-model" })).rejects.toThrow("different model");
+    for (const override of [{ session_id: "another-root" }, { process_id: process.pid + 1 }, { framework_tool: "forged" }, { process_tool: "forged" }]) {
+      writeJson(file, { ...receipt, ...override });
+      await expect(execute(request)).rejects.toThrow("refusing duplicate");
+    }
+    writeJson(file, receipt);
+    active = ["parr0t_process"];
+    await expect(execute(request)).rejects.toThrow("refusing duplicate");
+  });
+});
+
 describe("OMP prompt helper readiness", () => {
   test("direct-loaded operation does not require readiness APIs or write a receipt", async () => {
     const f = fixture();
@@ -112,6 +177,7 @@ describe("OMP prompt helper readiness", () => {
       session_id: root.ctx.sessionManager.getSessionId(), process_id: process.pid,
       helper_sha256: createHash("sha256").update(readFileSync(new URL("../src/game_l10n/templates/omp-prompt-isolation.mjs", import.meta.url))).digest("hex"),
       process_tool: "parr0t_process",
+      framework_tool: "parr0t_framework_mode",
     });
     expect(JSON.parse(receipt).session_id).not.toBe(root.ctx.agent.id);
     await root.emit("session_start");
