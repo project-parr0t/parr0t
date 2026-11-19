@@ -1665,6 +1665,7 @@ def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
             json.loads(_path_in_workspace(work_dir, args.offline_processing, must_exist=True).read_text(encoding="utf-8"))
             if args.offline_processing else None
         ),
+        discard_unverified_receipt=args.discard_unverified_receipt,
     )
     if (
         args.worker_role == "image_ui_inventory"
@@ -4732,6 +4733,10 @@ def build_parser() -> argparse.ArgumentParser:
     data_plane_prepare.add_argument(
         "--output",
         help="Private task directory; defaults under .game-l10n/data-plane",
+    )
+    data_plane_prepare.add_argument(
+        "--discard-unverified-receipt", metavar="TASK_ID",
+        help="Retire the exact incomplete reconciler receipt after Core verifies the stale relay was never admitted",
     )
     data_plane_prepare.add_argument(
         "--content-source-grant",

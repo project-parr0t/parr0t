@@ -78,15 +78,18 @@ class InventoryConstraintTests(unittest.TestCase):
         return save_inventory_attestation(self.work, self.primary, self.independent)
 
     def _prepare(self) -> dict:
-        return prepare_data_plane_task(
+        prepared = prepare_data_plane_task(
             self.work, self.output, worker_role="inventory_reconciler",
             config=self.config, sdk_activation=self.activation,
         )
+        if prepared["status"] == "ready":
+            self.relay = self.work / prepared["relay_path"]
+        return prepared
 
     def _seal(self, *, codes: list[str] | None = None, verify: bool = True) -> dict:
         if verify:
             self._verify()
-        task = json.loads((self.output / "task.json").read_text(encoding="utf-8"))
+        task = json.loads(self.relay.with_name("task.json").read_text(encoding="utf-8"))
         self._write(self.work / task["output_envelope"], {
             "schema": "parr0t.control-envelope.v2", "worker_role": "inventory_reconciler",
             "stage": "inventory", "status": "partial", "target_ids": [],
@@ -95,7 +98,7 @@ class InventoryConstraintTests(unittest.TestCase):
             "artifact_paths": [".game-l10n/inventory-attestation.json"],
             "queue_transitions": [], "route_evidence_path": "",
         })
-        return seal_data_plane_task(self.work, self.output / "relay.json", worker_ended=True)
+        return seal_data_plane_task(self.work, self.relay, worker_ended=True)
 
     def _pending(self) -> dict | None:
         return current_inventory_constraint(
@@ -166,6 +169,17 @@ class InventoryConstraintTests(unittest.TestCase):
         self.assertEqual(result["status"], "pending")
         self.assertFalse(alternate.exists())
 
+    def test_alternate_output_cannot_fork_open_reconciliation(self) -> None:
+        first = self._prepare()
+        alternate = self.work / ".game-l10n/synthetic-alternate-dispatch"
+        with self.assertRaisesRegex(ConfigurationError, "requires its canonical stage directory"):
+            prepare_data_plane_task(
+                self.work, alternate, worker_role="inventory_reconciler",
+                config=self.config, sdk_activation=self.activation,
+            )
+        self.assertFalse(alternate.exists())
+        self.assertEqual(self._prepare()["task_id"], first["task_id"])
+
     def test_control_generation_and_envelope_bytes_invalidate_hold(self) -> None:
         self._block()
         with patch("game_l10n.data_plane_task.control_plane_state",
@@ -230,7 +244,7 @@ class InventoryConstraintTests(unittest.TestCase):
         resumed = self._prepare()
         self.assertEqual(resumed["status"], "ready")
         self.assertEqual(historical.read_bytes(), history_bytes)
-        self.assertEqual(json.loads((self.output / "task.json").read_text())["attempt"], 2)
+        self.assertEqual(json.loads(self.relay.with_name("task.json").read_text())["attempt"], 2)
 
     def test_fingerprint_and_config_changes_invalidate_bound_hold(self) -> None:
         self._block()
@@ -286,7 +300,7 @@ class InventoryConstraintTests(unittest.TestCase):
     def test_legacy_receipt_and_missing_output_keep_normal_resume(self) -> None:
         self._prepare()
         result = seal_data_plane_task(
-            self.work, self.output / "relay.json", worker_ended=True
+            self.work, self.relay, worker_ended=True
         )
         self.assertEqual(result["issue_codes"], ["task_incomplete"])
         self.assertIsNone(self._pending())
@@ -312,7 +326,7 @@ class InventoryConstraintTests(unittest.TestCase):
         self._write(receipt_path, receipt)
         self.assertIsNone(self._pending())
         self.assertEqual(self._prepare()["status"], "ready")
-        task = json.loads((self.output / "task.json").read_text())
+        task = json.loads(self.relay.with_name("task.json").read_text())
         self.assertEqual(task["worker_route"], "native-luna")
         self.assertEqual(task["data_plane_route_index"], 1)
 

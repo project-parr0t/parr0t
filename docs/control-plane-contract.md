@@ -133,7 +133,42 @@ Discovery/context relays have the same protection. Re-preparing a blocked task m
 
 Data-plane launch ledgers are keyed by the immutable task ID, so a completed attempt's recorded worker cannot satisfy or block the next attempt. Matching legacy ledgers remain authoritative; an obsolete legacy ledger is preserved and a fresh task receives its own ledger only when a sealed earlier-task receipt proves the prior lifecycle ended. Neither path clears or relabels a started worker's evidence.
 
-An inventory reconciler prepared after a sealed earlier attempt may itself remain unsubmitted when the OMP binding changes again. For a durable single-worker OMP relay, core may rebuild that task at a new address only if the exact obsolete relay has no launch ledger, host reservation/admission, failure record, or envelope. The older receipt stays bound to its own attempt; it is not a receipt for the abandoned relay. Core retains the old task and relay, rejects late lifecycle calls to their address, and uses the current SDK and runtime without consuming a semantic attempt. If launch/admission evidence exists, use the normal terminal-evidence rules instead.
+An unsubmitted inventory reconciler can outlive an OMP binding change. Core
+may rebuild an obsolete durable single-worker OMP relay at a new address
+only if that exact relay has no launch ledger, host reservation/admission,
+failure record, or envelope. This works without a receipt and after a
+sealed earlier attempt, including a partial result. The earlier receipt
+stays bound to its own attempt. Core keeps the old task and relay, rejects
+late lifecycle calls to their address, and uses the current SDK and runtime
+without consuming a semantic attempt.
+
+An incomplete error receipt for the obsolete task itself may be retired
+only when it records no successes, artifacts, or queue transitions. When
+preparation reports `discard_unverified_relay_receipt`, an explicit user
+decision may authorize this exact task:
+
+```text
+game-l10n prepare-data-plane-task --workspace <workspace> --worker-role inventory_reconciler --discard-unverified-receipt <task-id>
+```
+
+Core rechecks the same relay, unchanged receipt, and absence of admission
+evidence under the launch lock. It removes the receipt from the active slot
+and retains its bytes as a digest-named archive beside the obsolete relay.
+This is not a terminal seal or a successful result. A missing end event
+alone never permits retirement: a reservation, start, or other launch
+evidence still requires the normal lifecycle and terminal-evidence rules.
+
+Control-generation rotation does not end earlier workers. Before rebinding
+an earlier-generation relay, Core checks the original admission and launch
+evidence. A live reservation or worker, or a recorded start with no verified
+end or sealed receipt, blocks replacement. A valid rebound uses a different
+relay address and keeps the previous task, receipt, and execution evidence.
+
+Inventory reconciliation uses one canonical stage directory per workspace.
+Each replacement uses a new relay address, including ordinary retries after
+a seal. Core checks the exact current relay binding and receipt generation
+under the launch lock before publishing any data-plane receipt. A stale seal
+cannot publish to its successor's receipt slot.
 
 Every newly dispatched relay carries `launch_contract`. Before any worker starts, verify nested dispatch capability and record `record-native-launch --workspace <workspace> --relay <relay-path> --event capability-available`, then attempt the bound exact model. Missing nested dispatch records `capability-unavailable`. Only an observed execution-layer denial or model-availability result may record `model-unavailable`, using the bound command with `--failure-code host_dispatch_denied|host_model_not_found|host_model_unavailable`. The code is categorical evidence of the observed result, never a guess from an advertisement or allowlist. New contracts reject a model-unavailable event without it. Seal normally and return only the receipt path; never change models or fabricate per-target failures. Existing immutable contracts remain readable without rewriting started-worker evidence.
 

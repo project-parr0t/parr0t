@@ -10,9 +10,12 @@ from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
 
+from game_l10n import data_plane_task
 from game_l10n.cli import build_parser, main
 from game_l10n.errors import ConfigurationError
-from game_l10n.control_plane import establish_control_plane_entry
+from game_l10n.control_plane import (
+    CONTROL_HANDOFF_PATH, acknowledge_control_plane_rotation, establish_control_plane_entry, record_control_plane_leak,
+)
 from game_l10n.data_plane_task import (
     current_data_plane_operational_failure,
     prepare_data_plane_task,
@@ -144,11 +147,11 @@ class NativeRuntimeTests(unittest.TestCase):
         _, _, relay = self.prepare_probe()
         payload = json.loads(relay.read_text(encoding="utf-8"))
         dispatch = payload["launch_contract"]["worker_dispatches"]["worker-0"]
-        task = self.root / payload["task_path"]
+        task = (self.root / payload["task_path"]).resolve()
         self.assertEqual(Path(dispatch["task_path"]), task)
         self.assertEqual(dispatch["task_sha256"], hashlib.sha256(task.read_bytes()).hexdigest())
         self.assertEqual(dispatch["slot"], 0)
-        for binding in (str(self.root), str(task), dispatch["task_sha256"], "PARR0T_OMP_TASK=worker-0"):
+        for binding in (str(self.root.resolve()), str(task), dispatch["task_sha256"], "PARR0T_OMP_TASK=worker-0"):
             self.assertIn(binding, dispatch["worker_prompt"])
         self.assertIs(native_launch_summary(self.root, relay)["launch_observed"], False)
         preflight = self.invoke_argv(payload["command_argv"]["capability-available"])
@@ -1001,7 +1004,7 @@ class NativeRuntimeTests(unittest.TestCase):
             bind_data_plane_launch(self.root, relay)
         self.assertEqual(relay.read_bytes(), frozen)
 
-    def prepare_stale_reconciliation(self) -> tuple[dict, Path, Path]:
+    def first_reconciliation(self) -> tuple[dict, Path, Path]:
         game = self.root / "game"
         game.mkdir()
         config = {"game_roots": [str(game)], "sdk_root": str(self.root / "sdk")}
@@ -1016,20 +1019,48 @@ class NativeRuntimeTests(unittest.TestCase):
         )
         relay = self.root / prior["relay_path"]
         bind_data_plane_launch(self.root, relay)
-        record_native_launch(self.root, relay, event="model-unavailable", failure_code="host_dispatch_denied")
-        seal_data_plane_task(self.root, relay, worker_ended=True)
+        return config, output, relay
+
+    def prepare_stale_reconciliation(self, *, prior_partial: bool = False) -> tuple[dict, Path, Path]:
+        config, output, relay = self.first_reconciliation()
+        payload = json.loads(relay.read_bytes())
+        if prior_partial:
+            model = payload["launch_contract"]["model"]
+            record_native_launch(self.root, relay, event="capability-available")
+            record_native_launch(self.root, relay, event="worker-started", task="worker-0",
+                                 worker_id="synthetic-prior", model=model)
+            (output.parent.parent / "inventory-attestation.json").write_text(json.dumps({
+                "reconciliation": {"generation": 3},
+                "primary_id_fingerprint": "synthetic-ids",
+                "primary_identity_binding": {
+                    "policy": "append_only_preserve_existing_id_order",
+                    "id_fingerprint": "synthetic-ids", "records": 2,
+                },
+            }), encoding="utf-8")
+            (self.root / payload["expected_envelope"]).write_text(json.dumps({
+                "schema": "parr0t.control-envelope.v2", "worker_role": "inventory_reconciler",
+                "stage": "inventory", "status": "partial", "target_ids": [],
+                "counts": {"total": 2, "success": 1, "pending": 1},
+                "issue_codes": ["task_incomplete"], "queue_transitions": [],
+                "artifact_paths": [".game-l10n/inventory-attestation.json"], "route_evidence_path": "",
+            }), encoding="utf-8")
+        else:
+            record_native_launch(self.root, relay, event="model-unavailable", failure_code="host_dispatch_denied")
+        prior_receipt = seal_data_plane_task(self.root, relay, worker_ended=True)
+        self.assertEqual(prior_receipt["status"], "partial" if prior_partial else "error")
         configure_native_runtime(self.root, "omp", {}, host_policy_fingerprint="2" * 64)
         replacement = prepare_data_plane_task(
             self.root, output, worker_role="inventory_reconciler", config=config, sdk_activation={},
         )
-        self.assertNotEqual(replacement["task_id"], prior["task_id"])
+        self.assertNotEqual(replacement["task_id"], payload["task_id"])
+        relay = self.root / replacement["relay_path"]
         bind_data_plane_launch(self.root, relay)
         return config, output, relay
 
     def test_stale_unsubmitted_reconciliation_gets_new_address_without_relabeling(self) -> None:
         config, output, old_relay = self.prepare_stale_reconciliation()
         receipt = output / "receipt.json"
-        preserved = {path: path.read_bytes() for path in (old_relay, output / "task.json", receipt)}
+        preserved = {path: path.read_bytes() for path in (old_relay, old_relay.with_name("task.json"), receipt)}
         old = json.loads(preserved[old_relay])
         configure_native_runtime(self.root, "omp", {}, host_policy_fingerprint="3" * 64)
         fresh = prepare_data_plane_task(
@@ -1060,6 +1091,71 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(json.loads(receipt.read_bytes())["task_id"], fresh["task_id"])
         self.assertEqual(old_relay.read_bytes(), preserved[old_relay])
 
+    def test_prior_partial_receipt_does_not_block_superseding_unadmitted_reconciler(self) -> None:
+        config, output, old_relay = self.prepare_stale_reconciliation(prior_partial=True)
+        receipt = output / "receipt.json"
+        original = receipt.read_bytes()
+        old = json.loads(old_relay.read_bytes())
+        configure_native_runtime(self.root, "omp", {}, host_policy_fingerprint="3" * 64)
+        fresh = prepare_data_plane_task(
+            self.root, output, worker_role="inventory_reconciler", config=config, sdk_activation={},
+        )
+        relay = self.root / fresh["relay_path"]
+        self.assertNotEqual(relay, old_relay)
+        bind_data_plane_launch(self.root, relay)
+        self.assertEqual(json.loads(relay.read_bytes())["attempt"], old["attempt"])
+        self.assertEqual(receipt.read_bytes(), original)
+        self.assertEqual(native_launch_summary(self.root, relay)["unstarted_tasks"], ["worker-0"])
+
+    def test_missing_receipt_does_not_block_superseding_unadmitted_reconciler(self) -> None:
+        config, output, old_relay = self.prepare_stale_reconciliation()
+        receipt = output / "receipt.json"
+        receipt.unlink()
+        configure_native_runtime(self.root, "omp", {}, host_policy_fingerprint="3" * 64)
+        fresh = prepare_data_plane_task(
+            self.root, output, worker_role="inventory_reconciler", config=config, sdk_activation={},
+        )
+        relay = self.root / fresh["relay_path"]
+        self.assertNotEqual(relay, old_relay)
+        bind_data_plane_launch(self.root, relay)
+        self.assertFalse(receipt.exists())
+
+    def write_incomplete_reconciliation_receipt(self, output: Path, relay: Path) -> tuple[str, bytes]:
+        task_id = json.loads(relay.read_bytes())["task_id"]
+        receipt = output / "receipt.json"
+        payload = json.loads(receipt.read_bytes())
+        payload["task_id"] = task_id
+        payload["execution"]["complete"] = False
+        original = json.dumps(payload).encode("utf-8")
+        receipt.write_bytes(original)
+        return task_id, original
+
+    def test_explicit_discard_retires_only_the_exact_incomplete_receipt(self) -> None:
+        config, output, old_relay = self.prepare_stale_reconciliation()
+        task_id, original = self.write_incomplete_reconciliation_receipt(output, old_relay)
+        receipt = output / "receipt.json"
+        configure_native_runtime(self.root, "omp", {}, host_policy_fingerprint="3" * 64)
+        options = {"worker_role": "inventory_reconciler", "config": config, "sdk_activation": {}}
+        pending = prepare_data_plane_task(self.root, output, **options)
+        self.assertFalse(pending["dispatch_allowed"])
+        self.assertEqual(pending["task_id"], task_id)
+        with self.assertRaisesRegex(ConfigurationError, "E_NATIVE_RECEIPT_DISCARD_INVALID"):
+            prepare_data_plane_task(self.root, output, **options, discard_unverified_receipt="0" * 64)
+        self.assertEqual(receipt.read_bytes(), original)
+
+        fresh = prepare_data_plane_task(self.root, output, **options, discard_unverified_receipt=task_id)
+        relay = self.root / fresh["relay_path"]
+        self.assertNotEqual(relay, old_relay)
+        bind_data_plane_launch(self.root, relay)
+        self.assertFalse(receipt.exists())
+        discarded = old_relay.with_name(f"discarded-receipt-{hashlib.sha256(original).hexdigest()}.json")
+        self.assertEqual(discarded.read_bytes(), original)
+        with self.assertRaisesRegex(ConfigurationError, "relay was superseded"):
+            seal_data_plane_task(self.root, old_relay, worker_ended=True)
+        record_native_launch(self.root, relay, event="model-unavailable", failure_code="host_dispatch_denied")
+        seal_data_plane_task(self.root, relay, worker_ended=True)
+        self.assertEqual(json.loads(receipt.read_bytes())["task_id"], fresh["task_id"])
+
     def test_stale_reconciliation_with_host_reservation_cannot_be_replaced(self) -> None:
         config, output, relay = self.prepare_stale_reconciliation()
         original = relay.read_bytes()
@@ -1080,6 +1176,87 @@ class NativeRuntimeTests(unittest.TestCase):
             bind_data_plane_launch(self.root, relay)
         self.assertEqual(relay.read_bytes(), original)
         self.assertEqual(json.loads(admission.read_bytes())["state"], "reserved")
+
+        task_id, receipt_bytes = self.write_incomplete_reconciliation_receipt(output, relay)
+        with self.assertRaisesRegex(ConfigurationError, "E_NATIVE_RECEIPT_DISCARD_INVALID"):
+            prepare_data_plane_task(
+                self.root, output, worker_role="inventory_reconciler", config=config, sdk_activation={},
+                discard_unverified_receipt=task_id,
+            )
+        self.assertEqual((output / "receipt.json").read_bytes(), receipt_bytes)
+
+    def test_rotation_waits_for_bound_host_end_before_reissuing_reconciler(self) -> None:
+        config, output, old_relay = self.first_reconciliation()
+        original = old_relay.read_bytes()
+        old = json.loads(original)
+        model = old["launch_contract"]["model"]
+        record_native_launch(self.root, old_relay, event="capability-available")
+        record_native_launch(self.root, old_relay, event="worker-started", task="worker-0",
+                             worker_id="synthetic-worker", model=model)
+        record_control_plane_leak(self.root, "parent_opened_data_plane")
+        acknowledge_control_plane_rotation(self.root, self.root / CONTROL_HANDOFF_PATH)
+        establish_control_plane_entry(self.root)
+        bind_omp_isolation(self, self.root)
+        configure_native_runtime(self.root, "omp", {})
+
+        options = {"worker_role": "inventory_reconciler", "config": config, "sdk_activation": {}}
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_WORKER_TERMINATION_UNVERIFIED"):
+            prepare_data_plane_task(self.root, output, **options)
+
+        relay_digest = hashlib.sha256(original).hexdigest()
+        admission_key = hashlib.sha256(f"{relay_digest}\0worker-0".encode()).hexdigest()
+        admission = self.root / ".game-l10n/native/omp-launch-admissions" / f"{admission_key}.json"
+        admission.parent.mkdir(parents=True)
+        record = {"schema": "parr0t.omp-native-admission.v1", "relay_sha256": relay_digest,
+                  "task": "worker-0", "parent_id": "synthetic-relay", "worker_id": "synthetic-worker",
+                  "state": "started"}
+        admission.write_text(json.dumps(record), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_WORKER_ACTIVE"):
+            prepare_data_plane_task(self.root, output, **options)
+        self.assertEqual(old_relay.read_bytes(), original)
+        self.assertFalse((output / "receipt.json").exists())
+
+        admission.write_text(json.dumps({**record, "state": "ended"}), encoding="utf-8")
+        rebound = prepare_data_plane_task(self.root, output, **options)
+        relay = self.root / rebound["relay_path"]
+        self.assertNotEqual(relay, old_relay)
+        bind_data_plane_launch(self.root, relay)
+        self.assertEqual(json.loads(relay.read_bytes())["attempt"], old["attempt"])
+        self.assertEqual(old_relay.read_bytes(), original)
+
+    def test_inflight_reconciler_seal_cannot_overwrite_successor_receipt(self) -> None:
+        config, output, old_relay = self.first_reconciliation()
+        receipt_path = output / "receipt.json"
+        old = json.loads(old_relay.read_bytes())
+        record_native_launch(self.root, old_relay, event="capability-available")
+        record_native_launch(self.root, old_relay, event="worker-started", task="worker-0",
+                             worker_id="synthetic-worker", model=old["launch_contract"]["model"])
+        publish = data_plane_task._write_data_plane_receipt
+
+        def publish_after_successor(work_dir, relay, path, receipt):
+            # Pause the first publication at its lock boundary while a duplicate
+            # seals the old task and the successor completes.
+            publish(work_dir, relay, path, receipt)
+            original = receipt_path.read_bytes()
+            fresh = prepare_data_plane_task(
+                self.root, output, worker_role="inventory_reconciler", config=config, sdk_activation={},
+            )
+            fresh_relay = self.root / fresh["relay_path"]
+            self.assertNotEqual(fresh_relay, old_relay)
+            bind_data_plane_launch(self.root, fresh_relay)
+            record_native_launch(self.root, fresh_relay, event="model-unavailable", failure_code="host_dispatch_denied")
+            with patch.object(data_plane_task, "_write_data_plane_receipt", publish):
+                seal_data_plane_task(self.root, fresh_relay, worker_ended=True)
+            self.assertEqual((old_relay.parent / "sealed-receipt.json").read_bytes(), original)
+            self.assertEqual(json.loads(receipt_path.read_bytes())["task_id"], fresh["task_id"])
+            return publish(work_dir, relay, path, receipt)
+
+        with patch.object(data_plane_task, "_write_data_plane_receipt", publish_after_successor):
+            with self.assertRaisesRegex(ConfigurationError, "relay was superseded"):
+                seal_data_plane_task(self.root, old_relay, worker_ended=True)
+        with self.assertRaisesRegex(ConfigurationError, "relay was superseded"):
+            seal_data_plane_task(self.root, old_relay, worker_ended=True)
+        self.assertNotEqual(json.loads(receipt_path.read_bytes())["task_id"], old["task_id"])
 
     def test_data_plane_rebind_requires_terminal_evidence(self) -> None:
         _, _, relay = self.prepare_probe()

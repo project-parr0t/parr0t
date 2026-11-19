@@ -497,20 +497,29 @@ def _stale_unadmitted_omp_relay(work_dir: Path, relay_path: Path, relay: dict) -
     )
 
 
-def require_native_workers_ended(work_dir: Path, relay_path: Path) -> None:
-    """A terminal seal cannot race a host-admitted worker, including an unrecorded start."""
+def require_native_workers_ended(
+    work_dir: Path, relay_path: Path, *, require_terminal_evidence: bool = False,
+) -> None:
+    """Reject live admissions; require host proof of prior launches without a terminal receipt."""
     relay_bytes = relay_path.read_bytes()
     relay = json.loads(relay_bytes)
-    contract = relay.get("launch_contract") or {}
+    contract = relay.get("launch_contract")
+    if contract is None:
+        return
+    ledger = _load_launch_evidence(work_dir, relay_path)[2] if require_terminal_evidence else None
+    unverified = dict(ledger["workers"]) if ledger is not None else {}
     if "worker_dispatches" not in contract:
+        if ledger is not None and (unverified or ledger["capability"] == "available"):
+            raise ValueError("E_NATIVE_WORKER_TERMINATION_UNVERIFIED: require terminal evidence before replacement")
         return
     fingerprint = sha256(relay_bytes).hexdigest()
     for task in contract["tasks"]:
         key = sha256(f"{fingerprint}\0{task}".encode()).hexdigest()
         admission = work_dir / ".game-l10n/native/omp-launch-admissions" / f"{key}.json"
-        if not admission.exists():
+        if not os.path.lexists(admission):
             continue
-        _load_launch_evidence(work_dir, relay_path)
+        if ledger is None:
+            ledger = _load_launch_evidence(work_dir, relay_path)[2]
         record = json.loads(admission.read_text(encoding="utf-8"))
         if (
             record.get("schema") != "parr0t.omp-native-admission.v1"
@@ -520,6 +529,17 @@ def require_native_workers_ended(work_dir: Path, relay_path: Path) -> None:
             raise ValueError("E_NATIVE_LAUNCH_INVALID: host admission changed")
         if record["state"] in {"reserved", "started", "ending"}:
             raise ValueError("E_NATIVE_WORKER_ACTIVE: wait for the admitted worker before sealing")
+        if require_terminal_evidence:
+            worker = unverified.get(task)
+            observed_id = record.get("worker_id")
+            if record["state"] == "ended" and isinstance(observed_id, str) and observed_id:
+                if worker is not None and worker["worker_id"] != observed_id:
+                    raise ValueError("E_NATIVE_LAUNCH_INVALID: terminal worker identity changed")
+                unverified.pop(task, None)
+            elif record["state"] != "failed" or observed_id is not None:
+                raise ValueError("E_NATIVE_LAUNCH_INVALID: host termination evidence changed")
+    if unverified:
+        raise ValueError("E_NATIVE_WORKER_TERMINATION_UNVERIFIED: require terminal evidence before replacement")
 
 
 def bind_data_plane_launch(work_dir: Path, relay_path: Path) -> None:

@@ -2305,7 +2305,7 @@ class WorkspaceTests(unittest.TestCase):
                     config=config, sdk_activation=activation,
                 )
             prepared = prepare_data_plane_task(
-                work, work / "repair-task", worker_role=role,
+                work, work / ".game-l10n" / "data-plane" / role, worker_role=role,
                 config=config, sdk_activation=activation,
             )
             relay = json.loads((work / prepared["relay_path"]).read_text(encoding="utf-8"))
