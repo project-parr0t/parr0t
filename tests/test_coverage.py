@@ -424,6 +424,32 @@ class CoverageTests(unittest.TestCase):
 
         self.assertEqual(loaded["primary_fingerprint"], saved["primary_fingerprint"])
 
+    def test_legacy_attestation_rebinds_unchanged_pair_without_advancing_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary, independent = root / "primary.json", root / "independent.json"
+            rows = [{"id": "synthetic-1", "source": "SYNTHETIC LABEL"}]
+            write_inventory(primary, "primary", rows)
+            write_inventory(independent, "independent", rows)
+            saved = save_inventory_attestation(root, primary, independent)
+            state_path = root / ".game-l10n/inventory-attestation.json"
+            legacy = dict(saved)
+            legacy.pop("display_scope_validation_version")
+            state_path.write_text(json.dumps(legacy), encoding="utf-8")
+            identity_path = root / ".game-l10n/inventory-primary-identity.json"
+            identity = identity_path.read_bytes()
+
+            self.assertEqual(require_inventory_attestation(root, primary), saved)
+            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), saved)
+            self.assertEqual(identity_path.read_bytes(), identity)
+
+            write_inventory(independent, "independent", [
+                {"id": "synthetic-1", "source": "CHANGED SYNTHETIC LABEL"},
+            ])
+            with self.assertRaisesRegex(ConfigurationError, "Independent inventory changed"):
+                require_inventory_attestation(root, primary)
+            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), saved)
+
     def test_retry_approval_requires_current_generation_and_approved_status(self) -> None:
         segment = Segment("synthetic-retry", "SOURCE")
         for stage in ("review-grace-retry", "review-refusal-retry"):

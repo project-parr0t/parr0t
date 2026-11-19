@@ -10,7 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from . import omp_session
+from . import omp_bootstrap, omp_session
 
 from .content_source_policy import create_content_source_grant
 from .control_plane import (
@@ -49,6 +49,7 @@ from .coverage import (
     save_inventory_attestation,
     verify_inventory_pair,
 )
+from .inventory_scope import ActiveControlStorageError
 from .context_analysis import CONTEXT_STATE_SCHEMA, ContextAnalyzer, analyze_with_cache
 from .corrections import apply_user_corrections
 from .correction_ui import CorrectionWorkspace, serve_correction_ui
@@ -192,6 +193,15 @@ def _core_runtime() -> dict[str, Any]:
         "cli_argv": [
             sys.executable, "-I", "-B",
             str(module.with_name("templates") / "native-python.py"),
+        ],
+    }
+
+
+def _analysis_contracts() -> dict[str, Any]:
+    return {
+        "contract_base": str(Path(__file__).resolve().parents[2]),
+        "required_contracts": [
+            "docs/control-plane-contract.md", "skills/framework-analysis/SKILL.md",
         ],
     }
 
@@ -1655,6 +1665,7 @@ def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
             json.loads(_path_in_workspace(work_dir, args.offline_processing, must_exist=True).read_text(encoding="utf-8"))
             if args.offline_processing else None
         ),
+        discard_unverified_receipt=args.discard_unverified_receipt,
     )
     if (
         args.worker_role == "image_ui_inventory"
@@ -1947,6 +1958,8 @@ def cmd_framework_mode(args: argparse.Namespace) -> int:
         approval=approval,
     )
     result["core_runtime"] = _core_runtime()
+    if args.mode == "analysis":
+        result.update(_analysis_contracts())
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -2954,7 +2967,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             "next_actions": [
                 {"analysis": "analyze_framework_logs", "pause": "framework_paused", "shutdown": "framework_shutdown"}[session["mode"]]
             ],
-            "required_contracts": ["docs/control-plane-contract.md"],
+            **(_analysis_contracts() if session["mode"] == "analysis"
+               else {"required_contracts": ["docs/control-plane-contract.md"]}),
         }, ensure_ascii=False))
         return 0
     config = load_config(work_dir)
@@ -3166,6 +3180,17 @@ def cmd_status(args: argparse.Namespace) -> int:
                         inventory_state = require_inventory_attestation(
                             work_dir, Path(inventory_state["primary_path"]), config=config,
                         )
+                    except ActiveControlStorageError:
+                        inventory_verified = False
+                        inventory_gate.update(
+                            status="incomplete",
+                            static_complete=False,
+                            assurance_complete=False,
+                            independent_verified=False,
+                            continuation_required=True,
+                        )
+                        inventory_gate["issue_codes"].append(ActiveControlStorageError.code)
+                        action = "resolve_source_inventory_gaps"
                     except (GameL10nError, OSError, ValueError, json.JSONDecodeError):
                         inventory_verified = False
                         state_issue_codes.append("INVENTORY_ATTESTATION_STALE")
@@ -3920,6 +3945,10 @@ def build_parser() -> argparse.ArgumentParser:
     omp_entry = sub.add_parser("omp-session", help="Start the official request-bound OMP controller")
     omp_session.add_session_arguments(omp_entry)
     omp_entry.set_defaults(func=cmd_omp_session)
+
+    bootstrap = sub.add_parser("omp-bootstrap", help="Check or, with consent, install the first-party OMP entry tools")
+    omp_bootstrap.add_bootstrap_arguments(bootstrap)
+    bootstrap.set_defaults(func=omp_bootstrap.run_bootstrap)
 
     init = sub.add_parser("init-workspace", help="Create a private workspace outside the SDK repository")
     init.add_argument("workspace")
@@ -4708,6 +4737,10 @@ def build_parser() -> argparse.ArgumentParser:
     data_plane_prepare.add_argument(
         "--output",
         help="Private task directory; defaults under .game-l10n/data-plane",
+    )
+    data_plane_prepare.add_argument(
+        "--discard-unverified-receipt", metavar="TASK_ID",
+        help="Retire the exact incomplete reconciler receipt after Core verifies the stale relay was never admitted",
     )
     data_plane_prepare.add_argument(
         "--content-source-grant",

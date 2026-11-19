@@ -145,7 +145,11 @@ class FrameworkSessionTests(unittest.TestCase):
         self.assertEqual(control_plane.control_plane_state(self.workspace)["incident_id"], incident["incident_id"])
         code, output, error = self.call("status")
         self.assertEqual((code, error), (0, ""))
-        self.assertEqual(json.loads(output)["next_actions"], ["analyze_framework_logs"])
+        status = json.loads(output)
+        self.assertEqual(status["next_actions"], ["analyze_framework_logs"])
+        skill = "skills/framework-analysis/SKILL.md"
+        self.assertIn(skill, status["required_contracts"])
+        self.assertTrue((Path(status["contract_base"]) / skill).is_file())
         self.assertNotIn("SYNTHETIC_DIAGNOSTIC_EVENT", output)
 
     def test_diagnostics_work_despite_corrupt_control_state_and_configuration(self) -> None:
