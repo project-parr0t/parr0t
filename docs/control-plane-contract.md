@@ -268,6 +268,8 @@ Context claim and commit commands revalidate the exact task against its core rel
 
 The top-level agent may observe only core CLI metadata, a validated control-envelope path, a sealed relay-receipt path, and the categorical lifecycle of its direct relay. It may perform one bounded wait at a time on that relay, continuing bounded waits while it remains active and returning to the core state machine when new terminal evidence arrives. A wait interval is not a lifetime limit. It must not inspect `.codex/sessions`, chat transcripts, agent trees, nested-worker status or output, semantic-worker logs, terminal previews of semantic work, or another session to reconstruct progress. It must not query a nested worker even when the worker is visible to the host.
 
+A `parr0t_session` result reports controller startup or registration metadata, not session history. A readiness receipt does not trigger rotation.
+
 Usage accounting comes only from the core-owned usage ledger or a sealed relay receipt populated at the event boundary. Missing telemetry is unknown, not permission to scrape host/session logs. The relay may observe only bound task lifecycle categories needed to seal an ended task and must never forward child output. Any forbidden detail that reaches root is a control-plane leak: do not interpret it; record the fixed incident. Default recovery is rotation; only the explicit incident-scoped acceptance below provides a same-session alternative.
 
 Every host lifecycle observation must be a finite, interruptible per-call wait.
