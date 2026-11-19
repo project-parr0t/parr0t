@@ -30,7 +30,7 @@ async function publicHostModules(root) {
     assert.equal(typeof target, "string", `Selected host has no import export for ${subpath}`);
     return import(pathToFileURL(path.resolve(root, replacement === undefined ? target : target.replace("*", replacement))).href);
   }
-  const [extensions, loader, events, sessions, settings, registry, lifecycle, bus, write, bash, read] = await Promise.all([
+  const [extensions, loader, events, sessions, settings, registry, lifecycle, bus, write, bash, read, sdk, models, auth, runtimeInit] = await Promise.all([
     publicExport("./extensibility/extensions"),
     publicExport("./extensibility/extensions/loader"),
     publicExport("./utils/event-bus"),
@@ -42,22 +42,193 @@ async function publicHostModules(root) {
     publicExport("./tools/write"),
     publicExport("./tools/bash"),
     publicExport("./tools/read"),
+    publicExport("./sdk"),
+    publicExport("./config/model-registry"),
+    publicExport("./session/auth-storage"),
+    publicExport("./modes/runtime-init"),
   ]);
-  return { ...extensions, ...loader, ...events, ...sessions, ...settings, ...registry, ...lifecycle, ...bus, ...write, ...bash, ...read };
+  return { ...extensions, ...loader, ...events, ...sessions, ...settings, ...registry, ...lifecycle, ...bus, ...write, ...bash, ...read, ...sdk, ...models, ...auth, ...runtimeInit };
+}
+
+// Cold SDK construction owns the canonical registry, mounted-device state and
+// dynamic activation queue; the wrapper fixture below cannot establish those.
+async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
+  const { createAgentSession, initializeExtensions, ModelRegistry, AuthStorage, Settings, SessionManager, AgentRegistry, ExtensionToolWrapper } = host;
+  const agentDir = process.env.PI_CODING_AGENT_DIR;
+  assert.ok(agentDir && path.isAbsolute(agentDir), "The SDK proof requires an isolated agent directory");
+  const extensionDirectory = path.join(agentDir, "extensions");
+  mkdirSync(extensionDirectory, { recursive: true });
+  writeFileSync(path.join(extensionDirectory, "parr0t-native-process.ts"),
+    `export { default } from ${JSON.stringify(pathToFileURL(bootstrapPath).href)};\n`);
+  const originalControl = process.env.PARR0T_OMP_CONTROL_DIRECTORY;
+  const originalWorkspace = process.env.PARR0T_OMP_PROMPT_WORKSPACE;
+  delete process.env.PARR0T_OMP_CONTROL_DIRECTORY;
+  const networkAttempts = [];
+  const denyNetwork = async () => {
+    const error = new Error("The model-free selected-host proof forbids network access");
+    networkAttempts.push(error.stack);
+    throw error;
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = denyNetwork;
+  try {
+    for (const explicitHelper of [false, true]) {
+      const cwd = path.join(workspace, explicitHelper ? "sdk-helper" : "sdk-ambient");
+      mkdirSync(cwd);
+      const settings = await Settings.loadIsolated({
+        cwd, agentDir, inMemory: true,
+        overrides: {
+          "tools.approvalMode": "yolo", "tools.xdev": true, "lsp.enabled": false,
+          "secrets.enabled": false, "enabledModels": ["synthetic-no-provider/no-model"],
+          "disabledProviders": ["ollama", "llama.cpp", "lm-studio", "apple"],
+        },
+      });
+      const auth = await AuthStorage.create(":memory:", { usageFetch: denyNetwork });
+      const modelRegistry = new ModelRegistry(auth, path.join(agentDir, "models.yml"), {
+        settings, cacheDbPath: path.join(cwd, "models.db"), fetch: denyNetwork,
+      });
+      assert.deepEqual(modelRegistry.getDiscoverableProviders(), [], "No dynamic provider may enter cold startup");
+      const manager = SessionManager.inMemory(cwd);
+      let session;
+      try {
+        const created = await createAgentSession({
+          cwd, agentDir, settings, sessionManager: manager, modelRegistry,
+          agentRegistry: new AgentRegistry(), agentId: explicitHelper ? "SdkHelper" : "SdkAmbient",
+          additionalExtensionPaths: explicitHelper ? [helperPath] : [],
+          noContextFiles: true, contextFiles: [], skills: [], rules: [], promptTemplates: [], slashCommands: [],
+          preloadedCustomToolPaths: [], enableMCP: false, enableLsp: false, enableIrc: false,
+          skipPythonPreflight: true, cacheWarming: false, autoTitle: false,
+          deferSkillDescriptionCompression: true, bindProcessState: false,
+          hasUI: true, interactivePrompts: false, disableModelFallback: true,
+          assertDispatchModel() { assert.fail("A model-free consumer must never dispatch a model"); },
+        });
+        session = created.session;
+        assert.deepEqual(created.extensionsResult.errors, []);
+        assert.equal(session.model, undefined, "The SDK must stay model-less, not select a credentialed fallback");
+        assert.ok(created.extensionsResult.extensions.some(extension =>
+          path.basename(extension.path) === "parr0t-native-process.ts"), "Discover the isolated global-style bootstrap");
+        if (explicitHelper) created.extensionsResult.runtime.flagValues.set("parr0t-workspace", cwd);
+        await initializeExtensions(session, {
+          reportSendError(_action, error) { throw error; },
+          reportRuntimeError(error) { throw new Error(`Unexpected SDK extension error: ${error.error}`); },
+        });
+        const context = { autoApprove: true, cwd, settings, sessionManager: manager };
+        let sequence = 0;
+        const execute = (name, input, signal) => {
+          const tool = session.getToolByName(name);
+          assert.ok(tool, `The cold SDK must expose a real ${name} executor`);
+          const callable = tool instanceof ExtensionToolWrapper
+            ? tool : new ExtensionToolWrapper(tool, session.extensionRunner);
+          return callable.execute(`cold-${++sequence}`, input, signal, undefined, context);
+        };
+        assert.ok(session.getMountedXdevToolNames().length > 0, "The cold host must actually enable deferred-device transport");
+        const device = (name, input) => execute("write", { path: `xd://${name}`, content: JSON.stringify(input) });
+        const text = result => result.content.filter(part => part.type === "text").map(part => part.text).join("\n");
+        for (const name of ["parr0t_process", "parr0t_framework_mode", "parr0t_session"]) {
+          assert.ok(session.getActiveToolNames().includes(name), `${name} must be directly essential after activation`);
+          assert.equal(session.getMountedXdevToolNames().includes(name), false);
+          assert.equal(session.getAllToolNames().filter(candidate => candidate === name).length, 1);
+          const docs = await execute("read", { path: `xd://${name}` });
+          assert.notEqual(docs.isError, true, text(docs));
+          assert.match(text(docs), new RegExp(name));
+        }
+        const native = await device("parr0t_process", {
+          argv: [process.env.PARR0T_OMP_PYTHON ?? "python", "-I", "-B", "-c", "print('cold native transport')"],
+        });
+        assert.notEqual(native.isError, true, text(native));
+        assert.equal(native.details.xdev.tool, "parr0t_process");
+        assert.equal(native.details.xdev.inner.stdout.trim(), "cold native transport");
+        // No game-l10n.json exists: the real native CLI must reject before any
+        // controller/model launcher can run. This is an outcome, not an echo.
+        const launch = await device("parr0t_session", {
+          workspace: cwd, model: "synthetic-host/selected-model", user_requested: true,
+        });
+        assert.equal(launch.isError, true);
+        assert.equal(launch.details.xdev.inner.exitCode, 2);
+        assert.equal(JSON.parse(launch.details.xdev.inner.stderr).issue_code, "E_OMP_CONTROL_WORKSPACE_REQUIRED");
+        const noModel = await device("parr0t_session", { workspace: cwd, user_requested: true });
+        assert.equal(noModel.isError, true);
+        assert.match(text(noModel), /model.*required|model.*unavailable/i);
+        writeFileSync(path.join(cwd, "game-l10n.json"), "{}");
+        const bindRuntime = async () => {
+          const policy = await execute("read", { path: "cfg://modelRoles" });
+          assert.notEqual(policy.isError, true, text(policy));
+          const bound = await device("parr0t_process", {
+            argv: [process.env.PARR0T_OMP_PYTHON ?? "python", "-I", "-B",
+              fileURLToPath(new URL("../src/game_l10n/templates/native-python.py", import.meta.url)),
+              "native-runtime", "--workspace", cwd, "--host", "omp", "--omp-isolation", "prompt"],
+          });
+          assert.notEqual(bound.isError, true, text(bound));
+          return JSON.parse(bound.details.xdev.inner.stdout);
+        };
+        const originalPolicy = await bindRuntime();
+        assert.match(originalPolicy.host_policy_fingerprint, /^[a-f0-9]{64}$/);
+        settings.setModelRole("synthetic-selected", "synthetic-host/selected-model");
+        const repairedPolicy = await bindRuntime();
+        assert.notEqual(repairedPolicy.host_policy_fingerprint, originalPolicy.host_policy_fingerprint);
+        assert.deepEqual(repairedPolicy.models, originalPolicy.models);
+        const mode = { workspace: cwd, mode: "pause", user_requested: true };
+        const changed = await device("parr0t_framework_mode", mode);
+        assert.notEqual(changed.isError, true, text(changed));
+        assert.equal(changed.details.xdev.tool, "parr0t_framework_mode");
+        assert.equal(changed.details.xdev.inner.exitCode, 0);
+        const statePath = path.join(cwd, ".game-l10n/framework-session.json");
+        assert.equal(JSON.parse(readFileSync(statePath, "utf8")).mode, "pause");
+        assert.equal((await execute("parr0t_framework_mode", { ...mode, mode: "localization" })).isError, false);
+        assert.equal(JSON.parse(readFileSync(statePath, "utf8")).mode, "localization");
+        const unrequested = () => device("parr0t_framework_mode", { ...mode, user_requested: false });
+        if (explicitHelper) await assert.rejects(unrequested, /PARR0T_FRAMEWORK_APPROVAL/);
+        else assert.equal((await unrequested()).isError, true);
+        assert.equal(JSON.parse(readFileSync(statePath, "utf8")).mode, "localization");
+        const revision = readFileSync(statePath, "utf8");
+        const cancelled = new AbortController();
+        cancelled.abort();
+        await assert.rejects(execute("parr0t_framework_mode", mode, cancelled.signal), /cancel|abort/i);
+        assert.equal(readFileSync(statePath, "utf8"), revision);
+        if (explicitHelper) {
+          await assert.rejects(() => device("parr0t_framework_mode", { ...mode, workspace }),
+            /workspace does not match bound helper/);
+          assert.equal(readFileSync(statePath, "utf8"), revision);
+        }
+        const enabled = session.getEnabledToolNames();
+        await session.setActiveToolsByName(enabled.filter(name => name !== "parr0t_framework_mode"));
+        const disabled = await device("parr0t_framework_mode", mode);
+        assert.equal(disabled.isError, true);
+        assert.match(text(disabled), /No such tool/);
+        assert.equal(readFileSync(statePath, "utf8"), revision);
+        const missing = await device("parr0t_missing_synthetic_tool", {});
+        assert.equal(missing.isError, true);
+        assert.match(text(missing), /No such tool/);
+        await session.setActiveToolsByName(enabled);
+      } finally {
+        await session?.dispose();
+        await manager.close();
+        auth.close();
+      }
+    }
+    assert.deepEqual(networkAttempts, [], "Cold startup must not even attempt metadata/model network access");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalControl !== undefined) process.env.PARR0T_OMP_CONTROL_DIRECTORY = originalControl;
+    if (originalWorkspace === undefined) delete process.env.PARR0T_OMP_PROMPT_WORKSPACE;
+    else process.env.PARR0T_OMP_PROMPT_WORKSPACE = originalWorkspace;
+  }
 }
 
 async function runIntegration() {
   const root = process.env.PARR0T_OMP_HOST_PACKAGE;
   assert.ok(root, "PARR0T_OMP_HOST_PACKAGE must select an existing host package root");
+  const host = await publicHostModules(root);
   const {
     ExtensionRunner, ExtensionRuntime, ExtensionToolWrapper, loadExtensions, loadExtensionFromFactory,
     wrapRegisteredTool, EventBus, SessionManager, Settings, AgentRegistry,
     AgentLifecycleManager, IrcBus, WriteTool, BashTool, ReadTool, MAIN_AGENT_ID,
-  } = await publicHostModules(root);
+  } = host;
   const workspace = realpathSync(mkdtempSync(path.join(os.tmpdir(), "parr0t-real-host-synthetic-")));
   const assetRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), "parr0t-real-host-assets-")));
   const helperPath = fileURLToPath(new URL("../src/game_l10n/templates/omp-prompt-isolation.mjs", import.meta.url));
   const bootstrapPath = fileURLToPath(new URL("../src/game_l10n/templates/omp-native-process.mjs", import.meta.url));
+  await proveColdStart(host, workspace, bootstrapPath, helperPath);
   const controlDirectory = path.join(workspace, ".game-l10n", "omp-control", "b".repeat(32));
   const originalControl = process.env.PARR0T_OMP_CONTROL_DIRECTORY;
   const originalWorkspace = process.env.PARR0T_OMP_PROMPT_WORKSPACE;
@@ -167,6 +338,7 @@ async function runIntegration() {
       mode: input => registered("parr0t_framework_mode").execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
       task: input => registered("task").execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
       process: input => registered("parr0t_process").execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
+      start: input => registered("parr0t_session").execute(`synthetic-${++sequence}`, input, undefined, undefined, context),
       processSchema: () => registered("parr0t_process").parameters,
     };
     sessions.push(session);
@@ -199,11 +371,24 @@ async function runIntegration() {
       });
       assert.equal(result.isError, false);
       assert.equal(JSON.parse(result.details.stdout), literal);
-      assert.equal(session.activeTools.has("parr0t_framework_mode"), false);
+      assert.equal(session.activeTools.has("parr0t_framework_mode"), true);
+      assert.equal(session.activeTools.has("parr0t_session"), true);
       await session.runner.emit({ type: "session_start" });
       assert.equal(session.runner.getAllRegisteredTools().filter(tool => tool.definition.name === "parr0t_process").length, 1);
     }
     assert.equal(existsSync(path.join(controlDirectory, "ready.json")), false);
+    // Ambient availability is not worker attestation and must not install the
+    // official helper's messaging policy in unrelated projects.
+    assert.notEqual((await bootstrapChild.write({ path: `agent://${bootstrapRoot.id}`, content: "ordinary child control" })).isError, true);
+    deliveries.length = 0;
+    observations.length = 0;
+    const lifecycleState = path.join(workspace, ".game-l10n/framework-session.json");
+    for (const session of [bootstrapRoot, bootstrapChild]) {
+      assert.equal(session.runner.getAllRegisteredTools().filter(tool => tool.definition.name === "parr0t_framework_mode").length, 1);
+    }
+    await assert.rejects(bootstrapChild.mode({ workspace, mode: "pause", user_requested: true }), /root.*identity/i);
+    await assert.rejects(bootstrapChild.start({ workspace, model: "synthetic-host/selected-model", user_requested: true }), /root.*identity/i);
+    assert.equal(existsSync(lifecycleState), false);
     const parent = await makeSession(MAIN_AGENT_ID, "main", 0);
     const relay = await makeSession("SyntheticRelay", "sub", 1, parent.id);
     const peer = await makeSession("SyntheticPeer", "sub", 1, parent.id);
@@ -212,6 +397,10 @@ async function runIntegration() {
     await assert.rejects(parent.runner.emit({ type: "session_start" }), /parr0t_process is not active/);
     assert.equal(existsSync(readinessPath), false);
     parent.activeTools.set("parr0t_process", parent.registeredTools.get("parr0t_process"));
+    parent.activeTools.delete("parr0t_framework_mode");
+    await assert.rejects(parent.runner.emit({ type: "session_start" }), /parr0t_framework_mode is not active/);
+    assert.equal(existsSync(readinessPath), false);
+    parent.activeTools.set("parr0t_framework_mode", parent.registeredTools.get("parr0t_framework_mode"));
     await parent.runner.emit({ type: "session_start" });
     assert.equal(parent.runner.getAllRegisteredTools().filter(tool => tool.definition.name === "parr0t_process").length, 1);
     const receiptText = readFileSync(readinessPath, "utf8");
@@ -221,6 +410,7 @@ async function runIntegration() {
       session_id: parent.manager.getSessionId(), process_id: process.pid,
       helper_sha256: createHash("sha256").update(readFileSync(helperPath)).digest("hex"),
       process_tool: "parr0t_process",
+      framework_tool: "parr0t_framework_mode",
     });
     assert.notEqual(receipt.session_id, parent.id);
     assert.notEqual(receipt.session_id, relay.manager.getSessionId());
@@ -240,6 +430,12 @@ async function runIntegration() {
     // Fresh children are already restricted, before either lifecycle event.
     await deny(relay, parent.id);
     await deny(relay, peer.id);
+    for (const child of [relay, peer]) {
+      await assert.rejects(child.mode({ mode: "pause", user_requested: true }), /PARR0T_(?:FRAMEWORK_APPROVAL|OMP_PROMPT_ISOLATION)/);
+      await assert.rejects(child.start({ workspace, model: "synthetic-host/selected-model", user_requested: true }), /PARR0T_(?:FRAMEWORK_APPROVAL|OMP_PROMPT_ISOLATION)/);
+      await assert.rejects(child.write({ path: "xd://parr0t_framework_mode", content: JSON.stringify({ mode: "pause", user_requested: true }) }),
+        /PARR0T_(?:FRAMEWORK_APPROVAL|OMP_PROMPT_ISOLATION)/);
+    }
     await relay.bash({ command: "printf synthetic > agent://Main" }).then(
       () => assert.fail("Embedded bash must be denied"),
       error => assert.match(error.message, /PARR0T_OMP_PROMPT_ISOLATION/),
@@ -398,6 +594,9 @@ print(json.dumps(native_launch_summary(w,w/sys.argv[3])))
     }));
     const offlineWorker = await makeSession("OfflineWorker", "sub", 2, guardedRoot.id, guardPath);
     await offlineWorker.runner.emit({ type: "session_start" });
+    await assert.rejects(offlineWorker.mode({ mode: "pause", user_requested: true }), /PARR0T_(?:FRAMEWORK_APPROVAL|OMP_ISOLATION)/);
+    await assert.rejects(offlineWorker.write({ path: "xd://parr0t_framework_mode", content: JSON.stringify({ mode: "pause", user_requested: true }) }),
+      /PARR0T_(?:FRAMEWORK_APPROVAL|OMP_ISOLATION)/);
     await offlineWorker.runner.emitBeforeAgentStart(`PARR0T_OMP_RELAY=${offlineRelative}`, undefined, []);
     await assert.rejects(offlineWorker.write({ path: `agent://${guardedRoot.id}`, content: "denied" }), /PARR0T_OMP_ISOLATION/);
     await assert.rejects(offlineWorker.read({ path: unbound }), /PARR0T_OMP_ISOLATION/);
@@ -444,10 +643,22 @@ if (process.argv.includes("--parr0t-real-host-worker")) {
 } else {
   const { test } = await import("bun:test");
   const realHostTest = process.env.PARR0T_OMP_HOST_PACKAGE ? test : test.skip;
-  realHostTest("real selected host loads and proves the main helper before isolating descendants and executing native argv", async () => {
-    // Host globals and extension registrations never enter the suite's process.
+  realHostTest("real selected host cold-starts ambient tools and enforces native lifecycle and descendant isolation", async () => {
+    // All host discovery roots, state and credentials belong to this temporary
+    // subprocess. Retain only the selected host/Python and OS executable paths.
+    const sandbox = realpathSync(mkdtempSync(path.join(os.tmpdir(), "parr0t-host-home-")));
+    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) =>
+      ["PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "PARR0T_OMP_HOST_PACKAGE", "PARR0T_OMP_PYTHON"].includes(name.toUpperCase())));
+    for (const name of ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "CLAUDE_CONFIG_DIR"]) {
+      env[name] = sandbox;
+    }
+    env.PI_CONFIG_DIR = ".omp";
+    // Preserve the host's documented offline test-mode behavior in this isolated
+    // subprocess, including its otherwise automatic Codex-version refresh.
+    env.NODE_ENV = "test";
+    env.PI_CODING_AGENT_DIR = path.join(sandbox, ".omp", "agent");
     const worker = Bun.spawn([process.execPath, fileURLToPath(import.meta.url), "--parr0t-real-host-worker"], {
-      env: process.env, stdout: "pipe", stderr: "pipe",
+      cwd: sandbox, env, stdout: "pipe", stderr: "pipe",
     });
     try {
       const [code, stdout, stderr] = await Promise.all([
@@ -456,6 +667,7 @@ if (process.argv.includes("--parr0t-real-host-worker")) {
       assert.equal(code, 0, `Selected-host integration failed:\n${stderr}\n${stdout}`);
     } finally {
       if (worker.exitCode === null) worker.kill();
+      rmSync(sandbox, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 120_000);
 }

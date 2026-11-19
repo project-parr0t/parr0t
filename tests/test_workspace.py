@@ -2138,7 +2138,7 @@ class WorkspaceTests(unittest.TestCase):
                 target_engine="fixture-engine",
                 target_version="1.0",
             )
-            activate_workspace_adapter(work)
+            activate_workspace_adapter(work, runtime_root=work / "tools")
             inputs = work / "inputs"
             (inputs / "primary-inventory.json").write_text("{}", encoding="utf-8")
             (inputs / "independent-inventory.json").write_text("{}", encoding="utf-8")
@@ -2497,7 +2497,7 @@ class WorkspaceTests(unittest.TestCase):
                 target_engine="fixture-engine",
                 target_version="1.0",
             )
-            activate_workspace_adapter(work)
+            activate_workspace_adapter(work, runtime_root=work / "tools")
             write_verified_inventory(work)
             state_root = work / ".game-l10n"
             inventory_path = state_root / "inventory-attestation.json"
