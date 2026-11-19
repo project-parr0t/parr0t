@@ -234,9 +234,14 @@ for (const [label, factory] of [["guarded", guard], ["prompt", prompt]]) {
       expect(root.confirmations).toHaveLength(0);
     });
 
-    test("clean lifecycle resumes in-session but successful root history access requires canonical fresh recovery", async () => {
+    test("current-controller receipts leave the root ready, but successful history access requires fresh recovery", async () => {
       const { workspace, root } = await fixture(factory);
       const statePath = path.join(workspace, ".game-l10n/control-plane-state.json");
+      await root.emit("tool_result", {
+        toolName: "parr0t_session", input: { user_requested: true, mode: "auto" }, isError: false,
+        details: { status: factory === guard ? "guard_registered" : "helper_registered", existing: true },
+      });
+      expect(JSON.parse(readFileSync(statePath, "utf8")).status).toBe("ready");
       for (const mode of ["pause", "analysis", "shutdown", "localization"]) {
         expect((await root.approve({ mode })).isError).toBe(false);
       }

@@ -170,6 +170,8 @@ function privateFrameworkTarget(target, workspace, cwd) {
 export function hasFrameworkExposure(event, ctx, workspace) {
   if (ctx.agent?.kind !== "main" || event.isError || !event.input) return false;
   const tool = name(event.toolName);
+  // This root tool reports controller registration, not session history.
+  if (tool === SESSION_TOOL) return false;
   if (/(?:history|sessions?|messages?|irc)/.test(tool)) return true;
   const input = event.input;
   if (tool === "task") return (input.tasks ?? [input]).some(item =>
