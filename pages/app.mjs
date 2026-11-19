@@ -1,4 +1,4 @@
-import { buildPrompt } from "./prompt.mjs";
+import { buildPrompt, buildOmpCommand } from "./prompt.mjs";
 import { DEFAULT_MODEL_GROUPS, proxyModelGroups } from "./model-catalog.mjs";
 
 const form = document.querySelector("#composer");
@@ -53,6 +53,13 @@ function message(text, error = false) {
 }
 
 function update() {
+  const omp = form.elements.host.value === "omp";
+  document.querySelector("#core-path-field").hidden = !omp;
+  document.querySelector("#omp-help").hidden = !omp;
+  form.elements.corePath.disabled = !omp;
+  const outputTitle = omp ? "PowerShell 실행 명령" : "프롬프트";
+  document.querySelector("#output-title").textContent = outputTitle;
+  document.querySelector("#output-section").setAttribute("aria-label", `생성된 ${outputTitle}`);
   document.querySelector("#fallback-model-field").hidden = picker.value !== "__custom__";
   const migration = form.elements.operation.value === "migrate";
   for (const label of form.querySelectorAll("[data-localization]")) {
@@ -70,7 +77,7 @@ function update() {
     values.images = form.elements.images.checked;
     values.analyzeContext = form.elements.analyzeContext.checked;
     values.fallbackViaOpenCodex = activeProxyModels && picker.value === values.fallbackModel && Boolean(values.fallbackModel);
-    output.value = buildPrompt(values);
+    output.value = omp ? buildOmpCommand(values) : buildPrompt(values);
     copy.disabled = download.disabled = false;
     message("");
   } catch (error) {
@@ -89,24 +96,32 @@ picker.addEventListener("change", () => {
 });
 proxyToggle.addEventListener("change", refreshCatalog);
 copy.addEventListener("click", async () => {
+  const text = output.value;
+  const omp = form.elements.host.value === "omp";
+  const copied = () => message(omp ? "PowerShell 실행 명령을 복사했습니다. PowerShell에 붙여 넣어 실행하세요." : "복사했습니다.");
   try {
-    await navigator.clipboard.writeText(output.value);
-    message("복사했습니다.");
+    await navigator.clipboard.writeText(text);
+    if (output.value === text) copied();
   } catch {
+    if (output.value !== text) return;
     output.focus();
     output.select();
-    message("자동 복사가 차단되었습니다. 선택된 텍스트를 직접 복사하세요.", true);
+    let success = false;
+    try { success = document.execCommand("copy"); } catch { /* Retain manual selection when both browser transports deny copying. */ }
+    if (success) copied();
+    else message(omp ? "자동 복사가 차단되었습니다. 선택된 PowerShell 실행 명령을 직접 복사하세요." : "자동 복사가 차단되었습니다. 선택된 텍스트를 직접 복사하세요.", true);
   }
 });
 download.addEventListener("click", () => {
-  const url = URL.createObjectURL(new Blob([output.value], { type: "text/plain;charset=utf-8" }));
+  const omp = form.elements.host.value === "omp";
+  const url = URL.createObjectURL(new Blob([...(omp ? ["\uFEFF"] : []), output.value], { type: "text/plain;charset=utf-8" }));
   const link = document.createElement("a");
   link.href = url;
-  link.download = "parr0t-prompt.txt";
+  link.download = omp ? "parr0t-start.ps1" : "parr0t-prompt.txt";
   document.body.append(link);
   link.click();
   link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-  message("프롬프트 파일 저장을 요청했습니다.");
+  message(omp ? "PowerShell 실행 명령 파일(.ps1, UTF-8) 저장을 요청했습니다." : "프롬프트 파일 저장을 요청했습니다.");
 });
 refreshCatalog();

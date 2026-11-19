@@ -10,6 +10,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from . import omp_session
+
 from .content_source_policy import create_content_source_grant
 from .control_plane import (
     LEAK_INCIDENT_CODES,
@@ -1715,11 +1717,13 @@ def cmd_native_runtime(args: argparse.Namespace) -> int:
             omp_isolation=getattr(args, "omp_isolation", None),
             role_models=role_models,
             user_requested_models=getattr(args, "user_requested_models", False),
+            host_policy_fingerprint=getattr(args, "host_policy_fingerprint", None),
         )
     else:
         if (args.model or getattr(args, "role_model", None)
                 or getattr(args, "user_requested_models", False)
-                or getattr(args, "transport", None) or getattr(args, "omp_isolation", None)):
+                or getattr(args, "transport", None) or getattr(args, "omp_isolation", None)
+                or getattr(args, "host_policy_fingerprint", None)):
             raise ValueError("E_NATIVE_RUNTIME_INVALID: model overrides require --host")
         result = native_runtime(work_dir, required=True)
     print(json.dumps(result, ensure_ascii=False))
@@ -3903,11 +3907,19 @@ def cmd_review_policy(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_omp_session(args: argparse.Namespace) -> int:
+    return omp_session.run_session(args)
+
+
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="game-l10n", description="Parr0t game localization agent framework")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    omp_entry = sub.add_parser("omp-session", help="Start the official request-bound OMP controller")
+    omp_session.add_session_arguments(omp_entry)
+    omp_entry.set_defaults(func=cmd_omp_session)
 
     init = sub.add_parser("init-workspace", help="Create a private workspace outside the SDK repository")
     init.add_argument("workspace")
@@ -4346,6 +4358,8 @@ def build_parser() -> argparse.ArgumentParser:
     native_host.add_argument("--role-model", action="append", help="Exact role=model-id override; repeatable")
     native_host.add_argument("--user-requested-models", action="store_true",
                              help="Record role overrides explicitly selected in the initial user prompt")
+    native_host.add_argument("--host-policy-fingerprint",
+                             help="Bind changed, revalidated OMP operator policy identity; never grants a model")
     native_host.set_defaults(func=cmd_native_runtime)
 
     register_host = sub.add_parser("configure-native-host", help="Register an existing native worker API service")
@@ -5220,6 +5234,7 @@ def main(argv: list[str] | None = None) -> int:
             cmd_framework_mode,
             cmd_diagnostic_log,
             cmd_user_request,
+            cmd_omp_session,
             cmd_policy,
             cmd_native_runtime,
             cmd_configure_native_host,

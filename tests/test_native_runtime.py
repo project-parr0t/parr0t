@@ -360,7 +360,10 @@ class NativeRuntimeTests(unittest.TestCase):
         snapshot = {
             "schema": MODEL_SNAPSHOT_SCHEMA, "host": "omp",
             "session_id": "fixture-session", "process_id": 123,
-            "models": [{"provider": "fixture", "id": "org/model", "selector": "fixture/org/model"}],
+            "models": [
+                {"provider": "fixture", "id": "org/model", "selector": "fixture/org/model"},
+                {"provider": "org", "id": "unrelated", "selector": "org/unrelated"},
+            ],
         }
         path.write_text(json.dumps(snapshot), encoding="utf-8")
         for requested, expected in (
@@ -962,6 +965,41 @@ class NativeRuntimeTests(unittest.TestCase):
         record_native_launch(self.root, relay, event="worker-started", task="worker-0",
                              worker_id="new-probe", model="fixture/approved-new-model")
         self.assertEqual(native_launch_summary(self.root, relay)["started_workers"], 1)
+
+    def test_changed_host_policy_reopens_only_ended_unstarted_admission_with_same_model(self) -> None:
+        config, output, relay = self.prepare_probe()
+        original_task = (output / "task.json").read_bytes()
+        original = json.loads(relay.read_text())
+        original_models = native_runtime(self.root)["models"]
+        record_native_launch(self.root, relay, event="model-unavailable",
+                             failure_code="host_dispatch_denied")
+        seal_data_plane_task(self.root, relay, worker_ended=True)
+        original_receipt = (output / "receipt.json").read_bytes()
+        held = prepare_data_plane_task(self.root, output, worker_role="source_probe", config=config)
+        self.assertFalse(held["dispatch_allowed"])
+        self.assertEqual(held["issue_codes"], ["native_route_repair_required"])
+
+        configure_native_runtime(self.root, "omp", {},
+                                 host_policy_fingerprint=stable_hash({"operator_role": original["launch_contract"]["model"]}))
+        prepared = prepare_data_plane_task(self.root, output, worker_role="source_probe", config=config)
+        self.assertEqual(prepared["status"], "ready")
+        self.assertNotEqual(prepared["task_id"], original["task_id"])
+        bind_data_plane_launch(self.root, relay)
+        replacement = json.loads(relay.read_text())
+        self.assertEqual(replacement["launch_contract"]["model"], original["launch_contract"]["model"])
+        self.assertEqual(native_runtime(self.root)["models"], original_models)
+        history = output / "history" / original["task_id"]
+        self.assertEqual((history / "task.json").read_bytes(), original_task)
+        self.assertEqual((history / "receipt.json").read_bytes(), original_receipt)
+        record_native_launch(self.root, relay, event="capability-available")
+        record_native_launch(self.root, relay, event="worker-started", task="worker-0",
+                             worker_id="approved-same-model-worker", model=original["launch_contract"]["model"])
+        frozen = relay.read_bytes()
+        configure_native_runtime(self.root, "omp", {},
+                                 host_policy_fingerprint=stable_hash({"operator_role": "another-policy"}))
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_LAUNCH_INVALID"):
+            bind_data_plane_launch(self.root, relay)
+        self.assertEqual(relay.read_bytes(), frozen)
 
     def test_data_plane_rebind_requires_terminal_evidence(self) -> None:
         _, _, relay = self.prepare_probe()
