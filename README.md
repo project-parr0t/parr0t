@@ -23,27 +23,37 @@ Codex에서 요청 프롬프트로 시작하거나, OMP에서 프롬프트·통�
 
 Python 3.11 이상과 OMP가 설치되어 있어야 합니다. 전체 코어 저장소를 내려받고 아래처럼 **게임 폴더를 열지 않은 상태에서 외부 작업 폴더부터** 초기화합니다.
 
-일반 OMP 세션에서도 `parr0t_process`가 필요하면 OMP 사용자 확장 경로
-`~/.omp/agent/extensions/parr0t-native-process.ts`에 아래 한 줄을 두어 현재 코어의
-네이티브 실행 도구를 자동으로 등록합니다. 파일 URL은 실제 코어 위치로 바꿉니다.
+일반 OMP에서도 Parr0t 진입·생명주기·네이티브 실행 도구가 자동 등록되도록
+`~/.omp/agent/extensions/parr0t-native-process.ts`에 아래 한 줄을 둡니다.
+파일 URL은 실제 현재 코어 위치로 바꿉니다.
 OMP의 자동 탐색은 `.ts`/`.js` 진입 파일을 대상으로 하므로 이 파일을 `.mjs`로 만들지 않습니다.
 
 ```javascript
 export { default } from "file:///C:/path/to/parr0t/src/game_l10n/templates/omp-native-process.mjs";
 ```
 
-이 확장은 일반 세션과 그 하위 세션에 실행 도구만 제공하며, 게임 파일을 열거나
-모델·권한·통신 정책을 변경하지 않습니다. 전용 도우미나 실행 가드가 이미 등록되어
-있으면 덮어쓰지 않습니다. 도구 존재만으로 워커 격리나 제어 세션 ready가 증명되지는
-않으므로 실제 게임 작업은 아래 정식 런처를 사용합니다. 이미 실행 중인 OMP는 확장을
-다시 불러오거나 새 세션으로 시작해야 합니다.
+이 확장은 `parr0t_session`, `parr0t_framework_mode`, `parr0t_process`를 제공합니다.
+진입·생명주기 변경은 실제 루트만 호출할 수 있으며, 관련 없는 작업의
+모델·권한·통신 정책은 변경하지 않습니다. 이미 등록된 전용 도우미·가드는 우선합니다.
+도구 존재만으로 워커 격리가 증명되지는 않습니다. 요청된 자동 작업의 루트는
+`parr0t_session`에 절대 `workspace`와 `user_requested: true`를 전달해 정식 도우미를
+연결합니다. 모델을 생략하면 실제 현재 루트 모델·thinking을 그대로 사용하며 추측하거나
+다른 모델로 대체하지 않습니다. 이미 준비된 바인딩 루트에서는 기존 등록을 반환합니다.
+기존 OMP의 `guarded`/`prompt` 선택은 보존하며, 새 작업만 기본 `prompt`로 시작합니다.
+
+일반 루트에서 일시정지·분석·종료·재개할 때는 `parr0t_framework_mode`에 절대
+`workspace`를 지정합니다. 전용 도우미에서는 바인딩된 작업공간을 사용하며 다른 작업공간은
+거부합니다. 사용자 요청은 별도 확인 대화를 강제하지 않습니다.
+이미 실행 중인 OMP의 메모리에 파일 수정이 소급 적용되지는 않습니다. 이전 도구 목록만
+보고 작업을 포기하지 말고 실제 도구를 확인한 뒤, 필요한 첫 진입은 현재 Core의
+`omp-session` 명령으로 수행합니다. 실행 중이거나 `startup_pending`인 제어 세션은 중복 시작하지 않습니다.
 
 외부 작업 초기화와 정식 제어 세션 실행:
 
 ```text
 python -m pip install -e .
 game-l10n init-workspace "<external-workspace>" --sdk-root "<repository>" --game-root "<source-root>"
-python -m game_l10n.omp_session --workspace "<external-workspace>" --model "<approved-provider/model-id>" --mode workspace --foreground
+game-l10n omp-session --workspace "<external-workspace>" --model "<approved-provider/model-id>" --mode workspace --foreground
 ```
 
 `--model`에는 현재 OMP에서 허용된 정확한 최상위 모델 ID를 지정합니다. 새 세션에 위의 게임별 요청을 전달하세요. 기본 `prompt` 모드는 하위 에이전트의 충돌하는 협업 지시와 직접 메시지·기록 열람 경로를 제한하는 경량 훅을 연결하며, 일반 Python 실행은 유지합니다. 도구 등록은 새 세션에 적용되며 기존 세션에 도구를 추가하지 않습니다. 분리 실행의 `helper_registered`와 실제 PID·세션 ID로 등록을 확인하고, `startup_pending`이면 중복 실행하지 않습니다. 전체 실행 가드·전용 실행기가 필요하면 `--guarded`를 선택합니다. 어느 모드도 OS 샌드박스는 아닙니다. Codex의 기본 제공자 설정이나 전역 OMP 설정은 변경하지 않습니다. 이미 초기화된 작업은 첫 두 명령을 반복하지 않습니다.
