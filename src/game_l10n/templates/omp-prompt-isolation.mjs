@@ -247,9 +247,10 @@ export default function promptIsolation(pi) {
       if (relay && relay !== bound) throw new Error("PARR0T_OMP_PROMPT_ISOLATION: child relay binding cannot change");
       relay = bound;
     }
-    await lifecycle.before_agent_start(event, ctx);
+    const handoff = await lifecycle.before_agent_start(event, ctx);
     const blocks = (Array.isArray(event.systemPrompt) ? event.systemPrompt : [event.systemPrompt ?? ""]).map(stripCollaboration);
     if (!blocks.includes(POLICY)) blocks.push(POLICY);
+    if (handoff) blocks.push(handoff);
     return { systemPrompt: Array.isArray(event.systemPrompt) ? blocks : blocks.join("\n\n") };
   });
   pi.on("tool_call", async (event, ctx) => {
