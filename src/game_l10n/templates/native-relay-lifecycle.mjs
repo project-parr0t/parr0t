@@ -87,6 +87,39 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
         || !["reserved", "started", "ending", "ended", "failed"].includes(record.state)) throw new Error("admission binding changed");
   }
 
+  function singleWorkerHandoff(current) {
+    const { relay, dispatches } = current;
+    const launch = relay.launch_contract;
+    const dispatch = dispatches["worker-0"];
+    if (relay.schema !== "parr0t.data-plane-relay.v4"
+        || relay.execution_plan?.tracking_required !== false
+        || launch.host !== "omp" || (launch.transport ?? "collaboration") !== "collaboration"
+        || launch.tasks?.length !== 1 || launch.tasks[0] !== "worker-0"
+        || Object.keys(dispatches).length !== 1 || dispatch?.slot !== 0
+        || launch.model !== dispatch.model
+        || typeof dispatch.model !== "string"
+        || !/^[A-Za-z0-9][A-Za-z0-9_.:@/+%-]{0,254}$/.test(dispatch.model)
+        || !Array.isArray(relay.command_argv?.["capability-available"])
+        || !Array.isArray(relay.command_argv?.["worker-started"]?.["worker-0"])) return;
+    try {
+      const { record } = recordFor("worker-0", current);
+      requireRecord(record, current, "worker-0");
+      return; // Existing admission must be handled under the normal lifecycle.
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    const call = JSON.stringify({
+      context: "Execute the exact core-bound data-plane task.",
+      tasks: [{ task: "PARR0T_OMP_TASK=worker-0", model: dispatch.model, solutionSpace: "Exact bound task only." }],
+    });
+    return [
+      "OMP single-worker relay: dispatch first, without opening the relay file or making a separate preflight call.",
+      `Your first tool call is the built-in task with ${call}. Resolve xd://task only if task is deferred.`,
+      "The loaded host helper records capability and the actual worker start; it supplies the exact worker prompt. Do not duplicate those calls or dispatch twice.",
+      "Wait for actual terminal lifecycle, not a time limit. For sealing or an observed dispatch/runtime error, read the bound relay command_argv and follow its exact lifecycle. Do not read or forward child output. Return only the sealed receipt path.",
+    ].join("\n");
+  }
+
   async function flushContextEnds(current, ctx) {
     if (!current.relay.execution_plan?.tracking_required) return;
     const keys = Object.keys(current.dispatches).filter(key => key !== "finalizer");
@@ -111,7 +144,7 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
     const task = marker(event.prompt, "PARR0T_OMP_TASK");
     if (ctx.agent.depth === 1) {
       if (task) throw new Error("PARR0T_NATIVE_LIFECYCLE: relay cannot impersonate a worker");
-      return;
+      return singleWorkerHandoff(current);
     }
     if (!task || !Object.hasOwn(current.dispatches, task)) throw new Error("PARR0T_NATIVE_LIFECYCLE: exact worker binding required");
     const dispatch = current.dispatches[task];

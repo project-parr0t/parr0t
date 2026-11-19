@@ -19,6 +19,16 @@ DISPLAY_SCOPE_SCHEMA = "parr0t.display-scope.v1"
 DISPLAY_SCOPE_EVIDENCE_FIELD = "display_scope_evidence"
 
 
+class ActiveControlStorageError(ConfigurationError):
+    code = "INVENTORY_ACTIVE_CONTROL_STORAGE"
+
+    def __init__(self) -> None:
+        super().__init__(
+            f"{self.code}: Control storage is not an active display target; "
+            "use a separate display projection"
+        )
+
+
 def _invalid() -> ConfigurationError:
     return ConfigurationError("E_INVENTORY_SCOPE_CORRECTION_INVALID: invalid bound scope evidence")
 
@@ -286,4 +296,4 @@ def _validate_active_display_scope(
         ):
             raise ConfigurationError("Every inventory target requires display binding or dependency evidence")
         if metadata.get("storage_role") in _CONTROL_ROLES:
-            raise ConfigurationError("Control storage is not an active display target; use a separate display projection")
+            raise ActiveControlStorageError()

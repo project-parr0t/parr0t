@@ -34,6 +34,8 @@ UI_COMPOSITION_FIELDS = (
 UI_SLOT_ROLES = {"standalone", "label", "value", "state_value", "template_fragment"}
 INVENTORY_COMPARISON_KEY = "inventory_comparison_key"
 PRIMARY_IDENTITY_SCHEMA = "parr0t.primary-inventory-identity.v1"
+# Bump when a stricter active display rule requires revalidating saved attestations.
+_DISPLAY_SCOPE_VALIDATION_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +43,7 @@ class _InventoryDocument:
     payload: dict[str, Any]
     active_rows: list[dict[str, Any]]
     scope_correction: dict[str, Any] | None
+    sha256: str
 
 
 def validate_inventory_display_scope(
@@ -179,7 +182,12 @@ def _inventory_document(
     _basis_cache: dict[Path, _BasisSnapshot] | None = None,
 ) -> _InventoryDocument:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        raw = path.read_bytes()
+        digest = sha256(raw).hexdigest()
+        text = raw.decode("utf-8-sig")
+        del raw
+        payload = json.loads(text)
+        del text
     except UnicodeDecodeError as exc:
         raise ConfigurationError(
             "E_INVENTORY_INVALID_UNICODE: inventory must be valid UTF-8"
@@ -221,7 +229,7 @@ def _inventory_document(
     if tracking is not None and tracking["included_count"] != len(active_rows):
         raise ConfigurationError("Inventory static scope included count does not match eligible segments")
     _validate_active_display_scope(payload, active_rows, required=required_display_scope)
-    return _InventoryDocument(payload, active_rows, correction)
+    return _InventoryDocument(payload, active_rows, correction, digest)
 
 
 def _segment_map(
@@ -585,15 +593,17 @@ def _verify_inventory_payloads(
         correction["projection_constraint_count"]
         for correction in (primary_correction, independent_correction) if correction is not None
     )
-    scope_correction = None
-    if primary_correction is not None:
-        scope_correction = {**primary_correction, "basis_files": [
-            {"path": str((path.parent / correction["basis_file"]).resolve()),
-             "sha256": correction["basis_sha256"]}
-            for path, correction in ((primary_path, primary_correction),
-                                     (independent_path, independent_correction))
-            if correction is not None
-        ]}
+    basis_files = [
+        {"path": str((path.parent / correction["basis_file"]).resolve()),
+         "sha256": correction["basis_sha256"]}
+        for path, correction in ((primary_path, primary_correction),
+                                 (independent_path, independent_correction))
+        if correction is not None
+    ]
+    scope_correction = (
+        {**primary_correction, "basis_files": basis_files}
+        if primary_correction is not None else None
+    )
 
     primary_rows = _segment_map(primary_targets, use_comparison_key=True)
     independent_rows = _segment_map(independent_targets, use_comparison_key=True)
@@ -632,26 +642,17 @@ def _verify_inventory_payloads(
     )
     missing_from_primary = independent_ids - primary_ids
     missing_from_independent = primary_ids - independent_ids
-    source_mismatches = {
-        target_id
-        for target_id in primary_ids & independent_ids
-        if primary_rows[target_id] != independent_rows[target_id]
-    }
-    ui_contract_mismatches = {
-        target_id
-        for target_id in primary_ids & independent_ids
-        if primary_ui_contracts[target_id] != independent_ui_contracts[target_id]
-    }
-    authority_contract_mismatches = {
-        target_id
-        for target_id in primary_ids & independent_ids
-        if primary_authority_contracts[target_id]
-        != independent_authority_contracts[target_id]
-    }
-    agreed_target_count = len(
-        (primary_ids & independent_ids)
-        - source_mismatches - ui_contract_mismatches - authority_contract_mismatches
-    )
+    shared_ids = primary_ids & independent_ids
+    source_mismatches = ui_contract_mismatches = authority_contract_mismatches = 0
+    agreed_target_count = 0
+    for target_id in shared_ids:
+        source_differs = primary_rows[target_id] != independent_rows[target_id]
+        ui_differs = primary_ui_contracts[target_id] != independent_ui_contracts[target_id]
+        authority_differs = primary_authority_contracts[target_id] != independent_authority_contracts[target_id]
+        source_mismatches += source_differs
+        ui_contract_mismatches += ui_differs
+        authority_contract_mismatches += authority_differs
+        agreed_target_count += not (source_differs or ui_differs or authority_differs)
     order_mismatch = primary_order != independent_order
     visible_exclusions = [
         item
@@ -662,7 +663,7 @@ def _verify_inventory_payloads(
     primary_scope = _static_scope_tracking(primary["coverage"])
     independent_scope = _static_scope_tracking(independent["coverage"])
     scope_tracking_mismatch = primary_scope != independent_scope
-    comparison_key_overlap_ratio = len(primary_ids & independent_ids) / max(
+    comparison_key_overlap_ratio = len(shared_ids) / max(
         1, min(len(primary_ids), len(independent_ids))
     )
     namespace_mismatch = bool(
@@ -721,9 +722,9 @@ def _verify_inventory_payloads(
     )
     gap_score = (
         missing_gap_score
-        + len(source_mismatches)
-        + len(ui_contract_mismatches)
-        + len(authority_contract_mismatches)
+        + source_mismatches
+        + ui_contract_mismatches
+        + authority_contract_mismatches
         + len(visible_exclusions)
         + int(order_mismatch)
         + int(scope_tracking_mismatch)
@@ -757,9 +758,9 @@ def _verify_inventory_payloads(
         "projection_constraint_count": projection_constraints,
         "missing_from_primary_count": len(missing_from_primary),
         "missing_from_independent_count": len(missing_from_independent),
-        "source_mismatch_count": len(source_mismatches),
-        "ui_composition_mismatch_count": len(ui_contract_mismatches),
-        "localization_authority_mismatch_count": len(authority_contract_mismatches),
+        "source_mismatch_count": source_mismatches,
+        "ui_composition_mismatch_count": ui_contract_mismatches,
+        "localization_authority_mismatch_count": authority_contract_mismatches,
         "order_mismatch": order_mismatch,
         "user_visible_exclusion_count": len(visible_exclusions),
         "static_scope": primary_scope,
@@ -791,6 +792,11 @@ def _verify_inventory_payloads(
             "primary": _file_binding(primary_path),
             "independent": _file_binding(independent_path),
         },
+        "constraint_inputs": [
+            {"path": str(primary_path.resolve()), "sha256": primary_document.sha256},
+            {"path": str(independent_path.resolve()), "sha256": independent_document.sha256},
+            *basis_files,
+        ],
     }
 
 
@@ -920,6 +926,7 @@ def save_inventory_attestation(
         "continuation_required": attestation["continuation_required"],
         "terminal": False,
     }
+    attestation["display_scope_validation_version"] = _DISPLAY_SCOPE_VALIDATION_VERSION
     _atomic_json(state_path, attestation)
     return attestation
 
@@ -982,13 +989,17 @@ def require_inventory_attestation(
         raise ConfigurationError("Independent source inventory is incomplete")
     if state.get("primary_path") != str(primary_path.resolve()):
         raise ConfigurationError("Verified primary inventory does not match this context input")
+    independent_path_value = state.get("independent_path")
+    if not isinstance(independent_path_value, str) or not independent_path_value:
+        raise ConfigurationError("Verified independent inventory path is missing")
+    independent_path = Path(independent_path_value)
     correction = state.get("scope_correction")
     if correction is not None:
         basis_file = correction.get("basis_file") if isinstance(correction, dict) else None
         if (not isinstance(basis_file, str)
                 or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.json", basis_file) is None):
             raise ConfigurationError("E_INVENTORY_SCOPE_CORRECTION_BASIS_STALE")
-        independent_path = Path(str(state.get("independent_path", "")))
+        # A correction basis is separately mutable even when both inventories are unchanged.
         try:
             for directory in {primary_path.parent.resolve(), independent_path.parent.resolve()}:
                 basis_path = directory / basis_file
@@ -997,29 +1008,31 @@ def require_inventory_attestation(
                 with basis_path.open("rb") as handle:
                     if file_digest(handle, "sha256").hexdigest() != correction.get("basis_sha256"):
                         raise ConfigurationError("E_INVENTORY_SCOPE_CORRECTION_BASIS_STALE")
-            independent_binding = _file_binding(independent_path)
         except OSError as exc:
             raise ConfigurationError("E_INVENTORY_SCOPE_CORRECTION_BASIS_STALE") from exc
-        if state.get("file_bindings", {}).get("independent") != independent_binding:
-            independent_payload = _inventory_document(independent_path)
-            if inventory_fingerprint(independent_payload.payload) != state.get("independent_fingerprint"):
-                raise ConfigurationError("Independent inventory changed after scope correction verification")
-    bindings = state.get("file_bindings")
-    if (
-        isinstance(bindings, dict)
-        and bindings.get("primary") == _file_binding(primary_path)
-    ):
-        return state
-    payload = _inventory_document(primary_path)
-    if state.get("primary_fingerprint") != inventory_fingerprint(payload.payload):
-        raise ConfigurationError("Primary inventory changed after independent verification")
-    independent_path = Path(str(state.get("independent_path", "")))
-    state["file_bindings"] = {
+    bindings = {
         "primary": _file_binding(primary_path),
-        "independent": (
-            _file_binding(independent_path) if independent_path.is_file() else None
-        ),
+        "independent": _file_binding(independent_path),
     }
+    saved_bindings = state.get("file_bindings")
+    current_validation = (
+        isinstance(saved_bindings, dict)
+        and state.get("display_scope_validation_version") == _DISPLAY_SCOPE_VALIDATION_VERSION
+    )
+    if current_validation and saved_bindings == bindings:
+        return state
+
+    # Revalidate legacy checkpoints in place, without advancing the reconciliation
+    # generation or replacing the attested scope and identity history.
+    basis_cache: dict[Path, _BasisSnapshot] = {}
+    for role, path in (("primary", primary_path), ("independent", independent_path)):
+        if current_validation and saved_bindings.get(role) == bindings[role]:
+            continue
+        document = _inventory_document(path, _basis_cache=basis_cache)
+        if state.get(f"{role}_fingerprint") != inventory_fingerprint(document.payload):
+            raise ConfigurationError(f"{role.capitalize()} inventory changed after independent verification")
+    state["display_scope_validation_version"] = _DISPLAY_SCOPE_VALIDATION_VERSION
+    state["file_bindings"] = bindings
     _atomic_json(state_path, state)
     return state
 
