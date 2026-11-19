@@ -467,6 +467,36 @@ def _relay_worker_dispatches(work_dir: Path, relay_path: Path, relay: dict, cont
     return dispatches
 
 
+def _stale_unadmitted_omp_relay(work_dir: Path, relay_path: Path, relay: dict) -> bool:
+    """Require the durable single-worker OMP protocol and no launch or admission evidence."""
+    contract = relay.get("launch_contract") or {}
+    if (
+        contract.get("host") != "omp"
+        or contract.get("transport", "collaboration") != "collaboration"
+        or relay.get("execution_plan", {}).get("tracking_required") is not False
+        or contract.get("tasks") != ["worker-0"]
+        or set(contract.get("worker_dispatches") or {}) != {"worker-0"}
+    ):
+        return False
+    try:
+        _load(work_dir, relay_path)
+    except ValueError as exc:
+        if str(exc) not in {"E_NATIVE_LAUNCH_INVALID: runtime binding changed", ISOLATION_ISSUE}:
+            raise
+    else:
+        return False
+    ledger = _ledger_path(work_dir, relay_path)
+    if os.path.lexists(ledger) or next(ledger.parent.glob(ledger.name + ".legacy-*"), None):
+        return False
+    relay_digest = sha256(relay_path.read_bytes()).hexdigest()
+    key = sha256(f"{relay_digest}\0worker-0".encode()).hexdigest()
+    admission = work_dir / ".game-l10n/native/omp-launch-admissions" / f"{key}.json"
+    return not (
+        os.path.lexists(admission)
+        or next(admission.parent.glob(admission.name + ".failed-*"), None)
+    )
+
+
 def require_native_workers_ended(work_dir: Path, relay_path: Path) -> None:
     """A terminal seal cannot race a host-admitted worker, including an unrecorded start."""
     relay_bytes = relay_path.read_bytes()
@@ -496,6 +526,9 @@ def bind_data_plane_launch(work_dir: Path, relay_path: Path) -> None:
     """Attach host routing to an existing core-bound task without rebuilding it."""
     if not relay_path.resolve().is_relative_to(work_dir.resolve() / ".game-l10n"):
         raise ValueError("E_NATIVE_LAUNCH_INVALID: relay escaped control metadata")
+    from .data_plane_task import _require_current_data_plane_relay
+
+    _require_current_data_plane_relay(relay_path)
     runtime = native_runtime(work_dir, required=True)
     runtime_isolation(work_dir, runtime)
     relay = json.loads(relay_path.read_text(encoding="utf-8"))
@@ -649,6 +682,10 @@ def _load_launch_evidence(work_dir: Path, relay_path: Path) -> tuple[dict, dict,
 
 def _load(work_dir: Path, relay_path: Path) -> tuple[dict, dict, dict]:
     relay, contract, ledger = _load_launch_evidence(work_dir, relay_path)
+    if str(relay.get("schema", "")).startswith("parr0t.data-plane-relay."):
+        from .data_plane_task import _require_current_data_plane_relay
+
+        _require_current_data_plane_relay(relay_path)
     if contract.get("host") == "omp" and contract.get("transport", "collaboration") == "collaboration":
         runtime = native_runtime(work_dir, required=True)
         isolation = runtime_isolation(work_dir, runtime)

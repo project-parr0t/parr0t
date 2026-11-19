@@ -68,7 +68,10 @@ from .inventory_constraints import (
 from .inventory_scope import ActiveControlStorageError
 from .language_policy import language_binding
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext, Segment
-from .native_runtime import RUNTIME_ISSUES, native_launch_evidence, native_launch_summary, native_runtime, require_native_workers_ended
+from .native_runtime import (
+    RUNTIME_ISSUES, _stale_unadmitted_omp_relay, native_launch_evidence,
+    native_launch_summary, native_runtime, require_native_workers_ended,
+)
 from .omp_isolation import ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
 from .privacy import is_within
 from .store import exclusive_file_lock, stable_hash
@@ -983,10 +986,44 @@ def data_plane_receipt_path(work_dir: Path, worker_role: str, *, purpose: str = 
     return work_dir / ".game-l10n" / "data-plane" / (purpose or worker_role) / "receipt.json"
 
 
+def _active_data_plane_dir(stage_dir: Path) -> Path:
+    locator = stage_dir / "active-launch-revision.json"
+    try:
+        revision = json.loads(locator.read_text(encoding="utf-8"))["revision"]
+    except FileNotFoundError:
+        if not os.path.lexists(locator):
+            return stage_dir
+        raise ConfigurationError("E_NATIVE_LAUNCH_INVALID: launch revision locator is missing") from None
+    except (ValueError, TypeError, KeyError):
+        raise ConfigurationError("E_NATIVE_LAUNCH_INVALID: invalid launch revision locator") from None
+    if not isinstance(revision, str) or re.fullmatch(r"[a-f0-9]{32}", revision) is None:
+        raise ConfigurationError("E_NATIVE_LAUNCH_INVALID: invalid launch revision locator")
+    destination = stage_dir / "launch-revisions" / revision
+    if destination.resolve() != destination or not (destination / "relay.json").is_file():
+        raise ConfigurationError("E_NATIVE_LAUNCH_INVALID: launch revision is missing or redirected")
+    return destination
+
+
+def _require_current_data_plane_relay(relay_path: Path) -> None:
+    relay_dir = relay_path.resolve().parent
+    stage_dir = relay_dir.parent.parent if relay_dir.parent.name == "launch-revisions" else relay_dir
+    if _active_data_plane_dir(stage_dir) != relay_dir:
+        raise ConfigurationError("E_NATIVE_LAUNCH_INVALID: data-plane relay was superseded")
+
+
+def _revisable_data_plane_relay(work_dir: Path, relay_path: Path, relay: dict) -> bool:
+    return (
+        not os.path.lexists(work_dir / relay["expected_envelope"])
+        and not os.path.lexists(_operational_failure_path(relay_path, relay["task_id"]))
+        and _stale_unadmitted_omp_relay(work_dir, relay_path, relay)
+    )
+
+
 def current_data_plane_operational_failure(
     work_dir: Path, worker_role: str, *, purpose: str = ""
 ) -> dict[str, Any] | None:
-    relay_path = data_plane_receipt_path(work_dir, worker_role, purpose=purpose).with_name("relay.json")
+    stage_dir = data_plane_receipt_path(work_dir, worker_role, purpose=purpose).parent
+    relay_path = _active_data_plane_dir(stage_dir) / "relay.json"
     if not relay_path.is_file():
         return None
     try:
@@ -2164,6 +2201,8 @@ def prepare_data_plane_task(
     output_dir = output_dir.resolve()
     if not is_within(output_dir, work_dir):
         raise ConfigurationError("E_DATA_PLANE_TASK_PATH: output must stay inside the workspace")
+    stage_dir = output_dir
+    output_dir = _active_data_plane_dir(stage_dir)
     if worker_role == "inventory_reconciler":
         blocked = current_inventory_constraint(
             work_dir, config=config, sdk_activation=sdk_activation or {}
@@ -2236,6 +2275,9 @@ def prepare_data_plane_task(
     previous_receipt_closes = False
     runtime_repaired = False
     retry_repaired_runtime = False
+    superseded: tuple[Path, dict, str] | None = None
+    previous_receipt_path = data_plane_receipt_path(work_dir, worker_role, purpose=purpose)
+    previous_receipt: dict[str, Any] | None = None
     previous_task_path = output_dir / "task.json"
     previous_source_policy: dict[str, Any] | None = None
     previous_task: dict[str, Any] = {}
@@ -2257,7 +2299,6 @@ def prepare_data_plane_task(
                 if type(previous_revision) is not int or previous_revision < 1:
                     raise ConfigurationError("E_DATA_PLANE_TASK_INVALID: prior task revision is invalid")
                 task_revision = previous_revision + 1
-            previous_receipt_path = data_plane_receipt_path(work_dir, worker_role, purpose=purpose)
             previous_receipt = (
                 json.loads(previous_receipt_path.read_text(encoding="utf-8"))
                 if previous_receipt_path.is_file()
@@ -2431,16 +2472,45 @@ def prepare_data_plane_task(
                             )
                             if proposed_assets != bound_task.get("bound_local_assets", []):
                                 raise ConfigurationError("E_DATA_PLANE_TASK_ACTIVE: end the current bound task before revising inspection assets")
-                        return {
-                            "schema": previous_relay["schema"],
-                            "status": "ready",
-                            "worker_role": worker_role,
-                            "stage": profile["stage"],
-                            "relay_path": _relative(work_dir, previous_relay_path),
-                            "task_id": previous_task["task_id"],
-                            "control_generation": control_generation,
-                            **({"candidate_discovery": bound_task["input_image_candidates"]} if bound_task.get("input_image_candidates") else {}),
-                        }
+                        # A prior receipt is not evidence about this replacement.
+                        # Recovery additionally requires no admission or launch for this exact relay.
+                        receipt_id = previous_receipt.get("task_id") if isinstance(previous_receipt, dict) else None
+                        if (
+                            worker_role == "inventory_reconciler"
+                            and isinstance(receipt_id, str)
+                            and re.fullmatch(r"[a-f0-9]{64}", receipt_id)
+                            and receipt_id != bound_task["task_id"]
+                            and previous_receipt.get("schema") == DATA_PLANE_RECEIPT_SCHEMA
+                            and previous_receipt.get("worker_role") == worker_role
+                            and previous_receipt.get("stage") == profile["stage"]
+                            and previous_receipt.get("control_generation") == control_generation
+                            and previous_receipt.get("status") == "error"
+                            and _safe_execution_summary(previous_receipt.get("execution")) is not None
+                            and previous_receipt["execution"]["complete"] is True
+                            and _revisable_data_plane_relay(work_dir, previous_relay_path, previous_relay)
+                        ):
+                            previous_route = bound_task.get("worker_route")
+                            if route_chain and previous_route not in route_chain:
+                                raise ConfigurationError("E_DATA_PLANE_ROUTE_INVALID: prior route is no longer configured")
+                            if route_chain:
+                                route_index = route_chain.index(previous_route)
+                                worker_route = previous_route
+                            attempt = previous_attempt
+                            superseded = (previous_relay_path, previous_relay, _digest(previous_receipt_path))
+                            output_dir = stage_dir / "launch-revisions" / os.urandom(16).hex()
+                            if output_dir.resolve() != output_dir:
+                                raise ConfigurationError("E_DATA_PLANE_TASK_PATH: launch revision is redirected")
+                        else:
+                            return {
+                                "schema": previous_relay["schema"],
+                                "status": "ready",
+                                "worker_role": worker_role,
+                                "stage": profile["stage"],
+                                "relay_path": _relative(work_dir, previous_relay_path),
+                                "task_id": previous_task["task_id"],
+                                "control_generation": control_generation,
+                                **({"candidate_discovery": bound_task["input_image_candidates"]} if bound_task.get("input_image_candidates") else {}),
+                            }
         except (OSError, json.JSONDecodeError):
             attempt = 1
     # Every attempt and control-plane generation owns a distinct response path.
@@ -3130,13 +3200,18 @@ def prepare_data_plane_task(
     task_id = stable_hash(private_payload)
     task = {**private_payload, "task_id": task_id}
     task_path = output_dir / "task.json"
-    if previous_task and previous_task.get("task_id") != task_id:
+    if superseded is None and previous_task and previous_task.get("task_id") != task_id:
         if re.fullmatch(r"[a-f0-9]{64}", str(previous_task.get("task_id", ""))) is None:
             raise ConfigurationError("E_DATA_PLANE_RELAY_INVALID: prior task identity changed")
         history_dir = output_dir / "history" / str(previous_task["task_id"])
         history_dir.mkdir(parents=True, exist_ok=True)
         for name in ("task.json", "relay.json", "relay-lifecycle.json", "receipt.json"):
-            previous_path, archived_path = output_dir / name, history_dir / name
+            if name == "receipt.json" and (
+                not isinstance(previous_receipt, dict) or previous_receipt.get("task_id") != previous_task["task_id"]
+            ):
+                continue
+            previous_path = previous_receipt_path if name == "receipt.json" else output_dir / name
+            archived_path = history_dir / name
             if previous_path.is_file() and not archived_path.exists():
                 archived_path.write_bytes(previous_path.read_bytes())
     previous_task_bytes = (
@@ -3158,8 +3233,6 @@ def prepare_data_plane_task(
             else:
                 _atomic_bytes(task_path, previous_task_bytes)
             raise
-    if worker_role == "inventory_reconciler":
-        _inventory_constraint_locator(work_dir, output_dir, task_id)
     lifecycle_path = output_dir / "relay-lifecycle.json"
     lifecycle_relative = (
         _relative(work_dir, lifecycle_path)
@@ -3219,6 +3292,20 @@ def prepare_data_plane_task(
     }
     relay_path = output_dir / "relay.json"
     _atomic_json(relay_path, relay)
+    if superseded is not None:
+        # Different relay address: a delayed old host call cannot resolve the new binding.
+        previous_relay_path, previous_relay, receipt_digest = superseded
+        with exclusive_file_lock(work_dir / ".game-l10n/native/launch.lock", issue_code="E_NATIVE_LAUNCH_BUSY", blocking=True):
+            _require_current_data_plane_relay(previous_relay_path)
+            if (
+                json.loads(previous_relay_path.read_text(encoding="utf-8")) != previous_relay
+                or _digest(previous_receipt_path) != receipt_digest
+                or not _revisable_data_plane_relay(work_dir, previous_relay_path, previous_relay)
+            ):
+                raise ConfigurationError("E_NATIVE_LAUNCH_INVALID: launch evidence changed during repair")
+            _atomic_json(stage_dir / "active-launch-revision.json", {"revision": output_dir.name})
+    if worker_role == "inventory_reconciler":
+        _inventory_constraint_locator(work_dir, output_dir, task_id)
     return {
         "schema": DATA_PLANE_RELAY_SCHEMA,
         "status": "ready",
@@ -3241,6 +3328,7 @@ def _load_bound_data_plane_relay(
     resolved_relay = relay_path.resolve()
     if not is_within(resolved_relay, work_dir) or not resolved_relay.is_file():
         raise ConfigurationError("E_DATA_PLANE_RELAY_INVALID: relay must be a workspace file")
+    _require_current_data_plane_relay(resolved_relay)
     relay = json.loads(resolved_relay.read_text(encoding="utf-8"))
     legacy_relay_fields = {
         "schema",
@@ -3807,6 +3895,18 @@ def _record_data_plane_relay_event(
     }
 
 
+def _write_data_plane_receipt(
+    work_dir: Path, relay: dict[str, Any], path: Path, receipt: dict[str, Any],
+) -> None:
+    if relay.get("worker_role") == "inventory_reconciler":
+        relay_path = (work_dir / relay["task_path"]).with_name("relay.json")
+        with exclusive_file_lock(work_dir / ".game-l10n/native/launch.lock", issue_code="E_NATIVE_LAUNCH_BUSY", blocking=True):
+            _require_current_data_plane_relay(relay_path)
+            _atomic_json(path, receipt)
+    else:
+        _atomic_json(path, receipt)
+
+
 def _seal_bound_data_plane_task(
     work_dir: Path, relay: dict[str, Any], task: dict[str, Any]
 ) -> dict[str, Any]:
@@ -4173,7 +4273,7 @@ def _seal_bound_data_plane_task(
     receipt_path = data_plane_receipt_path(
         work_dir, str(result["worker_role"]), purpose=task.get("purpose", "")
     )
-    _atomic_json(receipt_path, receipt)
+    _write_data_plane_receipt(work_dir, relay, receipt_path, receipt)
     _seal_inventory_constraint(work_dir, relay, task, receipt)
     return {
         "schema": receipt["schema"],
@@ -4232,7 +4332,7 @@ def _seal_ended_data_plane_task(
     receipt_path = data_plane_receipt_path(
         work_dir, str(relay["worker_role"]), purpose=(task or {}).get("purpose", "")
     )
-    _atomic_json(receipt_path, receipt)
+    _write_data_plane_receipt(work_dir, relay, receipt_path, receipt)
     return {
         "schema": receipt["schema"],
         "status": receipt["status"],
