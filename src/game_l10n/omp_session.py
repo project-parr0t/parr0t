@@ -22,6 +22,8 @@ from .errors import ConfigurationError
 from .user_request import user_request_binding
 from .model_policy import exact_native_model
 from .native_host import resolve_native_model
+from .native_runtime import native_runtime
+from .omp_host_policy import operator_config_paths
 
 
 def _startup_prompt(
@@ -43,6 +45,10 @@ def _startup_prompt(
         "다음 정확한 코어 argv에 필요한 명령을 덧붙여 실행하라: "
         f"{json.dumps([sys.executable, '-I', '-B', str(core / 'src/game_l10n/templates/native-python.py')], ensure_ascii=False)}. "
         "user-request --workspace를 사용해 요청 바인딩을 검증한 뒤 상태에 맞는 진입 절차를 수행하라. "
+        "OMP 모델은 카탈로그 등록과 실제 호스트 승인이 별개다. read cfg://modelRoles, "
+        "read cfg://task/perCallModelAllow, read cfg://task/agentModelOverrides로 현재 정책을 "
+        "확인한 뒤 native-runtime을 바인딩하라. 실제 호스트의 승인 거부를 가용성 부족·번역 거부로 "
+        "오인하지 말고, 승인 복구 후 변경된 호스트 정책 지문으로 새 작업을 준비하라. "
         +
         (
             f"정식 인계 영수증 {CONTROL_HANDOFF_PATH}만 사용하여 새 세션 재개 절차를 수행하라. "
@@ -77,9 +83,12 @@ def _startup_prompt(
             "공식 도우미의 parr0t_process에 실행 파일부터 시작하는 argv로 전달하라. "
             "이 도구는 새로 실행된 현재 호스트 세션에 속한다. 호출자 세션의 도구 목록이나 "
             "작업 폴더의 entry ready 상태를 이 호스트의 도우미 등록 증거로 취급하지 마라. "
-            "parr0t_process가 최상위 함수 목록에 없으면 먼저 read xd://parr0t_process로 "
-            "활성·마운트된 도구 장치를 확인한 뒤에만 등록 누락을 판단하라. "
-            "도구가 실제로 없으면 현재 프로세스·세션을 유지하고 차단을 보고하며 자동 재시작하지 마라. "
+            "최상위 함수 목록만으로 도구 누락을 판단하지 말고 read xd://parr0t_process와 "
+            "read xd://parr0t_framework_mode로 실제 등록을 각각 확인하라. "
+            "최초 사용자 요청에 따른 진입은 추가 확인 대화 없이 완료하라. 일반 호출자에서는 "
+            "parr0t_session 또는 현재 Core의 omp-session 명령으로 공식 도우미를 연결한다. "
+            "이미 helper_registered 또는 startup_pending인 호스트가 있으면 그 실제 세션을 "
+            "이어가며, 호출자의 도구 누락을 이유로 실행 중인 호스트를 중복 시작하지 마라. "
             "도우미는 마커가 빠진 하위 세션에도 메시지·기록 접근과 내장 bash/eval 브리지를 차단한다. "
             "일반 네이티브 프로세스는 샌드박스화하지 않으며 실행 가드 등록을 기다리지 마라. "
         )
@@ -124,11 +133,24 @@ def _resolve_mode(workspace: Path, mode: str) -> str:
     return mode
 
 
+def _guarded_selection(workspace: Path, guarded: bool | None) -> bool:
+    if guarded is not None:
+        return guarded
+    runtime = native_runtime(workspace, allow_stale_generation=True)
+    return bool(
+        runtime is not None and runtime["host"] == "omp"
+        and runtime.get("transport", "collaboration") == "collaboration"
+        and runtime.get("omp_isolation", "guarded") == "guarded"
+    )
+
+
 def _plan_command(
-    workspace: Path, model: str, mode: str = "auto", *, guarded: bool = False,
+    workspace: Path, model: str, mode: str = "auto", *, guarded: bool | None = None,
+    thinking: str | None = None,
 ) -> tuple[list[str], Path, Path | None]:
     """Validate prerequisites and plan a fresh session without writing anything."""
     workspace = workspace.resolve()
+    guarded = _guarded_selection(workspace, guarded)
     if not exact_native_model(model):
         raise ValueError("E_OMP_CONTROL_EXACT_MODEL_REQUIRED")
     if not (workspace / "game-l10n.json").is_file():
@@ -151,6 +173,12 @@ def _plan_command(
         executable, "--cwd", str(workspace), "--model", model,
         "--session-dir", str(session_dir), "--no-prewalk", "--no-title",
     ]
+    if thinking is not None:
+        if not isinstance(thinking, str) or not thinking.strip() or "\0" in thinking:
+            raise ValueError("E_OMP_CONTROL_THINKING_INVALID")
+        command.extend(["--thinking", thinking])
+    for config in operator_config_paths():
+        command.extend(["--config", str(config)])
     command.extend(["--trusted-extension", str(extension.resolve()), "--parr0t-workspace", str(workspace)])
     request = user_request_binding(workspace)
     command.append(_startup_prompt(workspace, core, mode, request, guarded=guarded))
@@ -171,7 +199,8 @@ def _read_registration(launch_dir: Path, digest: str, *, guarded: bool) -> dict 
         and proof.get("guard_sha256" if guarded else "helper_sha256") == digest
         and isinstance(proof.get("session_id"), str)
         and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", proof["session_id"])
-        and (guarded or proof.get("process_tool") == "parr0t_process")
+        and proof.get("process_tool") == ("parr0t_exec" if guarded else "parr0t_process")
+        and proof.get("framework_tool") == "parr0t_framework_mode"
     ):
         return proof
     return None
@@ -179,19 +208,24 @@ def _read_registration(launch_dir: Path, digest: str, *, guarded: bool) -> dict 
 
 def _launch(
     workspace: Path, model: str, startup_seconds: float = 45.0,
-    *, mode: str = "auto", foreground: bool = False, guarded: bool = False,
+    *, mode: str = "auto", foreground: bool = False, guarded: bool | None = None,
+    thinking: str | None = None,
 ) -> dict:
     workspace = workspace.resolve()
+    guarded = _guarded_selection(workspace, guarded)
     if os.name != "nt" and not foreground:
         raise ValueError("E_OMP_CONTROL_TERMINAL_REQUIRED: use --foreground")
     mode = _resolve_mode(workspace, mode)
-    command, launch_dir, guard = _plan_command(workspace, model, mode, guarded=guarded)
+    command, launch_dir, guard = _plan_command(
+        workspace, model, mode, guarded=guarded, thinking=thinking,
+    )
     session_dir = launch_dir / "sessions"
     session_dir.mkdir(parents=True)
     record = {
         "schema": "parr0t.omp-control-launch.v1", "status": "starting",
         "model": command[command.index("--model") + 1], "requested_model": model,
         "session_directory": str(session_dir),
+        "thinking": thinking,
         "handoff_receipt": CONTROL_HANDOFF_PATH if mode == "rotation" else None,
         "mode": mode, "omp_isolation": "guarded" if guarded else "prompt", "process_id": None,
         "user_request": user_request_binding(workspace),
@@ -244,22 +278,28 @@ def _launch(
     return {**record, "launch_record": str(record_path)}
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+def add_session_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--model", required=True, help="Exact approved provider/model identifier")
+    parser.add_argument("--thinking", help="Current host thinking level, forwarded unchanged")
     parser.add_argument("--mode", choices=("auto", "rotation", "workspace"), default="auto")
     parser.add_argument("--foreground", action="store_true", help="Use the current terminal")
-    parser.add_argument("--guarded", action="store_true", help="Require the OMP execution guard and registration proof")
+    parser.add_argument("--guarded", action="store_true", default=None,
+                        help="Require the guard; otherwise preserve configured OMP isolation or use prompt for new work")
     parser.add_argument("--print-command", action="store_true", help="Print JSON argv without launching")
-    args = parser.parse_args(argv)
+
+
+def run_session(args: argparse.Namespace) -> int:
     try:
         if args.print_command:
-            command, _, _ = _plan_command(args.workspace, args.model, args.mode, guarded=args.guarded)
+            command, _, _ = _plan_command(
+                args.workspace, args.model, args.mode, guarded=args.guarded, thinking=args.thinking,
+            )
             print(json.dumps(command, ensure_ascii=False))
             return 0
         result = _launch(
             args.workspace, args.model, mode=args.mode, foreground=args.foreground, guarded=args.guarded,
+            thinking=args.thinking,
         )
     except (ConfigurationError, OSError, ValueError) as error:
         issue = str(error).split(":", 1)[0]
@@ -273,6 +313,12 @@ def main(argv: list[str] | None = None) -> int:
             return result["exit_code"]
         return 0 if result["status"] == "exited" else 1
     return 0 if result["status"] in {"helper_registered", "guard_registered"} else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_session_arguments(parser)
+    return run_session(parser.parse_args(argv))
 
 
 if __name__ == "__main__":

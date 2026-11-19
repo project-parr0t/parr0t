@@ -65,7 +65,7 @@ def resolve_native_model(work_dir: Path, host: str, model: str) -> str:
             return model
         raise
     rows = snapshot["models"] if snapshot else []
-    if any(row["selector"] == model or model.startswith(row["provider"] + "/") for row in rows):
+    if any(row["selector"] == model for row in rows):
         return model
     matches = {row["selector"] for row in rows if row["id"] == model}
     if not matches:

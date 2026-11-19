@@ -356,8 +356,6 @@ for (const [label, factory] of [["guarded", guard], ["prompt", prompt]]) {
         ["write", { path: "xd://ast_edit", content: JSON.stringify({ paths: [approval], ops: [] }) }],
         ["write", { path: "xd://write", content: JSON.stringify({ path: state, content: "forged" }) }],
         ["write", { path: "xd://edit", content: `*** Begin Patch\n[${state}#ABCD]\nREM\n*** End Patch` }],
-        ["write", { path: "xd://parr0t_framework_mode", content: JSON.stringify({ mode: "analysis", user_requested: true }) }],
-        ["write", { path: "xd://write", content: JSON.stringify({ path: "xd://parr0t_framework_mode", content: JSON.stringify({ mode: "analysis", user_requested: true }) }) }],
         ["ast_edit", { paths: [".game-l10n/*"], ops: [] }],
         ["ast_edit", { paths: ["synthetic-metadata-alias/*"], ops: [] }],
         ["multi_tool_use.parallel", { tool_uses: [{ recipient_name: "functions.write", parameters: { path: approval, content: "forged" } }] }],
@@ -374,6 +372,30 @@ for (const [label, factory] of [["guarded", guard], ["prompt", prompt]]) {
       expect(root.processes).toHaveLength(0);
       expect(existsSync(path.join(workspace, state))).toBe(false);
       expect(existsSync(path.join(workspace, approval))).toBe(false);
+    });
+
+    test("registered deferred lifecycle devices accept exact root requests and still deny children and forged roots", async () => {
+      const { workspace, root } = await fixture(factory);
+      const request = { mode: "pause", user_requested: true };
+      const devices = [
+        { path: "xd://parr0t_framework_mode", content: JSON.stringify(request) },
+        { path: "xd://write", content: JSON.stringify({ path: "xd://parr0t_framework_mode", content: JSON.stringify(request) }) },
+      ];
+      for (const input of devices) {
+        expect((await root.call("write", input))?.block).not.toBe(true);
+        const result = await root.approve(request);
+        expect(result.isError).toBe(false);
+        expect(JSON.parse(readFileSync(path.join(workspace, ".game-l10n/framework-session.json"), "utf8")).mode).toBe("pause");
+      }
+      for (const content of ["{", JSON.stringify({ mode: "pause" }), JSON.stringify({ ...request, token: "forged" }), JSON.stringify({ ...request, workspace: path.dirname(workspace) })]) {
+        expect((await root.call("write", { path: "xd://parr0t_framework_mode", content }))?.block).toBe(true);
+      }
+      for (const agent of [{ kind: "sub", depth: 1 }, { kind: "main", depth: 1 }]) {
+        Object.assign(root.ctx.agent, agent);
+        for (const input of devices) expect((await root.call("write", input))?.block).toBe(true);
+      }
+      expect(root.confirmations).toHaveLength(0);
+      expect(root.processes).toHaveLength(0);
     });
 
     test("a real diagnostic child cannot call the root approval tool directly", async () => {
