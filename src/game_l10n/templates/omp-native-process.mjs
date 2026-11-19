@@ -30,15 +30,18 @@ export function registerNativeProcess(pi, { beforeExecute, defaultCwd } = {}) {
 }
 
 export default function bootstrapNativeProcess(pi) {
-  // The host binds availability APIs before session_start and waits for dynamic
-  // registrations before exposing tools. Explicit helpers/guards take priority.
-  pi.on("session_start", (_event, ctx) => {
-    captureOperatorConfigs(ctx);
-    const tools = pi.getAllTools();
-    const names = new Set(tools.map(tool => tool.name));
-    if (!names.has("parr0t_process") && !names.has("parr0t_exec") && typeof pi.exec === "function") registerNativeProcess(pi);
-    if (!names.has("parr0t_framework_mode")) registerFrameworkModeApproval(pi);
-    if (!names.has("parr0t_session")) registerParr0tSession(pi);
-  });
+  // Register ordinary entry tools before the host builds its initial registry.
+  // Late session_start registration also awaits prompt rediscovery in OMP.
+  // The official bound launcher supplies this helper-owned flag; its dedicated
+  // helper/guard registers the tools instead, including guarded Python execution.
+  const end = process.argv.indexOf("--", 2);
+  const args = process.argv.slice(2, end < 0 ? undefined : end);
+  const dedicated = args.some(arg => arg === "--parr0t-workspace" || arg.startsWith("--parr0t-workspace="));
+  if (!dedicated) {
+    registerNativeProcess(pi);
+    registerFrameworkModeApproval(pi);
+    registerParr0tSession(pi);
+  }
+  pi.on("session_start", (_event, ctx) => captureOperatorConfigs(ctx));
   pi.on("tool_result", observeOperatorPolicy);
 }
