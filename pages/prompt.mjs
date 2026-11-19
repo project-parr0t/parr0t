@@ -10,11 +10,12 @@ const policies = {
 
 export function buildPrompt(options = {}) {
   const {
-    operation = "localize", repositoryUrl = "",
+    host = "codex", operation = "localize", repositoryUrl = "",
     gameType = "dialogue", koreanPolicy = "check", delivery = "patch",
     fonts = false, images = false, gamePath = "", fallbackModel = "", fallbackAttempts = "",
     baseModel = "", triageModel = "", strongModel = "", rewriteModel = "", analyzeContext = true, contextModel = "",
   } = options;
+  if (!["codex", "omp"].includes(host)) throw new Error("지원하는 호스트를 선택하세요.");
   if (!["localize", "migrate"].includes(operation) || !["dialogue", "logic"].includes(gameType) || !Object.hasOwn(policies, koreanPolicy) || !["patch", "mod"].includes(delivery)) {
     throw new Error("선택 항목을 확인하세요.");
   }
@@ -77,6 +78,13 @@ export function buildPrompt(options = {}) {
     "원어의 의미·어조·말투·용어·패러디를 보존하라. 코드·식별자·리소스 키·플레이스홀더·태그·제어 코드·조건·수치·단위·게임 동작은 변경하지 마라. 정적·합성 검증으로 줄바꿈·UI 잘림을 확인하고 실제 실행에서만 확인할 수 있는 항목은 미확인으로 구분하라.",
   ];
   }
+  if (host === "omp") sections.unshift(
+    "네이티브 호스트는 OMP로 명시 선택했다. 현재 Core 체크아웃의 완전한 bootstrap(omp-native-process.mjs)이 제공하는 parr0t_process·parr0t_framework_mode·parr0t_session을 사용하라. 일반 bootstrap의 존재는 현지화 통신 정책의 강제나 워커 격리 증거가 아니다. 전체 prompt helper는 실제 공식 제어 세션에서만 로드하라.",
+    operation === "migrate"
+      ? "외부 bootstrap 제어 디렉터리는 이전 프로젝트의 workspace가 아니다. 지정된 기존 프로젝트와 실제 workspace를 먼저 찾아 status·호환성·요청 바인딩을 확인하라. 기존 프로젝트 위에 init-workspace를 실행하거나 bootstrap 폴더에 신규 현지화 작업을 만들어 이전을 대신하지 마라. 유효한 성공·체크포인트를 보존하고 호환되지 않는 범위만 갱신하라."
+      : "외부 bootstrap 제어 디렉터리는 실제 게임 작업 workspace가 아니다. 기존 작업이 있으면 먼저 status·요청 바인딩을 확인하고 재초기화하지 마라. 새 작업에만 게임과 Core 밖의 별도 workspace를 초기화하고 최초 요청 원문을 UTF-8 파일로 보존·바인딩하라.",
+    "필수 초기화 또는 기존 상태 확인과 user-request 바인딩·검증을 완료한 뒤, 실제 작업의 절대 workspace로 parr0t_session({workspace: <실제 작업 절대 경로>, user_requested: true})을 자동 호출하여 첫 공식 제어 세션에 진입하라. 이미 요청한 자동화의 같은 모델·작업에 추가 사람 확인을 요구하지 마라. model은 생략해 실제 현재 root 모델·thinking을 보존하고 역할 모델로 root를 추측·대체하지 마라. 기존 live/pending 제어 세션을 중복 생성하지 마라. 호출 결과의 실제 준비·오류 증거를 확인하고, 초기 bootstrap에서 현지화 워커를 직접 실행하지 마라.",
+  );
   const specifiedModels = roleModels.filter(([, , value]) => String(value).trim());
   const nativeRoleModels = specifiedModels.map(([role, , value]) => [role, String(value).trim()]);
   if (model) nativeRoleModels.push(["review-fallback", model]);
@@ -85,8 +93,10 @@ export function buildPrompt(options = {}) {
     sections.push([
       ...specifiedModels.map(([, label, value]) => `${label}: ${String(value).trim()}`),
       "모델 선택 우선순위: 이 초기 사용자 프롬프트·템플릿의 명시적 역할별 모델 선택이 preset 모델 기본값보다 우선한다. preset은 기본값이지 모델 선택을 고정하는 권한이 아니다. 정확한 ID(제공자·경로·접미사 포함)를 보존하고 지정한 역할 슬롯만 교체하라. 미지정 역할과 나머지 경로는 기존 설정을 유지하라.",
-      "현재 네이티브 호스트에서 허용된 역할의 명시 선택은 다음 native-runtime 명령으로 기록하라. <current-native-host>는 이미 선택한 codex 또는 omp로 채우고, API 역할에 이 명령을 적용하거나 API/native를 암묵적으로 교환하지 마라:",
-      `game-l10n native-runtime --workspace <workspace> --host <current-native-host> ${bindings} --user-requested-models`,
+      host === "omp"
+        ? "명시 선택한 OMP의 허용된 역할만 다음 native-runtime 명령으로 기록하라. API 역할에 적용하거나 API/native를 암묵적으로 교환하지 마라:"
+        : "현재 네이티브 호스트에서 허용된 역할의 명시 선택은 다음 native-runtime 명령으로 기록하라. <current-native-host>는 이미 선택한 codex 또는 omp로 채우고, API 역할에 이 명령을 적용하거나 API/native를 암묵적으로 교환하지 마라:",
+      `game-l10n native-runtime --workspace <workspace> --host ${host === "omp" ? "omp" : "<current-native-host>"} ${bindings} --user-requested-models`,
       "선택한 호스트·허용된 전송 경로와 호환되지 않거나 호스트가 아직 바인딩되지 않았으면 정확한 요청을 보존한 pending으로 유지하라. 다른 모델이나 기본 DeepSeek로 대체하거나 실패·거부·경로 소진으로 해석하지 마라. provider mode, 제공자 역할 권한, 엔드포인트·자격 증명, 대상별 호출 상한, 시작된 워커의 바인딩·실행 증거와 완료 결과를 변경하지 마라.",
     ].join("\n"));
   }
@@ -112,4 +122,98 @@ export function buildPrompt(options = {}) {
   if (String(gamePath).trim()) sections.push(`게임 폴더:\n${String(gamePath).trim()}`);
   else if (operation === "localize") sections.push("게임 폴더는 이 요청에 첨부한 폴더를 사용하라.");
   return sections.join("\n\n") + "\n";
+}
+
+function base64Lines(value) {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (let start = 0; start < bytes.length; start += 8192) {
+    binary += String.fromCharCode(...bytes.subarray(start, start + 8192));
+  }
+  return btoa(binary).match(/.{1,120}/g).map(line => `    '${line}'`).join(",\n");
+}
+
+// Only request/options data is encoded here; the composer never opens game files.
+export function buildOmpCommand(options = {}) {
+  const request = buildPrompt({ ...options, host: "omp" });
+  const corePath = String(options.corePath ?? "").trim();
+  if (corePath && (!/^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+|\/)/.test(corePath) || corePath.includes("\0"))) {
+    throw new Error("현재 Core 체크아웃의 절대 경로를 입력하세요.");
+  }
+  const selectedModels = {};
+  for (const [key, role] of [
+    ["baseModel", "translation"], ["triageModel", "triage"], ["strongModel", "strong_review"],
+    ["rewriteModel", "rewrite"], ["fallbackModel", "review_fallback"],
+    ...(options.analyzeContext === undefined || options.analyzeContext ? [["contextModel", "context"]] : []),
+  ]) {
+    const model = String(options[key] === undefined ? "" : options[key]).trim();
+    if (model) selectedModels[role] = model;
+  }
+  const data = base64Lines(JSON.stringify({ corePath, selectedModels }));
+  const requestData = base64Lines(request);
+  return `# PowerShell (Windows PowerShell 5.1+ / PowerShell 7+)
+# Requires the current complete Parr0t Core checkout and an already configured OMP.
+# No clone, install, download, global config edit, or game execution is performed.
+# Keep the printed external control directory until ALL dependent controllers finish.
+& {
+  $ErrorActionPreference = 'Stop'
+  $parr0tData = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((@(
+${data}
+  ) -join ''))) | ConvertFrom-Json
+  $parr0tCore = if ($parr0tData.corePath) { $parr0tData.corePath } else { Join-Path $HOME 'parr0t' }
+  $parr0tCore = [IO.Path]::GetFullPath($parr0tCore)
+  $parr0tExtension = Join-Path $parr0tCore 'src/game_l10n/templates/omp-native-process.mjs'
+  foreach ($parr0tRequired in @('AGENTS.md', 'docs/agent-usage.md', 'docs/control-plane-contract.md', 'src/game_l10n/templates/native-python.py', 'src/game_l10n/templates/omp-native-process.mjs', 'src/game_l10n/templates/framework-mode-approval.mjs')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $parr0tCore $parr0tRequired) -PathType Leaf)) {
+      throw ('Current complete Parr0t Core checkout required; missing: ' + (Join-Path $parr0tCore $parr0tRequired))
+    }
+  }
+  $null = Get-Command omp -ErrorAction Stop
+  $parr0tId = [Guid]::NewGuid().ToString('N')
+  $parr0tControl = Join-Path (Join-Path ([IO.Path]::GetTempPath()) 'Parr0t-OMP-Control') $parr0tId
+  $parr0tSessions = Join-Path $parr0tControl 'sessions'
+  $null = [IO.Directory]::CreateDirectory($parr0tSessions)
+  $parr0tUtf8 = [Text.UTF8Encoding]::new($false)
+  $parr0tRequest = Join-Path $parr0tControl 'original-request.txt'
+  [IO.File]::WriteAllBytes($parr0tRequest, [Convert]::FromBase64String((@(
+${requestData}
+  ) -join '')))
+  $parr0tStartup = Join-Path $parr0tControl 'bootstrap.txt'
+  $parr0tInstructions = @(
+    'Host: OMP. This is an external text-free setup session, NOT the actual job workspace or an official localization controller.'
+    ('Current Core checkout (use its AGENTS.md and docs): ' + $parr0tCore)
+    ('For setup Core commands use parr0t_process with the already configured Python 3.11+ and this current-checkout native argv prefix (append command arguments; do not use an unrelated installed Core): ' + (ConvertTo-Json -InputObject @('python', '-I', '-B', (Join-Path $parr0tCore 'src/game_l10n/templates/native-python.py')) -Compress))
+    ('The separate @file is the complete original semantic user request, UTF-8, at: ' + $parr0tRequest)
+    'Use the explicitly loaded complete bootstrap tools parr0t_process, parr0t_framework_mode, parr0t_session. Bootstrap availability does NOT enforce localization communications or attest worker isolation.'
+    'Do not inspect game/source/translation content or launch semantic workers here. Do not load the full prompt helper into this initial setup session. Do not install, download, clone, or execute the game automatically.'
+    'Locate the real external job workspace first. For migration, locate and inspect only metadata/status of the existing project; NEVER initialize a replacement job. For localization, reuse an existing job; initialize only a genuinely new workspace outside Core and the game.'
+    'Preserve existing valid checkpoints and locked successes. Stage the complete original request inside the actual job workspace and bind it with user-request --input <staged UTF-8 path> --user-requested --text-free-confirmed; for an existing immutable binding follow the Core verification/continuation contract instead of overwriting it.'
+    'After required initialization/status and original-request binding/verification, call parr0t_session with the ACTUAL absolute job workspace and user_requested: true. This already-requested automation needs no extra confirmation. Omit model to preserve the actual current root model/thinking; never guess or substitute it from worker-role choices. Do not duplicate a live/pending controller.'
+    'Only the official controller loads the full current first-party helper for the actual job and follows its entry gates. Report actual readiness/error evidence; never claim success from tool availability alone.'
+    'Explicit worker selections are exact operator --config custom roles for this command, not root/default model overrides. Preserve global roles, transport boundaries and unselected roles. No implicit model requests or substitutions.'
+    ('Keep original request, bootstrap, session and operator config files here while ANY controller depends on them: ' + $parr0tControl)
+  ) -join [Environment]::NewLine
+  [IO.File]::WriteAllText($parr0tStartup, $parr0tInstructions, $parr0tUtf8)
+  $parr0tArgs = @('--cwd', $parr0tControl, '--session-dir', $parr0tSessions, '--no-prewalk', '--no-title', '--trusted-extension', $parr0tExtension)
+  $parr0tRoles = [ordered]@{}
+  foreach ($parr0tRole in $parr0tData.selectedModels.PSObject.Properties) {
+    $parr0tRoles[('parr0t_requested_' + $parr0tId + '_' + $parr0tRole.Name)] = $parr0tRole.Value
+  }
+  if ($parr0tRoles.Count -gt 0) {
+    $parr0tConfig = Join-Path $parr0tControl 'operator-models.json'
+    [IO.File]::WriteAllText($parr0tConfig, (@{ modelRoles = $parr0tRoles } | ConvertTo-Json -Depth 5), $parr0tUtf8)
+    $parr0tArgs += @('--config', $parr0tConfig)
+  }
+  $parr0tArgs += @(('@' + $parr0tStartup), ('@' + $parr0tRequest))
+  Write-Host ('Parr0t external control directory (retain until all controllers finish): ' + $parr0tControl)
+  Push-Location -LiteralPath $parr0tControl
+  try {
+    $LASTEXITCODE = 0
+    & omp @parr0tArgs
+    if ($LASTEXITCODE -ne 0) { throw ('OMP exited with code ' + $LASTEXITCODE) }
+  } finally {
+    Pop-Location
+  }
+}
+`;
 }
