@@ -44,9 +44,14 @@ export { default } from "file:///C:/path/to/parr0t/src/game_l10n/templates/omp-n
 일반 루트에서 일시정지·분석·종료·재개할 때는 `parr0t_framework_mode`에 절대
 `workspace`를 지정합니다. 전용 도우미에서는 바인딩된 작업공간을 사용하며 다른 작업공간은
 거부합니다. 사용자 요청은 별도 확인 대화를 강제하지 않습니다.
-이미 실행 중인 OMP의 메모리에 파일 수정이 소급 적용되지는 않습니다. 이전 도구 목록만
-보고 작업을 포기하지 말고 실제 도구를 확인한 뒤, 필요한 첫 진입은 현재 Core의
-`omp-session` 명령으로 수행합니다. 실행 중이거나 `startup_pending`인 제어 세션은 중복 시작하지 않습니다.
+세 도구는 `session_start`가 아니라 확장 팩토리에서 등록됩니다. OMP 로그에서
+`parr0t-native-process.ts`의 `session_start`가 도구 등록 중 타임아웃됐다면,
+부트스트랩이 가리키는 Core를 갱신하고 OMP를 다시 실행해 이전에 로드된 팩토리를 교체합니다.
+이미 실행 중인 OMP에서 같은 확장 경로를 다시 활성화해도 로드된 모듈은 교체되지 않습니다.
+`xd://parr0t_session`, `xd://parr0t_framework_mode`, `xd://parr0t_process`가 실제로
+열리는지 확인하세요. 설정에 경로가 표시되는 것만으로는 등록이 확인된 것이 아닙니다.
+필요한 첫 진입은 현재 Core의 `omp-session` 명령으로 수행할 수 있습니다.
+실행 중이거나 `startup_pending`인 제어 세션은 중복 시작하지 않습니다.
 
 외부 작업 초기화와 정식 제어 세션 실행:
 

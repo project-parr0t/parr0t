@@ -53,7 +53,7 @@ async function publicHostModules(root) {
 // Cold SDK construction owns the canonical registry, mounted-device state and
 // dynamic activation queue; the wrapper fixture below cannot establish those.
 async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
-  const { createAgentSession, initializeExtensions, ModelRegistry, AuthStorage, Settings, SessionManager, AgentRegistry, ExtensionToolWrapper } = host;
+  const { createAgentSession, initializeExtensions, loadExtensions, ModelRegistry, AuthStorage, Settings, SessionManager, AgentRegistry, ExtensionToolWrapper } = host;
   const agentDir = process.env.PI_CODING_AGENT_DIR;
   assert.ok(agentDir && path.isAbsolute(agentDir), "The SDK proof requires an isolated agent directory");
   const extensionDirectory = path.join(agentDir, "extensions");
@@ -72,8 +72,10 @@ async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = denyNetwork;
   try {
-    for (const explicitHelper of [false, true]) {
-      const cwd = path.join(workspace, explicitHelper ? "sdk-helper" : "sdk-ambient");
+    for (const scenario of ["ambient", "helper", "live"]) {
+      const explicitHelper = scenario === "helper";
+      const liveBootstrap = scenario === "live";
+      const cwd = path.join(workspace, `sdk-${scenario}`);
       mkdirSync(cwd);
       const settings = await Settings.loadIsolated({
         cwd, agentDir, inMemory: true,
@@ -81,6 +83,7 @@ async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
           "tools.approvalMode": "yolo", "tools.xdev": true, "lsp.enabled": false,
           "secrets.enabled": false, "enabledModels": ["synthetic-no-provider/no-model"],
           "disabledProviders": ["ollama", "llama.cpp", "lm-studio", "apple"],
+          ...(liveBootstrap ? { disabledExtensions: ["extension-module:parr0t-native-process"] } : {}),
         },
       });
       const auth = await AuthStorage.create(":memory:", { usageFetch: denyNetwork });
@@ -96,7 +99,7 @@ async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
       try {
         const created = await createAgentSession({
           cwd, agentDir, settings, sessionManager: manager, modelRegistry,
-          agentRegistry: new AgentRegistry(), agentId: explicitHelper ? "SdkHelper" : "SdkAmbient",
+          agentRegistry: new AgentRegistry(), agentId: `Sdk-${scenario}`,
           additionalExtensionPaths: explicitHelper ? [helperPath] : [],
           noContextFiles: true, contextFiles: [], skills: [], rules: [], promptTemplates: [], slashCommands: [],
           preloadedCustomToolPaths: [], enableMCP: false, enableLsp: false, enableIrc: false,
@@ -114,8 +117,8 @@ async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
         session = created.session;
         assert.deepEqual(created.extensionsResult.errors, []);
         assert.equal(session.model, undefined, "The SDK must stay model-less, not select a credentialed fallback");
-        assert.ok(created.extensionsResult.extensions.some(extension =>
-          path.basename(extension.path) === "parr0t-native-process.ts"), "Discover the isolated global-style bootstrap");
+        assert.equal(created.extensionsResult.extensions.some(extension =>
+          path.basename(extension.path) === "parr0t-native-process.ts"), !liveBootstrap);
         if (explicitHelper) created.extensionsResult.runtime.flagValues.set("parr0t-workspace", cwd);
         startingExtensions = true;
         try {
@@ -125,6 +128,16 @@ async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
           });
         } finally {
           startingExtensions = false;
+        }
+        if (liveBootstrap) {
+          const names = ["parr0t_process", "parr0t_framework_mode", "parr0t_session"];
+          assert.ok(names.every(name => !session.getToolByName(name)));
+          // OMP's live source reconciler loads a new factory, activates the
+          // registered tools, and then replays session_start for that source.
+          const bootstrap = await loadExtensions(
+            [bootstrapPath], cwd, created.extensionsResult.runtime.eventBus, created.extensionsResult.runtime);
+          assert.deepEqual(bootstrap.errors, []);
+          await session.extensionRunner.addExtensions(bootstrap.extensions);
         }
         const context = { autoApprove: true, cwd, settings, sessionManager: manager };
         let sequence = 0;
