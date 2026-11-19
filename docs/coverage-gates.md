@@ -73,6 +73,8 @@ The metadata-only `agreed_target_count` counts active comparison keys whose sour
 
 Canonical occurrence identity and current translation eligibility are separate. A proven correction never deletes, renames, reorders, or changes the source of a checkpoint-bound primary occurrence. Keep historical primary rows in `segments`; the core compares and loads only eligible display rows after validating `coverage.scope_correction`.
 
+An attestation from an older display validator is rechecked against both cached inventories before semantic work. If a control-storage row is still active, status reports `INVENTORY_ACTIVE_CONTROL_STORAGE` and routes `resolve_source_inventory_gaps` to the isolated reconciler. This does not rewrite the historical attestation or authorize a fresh scan. Use each method's cached evidence to determine whether the occurrence is proven non-display or needs a separate display projection, then run pair verification again. A valid unchanged checkpoint acquires the current validation binding without changing its identity or reconciliation generation.
+
 This optional object uses `schema: parr0t.inventory-scope-correction.v1`, `basis`, and `records` only:
 
 - `basis.file` names an immutable pre-correction canonical inventory snapshot in the inventory's own directory. It is a safe ASCII basename ending in `.json`, not an absolute path or traversal. `basis.sha256` binds its complete bytes. Both inventories name the same content-bound basis. On the first correction, its semantic fingerprint must match the prior primary attestation; later corrections either retain that basis or roll forward from the prior attested primary. The basis retains earlier correction history on a rollover.
@@ -87,7 +89,7 @@ Corrected inventories require the ordinary `coverage.display_scope` declaration 
 
 All core context, translation, review, retry, correction, and native-pass ingestion uses `formats.read_segments`, which validates this bound correction and returns only eligible rows in canonical relative order. Adjacency is formed from those display rows, not retired control storage. Runtime coverage uses the same active denominator. SDK application and pack implementations must consume this same eligible scope and preserve retired source/control bytes; a correction is neither a translation failure nor `source_preserved`, and it never supplies runtime evidence or bypasses review, application, or pack verification.
 
-Pair verification reuses each document's validated active scope and a shared canonical basis only within that one command. A shared basis is read, parsed, indexed, and fingerprinted once per resolved path, while each inventory still checks its own expected digest and occurrence/projection bindings. No process-global or cross-command readiness cache is used: a later verification rereads the basis, and downstream admission still checks bound input freshness.
+Pair verification reuses each document's validated active scope within the command. It reads, parses, indexes, and fingerprints a shared canonical basis once per resolved path, while each inventory still checks its own expected digest and occurrence/projection bindings. The attestation records the SHA-256 of the exact verified inputs. Reconciler preparation can reuse an unchanged projection baseline after hashing each distinct input once, without reparsing. A new pair verification still reads and validates the complete inputs, and downstream admission still checks freshness.
 
 ## Context execution gate
 

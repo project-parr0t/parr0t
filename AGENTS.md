@@ -60,6 +60,7 @@ Parr0t is engine-neutral. Keep game/credential/title/job data in external worksp
 | SDK branch maintenance/update | `docs/branch-update-contract.md` |
 | Confirmed SDK promotion/publication | `docs/sdk-branch-contract.md`, `docs/engine-faq-contract.md` |
 | Framework troubleshooting | `docs/faq.md` |
+| Framework analysis mode or analysis management | `docs/control-plane-contract.md`, `skills/framework-analysis/SKILL.md` |
 | Triggered engine exception | selected SDK branch `docs/engine-faq.md` under `docs/engine-faq-contract.md` |
 
 ## Repository acceptance

@@ -80,6 +80,7 @@ export function buildPrompt(options = {}) {
   }
   if (host === "omp") sections.unshift(
     "네이티브 호스트는 OMP로 명시 선택했다. 현재 Core 체크아웃의 완전한 bootstrap(omp-native-process.mjs)이 제공하는 parr0t_process·parr0t_framework_mode·parr0t_session을 사용하라. 일반 bootstrap의 존재는 현지화 통신 정책의 강제나 워커 격리 증거가 아니다. 전체 prompt helper는 실제 공식 제어 세션에서만 로드하라.",
+    "일반 OMP에서 실제 도구와 xd:// 장치가 모두 없으면 세션을 종료하지 말고 현재 Core의 omp-bootstrap으로 상태를 조회하라. consent_required이면 공식 로컬 확장의 출처·설치 경로·변경 범위를 사용자에게 보여 주고, 명시적 동의를 받은 뒤에만 omp-bootstrap --user-approved를 실행하라. 설치 거부나 기존 설정 충돌이 있어도 기존 요청·체크포인트를 보존하고, 준비된 제어기가 없다면 현재 Core의 공식 omp-session 명령으로 승인된 작업을 이어간다.",
     operation === "migrate"
       ? "외부 bootstrap 제어 디렉터리는 이전 프로젝트의 workspace가 아니다. 지정된 기존 프로젝트와 실제 workspace를 먼저 찾아 status·호환성·요청 바인딩을 확인하라. 기존 프로젝트 위에 init-workspace를 실행하거나 bootstrap 폴더에 신규 현지화 작업을 만들어 이전을 대신하지 마라. 유효한 성공·체크포인트를 보존하고 호환되지 않는 범위만 갱신하라."
       : "외부 bootstrap 제어 디렉터리는 실제 게임 작업 workspace가 아니다. 기존 작업이 있으면 먼저 status·요청 바인딩을 확인하고 재초기화하지 마라. 새 작업에만 게임과 Core 밖의 별도 workspace를 초기화하고 최초 요청 원문을 UTF-8 파일로 보존·바인딩하라.",

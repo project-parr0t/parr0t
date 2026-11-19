@@ -553,7 +553,7 @@ class ControlPlaneContractTests(unittest.TestCase):
             self.assertEqual(payload["worker_route"], "native-luna")
             self.assertEqual(payload["launch_contract"]["model"], "gpt-6-luna")
             self.assertEqual(
-                json.loads((output / "task.json").read_text(encoding="utf-8"))[
+                json.loads((root / payload["task_path"]).read_text(encoding="utf-8"))[
                     "data_plane_route_index"
                 ],
                 1,
@@ -564,7 +564,7 @@ class ControlPlaneContractTests(unittest.TestCase):
             _, relay, payload = prepare()
             self.assertEqual(payload["worker_route"], "native-luna")
             self.assertEqual(
-                json.loads((output / "task.json").read_text(encoding="utf-8"))[
+                json.loads((root / payload["task_path"]).read_text(encoding="utf-8"))[
                     "data_plane_route_index"
                 ],
                 1,
@@ -1036,10 +1036,12 @@ class ControlPlaneContractTests(unittest.TestCase):
             rebound = prepare_data_plane_task(
                 work, output, worker_role="source_probe", config=config
             )
-            task = json.loads((output / "task.json").read_text(encoding="utf-8"))
+            rebound_path = work / rebound["relay_path"]
             rebound_relay = json.loads(
                 (work / rebound["relay_path"]).read_text(encoding="utf-8")
             )
+            task = json.loads((work / rebound_relay["task_path"]).read_text(encoding="utf-8"))
+            self.assertNotEqual(rebound_path, work / first["relay_path"])
             self.assertEqual(
                 first_envelope.read_text(encoding="utf-8"), "{prior output"
             )
