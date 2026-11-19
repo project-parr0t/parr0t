@@ -89,6 +89,9 @@ async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
       });
       assert.deepEqual(modelRegistry.getDiscoverableProviders(), [], "No dynamic provider may enter cold startup");
       const manager = SessionManager.inMemory(cwd);
+      const originalArgv = [...process.argv];
+      if (explicitHelper) process.argv.push("--parr0t-workspace", cwd);
+      let startingExtensions = false;
       let session;
       try {
         const created = await createAgentSession({
@@ -101,6 +104,12 @@ async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
           deferSkillDescriptionCompression: true, bindProcessState: false,
           hasUI: true, interactivePrompts: false, disableModelFallback: true,
           assertDispatchModel() { assert.fail("A model-free consumer must never dispatch a model"); },
+          systemPrompt(defaultPrompt) {
+            // Consumer prompt services may depend on completed extension startup.
+            // Late registration must not make startup re-enter those services.
+            if (startingExtensions) throw new Error("Prompt resources are unavailable until extension startup completes");
+            return defaultPrompt;
+          },
         });
         session = created.session;
         assert.deepEqual(created.extensionsResult.errors, []);
@@ -108,10 +117,15 @@ async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
         assert.ok(created.extensionsResult.extensions.some(extension =>
           path.basename(extension.path) === "parr0t-native-process.ts"), "Discover the isolated global-style bootstrap");
         if (explicitHelper) created.extensionsResult.runtime.flagValues.set("parr0t-workspace", cwd);
-        await initializeExtensions(session, {
-          reportSendError(_action, error) { throw error; },
-          reportRuntimeError(error) { throw new Error(`Unexpected SDK extension error: ${error.error}`); },
-        });
+        startingExtensions = true;
+        try {
+          await initializeExtensions(session, {
+            reportSendError(_action, error) { throw error; },
+            reportRuntimeError(error) { throw new Error(`Unexpected SDK extension error: ${error.error}`); },
+          });
+        } finally {
+          startingExtensions = false;
+        }
         const context = { autoApprove: true, cwd, settings, sessionManager: manager };
         let sequence = 0;
         const execute = (name, input, signal) => {
@@ -201,6 +215,7 @@ async function proveColdStart(host, workspace, bootstrapPath, helperPath) {
         assert.match(text(missing), /No such tool/);
         await session.setActiveToolsByName(enabled);
       } finally {
+        process.argv.splice(0, process.argv.length, ...originalArgv);
         await session?.dispose();
         await manager.close();
         auth.close();
@@ -259,7 +274,15 @@ async function runIntegration() {
     const spawned = [];
     const dispatchedTasks = [];
     const helperPaths = selectedHelper ? [bootstrapPath, selectedHelper] : [bootstrapPath];
-    const loaded = await loadExtensions(helperPaths, workspace, eventBus, runtime);
+    const originalArgv = [...process.argv];
+    let loaded;
+    try {
+      // Match the official launcher's helper-owned CLI profile during factory load.
+      if (selectedHelper) process.argv.push("--parr0t-workspace", workspace);
+      loaded = await loadExtensions(helperPaths, workspace, eventBus, runtime);
+    } finally {
+      process.argv.splice(0, process.argv.length, ...originalArgv);
+    }
     assert.deepEqual(loaded.errors, [], "Actual helper files must load through the selected host");
     assert.equal(loaded.extensions.length, helperPaths.length);
     const consumer = await loadExtensionFromFactory(pi => {
