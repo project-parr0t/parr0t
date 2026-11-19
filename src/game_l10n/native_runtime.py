@@ -467,20 +467,59 @@ def _relay_worker_dispatches(work_dir: Path, relay_path: Path, relay: dict, cont
     return dispatches
 
 
-def require_native_workers_ended(work_dir: Path, relay_path: Path) -> None:
-    """A terminal seal cannot race a host-admitted worker, including an unrecorded start."""
+def _stale_unadmitted_omp_relay(work_dir: Path, relay_path: Path, relay: dict) -> bool:
+    """Require the durable single-worker OMP protocol and no launch or admission evidence."""
+    contract = relay.get("launch_contract") or {}
+    if (
+        contract.get("host") != "omp"
+        or contract.get("transport", "collaboration") != "collaboration"
+        or relay.get("execution_plan", {}).get("tracking_required") is not False
+        or contract.get("tasks") != ["worker-0"]
+        or set(contract.get("worker_dispatches") or {}) != {"worker-0"}
+    ):
+        return False
+    try:
+        _load(work_dir, relay_path)
+    except ValueError as exc:
+        if str(exc) not in {"E_NATIVE_LAUNCH_INVALID: runtime binding changed", ISOLATION_ISSUE}:
+            raise
+    else:
+        return False
+    ledger = _ledger_path(work_dir, relay_path)
+    if os.path.lexists(ledger) or next(ledger.parent.glob(ledger.name + ".legacy-*"), None):
+        return False
+    relay_digest = sha256(relay_path.read_bytes()).hexdigest()
+    key = sha256(f"{relay_digest}\0worker-0".encode()).hexdigest()
+    admission = work_dir / ".game-l10n/native/omp-launch-admissions" / f"{key}.json"
+    return not (
+        os.path.lexists(admission)
+        or next(admission.parent.glob(admission.name + ".failed-*"), None)
+    )
+
+
+def require_native_workers_ended(
+    work_dir: Path, relay_path: Path, *, require_terminal_evidence: bool = False,
+) -> None:
+    """Reject live admissions; require host proof of prior launches without a terminal receipt."""
     relay_bytes = relay_path.read_bytes()
     relay = json.loads(relay_bytes)
-    contract = relay.get("launch_contract") or {}
+    contract = relay.get("launch_contract")
+    if contract is None:
+        return
+    ledger = _load_launch_evidence(work_dir, relay_path)[2] if require_terminal_evidence else None
+    unverified = dict(ledger["workers"]) if ledger is not None else {}
     if "worker_dispatches" not in contract:
+        if ledger is not None and (unverified or ledger["capability"] == "available"):
+            raise ValueError("E_NATIVE_WORKER_TERMINATION_UNVERIFIED: require terminal evidence before replacement")
         return
     fingerprint = sha256(relay_bytes).hexdigest()
     for task in contract["tasks"]:
         key = sha256(f"{fingerprint}\0{task}".encode()).hexdigest()
         admission = work_dir / ".game-l10n/native/omp-launch-admissions" / f"{key}.json"
-        if not admission.exists():
+        if not os.path.lexists(admission):
             continue
-        _load_launch_evidence(work_dir, relay_path)
+        if ledger is None:
+            ledger = _load_launch_evidence(work_dir, relay_path)[2]
         record = json.loads(admission.read_text(encoding="utf-8"))
         if (
             record.get("schema") != "parr0t.omp-native-admission.v1"
@@ -490,12 +529,26 @@ def require_native_workers_ended(work_dir: Path, relay_path: Path) -> None:
             raise ValueError("E_NATIVE_LAUNCH_INVALID: host admission changed")
         if record["state"] in {"reserved", "started", "ending"}:
             raise ValueError("E_NATIVE_WORKER_ACTIVE: wait for the admitted worker before sealing")
+        if require_terminal_evidence:
+            worker = unverified.get(task)
+            observed_id = record.get("worker_id")
+            if record["state"] == "ended" and isinstance(observed_id, str) and observed_id:
+                if worker is not None and worker["worker_id"] != observed_id:
+                    raise ValueError("E_NATIVE_LAUNCH_INVALID: terminal worker identity changed")
+                unverified.pop(task, None)
+            elif record["state"] != "failed" or observed_id is not None:
+                raise ValueError("E_NATIVE_LAUNCH_INVALID: host termination evidence changed")
+    if unverified:
+        raise ValueError("E_NATIVE_WORKER_TERMINATION_UNVERIFIED: require terminal evidence before replacement")
 
 
 def bind_data_plane_launch(work_dir: Path, relay_path: Path) -> None:
     """Attach host routing to an existing core-bound task without rebuilding it."""
     if not relay_path.resolve().is_relative_to(work_dir.resolve() / ".game-l10n"):
         raise ValueError("E_NATIVE_LAUNCH_INVALID: relay escaped control metadata")
+    from .data_plane_task import _require_current_data_plane_relay
+
+    _require_current_data_plane_relay(relay_path)
     runtime = native_runtime(work_dir, required=True)
     runtime_isolation(work_dir, runtime)
     relay = json.loads(relay_path.read_text(encoding="utf-8"))
@@ -649,6 +702,10 @@ def _load_launch_evidence(work_dir: Path, relay_path: Path) -> tuple[dict, dict,
 
 def _load(work_dir: Path, relay_path: Path) -> tuple[dict, dict, dict]:
     relay, contract, ledger = _load_launch_evidence(work_dir, relay_path)
+    if str(relay.get("schema", "")).startswith("parr0t.data-plane-relay."):
+        from .data_plane_task import _require_current_data_plane_relay
+
+        _require_current_data_plane_relay(relay_path)
     if contract.get("host") == "omp" and contract.get("transport", "collaboration") == "collaboration":
         runtime = native_runtime(work_dir, required=True)
         isolation = runtime_isolation(work_dir, runtime)
