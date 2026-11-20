@@ -179,7 +179,7 @@ Before an agent publishes an instance release, it must verify all of the followi
 9. The public installer exposes Install, Restore, and Verify; its `parr0t-patch-status.txt`, receipt, declared original replacements, custom errors, and player messages satisfy `docs/installer-contract.md`.
 10. Every launcher wrapper matches the approved Parr0t wrapper release and its architecture, source tag, reproducible-build record, Authenticode result, and published hashes; no Steam client configuration is edited and Steam is never terminated.
 11. The existing README is preserved except for reviewed, release-specific edits.
-12. Release notes identify the release ID, source commit, supported builds, changes, installation/update caveats, and asset checksums.
+12. Release notes identify the release ID, source commit, supported builds, changes, installation/update caveats, and asset checksums. Apply `skills/patch-notes/SKILL.md` to the change list only, not to the required release metadata.
 13. `parr0t-release-checkpoint.json` validates against the package IDs, SDK/build/inventory bindings, target digests, and declared locale-fallback result; it contains no separate raw-source copy or private work records, and any released source-preserved target remains explicitly unresolved.
 14. The uploaded assets are the same bytes that passed verification, and their published digests are checked once after upload.
 15. When translation source, game folder, and prior instance/checkpoint inputs are all supplied, each was validated and used for its declared role before any model work; no unchanged reviewed target was regenerated merely because one input was ignored.
