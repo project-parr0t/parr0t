@@ -74,6 +74,7 @@ from .native_runtime import (
 )
 from .omp_isolation import ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
 from .privacy import is_within
+from .sdk_inventory_repair import inventory_repair_tool, reconcile_cached_sdk_inventory
 from .store import exclusive_file_lock, stable_hash
 
 
@@ -2593,6 +2594,33 @@ def prepare_data_plane_task(
             raise ConfigurationError("E_NATIVE_LAUNCH_INVALID: cannot verify prior data-plane metadata") from None
     if discard_unverified_receipt is not None and replacement is None:
         raise ConfigurationError("E_NATIVE_RECEIPT_DISCARD_INVALID: no eligible relay to supersede")
+    sdk_repair = None
+    repair_tool = (
+        inventory_repair_tool(work_dir, sdk_activation or {})
+        if worker_role == "inventory_reconciler" and discard_unverified_receipt is None
+        else None
+    )
+    if repair_tool is not None:
+        with exclusive_file_lock(work_dir / ".game-l10n/native/launch.lock",
+                                 issue_code="E_NATIVE_LAUNCH_BUSY", blocking=True):
+            require_control_plane_ready(work_dir)
+            if (_active_data_plane_dir(stage_dir) != output_dir
+                    or control_plane_state(work_dir)["generation"] != control_generation
+                    or (replacement is None and previous_task_path.exists())):
+                raise ConfigurationError("E_NATIVE_LAUNCH_INVALID: reconciliation binding changed")
+            if replacement is not None:
+                prior_path, prior, kind = replacement
+                if kind == "unadmitted":
+                    if not _revisable_data_plane_relay(work_dir, prior_path, prior):
+                        raise ConfigurationError("E_NATIVE_LAUNCH_INVALID: reconciliation relay was admitted")
+                else:
+                    require_native_workers_ended(
+                        work_dir, prior_path, require_terminal_evidence=require_prior_terminal_evidence,
+                    )
+            sdk_repair = reconcile_cached_sdk_inventory(work_dir, repair_tool)
+        if sdk_repair is not None and sdk_repair["static_complete"]:
+            return {"status": "inventory_verified", "worker_role": worker_role,
+                    "dispatch_allowed": False, "sdk_reconciliation": sdk_repair}
     if replacement is not None:
         output_dir = stage_dir / "launch-revisions" / os.urandom(16).hex()
         if output_dir.resolve() != output_dir:
@@ -3110,14 +3138,19 @@ def prepare_data_plane_task(
                 "reuse_existing_inventory_scans_and_cached_evidence",
                 "do_not_repeat_full_source_scans",
                 "resolve_only_reported_gap_categories",
+                "for_large_gaps_group_cached_occurrences_by_evidenced_sdk_display_consumer_and_storage_role",
+                "apply_each_supported_structural_rule_to_all_matching_pending_occurrences_in_one_local_sdk_pass",
+                "preserve_independent_method_proof_for_each_occurrence_and_leave_ambiguous_cases_pending",
                 "use_inventory_comparison_key_for_proven_method_specific_aliases",
                 "treat_global_id_disagreement_as_identity_namespace_reconciliation_not_content_loss",
                 "never_rename_remove_or_reorder_checkpoint_bound_primary_ids",
                 "preserve_primary_ids_as_downstream_canonical_identity",
                 "repair_method_specific_aliases_on_the_independent_inventory_with_deterministic_evidence",
                 "do_not_match_duplicate_source_text_without_occurrence_or_location_evidence",
-                "run_core_verify_inventory_and_bind_current_attestation",
+                "stage_all_evidenced_repairs_before_running_core_verify_inventory_once_to_bind_the_current_pair",
+                "if_inputs_do_not_change_run_the_required_fresh_pair_verification_once_not_repeatedly",
                 "incomplete_with_measured_progress_requires_another_bounded_step",
+                "do_not_redo_resolved_sdk_projections_only_handle_remaining_exceptions",
                 "constraint_unsatisfiable_alone_requests_core_validation_not_terminal_authority",
                 "never_relabel_provider_transport_or_malformed_output_as_inventory_constraint",
                 "require_fresh_complete_pair_verification_and_bound_history_for_projection_constraints",
@@ -3430,6 +3463,7 @@ def prepare_data_plane_task(
         "relay_path": _relative(work_dir, relay_path),
         "task_id": task_id,
         "control_generation": control_generation,
+        **({"sdk_reconciliation": sdk_repair} if sdk_repair is not None else {}),
         **({"candidate_discovery": task["input_image_candidates"]} if task.get("input_image_candidates") else {}),
     }
 
