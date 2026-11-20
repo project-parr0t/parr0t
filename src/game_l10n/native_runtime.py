@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,19 @@ RUNTIME_ISSUES = {
     "E_NATIVE_WORKER_MODEL_UNAVAILABLE",
     ISOLATION_ISSUE,
 }
+
+
+def core_runtime() -> dict[str, Any]:
+    """Identify the running Core and its exact isolated Python launcher."""
+    module = Path(__file__).resolve().with_name("cli.py")
+    return {
+        "module": str(module),
+        "python": sys.executable,
+        "cli_argv": [
+            sys.executable, "-I", "-B",
+            str(module.with_name("templates") / "native-python.py"),
+        ],
+    }
 
 
 def active_execution_environment_policy(work_dir: Path) -> dict[str, Any] | None:

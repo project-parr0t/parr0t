@@ -31,6 +31,7 @@ from .content_source_policy import (
     validate_output_provenance,
 )
 from .control_plane import (
+    ISSUE_CODES_BY_STAGE,
     control_plane_state,
     safe_artifact_path,
     require_control_plane_entry,
@@ -38,7 +39,7 @@ from .control_plane import (
     validate_control_envelope,
 )
 from .coverage import require_inventory_attestation, validate_inventory_display_scope
-from .errors import ConfigurationError, ProviderError
+from .errors import ConfigurationError, ControlEnvelopeIssueCodeError, ProviderError
 from .extractor_preparation import (
     ACTION as EXTRACTOR_PREPARATION_ACTION,
     ATTESTATION_PATH as EXTRACTOR_ATTESTATION_PATH,
@@ -69,7 +70,7 @@ from .inventory_scope import ActiveControlStorageError
 from .language_policy import language_binding
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext, Segment
 from .native_runtime import (
-    RUNTIME_ISSUES, _stale_unadmitted_omp_relay, native_launch_evidence,
+    RUNTIME_ISSUES, _stale_unadmitted_omp_relay, core_runtime, native_launch_evidence,
     native_launch_summary, native_runtime, require_native_workers_ended,
 )
 from .omp_isolation import ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
@@ -95,6 +96,7 @@ CONTEXT_CHUNK_CLAIM_SCHEMA = "parr0t.context-chunk-claim.v1"
 CONTEXT_CHUNK_RESULT_SCHEMA = "parr0t.context-chunk-result.v1"
 CONTEXT_FRAGMENT_SCHEMA = "parr0t.context-fragment.v1"
 CONTEXT_WORKER_EXECUTION_SCHEMA = "parr0t.context-worker-execution.v1"
+INVENTORY_WORKER_EXECUTION_SCHEMA = "parr0t.inventory-worker-execution.v1"
 DATA_PLANE_OPERATIONAL_FAILURE_CODES = {
     "provider_operational_error",
     "execution_guard_denied",
@@ -2112,10 +2114,7 @@ def _seal_inventory_constraint(
         return
 
 
-def _context_worker_execution(
-    work_dir: Path, task_path: Path, runtime: dict[str, Any] | None
-) -> dict[str, Any]:
-    """Bind worker commands before task hashing, independently of relay lifecycle."""
+def _worker_python_transport(runtime: dict[str, Any] | None) -> tuple[dict[str, str], list[str]]:
     guarded = bool(
         runtime
         and runtime["host"] == "omp"
@@ -2123,16 +2122,28 @@ def _context_worker_execution(
         and runtime.get("omp_isolation", "guarded") == "guarded"
     )
     transport = tool_transport_contract(prompt=not guarded)
-    prefix = transport["relay_python_argv_prefix"]
-    workspace = str(work_dir.resolve())
-    task = str(task_path.resolve())
-    binding = ["--workspace", workspace, "--task", task]
-    contract = {
-        "schema": CONTEXT_WORKER_EXECUTION_SCHEMA,
+    binding = {
         "tool": transport["subagent_python_tool"],
         "argv_convention": (
             "python_arguments_without_executable" if guarded else "complete_executable_argv"
         ),
+    }
+    if guarded:
+        binding["tool_device"] = transport["subagent_python_tool_device"]
+    return binding, transport["relay_python_argv_prefix"]
+
+
+def _context_worker_execution(
+    work_dir: Path, task_path: Path, runtime: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Bind worker commands before task hashing, independently of relay lifecycle."""
+    transport, prefix = _worker_python_transport(runtime)
+    workspace = str(work_dir.resolve())
+    task = str(task_path.resolve())
+    binding = ["--workspace", workspace, "--task", task]
+    return {
+        "schema": CONTEXT_WORKER_EXECUTION_SCHEMA,
+        **transport,
         "workspace_root": workspace,
         "task_path": task,
         "substitution_policy": "replace_only_whole_declared_placeholder_arguments_never_shell_interpolate",
@@ -2154,9 +2165,29 @@ def _context_worker_execution(
             "finalizer_only": ["finalize-context-fragments"],
         },
     }
-    if guarded:
-        contract["tool_device"] = transport["subagent_python_tool_device"]
-    return contract
+
+
+def _inventory_worker_execution(work_dir: Path, runtime: dict[str, Any] | None) -> dict[str, Any]:
+    transport, prefix = _worker_python_transport(runtime)
+    workspace = str(work_dir.resolve())
+    return {
+        "schema": INVENTORY_WORKER_EXECUTION_SCHEMA,
+        **transport,
+        "workspace_root": workspace,
+        "core_runtime": core_runtime(),
+        "substitution_policy": "replace_only_whole_declared_placeholder_arguments_never_shell_interpolate",
+        "placeholders": {
+            "<primary-path>": "workspace_path_of_the_staged_primary_inventory",
+            "<independent-path>": "workspace_path_of_the_staged_independent_inventory",
+        },
+        "command_argv": {
+            "verify-inventory": [
+                *prefix, "verify-inventory", "--workspace", workspace,
+                "--primary", "<primary-path>", "--independent", "<independent-path>",
+            ],
+        },
+        "allowed_issue_codes": sorted(ISSUE_CODES_BY_STAGE["inventory"]),
+    }
 
 
 def prepare_data_plane_task(
@@ -3148,6 +3179,10 @@ def prepare_data_plane_task(
                 "repair_method_specific_aliases_on_the_independent_inventory_with_deterministic_evidence",
                 "do_not_match_duplicate_source_text_without_occurrence_or_location_evidence",
                 "stage_all_evidenced_repairs_before_running_core_verify_inventory_once_to_bind_the_current_pair",
+                "use_worker_execution_core_runtime_for_the_exact_core_launcher_never_guess_paths",
+                "execute_verify_inventory_using_bound_worker_execution_tool_and_argv",
+                "if_execution_aborts_without_pair_verification_leave_the_output_envelope_unwritten",
+                "only_use_worker_execution_allowed_issue_codes_never_embed_diagnostics_in_the_envelope",
                 "if_inputs_do_not_change_run_the_required_fresh_pair_verification_once_not_repeatedly",
                 "incomplete_with_measured_progress_requires_another_bounded_step",
                 "do_not_redo_resolved_sdk_projections_only_handle_remaining_exceptions",
@@ -3249,6 +3284,8 @@ def prepare_data_plane_task(
         private_payload["worker_execution"] = _context_worker_execution(
             work_dir, output_dir / "task.json", runtime
         )
+    elif worker_role == "inventory_reconciler":
+        private_payload["worker_execution"] = _inventory_worker_execution(work_dir, runtime)
 
     semantic_kind = {
         "context_analyzer": "localization_context",
@@ -4655,6 +4692,13 @@ def seal_data_plane_task(
         )
     try:
         return _seal_bound_data_plane_task(work_dir, relay, task)
+    except ControlEnvelopeIssueCodeError:
+        if not worker_ended:
+            raise
+        return _seal_ended_data_plane_task(
+            work_dir, relay, task, issue_code="malformed_response", execution=execution,
+            additional_issue_codes=["invalid_envelope_issue_codes"],
+        )
     except (
         ConfigurationError,
         ProviderError,

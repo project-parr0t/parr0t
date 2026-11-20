@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .errors import ConfigurationError
+from .errors import ConfigurationError, ControlEnvelopeIssueCodeError
 from .privacy import is_within
 
 
@@ -1094,11 +1094,11 @@ def validate_control_envelope(
             | (LEGACY_PROVIDER_ISSUE_CODES if schema == LEGACY_CONTROL_ENVELOPE_SCHEMA else set())
         )
     ):
-        raise ConfigurationError(
+        raise ControlEnvelopeIssueCodeError(
             "E_CONTROL_ENVELOPE_INVALID: issue_codes contain prose or an unauthorized semantic category"
         )
     if schema == CONTROL_ENVELOPE_SCHEMA and "provider_refusal" in issue_codes:
-        raise ConfigurationError(
+        raise ControlEnvelopeIssueCodeError(
             "E_CONTROL_ENVELOPE_INVALID: parent-facing refusals must be normalized to fallback_required"
         )
     if status == "fallback_required" and "fallback_required" not in issue_codes:

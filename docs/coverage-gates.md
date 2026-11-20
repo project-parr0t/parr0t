@@ -116,6 +116,17 @@ the remaining repair work. A no-work result is cached for the unchanged pair,
 basis and hook. Missing hooks and unsupported or ambiguous gaps retain the
 normal isolated repair workflow.
 
+An isolated inventory reconciler receives `worker_execution` in its bound
+task. Use its exact `core_runtime.cli_argv` to identify the Core launcher
+instead of inferring a checkout or import path, and its `verify-inventory`
+argv with only the two complete path placeholders replaced. Use the bound
+transport and do not pass SDK-specific options to Core. A verification that
+reports incomplete scope can still support a partial result. If execution
+aborts before verifying the pair, leave the envelope unwritten and let the
+relay seal the ended attempt. Core reports `invalid_envelope_issue_codes`
+alongside `malformed_response` when the submitted issue codes fail validation;
+it never forwards rejected values or worker error text.
+
 ## Context execution gate
 
 The context state records sealed successful work; refusal, capacity, timeout, malformed output, or operational error remains non-success. Each task binds a configured native route. Worker counts and chunk sizes use safe defaults but honor explicit bounds and available host/model capacity. Completed fragments remain reusable; continue unfinished claims and available independent work without requiring a whole no-progress route cycle. Stale output cannot be resealed, and only core sealing writes successful context state after evidence validation.

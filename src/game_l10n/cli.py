@@ -113,6 +113,7 @@ from .native_translation_retry import (
 from .native_runtime import (
     MODEL_FAILURE_CODES,
     bind_data_plane_launch, configure_native_runtime, native_runtime, record_native_launch,
+    core_runtime as _core_runtime,
 )
 from .omp_isolation import runtime_isolation, tool_transport_contract
 from .native_host import configure_native_host
@@ -183,18 +184,6 @@ from .workspace import (
     update_repository_policy,
     verify_sdk_promotion_commit,
 )
-
-
-def _core_runtime() -> dict[str, Any]:
-    module = Path(__file__).resolve()
-    return {
-        "module": str(module),
-        "python": sys.executable,
-        "cli_argv": [
-            sys.executable, "-I", "-B",
-            str(module.with_name("templates") / "native-python.py"),
-        ],
-    }
 
 
 def _analysis_contracts() -> dict[str, Any]:
