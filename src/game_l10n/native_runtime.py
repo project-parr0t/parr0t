@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,19 @@ RUNTIME_ISSUES = {
     "E_NATIVE_WORKER_MODEL_UNAVAILABLE",
     ISOLATION_ISSUE,
 }
+
+
+def core_runtime() -> dict[str, Any]:
+    """Identify the running Core and its exact isolated Python launcher."""
+    module = Path(__file__).resolve().with_name("cli.py")
+    return {
+        "module": str(module),
+        "python": sys.executable,
+        "cli_argv": [
+            sys.executable, "-I", "-B",
+            str(module.with_name("templates") / "native-python.py"),
+        ],
+    }
 
 
 def active_execution_environment_policy(work_dir: Path) -> dict[str, Any] | None:
@@ -499,6 +513,7 @@ def _stale_unadmitted_omp_relay(work_dir: Path, relay_path: Path, relay: dict) -
 
 def require_native_workers_ended(
     work_dir: Path, relay_path: Path, *, require_terminal_evidence: bool = False,
+    operator_confirmed_stop: bool = False,
 ) -> None:
     """Reject live admissions; require host proof of prior launches without a terminal receipt."""
     relay_bytes = relay_path.read_bytes()
@@ -527,7 +542,9 @@ def require_native_workers_ended(
             or record.get("state") not in {"reserved", "started", "ending", "ended", "failed"}
         ):
             raise ValueError("E_NATIVE_LAUNCH_INVALID: host admission changed")
-        if record["state"] in {"reserved", "started", "ending"}:
+        if record["state"] in {"reserved", "started", "ending"} and (
+            not operator_confirmed_stop or require_terminal_evidence
+        ):
             raise ValueError("E_NATIVE_WORKER_ACTIVE: wait for the admitted worker before sealing")
         if require_terminal_evidence:
             worker = unverified.get(task)

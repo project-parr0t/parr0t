@@ -31,6 +31,7 @@ from .content_source_policy import (
     validate_output_provenance,
 )
 from .control_plane import (
+    ISSUE_CODES_BY_STAGE,
     control_plane_state,
     safe_artifact_path,
     require_control_plane_entry,
@@ -38,7 +39,7 @@ from .control_plane import (
     validate_control_envelope,
 )
 from .coverage import require_inventory_attestation, validate_inventory_display_scope
-from .errors import ConfigurationError, ProviderError
+from .errors import ConfigurationError, ControlEnvelopeIssueCodeError, ProviderError
 from .extractor_preparation import (
     ACTION as EXTRACTOR_PREPARATION_ACTION,
     ATTESTATION_PATH as EXTRACTOR_ATTESTATION_PATH,
@@ -69,11 +70,12 @@ from .inventory_scope import ActiveControlStorageError
 from .language_policy import language_binding
 from .models import CharacterProfile, ContextMode, ContextPack, GlossaryEntry, ProjectContext, Segment
 from .native_runtime import (
-    RUNTIME_ISSUES, _stale_unadmitted_omp_relay, native_launch_evidence,
+    RUNTIME_ISSUES, _stale_unadmitted_omp_relay, core_runtime, native_launch_evidence,
     native_launch_summary, native_runtime, require_native_workers_ended,
 )
 from .omp_isolation import ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
 from .privacy import is_within
+from .sdk_inventory_repair import inventory_repair_tool, reconcile_cached_sdk_inventory
 from .store import exclusive_file_lock, stable_hash
 
 
@@ -94,6 +96,7 @@ CONTEXT_CHUNK_CLAIM_SCHEMA = "parr0t.context-chunk-claim.v1"
 CONTEXT_CHUNK_RESULT_SCHEMA = "parr0t.context-chunk-result.v1"
 CONTEXT_FRAGMENT_SCHEMA = "parr0t.context-fragment.v1"
 CONTEXT_WORKER_EXECUTION_SCHEMA = "parr0t.context-worker-execution.v1"
+INVENTORY_WORKER_EXECUTION_SCHEMA = "parr0t.inventory-worker-execution.v1"
 DATA_PLANE_OPERATIONAL_FAILURE_CODES = {
     "provider_operational_error",
     "execution_guard_denied",
@@ -2111,10 +2114,7 @@ def _seal_inventory_constraint(
         return
 
 
-def _context_worker_execution(
-    work_dir: Path, task_path: Path, runtime: dict[str, Any] | None
-) -> dict[str, Any]:
-    """Bind worker commands before task hashing, independently of relay lifecycle."""
+def _worker_python_transport(runtime: dict[str, Any] | None) -> tuple[dict[str, str], list[str]]:
     guarded = bool(
         runtime
         and runtime["host"] == "omp"
@@ -2122,16 +2122,28 @@ def _context_worker_execution(
         and runtime.get("omp_isolation", "guarded") == "guarded"
     )
     transport = tool_transport_contract(prompt=not guarded)
-    prefix = transport["relay_python_argv_prefix"]
-    workspace = str(work_dir.resolve())
-    task = str(task_path.resolve())
-    binding = ["--workspace", workspace, "--task", task]
-    contract = {
-        "schema": CONTEXT_WORKER_EXECUTION_SCHEMA,
+    binding = {
         "tool": transport["subagent_python_tool"],
         "argv_convention": (
             "python_arguments_without_executable" if guarded else "complete_executable_argv"
         ),
+    }
+    if guarded:
+        binding["tool_device"] = transport["subagent_python_tool_device"]
+    return binding, transport["relay_python_argv_prefix"]
+
+
+def _context_worker_execution(
+    work_dir: Path, task_path: Path, runtime: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Bind worker commands before task hashing, independently of relay lifecycle."""
+    transport, prefix = _worker_python_transport(runtime)
+    workspace = str(work_dir.resolve())
+    task = str(task_path.resolve())
+    binding = ["--workspace", workspace, "--task", task]
+    return {
+        "schema": CONTEXT_WORKER_EXECUTION_SCHEMA,
+        **transport,
         "workspace_root": workspace,
         "task_path": task,
         "substitution_policy": "replace_only_whole_declared_placeholder_arguments_never_shell_interpolate",
@@ -2153,9 +2165,29 @@ def _context_worker_execution(
             "finalizer_only": ["finalize-context-fragments"],
         },
     }
-    if guarded:
-        contract["tool_device"] = transport["subagent_python_tool_device"]
-    return contract
+
+
+def _inventory_worker_execution(work_dir: Path, runtime: dict[str, Any] | None) -> dict[str, Any]:
+    transport, prefix = _worker_python_transport(runtime)
+    workspace = str(work_dir.resolve())
+    return {
+        "schema": INVENTORY_WORKER_EXECUTION_SCHEMA,
+        **transport,
+        "workspace_root": workspace,
+        "core_runtime": core_runtime(),
+        "substitution_policy": "replace_only_whole_declared_placeholder_arguments_never_shell_interpolate",
+        "placeholders": {
+            "<primary-path>": "workspace_path_of_the_staged_primary_inventory",
+            "<independent-path>": "workspace_path_of_the_staged_independent_inventory",
+        },
+        "command_argv": {
+            "verify-inventory": [
+                *prefix, "verify-inventory", "--workspace", workspace,
+                "--primary", "<primary-path>", "--independent", "<independent-path>",
+            ],
+        },
+        "allowed_issue_codes": sorted(ISSUE_CODES_BY_STAGE["inventory"]),
+    }
 
 
 def prepare_data_plane_task(
@@ -2593,6 +2625,33 @@ def prepare_data_plane_task(
             raise ConfigurationError("E_NATIVE_LAUNCH_INVALID: cannot verify prior data-plane metadata") from None
     if discard_unverified_receipt is not None and replacement is None:
         raise ConfigurationError("E_NATIVE_RECEIPT_DISCARD_INVALID: no eligible relay to supersede")
+    sdk_repair = None
+    repair_tool = (
+        inventory_repair_tool(work_dir, sdk_activation or {})
+        if worker_role == "inventory_reconciler" and discard_unverified_receipt is None
+        else None
+    )
+    if repair_tool is not None:
+        with exclusive_file_lock(work_dir / ".game-l10n/native/launch.lock",
+                                 issue_code="E_NATIVE_LAUNCH_BUSY", blocking=True):
+            require_control_plane_ready(work_dir)
+            if (_active_data_plane_dir(stage_dir) != output_dir
+                    or control_plane_state(work_dir)["generation"] != control_generation
+                    or (replacement is None and previous_task_path.exists())):
+                raise ConfigurationError("E_NATIVE_LAUNCH_INVALID: reconciliation binding changed")
+            if replacement is not None:
+                prior_path, prior, kind = replacement
+                if kind == "unadmitted":
+                    if not _revisable_data_plane_relay(work_dir, prior_path, prior):
+                        raise ConfigurationError("E_NATIVE_LAUNCH_INVALID: reconciliation relay was admitted")
+                else:
+                    require_native_workers_ended(
+                        work_dir, prior_path, require_terminal_evidence=require_prior_terminal_evidence,
+                    )
+            sdk_repair = reconcile_cached_sdk_inventory(work_dir, repair_tool)
+        if sdk_repair is not None and sdk_repair["static_complete"]:
+            return {"status": "inventory_verified", "worker_role": worker_role,
+                    "dispatch_allowed": False, "sdk_reconciliation": sdk_repair}
     if replacement is not None:
         output_dir = stage_dir / "launch-revisions" / os.urandom(16).hex()
         if output_dir.resolve() != output_dir:
@@ -3110,14 +3169,23 @@ def prepare_data_plane_task(
                 "reuse_existing_inventory_scans_and_cached_evidence",
                 "do_not_repeat_full_source_scans",
                 "resolve_only_reported_gap_categories",
+                "for_large_gaps_group_cached_occurrences_by_evidenced_sdk_display_consumer_and_storage_role",
+                "apply_each_supported_structural_rule_to_all_matching_pending_occurrences_in_one_local_sdk_pass",
+                "preserve_independent_method_proof_for_each_occurrence_and_leave_ambiguous_cases_pending",
                 "use_inventory_comparison_key_for_proven_method_specific_aliases",
                 "treat_global_id_disagreement_as_identity_namespace_reconciliation_not_content_loss",
                 "never_rename_remove_or_reorder_checkpoint_bound_primary_ids",
                 "preserve_primary_ids_as_downstream_canonical_identity",
                 "repair_method_specific_aliases_on_the_independent_inventory_with_deterministic_evidence",
                 "do_not_match_duplicate_source_text_without_occurrence_or_location_evidence",
-                "run_core_verify_inventory_and_bind_current_attestation",
+                "stage_all_evidenced_repairs_before_running_core_verify_inventory_once_to_bind_the_current_pair",
+                "use_worker_execution_core_runtime_for_the_exact_core_launcher_never_guess_paths",
+                "execute_verify_inventory_using_bound_worker_execution_tool_and_argv",
+                "if_execution_aborts_without_pair_verification_leave_the_output_envelope_unwritten",
+                "only_use_worker_execution_allowed_issue_codes_never_embed_diagnostics_in_the_envelope",
+                "if_inputs_do_not_change_run_the_required_fresh_pair_verification_once_not_repeatedly",
                 "incomplete_with_measured_progress_requires_another_bounded_step",
+                "do_not_redo_resolved_sdk_projections_only_handle_remaining_exceptions",
                 "constraint_unsatisfiable_alone_requests_core_validation_not_terminal_authority",
                 "never_relabel_provider_transport_or_malformed_output_as_inventory_constraint",
                 "require_fresh_complete_pair_verification_and_bound_history_for_projection_constraints",
@@ -3216,6 +3284,8 @@ def prepare_data_plane_task(
         private_payload["worker_execution"] = _context_worker_execution(
             work_dir, output_dir / "task.json", runtime
         )
+    elif worker_role == "inventory_reconciler":
+        private_payload["worker_execution"] = _inventory_worker_execution(work_dir, runtime)
 
     semantic_kind = {
         "context_analyzer": "localization_context",
@@ -3430,6 +3500,7 @@ def prepare_data_plane_task(
         "relay_path": _relative(work_dir, relay_path),
         "task_id": task_id,
         "control_generation": control_generation,
+        **({"sdk_reconciliation": sdk_repair} if sdk_repair is not None else {}),
         **({"candidate_discovery": task["input_image_candidates"]} if task.get("input_image_candidates") else {}),
     }
 
@@ -4621,6 +4692,13 @@ def seal_data_plane_task(
         )
     try:
         return _seal_bound_data_plane_task(work_dir, relay, task)
+    except ControlEnvelopeIssueCodeError:
+        if not worker_ended:
+            raise
+        return _seal_ended_data_plane_task(
+            work_dir, relay, task, issue_code="malformed_response", execution=execution,
+            additional_issue_codes=["invalid_envelope_issue_codes"],
+        )
     except (
         ConfigurationError,
         ProviderError,

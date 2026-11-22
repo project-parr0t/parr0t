@@ -14,6 +14,8 @@ Treat `required_tags` as a non-destructive requirement set. Read the item's curr
 
 SteamCMD remains the required path for Workshop content and default-locale metadata. Its documented Workshop VDF does not provide localized-language selection. An unrecognized `language` field and a successful `workshop_build_item` command do not prove that localized metadata changed.
 
+Follow `skills/patch-notes/SKILL.md` when drafting or revising the VDF `changenote`. It does not govern the item title or description.
+
 Localized title and description synchronization may use `scripts/sync_steam_workshop_metadata.py`, which calls Valve's native Steam API through Python's standard library. Apply mode requires:
 
 - the exact manifest-bound published-file ID through `--approve-item`;

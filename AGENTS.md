@@ -56,6 +56,7 @@ Parr0t is engine-neutral. Keep game/credential/title/job data in external worksp
 | Real install/update/remove/launch | `docs/runtime-approval.md` |
 | Windows package | `docs/installer-contract.md` plus `docs/filesystem-packaging.md` or `docs/steam-packaging.md` |
 | Steam discovery or Play-button integration | `docs/steam-faq.md`, `docs/wrapper-executable.md` |
+| Draft, revise, or review patch notes | `skills/patch-notes/SKILL.md` (not commit messages or `README.md`) |
 | Publication/Workshop metadata | `docs/instance-release.md`, `docs/workshop-metadata.md` |
 | SDK branch maintenance/update | `docs/branch-update-contract.md` |
 | Confirmed SDK promotion/publication | `docs/sdk-branch-contract.md`, `docs/engine-faq-contract.md` |

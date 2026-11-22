@@ -397,6 +397,44 @@ describe("OMP descendant communication boundary", () => {
     }
   });
 
+  test("withholds unmarked child replies and explicit yield without forwarding private data", async () => {
+    const f = fixture();
+    const session = host(f.workspace, "sub", 1);
+    const message = { content: [{ type: "text", text: "PRIVATE_SYNTHETIC_FINAL" }, { type: "text", text: "PRIVATE_MORE" }] };
+    const terminal = "E_NATIVE_MESSAGE_ISOLATION_REQUIRED";
+    expect((await session.emit("assistant_message", { message })).content.map(block => block.text).join("")).toBe(terminal);
+    const yieldInput = { data: { text: "PRIVATE_YIELD" }, error: "PRIVATE_ERROR", type: "PRIVATE_SECTION" };
+    let delivered;
+    await session.call("yield", yieldInput, input => { delivered = input; });
+    expect(delivered).toEqual({ data: terminal });
+    await deniedWithoutDelivery(session, "multi_tool_use.parallel", {
+      tool_uses: [{ recipient_name: "functions.yield", parameters: yieldInput }],
+    });
+    expect(await host(f.workspace, "main").emit("assistant_message", { message })).toBeUndefined();
+  });
+
+  test("bound child returns contain only the expected locator or lifecycle code", async () => {
+    const text = { type: "text", text: "PRIVATE_SYNTHETIC_COMMENTARY" };
+    const call = { type: "toolCall", id: "synthetic-call", name: "read", arguments: { path: "synthetic-input.json" } };
+    for (const native of [false, true]) {
+      const f = fixture(native);
+      const relative = native ? f.marker.split("=")[1] : ".game-l10n/data-plane/synthetic/launch-revisions/synthetic-revision/relay.json";
+      const envelope = relative.replace(/relay\.json$/, "control-envelope.g1.attempt-2.revision-3.json");
+      if (!native) writeJson(path.join(f.workspace, relative), {
+        schema: "parr0t.data-plane-relay.v4", task_id: "synthetic-task", expected_envelope: envelope,
+      });
+      for (const depth of [1, 2]) {
+        const session = host(f.workspace, "sub", depth);
+        await session.emit("before_agent_start", { prompt: `PARR0T_OMP_RELAY=${relative}`, systemPrompt: [] });
+        const expected = depth === 1
+          ? native ? relative.replace(/\.json$/, "-receipt.json") : ".game-l10n/data-plane/synthetic/receipt.json"
+          : native ? "worker_ended" : envelope;
+        expect((await session.emit("assistant_message", { message: { content: [text] } })).content).toEqual([{ type: "text", text: expected }]);
+        expect((await session.emit("assistant_message", { message: { content: [text, call] } })).content).toEqual([{ type: "text", text: "" }, call]);
+      }
+    }
+  });
+
   test("unmarked analysis and diagnostic children cannot become communication channels", async () => {
     const f = fixture();
     writeJson(path.join(f.workspace, ".game-l10n/framework-session.json"), { mode: "analysis" });
