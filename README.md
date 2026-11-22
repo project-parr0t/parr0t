@@ -53,7 +53,7 @@ python -I -B src/game_l10n/templates/native-python.py omp-bootstrap --prompt
 `xd://parr0t_session`, `xd://parr0t_framework_mode`, `xd://parr0t_process`가 실제로
 열리는지 확인하세요. 설정에 경로가 표시되는 것만으로는 등록이 확인된 것이 아닙니다.
 필요한 첫 진입은 현재 Core의 `omp-session` 명령으로 수행할 수 있습니다.
-실행 중이거나 `startup_pending`인 제어 세션은 중복 시작하지 않습니다.
+별도 제어 세션이 실행 중이거나 `startup_pending`이어도 사용자가 요청한 실행을 차단하지 않습니다.
 설치에 동의하지 않아도 체크포인트는 유지됩니다. 현재 세션에서 도구를 쓸 수 없다면
 전역 설치와 무관하게 공식 `omp-session`이 해당 작업 세션에만 번들 확장을 로드할 수 있습니다.
 
@@ -65,7 +65,7 @@ game-l10n init-workspace "<external-workspace>" --sdk-root "<repository>" --game
 game-l10n omp-session --workspace "<external-workspace>" --model "<approved-provider/model-id>" --mode workspace --foreground
 ```
 
-`--model`에는 현재 OMP에서 허용된 정확한 최상위 모델 ID를 지정합니다. 새 세션에 위의 게임별 요청을 전달하세요. 기본 `prompt` 모드는 하위 에이전트의 충돌하는 협업 지시와 직접 메시지·기록 열람 경로를 제한하는 경량 훅을 연결하며, 일반 Python 실행은 유지합니다. 도구 등록은 새 세션에 적용되며 기존 세션에 도구를 추가하지 않습니다. 분리 실행의 `helper_registered`와 실제 PID·세션 ID로 등록을 확인하고, `startup_pending`이면 중복 실행하지 않습니다. 전체 실행 가드·전용 실행기가 필요하면 `--guarded`를 선택합니다. 어느 모드도 OS 샌드박스는 아닙니다. Codex의 기본 제공자 설정이나 전역 OMP 설정은 변경하지 않습니다. 이미 초기화된 작업은 첫 두 명령을 반복하지 않습니다.
+`--model`에는 현재 OMP에서 허용된 정확한 최상위 모델 ID를 지정합니다. 새 세션에 위의 게임별 요청을 전달하세요. 기본 `prompt` 모드는 하위 에이전트의 충돌하는 협업 지시와 직접 메시지·기록 열람 경로를 제한하는 경량 훅을 연결하며, 일반 Python 실행은 유지합니다. 도구 등록은 새 세션에 적용되며 기존 세션에 도구를 추가하지 않습니다. 분리 실행의 `helper_registered`와 실제 PID·세션 ID로 등록을 확인합니다. `startup_pending`은 해당 세션의 등록 대기 상태이며 자동 재실행 신호가 아닙니다. 전체 실행 가드·전용 실행기가 필요하면 `--guarded`를 선택합니다. 어느 모드도 OS 샌드박스는 아닙니다. Codex의 기본 제공자 설정이나 전역 OMP 설정은 변경하지 않습니다. 이미 초기화된 작업은 첫 두 명령을 반복하지 않습니다.
 
 명령만 확인하려면 마지막 명령에 `--print-command`를 추가합니다. 이 옵션은 세션이나 파일을 만들지 않습니다. 실제 게임 내용·비공개 기록에 노출된 제어 세션은 정식 handoff와 새 세션이 필요하며 `--mode rotation`을 사용합니다. 노출 없이 일시정지·분석·종료한 경우에는 현재 사용자의 명시적 재개 요청을 루트 `parr0t_framework_mode` 도구에 전달하여 같은 깨끗한 세션에서 재개할 수 있습니다. 별도 UI 확인은 필수가 아니며 이전 기록을 불러오는 `omp --resume`와도 다릅니다. 워커 모델 바인딩과 호스트 조건은 [OMP 진입 규약](docs/control-plane-contract.md#omp-entry)을 따릅니다.
 

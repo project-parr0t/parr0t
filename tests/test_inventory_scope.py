@@ -8,13 +8,16 @@ import tempfile
 import unittest
 
 from game_l10n.cli import _public_inventory_gate
+from game_l10n.control_plane import establish_control_plane_entry
 from game_l10n.coverage import (
     record_runtime_coverage, require_inventory_attestation, save_inventory_attestation,
     verify_inventory_pair,
 )
+from game_l10n.data_plane_task import data_plane_receipt_path, prepare_data_plane_task
 from game_l10n.errors import ConfigurationError
 from game_l10n.formats import read_segments
 from game_l10n.inventory_scope import SCOPE_CORRECTION_SCHEMA, inventory_scope
+from game_l10n.workspace import initialize_workspace, load_config
 
 
 def _row(target_id: str, key: str, source: str) -> dict:
@@ -206,6 +209,122 @@ class InventoryScopeCorrectionTests(unittest.TestCase):
         state = save_inventory_attestation(self.root, self.primary_path, self.independent_path)
         self.assertTrue(state["static_complete"])
         self.assertNotIn("canonical-control", [row.id for row in read_segments(self.primary_path)])
+
+    def _prepare_sdk_projection_fixture(self, *, residual: bool) -> tuple[dict, dict]:
+        self.root = self.root.resolve()
+        game = self.root / "synthetic-game"
+        sdk = self.root / "synthetic-sdk"
+        game.mkdir()
+        sdk.mkdir()
+        initialize_workspace(self.root, sdk, game_roots=[game])
+        establish_control_plane_entry(self.root)
+        hook = self.root / "tools/reconcile_inventory.py"
+        hook.write_text(
+            "import json, sys\n"
+            "data = json.load(sys.stdin.buffer)\n"
+            "json.dump({k: sorted(v) for k, v in data['primary'].items() "
+            "if data['independent'].get(k) == v}, sys.stdout)\n",
+            encoding="utf-8",
+        )
+        activation = {"workspace_tools": {"manifest": [
+            {"path": hook.name, "sha256": sha256(hook.read_bytes()).hexdigest()}
+        ]}}
+        original = self.correction["records"][0]
+        original["classification"] = "control_storage_with_projection"
+        for doc in (self.primary, self.independent):
+            next(x for x in doc["segments"] if x["metadata"]["inventory_comparison_key"] == "label")[
+                "metadata"
+            ]["display_projection_of"] = "control"
+        for i in range(3):
+            key = f"second-control-{i}"
+            source = f"SYNTHETIC CONTROL {i}"
+            control = _row(f"canonical-{key}", key, source)
+            control["metadata"]["storage_role"] = "lookup_key"
+            self.primary["segments"].append(control)
+            for role, doc in (("canonical", self.primary), ("independent", self.independent)):
+                display = _row(f"{role}-screen-{i}", f"screen-{i}", f"SYNTHETIC SCREEN {i}")
+                if not residual or i != 2 or role == "canonical":
+                    display["metadata"]["display_projection_of"] = key
+                doc["segments"].append(display)
+            self.correction["records"].append({
+                **original, "canonical_id": control["id"], "comparison_key": key,
+                "source_sha256": sha256(source.encode()).hexdigest(),
+            })
+        self._write()
+        save_inventory_attestation(self.root, self.primary_path, self.independent_path)
+        self.basis_path.write_bytes(self.primary_path.read_bytes())
+        self.correction["basis"]["sha256"] = sha256(self.basis_path.read_bytes()).hexdigest()
+        self._correct()
+        for doc in (self.primary, self.independent):
+            doc["coverage"]["display_scope"].update(
+                raw_occurrence_count=9, display_candidate_count=5, control_only_count=4,
+            )
+        self._write()
+        before = save_inventory_attestation(self.root, self.primary_path, self.independent_path)
+        return activation, before
+
+    def test_sdk_repair_seals_all_supported_projections_without_a_model_relay(self) -> None:
+        activation, before = self._prepare_sdk_projection_fixture(residual=False)
+        originals = [path.read_bytes() for path in (self.primary_path, self.independent_path)]
+        directory = data_plane_receipt_path(self.root, "inventory_reconciler").parent
+        result = prepare_data_plane_task(
+            self.root, directory, worker_role="inventory_reconciler",
+            config=load_config(self.root), sdk_activation=activation,
+        )
+        self.assertEqual(result["status"], "inventory_verified")
+        self.assertFalse(result["dispatch_allowed"])
+        self.assertEqual(result["sdk_reconciliation"]["resolved_projections"], 4)
+        self.assertFalse(directory.exists())
+        state_path = self.root / ".game-l10n/inventory-attestation.json"
+        current = json.loads(state_path.read_bytes())
+        self.assertEqual(current["reconciliation"]["generation"], before["reconciliation"]["generation"] + 1)
+        self.assertTrue(current["static_complete"])
+        self.assertNotEqual(current["primary_path"], before["primary_path"])
+        self.assertEqual(current["primary_id_fingerprint"], before["primary_id_fingerprint"])
+        self.assertEqual([path.read_bytes() for path in (self.primary_path, self.independent_path)], originals)
+        self.assertEqual([r.id for r in read_segments(Path(current["primary_path"]))],
+                         ["canonical-label", "canonical-tail", "canonical-screen-0",
+                          "canonical-screen-1", "canonical-screen-2"])
+
+    def test_sdk_repair_prepares_the_model_against_only_unresolved_projection_constraints(self) -> None:
+        activation, before = self._prepare_sdk_projection_fixture(residual=True)
+        directory = data_plane_receipt_path(self.root, "inventory_reconciler").parent
+        config = load_config(self.root)
+        result = prepare_data_plane_task(
+            self.root, directory, worker_role="inventory_reconciler", config=config, sdk_activation=activation,
+        )
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["sdk_reconciliation"]["resolved_projections"], 3)
+        relay = json.loads((self.root / result["relay_path"]).read_bytes())
+        task = json.loads((self.root / relay["task_path"]).read_bytes())
+        gate = task["inventory_gate"]
+        self.assertEqual(gate["reconciliation_generation"], before["reconciliation"]["generation"] + 1)
+        self.assertEqual(gate["gap_score"], before["gap_score"] - 6)
+        for role in ("primary", "independent"):
+            doc = json.loads(Path(gate[f"{role}_path"]).read_bytes())
+            pending = [row["comparison_key"] for row in doc["coverage"]["scope_correction"]["records"]
+                       if not row["projection_ids"]]
+            self.assertEqual(pending, ["second-control-2"])
+        same = prepare_data_plane_task(
+            self.root, directory, worker_role="inventory_reconciler", config=config, sdk_activation=activation,
+        )
+        self.assertEqual(same["task_id"], result["task_id"])
+
+    def test_sdk_repair_rejects_a_one_sided_proposal_without_changing_the_pair(self) -> None:
+        activation, before = self._prepare_sdk_projection_fixture(residual=True)
+        hook = self.root / "tools/reconcile_inventory.py"
+        hook.write_text('print(\'{"second-control-2": ["render-screen-2"]}\')\n', encoding="utf-8")
+        activation["workspace_tools"]["manifest"][0]["sha256"] = sha256(hook.read_bytes()).hexdigest()
+        directory = data_plane_receipt_path(self.root, "inventory_reconciler").parent
+        originals = [path.read_bytes() for path in (self.primary_path, self.independent_path)]
+        with self.assertRaisesRegex(ConfigurationError, "E_SDK_INVENTORY_REPAIR"):
+            prepare_data_plane_task(
+                self.root, directory, worker_role="inventory_reconciler",
+                config=load_config(self.root), sdk_activation=activation,
+            )
+        self.assertFalse(directory.exists())
+        self.assertEqual([path.read_bytes() for path in (self.primary_path, self.independent_path)], originals)
+        self.assertEqual(json.loads((self.root / ".game-l10n/inventory-attestation.json").read_bytes()), before)
 
     def test_invalid_basis_cannot_masquerade_as_a_valid_projection_constraint(self) -> None:
         self.correction["records"][0]["classification"] = "control_storage_with_projection"

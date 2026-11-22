@@ -71,6 +71,14 @@ Context is evidence for already eligible targets, not an inventory filter. Attac
 
 Primary and independent methods independently discover supported physical target locations and their eligibility. They may share lossless format readers, public role specifications and identity normalization, but not a discovered segment list, copied classifications, or counterpart output. Two traversals of one already selected list do not establish independent extraction.
 
+Put repeatable cached reconciliation in the SDK's deterministic entry point,
+not in scripts generated or substituted by individual relays. Validate each
+method's cache schema and evidence binding separately. Apply each supported
+consumer rule across the matching unresolved occurrences in one cached pass.
+Distinguish an unsupported consumer from missing or conflicting evidence in
+aggregate diagnostics. Reuse locked outcomes; do not infer an exclusion
+from a missing rule or classify by equal wording.
+
 SDK acceptance fixtures must exercise the actual extractor-to-consumer boundary: visible text survives; control/editor/unused records do not become targets; unsupported actual display dependencies remain pending; relevant context survives without unrelated records; excluded source bytes remain unchanged on apply/repack; and an omission in one discovery method produces an inventory disagreement. Use synthetic format fixtures, not source-text assertions, output echoes, or mere equal counts. A core test pass, a clean privacy scan and an `up_to_date` branch state do not establish these engine-specific properties.
 
 Existing checkpoint-bound raw history is never silently deleted to fix eligibility. Use the bound scope-correction contract for retired occurrences and regenerate affected context/review bindings without renaming successful historical identities.
@@ -94,6 +102,13 @@ Promotion exports only behavior actually used and verified after the user confir
 A promotion commit owns engine-specific implementation only. It must be a separate non-merge commit after the intended `main` revision is merged, and it must not modify any path that exists on `main`. Do not use promotion to bundle a generally useful helper, control-plane rule, provider change, common test, root documentation edit, or cleanup. If engine work exposes a genuine core need, stop promotion, make that a separately authorized `main` change, verify it there, merge the resulting core commit into the SDK branch, and then create a clean engine-only promotion commit. Never stage or commit both scopes together.
 
 An exact engine build observed in a private workspace may be reduced to its declared public compatibility line for the branch name, but the line must be derived from that observed build before evaluation begins. After it is recorded, the exact `sdk-<engine>-<version>` identity controls ownership; an older, newer, or merely similar branch cannot absorb the result.
+
+For cached reconciliation, the promotion candidate may contain reusable
+cache readers, public-format consumer rules, and synthetic regression
+fixtures. Keep rule instances bound to private files or ranges, their
+witnesses, scan caches, and diagnostic counts in the external workspace.
+A successful cache-only run proves only that exercised capability; it does
+not satisfy the confirmed patch-success gate.
 
 ## Branch audit and update route
 
