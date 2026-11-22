@@ -17,6 +17,40 @@ from game_l10n.orchestrator import OrchestratorConfig
 
 
 class NativeReviewTests(unittest.TestCase):
+    def test_additional_fallback_is_one_call_and_only_for_the_bound_candidate(self):
+        from dataclasses import replace
+        from game_l10n.models import AttemptRecord
+        from game_l10n.native_pass import _load_task_manifest, _native_review_call_budget
+        from game_l10n.native_review import _bound_result, _pending_segment
+        from game_l10n.review_policy import _record_additional_fallback_review
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            provider, model = "native-review-fallback", "fixture/exact"
+            (root / "game-l10n.json").write_text(json.dumps({"routing": {
+                "reviewers": ["native-sol", provider], "review_attempt_limits": {provider: 2},
+            }}), encoding="utf-8")
+            segment = review_segment("held")
+            result = _bound_result(segment)
+            result.attempts = [AttemptRecord("review", provider, "rewrite", ordinal=ordinal, model=model)
+                               for ordinal in (1, 2)]
+            source = root / "held.jsonl"
+            source.write_text(json.dumps(asdict(_pending_segment(segment, result))) + "\n", encoding="utf-8")
+            segments = read_segments(source)
+            output = _record_additional_fallback_review(root, segments, provider, model)
+            ordinary = root / "ordinary"
+            for dest in (output, ordinary):
+                prepare_native_tasks(root, source, segments, dest, pass_kind="review", review_tier="strong",
+                                     route_binding={"provider": provider, "model": model, "attempt": 1})
+            scoped_path, ordinary_path = output / "manifest.json", ordinary / "manifest.json"
+            scoped = _load_task_manifest(root, scoped_path)
+            self.assertEqual(_native_review_call_budget(root, scoped_path, scoped), 1)
+            self.assertEqual(_native_review_call_budget(root, ordinary_path, _load_task_manifest(root, ordinary_path)), 0)
+            with self.assertRaisesRegex(ValueError, "APPROVAL_INVALID"):
+                _native_review_call_budget(root, ordinary_path, scoped)
+            with self.assertRaisesRegex(ValueError, "SCOPE_IMMUTABLE"):
+                _record_additional_fallback_review(root, [replace(segments[0], source="different")], provider, model)
+
     def test_explicit_review_budget_does_not_reset_when_candidate_generation_advances(self):
         from game_l10n.models import AttemptRecord
         from game_l10n.native_review import _bound_result, _pending_segment, partition_native_review_routes
@@ -190,7 +224,7 @@ class NativeReviewTests(unittest.TestCase):
                 ["reviewed", "accepted_unreviewed", "source_preserved"],
             )
             self.assertEqual(rows[1].attempts[-1].status, "rewrite")
-            self.assertEqual(rows[1].acceptance_authority, "user")
+            self.assertEqual(rows[1].acceptance_authority, "user_policy")
             self.assertEqual(rows[1].candidate_generation, 1)
             self.assertEqual(rows[1].metadata["delivery_review_status"], "not_approved")
             self.assertEqual(rows[2].text, rows[2].source)
@@ -369,6 +403,49 @@ class NativeReviewTests(unittest.TestCase):
                     collect_reviewed_candidates(root, source,
                                                 [root / "stale.json"], root / "invalid.json")
             self.assertFalse((root / "invalid.json").exists())
+
+    def test_resume_review_queues_uses_only_latest_unapproved_evidence(self):
+        from game_l10n.formats import write_results
+        from game_l10n.models import AttemptRecord
+        from game_l10n.native_review import _bound_result, _pending_segment, _resume_review_queues
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            items = {key: review_segment(key) for key in ("approved", "later", "conflict", "missing")}
+
+            def save(name, rows):
+                path = root / name
+                path.write_text("".join(json.dumps(asdict(row)) + "\n" for row in rows), encoding="utf-8")
+                return path
+
+            original = save("inventory.jsonl", items.values())
+            result = _bound_result(items["approved"])
+            result.status = "reviewed"
+            result.acceptance_authority = "reviewer"
+            write_results(root / "approved.json", [result])
+
+            def pending(key, *attempts):
+                item = items[key]
+                state = _bound_result(item)
+                state.attempts = list(attempts)
+                return _pending_segment(item, state)
+
+            triage = AttemptRecord("review-triage", "native-luna", "rewrite")
+            strong = AttemptRecord("review", "native-sol", "error")
+            prior = save("strong-input.jsonl", [
+                pending("approved", triage), pending("later", triage), pending("conflict", triage)
+            ])
+            later = save("fallback-input.jsonl", [
+                pending("later", triage, strong), pending("conflict", strong)
+            ])
+            output = root / "continuation"
+            with patch("game_l10n.native_review.require_inventory_attestation"):
+                summary = _resume_review_queues(
+                    root, original, root / "approved.json", [later, prior], output,
+                )
+            self.assertEqual((summary["unreviewed"], summary["missing"], summary["conflicting"]), (3, 1, 1))
+            self.assertEqual(set(summary["queues"]), {"fallback"})
+            self.assertEqual(read_segments(output / "fallback.jsonl"), read_segments(later)[:1])
 
     def test_only_current_ok_is_accepted_and_other_targets_are_routed(self):
         with tempfile.TemporaryDirectory() as directory:
