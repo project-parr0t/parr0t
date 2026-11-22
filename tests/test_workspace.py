@@ -2243,6 +2243,33 @@ class WorkspaceTests(unittest.TestCase):
             "native_pass_wave_only",
         )
 
+    def test_reconciler_bound_argv_verifies_pair_without_guessing_core_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk, game, work = root / "sdk", root / "game", root / "workspace with spaces"
+            sdk.mkdir()
+            game.mkdir()
+            initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+            establish_control_plane_entry(work)
+            record_sdk_selection(work, "private-new", target_engine="fixture-engine", target_version="1.0")
+            activation = activate_workspace_adapter(work)
+            primary, before = write_verified_inventory(work)
+            prepared = prepare_data_plane_task(
+                work, work / ".game-l10n/data-plane/inventory_reconciler",
+                worker_role="inventory_reconciler", config=load_config(work), sdk_activation=activation,
+            )
+            relay = json.loads((work / prepared["relay_path"]).read_bytes())
+            task = json.loads((work / relay["task_path"]).read_bytes())
+            execution = task["worker_execution"]
+            paths = {"<primary-path>": str(primary), "<independent-path>": before["independent_path"]}
+            argv = [paths.get(arg, arg) for arg in execution["command_argv"]["verify-inventory"]]
+            result = subprocess.run(argv, cwd=work, capture_output=True, encoding="utf-8")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            verified = json.loads(result.stdout)
+            self.assertTrue(verified["static_complete"])
+            self.assertEqual(verified["reconciliation"]["generation"], before["reconciliation"]["generation"] + 1)
+            self.assertEqual(verified["primary_identity_binding"], before["primary_identity_binding"])
+
     def test_legacy_active_control_storage_routes_to_isolated_inventory_repair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

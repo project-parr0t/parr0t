@@ -43,6 +43,11 @@ class ConfigurationError(GameL10nError):
     """Project configuration is invalid."""
 
 
+
+class ControlEnvelopeIssueCodeError(ConfigurationError):
+    """A worker envelope supplied issue codes outside its allowed vocabulary."""
+
+
 class ToolExecutionError(GameL10nError):
     """An unpack/pack tool failed; its message is private data-plane diagnostics."""
 
