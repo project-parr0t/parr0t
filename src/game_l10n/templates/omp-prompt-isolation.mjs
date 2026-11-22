@@ -17,8 +17,10 @@ const POLICY = [
   "This role-specific policy supersedes generic Coop, Peers, collaboration, and blocker-message advice. Do not message Main, a parent, a peer, or any agent, even to report a blocker or ask a question. Do not use IRC, host message routing, agent://, history://, or session history tools. Do not inspect parent/peer/session history.",
   "Use local artifact tools and parr0t_process for native Python/process execution. Its argv starts with the executable, followed by exact arguments; use the available Python executable or the core-bound executable. Do not use embedded bash, eval, or a builtin bridge: their host virtual filesystems can route messages. Native process execution has no implicit deadline and is not an OS/filesystem/network sandbox. Report completion through the normal task return and core-owned result files, never an outbound message. Host/system safety policy and the assigned task remain in force.",
   "A relay marker binds work, never permission to communicate. Missing markers and framework mode changes do not enable child messaging or session-history access.",
+  "The host withholds free-form child replies. Write the assigned output artifact and return only its locator or the bound categorical result.",
 ].join("\n");
 const DENIAL = { block: true, reason: "PARR0T_OMP_PROMPT_ISOLATION: child communication or history access denied" };
+const WITHHELD_REPLY = "E_NATIVE_MESSAGE_ISOLATION_REQUIRED";
 const ROUTES = /(?:agent|history|sessions?|irc|peers?|coop|messages?|proc):/i;
 const BRIDGES = new Set(["bash", "eval", "builtin", "builtins", "call_builtin", "invoke_builtin", "exec", "python", "tool"]);
 const MESSAGING = new Set([
@@ -56,6 +58,7 @@ function deniedTarget(value) {
 export function deniedCall(name, input, depth = 0, ownedChildren) {
   if (depth > 32) return true;
   const tool = toolName(name);
+  if (tool === "yield" && depth !== 0) return true;
   const components = normalized(name).split(/[./:]/).filter(Boolean);
   if (components.some(part => BRIDGES.has(part) || MESSAGING.has(part)
       || /(?:history|sessions?|messages?|irc|(?:^|_)(?:agent|peer|coop)(?:_|$))/.test(part))) return true;
@@ -141,7 +144,25 @@ function boundRelay(prompt, workspace) {
   const metadata = JSON.parse(readFileSync(target, "utf8"));
   if (native ? metadata.schema !== "parr0t.native-wave-relay.v1" || !Array.isArray(metadata.task_bindings)
     : !/^parr0t\.data-plane-relay\.v[1-4]$/.test(metadata.schema) || typeof metadata.task_id !== "string") throw new Error("relay_binding");
-  return target;
+  return { target, local, native, metadata };
+}
+
+function childReply({ local, native, metadata }, depth) {
+  if (local.split("/").some(part => !/^[A-Za-z0-9._-]+$/.test(part))) return WITHHELD_REPLY;
+  if (depth === 1) {
+    if (native) return local.replace(/\.json$/, "-receipt.json");
+    // The receipt stays in the stage directory even when launch evidence
+    // moves the active relay into a purpose-specific launch revision.
+    const stage = local.split("/")[2];
+    return `.game-l10n/data-plane/${stage}/receipt.json`;
+  }
+  if (native) return "worker_ended";
+  const envelope = metadata.expected_envelope;
+  if (typeof envelope !== "string" || path.posix.dirname(envelope) !== path.posix.dirname(local)
+      || !/^control-envelope\.g\d+\.attempt-\d+(?:\.revision-\d+)?\.json$/.test(path.posix.basename(envelope))) {
+    return WITHHELD_REPLY;
+  }
+  return envelope;
 }
 
 function bindTaskMarkers(name, input, marker) {
@@ -165,6 +186,7 @@ function bindTaskMarkers(name, input, marker) {
 export default function promptIsolation(pi) {
   pi.registerFlag("parr0t-workspace", { description: "Absolute Parr0t workspace for prompt child communication boundaries", type: "string" });
   let relay;
+  let reply = WITHHELD_REPLY;
   const ownedChildren = new Set();
   const lifecycle = createNativeRelayLifecycle({
     workspace,
@@ -244,8 +266,9 @@ export default function promptIsolation(pi) {
       throw new Error("PARR0T_OMP_PROMPT_ISOLATION: invalid core relay binding");
     }
     if (bound) {
-      if (relay && relay !== bound) throw new Error("PARR0T_OMP_PROMPT_ISOLATION: child relay binding cannot change");
-      relay = bound;
+      if (relay && relay !== bound.target) throw new Error("PARR0T_OMP_PROMPT_ISOLATION: child relay binding cannot change");
+      relay = bound.target;
+      reply = childReply(bound, ctx.agent.depth);
     }
     const handoff = await lifecycle.before_agent_start(event, ctx);
     const blocks = (Array.isArray(event.systemPrompt) ? event.systemPrompt : [event.systemPrompt ?? ""]).map(stripCollaboration);
@@ -253,12 +276,24 @@ export default function promptIsolation(pi) {
     if (handoff) blocks.push(handoff);
     return { systemPrompt: Array.isArray(event.systemPrompt) ? blocks : blocks.join("\n\n") };
   });
+  pi.on("assistant_message", (event, ctx) => {
+    if (ctx.agent?.kind !== "sub") return;
+    const terminalReply = event.message.content.some(block => block.type === "toolCall") ? "" : reply;
+    let emitted = false;
+    return { content: event.message.content.map(block => {
+      if (block.type !== "text") return block;
+      const text = emitted ? "" : terminalReply;
+      emitted = true;
+      return { ...block, text };
+    }) };
+  });
   pi.on("tool_call", async (event, ctx) => {
     try { checkFrameworkToolCall(event, ctx, realpathSync(workspace(ctx))); }
     catch (error) { return { block: true, reason: error.message }; }
     if (ctx.agent?.kind !== "sub") return;
     try {
       if (deniedCall(event.toolName, event.input, 0, ownedChildren)) return { ...DENIAL };
+      if (toolName(event.toolName) === "yield") return { input: { data: reply } };
       if (relay) {
         const marker = `PARR0T_OMP_RELAY=${path.relative(realpathSync(workspace(ctx)), relay).split(path.sep).join("/")}`;
         if (toolName(event.toolName) === "task" || WRAPPERS.has(toolName(event.toolName))) {

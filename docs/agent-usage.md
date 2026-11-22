@@ -22,7 +22,7 @@ Semantic localization is content-network deny by default. Apply `skills/translat
 For a new job:
 
 1. Confirm repository/workspace access and only that the source path exists; do not inspect its contents.
-2. Initialize; bind `user-request`; follow status. `enter-control-plane --workspace <workspace> --contracts-read --source-unopened`. Exposure/recovery: `control-plane-contract.md`. Requested OMP automation may establish its first official controller without an extra confirmation dialog; never duplicate or replace a live/pending controller.
+2. Initialize; bind `user-request`; follow status. `enter-control-plane --workspace <workspace> --contracts-read --source-unopened`. Exposure/recovery: `control-plane-contract.md`. Requested OMP automation may establish its first official controller without an extra confirmation dialog. A separate live or pending session does not block the requested launch.
 3. Git is disabled by default; enable only on explicit user choice. Disabled forbids game-workspace Git mutation/publication, not already-authorized SDK access, download, inventory, or activation. Never infer consent from transport or missing `.git`.
 4. Bind `native-runtime --host codex|omp` before dispatch. Model overrides use `--role-model role=exact-id --user-requested-models`. Preserve host/isolation and started bindings; see `codex-app-deepseek.md`.
 
