@@ -297,19 +297,40 @@ class FrameworkSessionTests(unittest.TestCase):
                 self.workspace, self.workspace / ".game-l10n/native/relay/unopened.json",
                 event="capability-available",
             )
-        for command in (
-            ("accept-control-plane-exposure", "--contracts-read", "--user-confirmed-exposure-acceptance"),
-            ("enter-control-plane", "--contracts-read", "--source-unopened"),
-        ):
-            with self.subTest(command=command):
-                code, output, error = self.call(*command)
-                self.assertEqual(code, 2)
-                self.assertEqual(output, "")
-                self.assertIn("FRAMEWORK_INACTIVE", error)
+        code, output, error = self.call(
+            "accept-control-plane-exposure", "--contracts-read", "--user-confirmed-exposure-acceptance",
+        )
+        self.assertEqual((code, output), (2, ""))
+        self.assertIn("no exposure incident is pending", error)
+        code, output, error = self.call("enter-control-plane", "--contracts-read", "--source-unopened")
+        self.assertEqual((code, output), (2, ""))
+        self.assertIn("FRAMEWORK_INACTIVE", error)
         code, _, error = self.call("resume-control-plane")
         self.assertEqual(code, 2)
         self.assertIn("FRESH_SESSION_REQUIRED", error)
         self.assertFalse(framework_session.framework_session_state(self.workspace)["instructions_active"])
+
+    def test_acceptance_during_analysis_still_requires_separate_lifecycle_approval(self) -> None:
+        inactive = self.change(logs=[self.external_log])["framework_session"]
+        with self.assertRaisesRegex(ConfigurationError, "ROTATION_REQUIRED"):
+            self.change("localization")
+
+        code, output, error = self.call(
+            "accept-control-plane-exposure", "--contracts-read", "--user-confirmed-exposure-acceptance",
+        )
+        self.assertEqual((code, error), (0, ""))
+        public = json.loads(output)["control_plane"]
+        self.assertEqual(public["boundary_mode"], "user_accepted_exposure")
+        self.assertEqual(framework_session.framework_session_state(self.workspace), inactive)
+        with self.assertRaisesRegex(ConfigurationError, "FRAMEWORK_INACTIVE"):
+            control_plane.require_control_plane_ready(self.workspace)
+
+        active = self.change("localization")["framework_session"]
+        self.assertEqual(active["mode"], "localization")
+        self.assertEqual(active["logs"], [])
+        state = control_plane.require_control_plane_ready(self.workspace)
+        self.assertEqual(control_plane.public_control_plane_state(state), public)
+        control_plane.require_control_plane_entry(self.workspace)
 
     def test_canonical_fresh_recovery_restores_localization_and_revokes_logs(self) -> None:
         result = self.change(logs=[self.external_log])

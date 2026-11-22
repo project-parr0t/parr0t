@@ -701,6 +701,39 @@ class ControlPlaneContractTests(unittest.TestCase):
         self.assertEqual(sealed["status"], "error")
         self.assertEqual(sealed["issue_codes"], ["malformed_response"])
 
+    def test_ended_worker_rejects_unknown_issue_codes_without_echoing_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            game, sdk = work / "game", work / "sdk"
+            game.mkdir()
+            sdk.mkdir()
+            (work / "game-l10n.json").write_text("{}", encoding="utf-8")
+            establish_control_plane_entry(work)
+            prepared = prepare_data_plane_task(
+                work, work / ".game-l10n/data-plane/source_probe",
+                worker_role="source_probe",
+                config={
+                    "game_roots": [str(game)], "sdk_root": str(sdk),
+                    "sdk_selection": {"inventory_fingerprint": "fixture-inventory"},
+                },
+            )
+            relay = work / prepared["relay_path"]
+            envelope = work / json.loads(relay.read_bytes())["expected_envelope"]
+            rejected = "synthetic private failure message"
+            envelope.write_text(json.dumps({
+                "schema": "parr0t.control-envelope.v2", "worker_role": "source_probe",
+                "stage": "discovery", "status": "error", "target_ids": [],
+                "counts": {"total": 1, "error": 1, "pending": 1},
+                "issue_codes": ["task_incomplete", rejected], "queue_transitions": [],
+                "artifact_paths": ["game-l10n.json"], "route_evidence_path": "",
+            }), encoding="utf-8")
+            sealed = seal_data_plane_task(work, relay, worker_ended=True)
+            receipt = (work / sealed["receipt_path"]).read_text(encoding="utf-8")
+            self.assertEqual(sealed["issue_codes"], ["malformed_response", "invalid_envelope_issue_codes"])
+            self.assertEqual(json.loads(receipt)["artifact_paths"], [])
+            self.assertNotIn(rejected, receipt)
+            self.assertNotIn(rejected, json.dumps(sealed))
+
     def test_legacy_data_plane_relay_remains_sealable_for_checkpoint_resume(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
