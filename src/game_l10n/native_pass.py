@@ -22,7 +22,18 @@ from .content_source_policy import (
 from .language_policy import DEFAULT_TARGET_LANGUAGE, language_policy_digest
 from .models import Segment
 from .native_followup import CANDIDATE_METADATA_KEY
-from .native_runtime import RUNTIME_ISSUES, launch_contract, native_launch_summary, native_runtime, require_native_workers_ended, _unstarted_launch_ledger, _relay_command_argv, _relay_worker_dispatches, _preserve_legacy_launch_fields
+from .native_runtime import (
+    RUNTIME_ISSUES,
+    _load_launch_evidence,
+    _preserve_legacy_launch_fields,
+    _relay_command_argv,
+    _relay_worker_dispatches,
+    _unstarted_launch_ledger,
+    launch_contract,
+    native_launch_summary,
+    native_runtime,
+    require_native_workers_ended,
+)
 from .omp_isolation import ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
 from .store import stable_hash, stable_hash_sequence
 from .review_policy import _additional_fallback_review_budget, judge_calls, review_call_limit, review_worker_limit
@@ -2189,16 +2200,6 @@ def _repair_ended_wave_relay(
     old_launch = payload.get("launch_contract")
     if "launch_contract" in payload and not isinstance(old_launch, dict):
         raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
-    runtime = native_runtime(work_dir, required=True)
-    runtime_isolation(work_dir, runtime)
-    if isinstance(old_launch, dict):
-        if (old_launch.get("host") == runtime["host"]
-                and old_launch.get("model") == runtime["models"].get(old_launch.get("route"))
-                and old_launch.get("transport", "collaboration") == runtime.get("transport", "collaboration")
-                and old_launch.get("host_profile_fingerprint") == runtime.get("host_profile_fingerprint")):
-            if old_launch.get("message_isolation") == runtime_isolation(work_dir, runtime):
-                return False
-        _unstarted_launch_ledger(work_dir, path, payload)
     unsigned = {key: value for key, value in payload.items() if key != "dispatch_fingerprint"}
     relative_manifest = manifest_path.resolve().relative_to(work_dir.resolve()).as_posix()
     bindings = payload.get("task_bindings")
@@ -2221,6 +2222,56 @@ def _repair_ended_wave_relay(
                 or binding.get("result") != expected_result or binding.get("records") != task["records"]):
             raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
     receipt_path = path.with_name(path.stem + "-receipt.json")
+    runtime = native_runtime(work_dir, required=True)
+    isolation = runtime_isolation(work_dir, runtime)
+    if old_launch is not None:
+        same_route = (
+            old_launch.get("host") == runtime["host"]
+            and old_launch.get("route") == _configured_manifest_provider(work_dir, manifest)
+            and old_launch.get("model") == runtime["models"].get(old_launch.get("route"))
+            and old_launch.get("transport", "collaboration") == runtime.get("transport", "collaboration")
+            and old_launch.get("host_profile_fingerprint") == runtime.get("host_profile_fingerprint")
+        )
+        same_isolation = old_launch.get("message_isolation") == isolation
+        if same_route:
+            _, _, ledger = _load_launch_evidence(work_dir, path)
+            issue = ledger.get("issue_code")
+            policy = runtime.get("host_policy_fingerprint")
+            policy_denied = (
+                runtime["host"] == "omp" and runtime.get("transport", "collaboration") == "collaboration"
+                and issue == "E_NATIVE_WORKER_MODEL_UNAVAILABLE"
+                and ledger.get("model_failure_code") == "host_dispatch_denied"
+            )
+            capability_denied = issue == "E_NATIVE_DISPATCH_UNAVAILABLE"
+            if policy_denied or capability_denied:
+                # Explicit resume asserts that nested dispatch was restored. A
+                # model-policy denial additionally needs a changed bound policy.
+                if policy_denied and (not policy or policy == old_launch.get("host_policy_fingerprint")):
+                    return False
+                if ledger["workers"]:
+                    raise ValueError("E_NATIVE_LAUNCH_INVALID: cannot rebind a started worker")
+                if ledger["capability"] != "unavailable":
+                    raise ValueError("E_NATIVE_LAUNCH_INVALID: terminal denial evidence changed")
+                if not receipt_path.is_file():
+                    if policy_denied:
+                        raise ValueError("E_NATIVE_RELAY_RECEIPT_REQUIRED")
+                    return False
+                _validated_native_wave_relay_receipt(
+                    work_dir, plan_fingerprint, wave, manifest=manifest,
+                    launch_evidence={"issue_codes": [issue]},
+                )
+                require_native_workers_ended(work_dir, path, require_terminal_evidence=True)
+                # The host may have admitted a worker before the ledger recorded it.
+                if "worker_dispatches" in old_launch:
+                    digest = _file_sha256(path)
+                    for task in old_launch["tasks"]:
+                        key = hashlib.sha256(f"{digest}\0{task}".encode()).hexdigest()
+                        admission = work_dir / ".game-l10n/native/omp-launch-admissions" / f"{key}.json"
+                        if admission.is_file() and json.loads(admission.read_text(encoding="utf-8"))["state"] == "ended":
+                            raise ValueError("E_NATIVE_LAUNCH_INVALID: cannot rebind a started worker")
+            elif same_isolation:
+                return False
+        _unstarted_launch_ledger(work_dir, path, payload)
     if receipt_path.is_file():
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         if (not isinstance(receipt, dict) or receipt.get("dispatch_fingerprint") != payload["dispatch_fingerprint"]
@@ -2695,6 +2746,7 @@ def _validated_native_wave_relay_receipt(
     *,
     manifest: dict[str, Any],
     allow_runtime_repair: bool = False,
+    launch_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     dispatch_path = _wave_relay_dispatch_path(work_dir, plan_fingerprint, wave).resolve()
     receipt_path = dispatch_path.with_name(f"{dispatch_path.stem}-receipt.json")
@@ -2732,7 +2784,9 @@ def _validated_native_wave_relay_receipt(
         raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
     runtime = native_runtime(work_dir) or {}
     omp_host = runtime.get("host") == "omp" and runtime.get("transport", "collaboration") == "collaboration"
-    launch = native_launch_summary(work_dir, dispatch_path) if "launch_contract" in dispatch or omp_host else None
+    launch = launch_evidence
+    if launch is None and ("launch_contract" in dispatch or omp_host):
+        launch = native_launch_summary(work_dir, dispatch_path)
     unstarted = _interrupted_rewrite_slots(dispatch, launch) if recovered_rewrite else set()
     # A blocked receipt is an immutable observation. Capability may have been
     # restored since it was sealed; resume may reopen only this bound blocker.
@@ -3777,7 +3831,10 @@ def _native_control_step_single(
                 elif (
                     resume_relay and not confirm_rewrite_workers_stopped
                     and relay_issue in RUNTIME_ISSUES
-                    and relay_issue not in {"E_NATIVE_WORKER_NOT_STARTED", "E_NATIVE_WORKER_MODEL_UNAVAILABLE"}
+                    and relay_issue not in {
+                        "E_NATIVE_WORKER_NOT_STARTED", "E_NATIVE_WORKER_MODEL_UNAVAILABLE",
+                        "E_NATIVE_DISPATCH_UNAVAILABLE",
+                    }
                 ):
                     # Reopen the same transport after repair. Preserve all result
                     # files, launches, successful shards, route and attempt counts.

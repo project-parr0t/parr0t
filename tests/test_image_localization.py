@@ -24,6 +24,27 @@ def digest(data: bytes) -> str:
 
 
 class ImageLocalizationTests(unittest.TestCase):
+    def test_font_glyph_coverage_reads_unicode_cmap_from_sfnt_and_woff(self):
+        import struct
+        import zlib
+        from game_l10n.font_coverage import _font_glyph_coverage
+
+        groups = struct.pack(">IIIIII", 0x30, 0x39, 3, 0xAC00, 0xAC01, 0)
+        table = struct.pack(">HHIII", 12, 0, 16 + len(groups), 0, 2) + groups
+        cmap = struct.pack(">HHHHI", 0, 1, 3, 10, 12) + table
+        sfnt = struct.pack(">4sHHHH4sIII", b"OTTO", 1, 0, 0, 0, b"cmap", 0, 28, len(cmap)) + cmap
+        compressed = zlib.compress(cmap)
+        woff = (struct.pack(">4s4sIHHIHHIIIII", b"wOFF", b"OTTO", 64 + len(compressed), 1, 0,
+                            len(sfnt), 1, 0, 0, 0, 0, 0, 0)
+                + struct.pack(">4sIIII", b"cmap", 64, len(compressed), len(cmap), 0) + compressed)
+        with tempfile.TemporaryDirectory() as directory:
+            for name, data in (("fixture.otf", sfnt), ("fixture.woff", woff)):
+                path = Path(directory) / name
+                path.write_bytes(data)
+                result = _font_glyph_coverage(path)
+                self.assertEqual(result["hangul_syllables"], {"supported": 1, "total": 11172})
+                self.assertEqual(result["digits"], {"supported": 10, "total": 10})
+
     def _fixture(self, root: Path) -> tuple[Path, Path, Path]:
         work = root / "work"
         game = root / "game"

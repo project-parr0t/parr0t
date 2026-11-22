@@ -57,6 +57,7 @@ from .data_plane_task import (
     DATA_PLANE_PROFILES,
     DATA_PLANE_RELAY_SCHEMA,
     DATA_PLANE_RECEIPT_SCHEMA,
+    ENGINE_MEDIA_BINDINGS_PURPOSE,
     _load_bound_data_plane_relay,
     claim_context_chunk,
     commit_context_fragment,
@@ -1698,6 +1699,48 @@ def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_engine_media_bindings_status(args: argparse.Namespace) -> int:
+    from .image_localization import _verify_engine_media_binding_probe, require_image_inspection_requested
+
+    work_dir = Path(args.workspace).resolve()
+    require_control_plane_ready(work_dir)
+    require_image_inspection_requested(work_dir)
+    relay_path = _path_in_workspace(work_dir, args.relay, must_exist=True)
+    relay, task = _load_bound_data_plane_relay(work_dir, relay_path)
+    purpose = ENGINE_MEDIA_BINDINGS_PURPOSE
+    if task.get("purpose") != purpose:
+        raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID")
+    receipt_path = data_plane_receipt_path(work_dir, "image_ui_inventory", purpose=purpose)
+    public = current_data_plane_receipt(work_dir, "image_ui_inventory", purpose=purpose)
+    if public is None or public["status"] not in {"success", "partial"}:
+        print(json.dumps({"status": "pending", "receipt": public}, ensure_ascii=False))
+        return 0
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    artifact = _path_in_workspace(work_dir, task["output_artifact"], must_exist=True)
+    sidecar = _path_in_workspace(work_dir, str(artifact.with_suffix(".sha256.txt")), must_exist=True)
+    if (receipt["task_id"] != relay["task_id"]
+            or task["output_artifact"] not in receipt["artifact_paths"]
+            or sidecar.read_text(encoding="ascii") != hashlib.sha256(artifact.read_bytes()).hexdigest()):
+        raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID")
+    metadata = _verify_engine_media_binding_probe(work_dir, artifact, task)
+    if args.verify_fonts:
+        from .font_coverage import _font_glyph_coverage
+        import struct
+        import zlib
+
+        fonts = {}
+        for item in metadata["references"]:
+            if item["kind"] == "font" and item["exists"]:
+                name = item["path"]
+                try:
+                    fonts[name] = {"status": "verified", "glyphs": _font_glyph_coverage(Path(name))}
+                except (OSError, ValueError, struct.error, zlib.error):
+                    fonts[name] = {"status": "format_unverified"}
+        metadata["font_coverage"] = fonts
+    print(json.dumps({**public, **metadata}, ensure_ascii=True))
+    return 0
+
+
 def cmd_native_runtime(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     if args.host:
@@ -2156,6 +2199,12 @@ def _prepare_native_pass(args: argparse.Namespace) -> dict[str, Any]:
             else int(configured_records)
         )
     )
+    if retry_state is not None:
+        from .native_translation_retry import _pending_output_repair_cap
+
+        repair_cap = _pending_output_repair_cap(retry_state)
+        if repair_cap is not None:
+            max_records = min(max_records, repair_cap)
     configured_material = (
         execution.get(
             "native_review_shard_material_tokens",
@@ -2496,6 +2545,8 @@ def cmd_repair_native_translation_retries(args: argparse.Namespace) -> int:
     result = repair_native_translation_retries(
         work_dir, state_dir,
         route_plan=_native_translation_retry_plan(work_dir, config, retry_state_path=state_dir / NATIVE_RETRY_STATE_NAME),
+        retry_failed_output=args.retry_failed_output,
+        incomplete_output_max_records=args.incomplete_output_max_records,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -4655,10 +4706,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     native_retry_repair = sub.add_parser(
         "repair-native-translation-retries",
-        help="Bind approved route extensions to operationally unfinished targets only",
+        help="Recover operationally unfinished native translation targets",
     )
     native_retry_repair.add_argument("--workspace", required=True)
     native_retry_repair.add_argument("--state-dir", required=True)
+    native_retry_repair.add_argument("--retry-failed-output", action="store_true",
+                                     help="Explicitly retry receipt-backed missing or rejected worker outputs")
+    native_retry_repair.add_argument("--incomplete-output-max-records", type=int,
+                                     help="Bind a smaller task size when explicitly retrying failed output")
     native_retry_repair.set_defaults(func=cmd_repair_native_translation_retries)
 
     native_retry_content = sub.add_parser(
@@ -4790,8 +4845,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--worker-role", choices=sorted(DATA_PLANE_PROFILES), required=True
     )
     data_plane_prepare.add_argument(
-        "--purpose", choices=[EXTRACTOR_PREPARATION_PURPOSE], default="",
-        help="Bind source_probe to isolated pre-inventory extractor implementation and checks",
+        "--purpose", choices=[EXTRACTOR_PREPARATION_PURPOSE, ENGINE_MEDIA_BINDINGS_PURPOSE], default="",
+        help="Bind an extractor-preparation probe or an exact-seed engine media probe",
     )
     data_plane_prepare.add_argument(
         "--output",
@@ -4812,6 +4867,12 @@ def build_parser() -> argparse.ArgumentParser:
     data_plane_prepare.set_defaults(func=cmd_prepare_data_plane_task)
     data_plane_prepare.add_argument("--inspection-asset", action="append", help="Exact approved local image/font inspection asset")
     data_plane_prepare.add_argument("--offline-processing", help="Workspace JSON manifest of approved exact offline argv bindings")
+
+    media_status = sub.add_parser("engine-media-bindings-status", help="Read sealed media binding metadata")
+    media_status.add_argument("--workspace", required=True)
+    media_status.add_argument("--relay", required=True)
+    media_status.add_argument("--verify-fonts", action="store_true")
+    media_status.set_defaults(func=cmd_engine_media_bindings_status)
 
     extractor_check = sub.add_parser(
         "check-extractor-preparation", help="Run bound local format checks inside the isolated preparation worker",
