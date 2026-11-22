@@ -1562,6 +1562,7 @@ def cmd_native_pass_step(args: argparse.Namespace) -> int:
         require_relay_receipt=True,
         require_runtime=True,
         resume_relay=getattr(args, "resume_relay", False),
+        confirm_rewrite_workers_stopped=args.confirm_rewrite_workers_stopped,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -1964,7 +1965,8 @@ def _prepare_native_pass(args: argparse.Namespace) -> dict[str, Any]:
     config = load_config(work_dir)
     require_sdk_activation(work_dir, config)
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
-    output = _path_in_workspace(work_dir, args.output)
+    extra_fallback = getattr(args, "user_requested_additional_fallback_review", False)
+    output = None if extra_fallback else _path_in_workspace(work_dir, args.output)
     execution = config.get("execution", {})
     requested_pass_kind = args.pass_kind
     if requested_pass_kind in {"triage", "strong_review"}:
@@ -1988,6 +1990,12 @@ def _prepare_native_pass(args: argparse.Namespace) -> dict[str, Any]:
     declared_native_roles = native_role_models(config)
     ordered_native_review = bool(declared_native_roles) and pass_kind in {"review", "rewrite"}
     segments = read_segments(source)
+    if extra_fallback and (
+        pass_kind != "review" or args.review_tier != "strong" or not ordered_native_review
+        or args.native_provider is not None or args.route_attempt is not None
+        or args.content_source_grant is not None or args.content_source_scope is not None
+    ):
+        raise ConfigurationError("E_ADDITIONAL_FALLBACK_SCOPE_INVALID")
     retry_state = None
     retry_state_path = None
     predecessor_receipt = (
@@ -2046,6 +2054,16 @@ def _prepare_native_pass(args: argparse.Namespace) -> dict[str, Any]:
                 segments, routing.get(role, []), stage=stage, route_models=runtime_models,
                 attempt_limits=routing.get("review_attempt_limits", {}), tier_limit=tier_limit,
             )
+            if extra_fallback:
+                from .review_policy import _record_additional_fallback_review
+
+                fallback = NATIVE_ROLE_ROUTES["review-fallback"]
+                if (list(groups) != [""] or not segments
+                        or fallback not in routing.get("reviewers", [])[1:]
+                        or fallback not in runtime_models):
+                    raise ConfigurationError("E_ADDITIONAL_FALLBACK_SCOPE_INVALID: require exhausted targets and a bound fallback")
+                output = _record_additional_fallback_review(work_dir, segments, fallback, runtime_models[fallback])
+                groups = {fallback: segments}
             if args.route_attempt not in {None, 1}:
                 raise ConfigurationError("E_NATIVE_ROUTE_INVALID: review attempts follow current candidate evidence")
             if args.native_provider is not None and args.native_provider not in groups:
@@ -2236,7 +2254,7 @@ def _prepare_native_pass(args: argparse.Namespace) -> dict[str, Any]:
         max_root_model_calls_per_turn=max_root_model_calls_per_turn,
         max_root_input_tokens_per_turn=max_root_input_tokens_per_turn,
         control_turn_budget_user_approved=control_turn_budget_user_approved,
-        review_split_max_depth=int(execution.get("native_review_split_max_depth", 11)),
+        review_split_max_depth=0 if extra_fallback else int(execution.get("native_review_split_max_depth", 11)),
         review_split_max_record_amplification=execution.get("native_review_split_max_record_amplification"),
         review_tier=args.review_tier,
         route_binding=route_binding,
@@ -2259,6 +2277,8 @@ def _prepare_native_pass(args: argparse.Namespace) -> dict[str, Any]:
             else None
         ),
     )
+    if extra_fallback:
+        result["additional_calls_per_target"] = 1
     return result
 
 
@@ -2509,16 +2529,30 @@ def cmd_materialize_delivery_candidates(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
     require_sdk_activation(work_dir, config)
+    inventory = _path_in_workspace(work_dir, args.input, must_exist=True)
+    destination = _path_in_workspace(work_dir, args.output)
     result = materialize_delivery_candidates(
-        work_dir, _path_in_workspace(work_dir, args.input, must_exist=True),
+        work_dir, inventory,
         _path_in_workspace(work_dir, args.approved, must_exist=True),
         [_path_in_workspace(work_dir, p, must_exist=True) for p in args.pending],
         _path_in_workspace(work_dir, args.translation_failures, must_exist=True),
-        _path_in_workspace(work_dir, args.output), include_unreviewed=args.include_unreviewed,
+        destination, include_unreviewed=args.include_unreviewed,
         report=_path_in_workspace(work_dir, args.report) if args.report else None,
         target_language=str(config.get("project", {}).get("target_language", "")),
         **_native_review_integrity_options(work_dir, config),
     )
+    if args.finalize_for_pack:
+        if result["included"] != result["records"]:
+            raise ConfigurationError("E_NATIVE_DELIVERY_NOT_FULL")
+        segments = read_segments(inventory)
+        summary, exit_code = _finalize_translation_results(
+            work_dir=work_dir, target_segments=segments, inventory_segments=segments,
+            results=read_translation_results(destination), destination=destination,
+            inventory_state=require_inventory_attestation(work_dir, inventory),
+            review_required=True, language_binding_state=language_binding(work_dir, config),
+        )
+        print(json.dumps({**result, "completion": summary}, ensure_ascii=False))
+        return exit_code
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -2535,6 +2569,21 @@ def cmd_collect_translation_exchange_candidates(args: argparse.Namespace) -> int
     result = collect_translation_exchange_candidates(
         work_dir, read_segments(source),
         _path_in_workspace(work_dir, args.bundle, must_exist=True), review, unresolved,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_resume_native_review_queues(args: argparse.Namespace) -> int:
+    from .native_review import _resume_review_queues
+
+    work_dir = Path(args.workspace).resolve()
+    require_sdk_activation(work_dir, load_config(work_dir))
+    result = _resume_review_queues(
+        work_dir, _path_in_workspace(work_dir, args.input, must_exist=True),
+        _path_in_workspace(work_dir, args.approved, must_exist=True),
+        [_path_in_workspace(work_dir, path, must_exist=True) for path in args.queue],
+        _path_in_workspace(work_dir, args.output),
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -4228,7 +4277,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     native_prepare.add_argument("--workspace", required=True)
     native_prepare.add_argument("--input", required=True, help="Ordered source segment file")
-    native_prepare.add_argument("--output", required=True, help="Private task directory")
+    native_output = native_prepare.add_mutually_exclusive_group(required=True)
+    native_output.add_argument("--output", help="Private task directory")
+    native_output.add_argument(
+        "--user-requested-additional-fallback-review", action="store_true",
+        help="After explicit consent, allow one more call on the configured fallback for exactly this exhausted cohort",
+    )
     native_prepare.add_argument(
         "--pass-kind",
         choices=["translation", "triage", "strong_review", "review", "rewrite"],
@@ -4356,6 +4410,10 @@ def build_parser() -> argparse.ArgumentParser:
     native_step.add_argument("--provider-cost-usd", type=float, default=0.0)
     native_step.add_argument("--resume-relay", action="store_true",
                              help="Assert the prior relay ended; recover its missing receipt or legacy launch binding after host repair; preserve results and attempt")
+    native_step.add_argument(
+        "--confirm-rewrite-workers-stopped", action="store_true",
+        help="With --resume-relay, confirm the interrupted OMP rewrite relay and all its workers stopped",
+    )
     native_step.set_defaults(func=cmd_native_pass_step)
 
     native_resume = sub.add_parser(
@@ -4482,6 +4540,7 @@ def build_parser() -> argparse.ArgumentParser:
     delivery.add_argument("--output", required=True)
     delivery.add_argument("--report")
     delivery.add_argument("--include-unreviewed", action="store_true")
+    delivery.add_argument("--finalize-for-pack", action="store_true", help="Attest the aligned native delivery for the offline pack tool")
     delivery.set_defaults(func=cmd_materialize_delivery_candidates)
 
     exchange_collect = sub.add_parser("collect-translation-exchange-candidates")
@@ -4513,6 +4572,17 @@ def build_parser() -> argparse.ArgumentParser:
     reviewed_collect.add_argument("--results", action="append", required=True)
     reviewed_collect.add_argument("--output", required=True)
     reviewed_collect.set_defaults(func=cmd_collect_reviewed_candidates)
+
+    review_queues = sub.add_parser(
+        "resume-native-review-queues",
+        help="Recover only unapproved targets from existing private native review queues",
+    )
+    review_queues.add_argument("--workspace", required=True)
+    review_queues.add_argument("--input", required=True, help="Independently verified primary inventory")
+    review_queues.add_argument("--approved", required=True, help="Core-collected approved results")
+    review_queues.add_argument("--queue", action="append", required=True)
+    review_queues.add_argument("--output", required=True, help="New private continuation directory")
+    review_queues.set_defaults(func=cmd_resume_native_review_queues)
 
     review_followup = sub.add_parser("process-native-review-followup")
     review_followup.add_argument("--workspace", required=True)

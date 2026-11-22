@@ -186,6 +186,79 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertIn("task_incomplete", sealed["issue_codes"])
         self.assertNotIn("E_NATIVE_WORKER_NOT_STARTED", sealed["issue_codes"])
 
+    def test_confirmed_interrupted_rewrite_keeps_started_output_and_rejects_unstarted_output(self) -> None:
+        from game_l10n.formats import read_segments
+        from game_l10n.models import AttemptRecord
+        from game_l10n.native_pass import merge_native_pass
+        from game_l10n.native_review import (
+            _bound_result, _pending_segment, collect_native_rewrite, partition_native_review_routes,
+        )
+        from tests.test_native_pass import review_segment
+
+        model = "fixture/rewrite"
+        configure_native_runtime(self.root, "omp", {"native-rewrite": model})
+        manifest = self.tasks / "manifest.json"
+        segments = []
+        for target in ("a", "b", "c"):
+            segment = review_segment(target, source="Fixture source")
+            candidate = _bound_result(segment)
+            candidate.attempts = [AttemptRecord("review", "native-sol", "rewrite", candidate_generation=1)]
+            candidate.metadata["rewrite_issues"] = ["voice"]
+            segments.append(_pending_segment(segment, candidate))
+        self.write_rows(self.source, [asdict(segment) for segment in segments])
+        segments = read_segments(self.source)
+        prepare_native_tasks(
+            self.root, self.source, segments, self.tasks, pass_kind="rewrite",
+            max_records=1, max_workers=3,
+            route_binding={"provider": "native-rewrite", "model": model, "attempt": 1},
+        )
+        relay = self.root / self.step()["relay"]["dispatch"]
+        relay_bytes = relay.read_bytes()
+        started, unstarted, interrupted = json.loads(relay_bytes)["task_bindings"]
+        record_native_launch(self.root, relay, event="capability-available")
+        record_native_launch(self.root, relay, event="worker-started", task=started["task"],
+                             worker_id="fixture-worker", model=model)
+        record_native_launch(self.root, relay, event="worker-started", task=interrupted["task"],
+                             worker_id="fixture-interrupted-worker", model=model)
+        digest = hashlib.sha256(relay_bytes).hexdigest()
+        key = hashlib.sha256(f"{digest}\0{started['task']}".encode()).hexdigest()
+        admission = self.root / f".game-l10n/native/omp-launch-admissions/{key}.json"
+        admission.parent.mkdir(parents=True)
+        admission.write_text(json.dumps({
+            "schema": "parr0t.omp-native-admission.v1", "relay_sha256": digest,
+            "task": started["task"], "parent_id": "fixture-relay",
+            "worker_id": "fixture-worker", "state": "started",
+        }), encoding="utf-8")
+        original_admission = admission.read_bytes()
+        started_result, unstarted_result = self.root / started["result"], self.root / unstarted["result"]
+        self.write_rows(started_result, [self.row("a", provider="native-rewrite")], model=model)
+        self.write_rows(unstarted_result, [self.row("b", provider="native-rewrite")], model=model)
+        original_unstarted_result = unstarted_result.read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_WORKER_ACTIVE"):
+            self.step(resume_relay=True)
+        recovered = self.step(resume_relay=True, confirm_rewrite_workers_stopped=True)
+        self.assertEqual(recovered["action"], "aggregate_completed_pass")
+        merged = self.root / "merged-rewrite.jsonl"
+        merge_native_pass(self.root, segments, merged, manifest_path=manifest)
+        first, second, third = map(json.loads, merged.read_text(encoding="utf-8").splitlines())
+        self.assertEqual((first["target_id"], first["status"], first["text"]), ("a", "success", "TARGET"))
+        self.assertEqual((second["target_id"], second["status"], second["issues"]),
+                         ("b", "error", ["worker_not_started"]))
+        self.assertEqual((third["target_id"], third["status"], third["issues"]),
+                         ("c", "error", ["worker_interrupted"]))
+        archives = list(unstarted_result.parent.glob(unstarted_result.name + ".ended-original-*"))
+        self.assertEqual([item.read_bytes() for item in archives], [original_unstarted_result])
+        self.assertEqual(admission.read_bytes(), original_admission)
+        self.assertEqual(relay.read_bytes(), relay_bytes)
+        self.assertEqual(self.step()["action"], "aggregate_completed_pass")
+        collected = (self.root / "collected").resolve()
+        summary = collect_native_rewrite(self.root, self.source, manifest, collected)
+        self.assertEqual((summary["confirmation_pending"], summary["unresolved"]), (1, 2))
+        pending = read_segments(collected / "unresolved-input.jsonl")
+        groups = partition_native_review_routes(pending, ["native-rewrite"], stage="review-rewrite")
+        self.assertEqual([segment.id for segment in groups["native-rewrite"]], ["b", "c"])
+
 
     def test_operational_failure_requires_cancellation_and_preserves_valid_success(self) -> None:
         config, output, relay = self.prepare_probe()
@@ -698,15 +771,34 @@ class NativeRuntimeTests(unittest.TestCase):
         record_native_launch(self.root, relay, event="capability-available")
         record_native_launch(self.root, relay, event="worker-started", task=first["task"], worker_id="worker-a", model=model)
         self.write_rows(self.root / first["result"], [self.row("a")])
+        self.write_rows(self.root / second["result"], [self.row("b")])
+        unverified = (self.root / second["result"]).read_bytes()
         original = (self.root / first["result"]).read_bytes()
         sealed = seal_native_wave_relay(self.root, relay, relay_ended=True)
         self.assertEqual(sealed["issue_codes"], ["E_NATIVE_WORKER_NOT_STARTED"])
-        self.assertFalse((self.root / second["result"]).exists())
+        receipt = self.root / sealed["receipt"]
+        original_receipt = receipt.read_bytes()
         self.assertEqual(self.step()["action"], "repair_native_runtime")
-        configure_native_runtime(self.root, "omp", {"native-extra": "fixture/approved-extra"})
-        self.step(resume_relay=True)
+        original_dispatch = relay.read_bytes()
+        resumed = self.step(resume_relay=True)
+        self.assertEqual(resumed["action"], "dispatch_isolated_wave_relay")
+        self.assertEqual(resumed["relay"]["dispatch"], relay.relative_to(self.root).as_posix())
+        self.assertEqual((resumed["relay"]["tasks"], resumed["relay"]["records"]), (1, 1))
+        self.assertEqual(relay.read_bytes(), original_dispatch)
+        self.assertFalse((self.root / second["result"]).exists())
+        self.assertEqual(receipt.with_name(
+            receipt.name + ".legacy-" + hashlib.sha256(original_receipt).hexdigest()
+        ).read_bytes(), original_receipt)
+        result = self.root / second["result"]
+        self.assertEqual(result.with_name(
+            result.name + ".unstarted-original-" + hashlib.sha256(unverified).hexdigest()
+        ).read_bytes(), unverified)
+        self.assertEqual(self.step()["action"], "wait_for_active_wave")
         pending = record_native_launch(self.root, relay, event="capability-available")
         self.assertEqual(pending["unstarted_tasks"], [second["task"]])
+        with self.assertRaisesRegex(ValueError, "worker already started"):
+            record_native_launch(self.root, relay, event="worker-started", task=first["task"],
+                                 worker_id="duplicate-worker", model=model)
         record_native_launch(self.root, relay, event="worker-started", task=second["task"], worker_id="worker-b", model=model, observed_model=model)
         self.write_rows(self.root / second["result"], [self.row("b")])
         self.assertEqual(seal_native_wave_relay(self.root, relay, relay_ended=True)["issue_codes"], [])
