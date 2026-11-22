@@ -1,6 +1,7 @@
 """Metadata-only explicit review limits with a documented fallback preset default."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,71 @@ DEFAULT_REVIEW_FALLBACK_CALLS = 3
 JUDGE_STAGES = frozenset({"review", "review-confirm", "review-grace-retry", "review-refusal-retry"})
 REVIEW_SETTING_FIELDS = ("triage_max_calls", "strong_max_calls", "review_max_workers", "triage_max_workers", "strong_max_workers")
 TRIAGE_STAGES = frozenset({"review-triage", "review-triage-confirm", "review-triage-grace-retry", "review-triage-refusal-retry"})
+
+_ADDITIONAL_FALLBACK_ROOT = Path(".game-l10n/native/additional-fallback-review")
+_ADDITIONAL_FALLBACK_SCHEMA = "parr0t.additional-fallback-review.v1"
+
+
+def _record_additional_fallback_review(
+    work_dir: Path, segments: list[Any], provider: str, model: str,
+) -> Path:
+    """Bind a one-call consent to one immutable review namespace."""
+    from dataclasses import asdict
+    from .control_plane import require_control_plane_ready
+    from .native_followup import _atomic_json
+    from .store import stable_hash, stable_hash_sequence
+
+    require_control_plane_ready(work_dir)
+    ids = sorted(segment.id for segment in segments)
+    if not ids or len(ids) != len(set(ids)):
+        raise ValueError("E_ADDITIONAL_FALLBACK_SCOPE_INVALID")
+    scope = stable_hash(ids)
+    output = work_dir / _ADDITIONAL_FALLBACK_ROOT / scope
+    if output.resolve() != output:
+        raise ValueError("E_ADDITIONAL_FALLBACK_SCOPE_INVALID")
+    receipt = output / "approval.json"
+    payload = {
+        "schema": _ADDITIONAL_FALLBACK_SCHEMA,
+        "source_fingerprint": stable_hash_sequence(asdict(segment) for segment in segments),
+        "records": len(ids),
+        "route_binding": {"provider": provider, "model": model, "attempt": 1},
+        "additional_calls_per_target": 1,
+        "scope": scope,
+    }
+    if receipt.exists():
+        if json.loads(receipt.read_text(encoding="utf-8")) != payload:
+            raise ValueError("E_ADDITIONAL_FALLBACK_SCOPE_IMMUTABLE")
+    else:
+        _atomic_json(receipt, payload)
+    return output
+
+
+def _additional_fallback_review_budget(
+    work_dir: Path, manifest_path: Path, manifest: dict[str, Any],
+) -> int | None:
+    namespace = Path(manifest.get("execution_namespace", ""))
+    if not namespace.is_relative_to(_ADDITIONAL_FALLBACK_ROOT):
+        return None
+    expected = {
+        "schema": _ADDITIONAL_FALLBACK_SCHEMA,
+        "source_fingerprint": manifest["source_fingerprint"],
+        "records": manifest["records"],
+        "route_binding": manifest.get("route_binding"),
+        "additional_calls_per_target": 1,
+        "scope": namespace.name,
+    }
+    try:
+        valid = (
+            namespace.parent == _ADDITIONAL_FALLBACK_ROOT
+            and (work_dir / namespace).resolve() == manifest_path.resolve().parent
+            and manifest["execution_contract"].get("review_tier") == "strong"
+            and json.loads((manifest_path.parent / "approval.json").read_text(encoding="utf-8")) == expected
+        )
+    except (OSError, ValueError):
+        valid = False
+    if not valid:
+        raise ValueError("E_ADDITIONAL_FALLBACK_APPROVAL_INVALID")
+    return 1
 
 
 
