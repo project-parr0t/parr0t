@@ -513,6 +513,7 @@ def _stale_unadmitted_omp_relay(work_dir: Path, relay_path: Path, relay: dict) -
 
 def require_native_workers_ended(
     work_dir: Path, relay_path: Path, *, require_terminal_evidence: bool = False,
+    operator_confirmed_stop: bool = False,
 ) -> None:
     """Reject live admissions; require host proof of prior launches without a terminal receipt."""
     relay_bytes = relay_path.read_bytes()
@@ -541,7 +542,9 @@ def require_native_workers_ended(
             or record.get("state") not in {"reserved", "started", "ending", "ended", "failed"}
         ):
             raise ValueError("E_NATIVE_LAUNCH_INVALID: host admission changed")
-        if record["state"] in {"reserved", "started", "ending"}:
+        if record["state"] in {"reserved", "started", "ending"} and (
+            not operator_confirmed_stop or require_terminal_evidence
+        ):
             raise ValueError("E_NATIVE_WORKER_ACTIVE: wait for the admitted worker before sealing")
         if require_terminal_evidence:
             worker = unverified.get(task)
