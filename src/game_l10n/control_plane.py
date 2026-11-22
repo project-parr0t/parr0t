@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .errors import ConfigurationError
+from .errors import ConfigurationError, ControlEnvelopeIssueCodeError
 from .privacy import is_within
 
 
@@ -521,7 +521,7 @@ def suspend_control_plane(work_dir: Path, *, source_exposed: bool = False) -> di
 
 
 def resume_clean_control_plane(work_dir: Path) -> dict[str, Any]:
-    """Resume only a clean controller, including historical clean suspensions."""
+    """Resume an admitted controller without discarding exposure-acceptance evidence."""
     state = control_plane_state(work_dir)
     if state["status"] == "rotation_required":
         if state["issue_code"] != "framework_suspended":
@@ -701,9 +701,11 @@ def _accept_control_plane_exposure_locked(
             "E_CONTROL_PLANE_ACCEPTANCE_REQUIRED: explicit user acceptance of this "
             "incident and the reduced-isolation contract are required"
         )
-    from .framework_session import require_localization_mode
+    from .framework_session import framework_session_state
 
-    require_localization_mode(work_dir)
+    # Acceptance and lifecycle activation are separate. While inactive,
+    # validate the lifecycle record but leave its mode and log grants intact.
+    framework_session_state(work_dir)
     state = control_plane_state(work_dir)
     if state["status"] != "rotation_required" or state["issue_code"] != "control_plane_leak":
         raise ConfigurationError("E_CONTROL_PLANE_STATE: no exposure incident is pending")
@@ -1092,11 +1094,11 @@ def validate_control_envelope(
             | (LEGACY_PROVIDER_ISSUE_CODES if schema == LEGACY_CONTROL_ENVELOPE_SCHEMA else set())
         )
     ):
-        raise ConfigurationError(
+        raise ControlEnvelopeIssueCodeError(
             "E_CONTROL_ENVELOPE_INVALID: issue_codes contain prose or an unauthorized semantic category"
         )
     if schema == CONTROL_ENVELOPE_SCHEMA and "provider_refusal" in issue_codes:
-        raise ConfigurationError(
+        raise ControlEnvelopeIssueCodeError(
             "E_CONTROL_ENVELOPE_INVALID: parent-facing refusals must be normalized to fallback_required"
         )
     if status == "fallback_required" and "fallback_required" not in issue_codes:

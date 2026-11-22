@@ -25,7 +25,7 @@ from .native_followup import CANDIDATE_METADATA_KEY
 from .native_runtime import RUNTIME_ISSUES, launch_contract, native_launch_summary, native_runtime, require_native_workers_ended, _unstarted_launch_ledger, _relay_command_argv, _relay_worker_dispatches, _preserve_legacy_launch_fields
 from .omp_isolation import ISOLATION_ISSUE, runtime_isolation, tool_transport_contract
 from .store import stable_hash, stable_hash_sequence
-from .review_policy import judge_calls, review_call_limit, review_worker_limit
+from .review_policy import _additional_fallback_review_budget, judge_calls, review_call_limit, review_worker_limit
 from .validators import validate_integrity
 
 
@@ -58,6 +58,7 @@ NATIVE_WAVE_RECEIPT_SCHEMA = "parr0t.native-wave-receipt.v1"
 NATIVE_WAVE_RELAY_SCHEMA = "parr0t.native-wave-relay.v1"
 NATIVE_WAVE_RELAY_RECEIPT_SCHEMA = "parr0t.native-wave-relay-receipt.v1"
 NATIVE_REVIEW_SPLIT_CHAIN_SCHEMA = "parr0t.native-review-split-chain.v1"
+INTERRUPTED_REWRITE_RECOVERY = "operator_confirmed_workers_stopped"
 USAGE_EVENT = re.compile(r"^[a-zA-Z0-9._-]{1,128}$")
 RESULT_VALIDATION_REVISION = 5
 RELAY_DISPATCH_REVISION = 2
@@ -69,6 +70,8 @@ OPERATIONAL_RESULT_ISSUES = {
     "worker_result_missing_target",
     "worker_result_provider_mismatch",
     "worker_result_schema_invalid",
+    "worker_not_started",
+    "worker_interrupted",
 }
 
 
@@ -1933,6 +1936,11 @@ def import_native_wave(
         receipt = _validated_native_wave_relay_receipt(work_dir, plan_fingerprint, wave, manifest=manifest)
         if receipt["issue_codes"]:
             raise ValueError("E_NATIVE_WORKER_NOT_STARTED: runtime repair must precede import")
+        if receipt.get("recovery") == INTERRUPTED_REWRITE_RECOVERY:
+            payload = json.loads(dispatch.read_text(encoding="utf-8"))
+            if any((work_dir / item["result"]).resolve().parent != source_dir.resolve()
+                   for item in payload["task_bindings"]):
+                raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID: results directory changed")
     tasks = [task for task in manifest["tasks"] if task["wave"] == wave]
     if not tasks:
         raise ValueError("Native task manifest does not contain the requested wave")
@@ -2284,6 +2292,36 @@ def _read_structurally_bound_result(
     return expected_ids, rows
 
 
+def _archive_ended_result(result: Path, original: bytes) -> None:
+    digest = hashlib.sha256(original).hexdigest()
+    archive = result.with_name(f"{result.name}.ended-original-{digest}")
+    if archive.exists():
+        if archive.read_bytes() != original:
+            raise ValueError("E_NATIVE_RELAY_INVALID: original archive changed")
+    else:
+        archive.write_bytes(original)
+
+
+def _unstarted_rewrite_rows(task: Path) -> list[dict[str, Any]]:
+    return [
+        {"target_id": target, "status": "error", "text": "",
+         "provider": "native-control", "issues": ["worker_not_started"]}
+        for target in _task_target_ids(task, require_payload=True)
+    ]
+
+
+def _interrupted_rewrite_slots(payload: dict, launch: dict | None) -> set[str]:
+    contract = payload.get("launch_contract") or {}
+    if (
+        payload.get("pass_kind") != "rewrite" or contract.get("host") != "omp"
+        or contract.get("transport", "collaboration") != "collaboration"
+        or not contract.get("worker_dispatches") or not launch
+        or set(launch["issue_codes"]) - {"E_NATIVE_WORKER_NOT_STARTED", "E_NATIVE_RELAY_PREFLIGHT_REQUIRED"}
+    ):
+        raise ValueError("E_NATIVE_INTERRUPTED_REWRITE_INVALID: require an interrupted OMP rewrite binding")
+    return {Path(task).name for task in launch["unstarted_tasks"]}
+
+
 def _complete_ended_task_result(
     task: Path,
     result: Path,
@@ -2291,6 +2329,7 @@ def _complete_ended_task_result(
     expected_records: int,
     validate_rows: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None = None,
     expected_provider: str | None = None,
+    interrupted: bool = False,
 ) -> bool:
     """Preserve an ordered partial result and fill only its missing targets."""
 
@@ -2365,13 +2404,7 @@ def _complete_ended_task_result(
         # Any result reaching this repair path will be rewritten. Preserve its
         # exact original bytes once so malformed/provider/binding evidence is
         # never collapsed into a generic missing-output diagnosis.
-        digest = hashlib.sha256(original).hexdigest()
-        archive = result.with_name(f"{result.name}.ended-original-{digest}")
-        if archive.exists():
-            if archive.read_bytes() != original:
-                raise ValueError("E_NATIVE_RELAY_INVALID: original archive changed")
-        else:
-            archive.write_bytes(original)
+        _archive_ended_result(result, original)
         preserved = {row["target_id"]: row for row in partial_rows}
 
     completed_rows = [
@@ -2382,7 +2415,7 @@ def _complete_ended_task_result(
                 "status": "error",
                 "text": "",
                 "provider": "native-control",
-                "issues": [issue_by_target.get(target_id, default_issue)],
+                "issues": ["worker_interrupted" if interrupted else issue_by_target.get(target_id, default_issue)],
             },
         )
         for target_id in expected_ids
@@ -2397,6 +2430,7 @@ def seal_native_wave_relay(
     *,
     ended_tasks: tuple[str, ...] = (),
     relay_ended: bool = False,
+    confirm_rewrite_workers_stopped: bool = False,
 ) -> dict[str, Any]:
     """Seal one relay and deterministically queue workers that ended without output."""
 
@@ -2493,7 +2527,11 @@ def seal_native_wave_relay(
         if payload["command_argv"] != _relay_command_argv(work_dir, resolved, payload):
             raise ValueError("E_NATIVE_RELAY_INVALID: lifecycle commands changed")
     if "launch_contract" in payload:
-        require_native_workers_ended(work_dir, resolved)
+        require_native_workers_ended(
+            work_dir, resolved, operator_confirmed_stop=confirm_rewrite_workers_stopped,
+        )
+    if confirm_rewrite_workers_stopped and not relay_ended:
+        raise ValueError("E_NATIVE_INTERRUPTED_REWRITE_INVALID: require relay termination confirmation")
 
     if relay_ended and ended_tasks:
         raise ValueError(
@@ -2558,12 +2596,14 @@ def seal_native_wave_relay(
     runtime = native_runtime(work_dir) or {}
     guarded_host = runtime.get("host") == "omp" and runtime.get("transport", "collaboration") == "collaboration"
     launch = native_launch_summary(work_dir, resolved) if "launch_contract" in payload or guarded_host else None
-    launch_blocked = bool(launch and launch["issue_codes"])
+    unstarted = _interrupted_rewrite_slots(payload, launch) if confirm_rewrite_workers_stopped else set()
+    launch_blocked = bool(launch and launch["issue_codes"] and not confirm_rewrite_workers_stopped)
     if relay_ended:
         effective_ended_tasks = tuple(
             name
             for name, (task, result, _) in bindings_by_name.items()
             if not launch_blocked
+            if name not in unstarted
             if _read_structurally_bound_result(task, result, validate_rows=validate_rows) is None
         )
     elif launch_blocked and ended_tasks:
@@ -2576,6 +2616,18 @@ def seal_native_wave_relay(
         raise ValueError("E_NATIVE_RELAY_INVALID: ended task is not bound to this wave")
 
     ended_tasks_recorded = 0
+    for name in unstarted:
+        task, result, expected_records = bindings_by_name[name]
+        rows = _unstarted_rewrite_rows(task)
+        if len(rows) != expected_records:
+            raise ValueError("E_NATIVE_RELAY_INVALID: unstarted task record count changed")
+        if result.is_file():
+            existing = _read_structurally_bound_result(task, result)
+            if existing is not None and existing[1] == rows:
+                continue
+            _archive_ended_result(result, result.read_bytes())
+        _atomic_jsonl(result, rows)
+        ended_tasks_recorded += 1
     for name in effective_ended_tasks:
         task, result, expected_records = bindings_by_name[name]
         ended_tasks_recorded += int(
@@ -2584,6 +2636,7 @@ def seal_native_wave_relay(
                 result,
                 expected_records=expected_records,
                 validate_rows=validate_rows,
+                interrupted=confirm_rewrite_workers_stopped,
                 expected_provider=(
                     manifest["route_binding"]["provider"]
                     if manifest.get("route_binding") is not None
@@ -2615,6 +2668,8 @@ def seal_native_wave_relay(
         },
         "issue_codes": issue_codes,
     }
+    if confirm_rewrite_workers_stopped:
+        receipt_unsigned["recovery"] = INTERRUPTED_REWRITE_RECOVERY
     receipt = {
         **receipt_unsigned,
         "receipt_fingerprint": stable_hash(receipt_unsigned),
@@ -2628,6 +2683,7 @@ def seal_native_wave_relay(
         "counts": receipt_unsigned["counts"],
         "issue_codes": issue_codes,
         "route_binding": payload.get("route_binding"),
+        **({"recovery": receipt["recovery"]} if confirm_rewrite_workers_stopped else {}),
         "ended_tasks_recorded": ended_tasks_recorded,
     }
 
@@ -2658,6 +2714,9 @@ def _validated_native_wave_relay_receipt(
         "issue_codes",
         "receipt_fingerprint",
     }
+    recovered_rewrite = isinstance(receipt, dict) and receipt.get("recovery") == INTERRUPTED_REWRITE_RECOVERY
+    if recovered_rewrite:
+        receipt_fields.add("recovery")
     if not isinstance(receipt, dict) or set(receipt) != receipt_fields:
         raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
     unsigned = {
@@ -2671,6 +2730,10 @@ def _validated_native_wave_relay_receipt(
         or dispatch_revision not in {None, RELAY_DISPATCH_REVISION}
     ):
         raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
+    runtime = native_runtime(work_dir) or {}
+    omp_host = runtime.get("host") == "omp" and runtime.get("transport", "collaboration") == "collaboration"
+    launch = native_launch_summary(work_dir, dispatch_path) if "launch_contract" in dispatch or omp_host else None
+    unstarted = _interrupted_rewrite_slots(dispatch, launch) if recovered_rewrite else set()
     # A blocked receipt is an immutable observation. Capability may have been
     # restored since it was sealed; resume may reopen only this bound blocker.
     if (
@@ -2721,6 +2784,10 @@ def _validated_native_wave_relay_receipt(
                 bound_result = _read_structurally_bound_result(
                     task, result, validate_rows=validate_rows
                 )
+        if task.name in unstarted and (
+            bound_result is None or bound_result[1] != _unstarted_rewrite_rows(task)
+        ):
+            raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
         ready += int(bound_result is not None)
     total = len(bindings)
     expected_counts = {
@@ -2728,11 +2795,8 @@ def _validated_native_wave_relay_receipt(
         "ready_tasks": ready,
         "pending_tasks": total - ready,
     }
-    runtime = native_runtime(work_dir) or {}
-    guarded_host = runtime.get("host") == "omp" and runtime.get("transport", "collaboration") == "collaboration"
-    launch = native_launch_summary(work_dir, dispatch_path) if "launch_contract" in dispatch or guarded_host else None
     expected_issues = (
-        launch["issue_codes"] if launch and launch["issue_codes"]
+        launch["issue_codes"] if launch and launch["issue_codes"] and not recovered_rewrite
         else ([] if ready == total else ["E_NATIVE_WAVE_INCOMPLETE"])
     )
     if (
@@ -3208,6 +3272,9 @@ def _configured_manifest_provider(work_dir: Path, manifest: dict[str, Any]) -> s
 
 
 def _native_review_call_budget(work_dir: Path, manifest_path: Path, manifest: dict[str, Any]) -> int | None:
+    additional = _additional_fallback_review_budget(work_dir, manifest_path, manifest)
+    if additional is not None:
+        return additional
     provider = _configured_manifest_provider(work_dir, manifest)
     if not provider:
         return None
@@ -3481,6 +3548,7 @@ def _native_control_step_single(
     require_relay_receipt: bool = False,
     require_runtime: bool = False,
     resume_relay: bool = False,
+    confirm_rewrite_workers_stopped: bool = False,
 ) -> dict[str, Any]:
     """Advance one manifest pass without asking a model to schedule or recover it."""
 
@@ -3541,6 +3609,7 @@ def _native_control_step_single(
             raise ValueError("E_NATIVE_CONTROL_STATE_INVALID: imported task count is invalid")
     import_summary: dict[str, Any] | None = None
     rebound_relay = False
+    resumed_tasks: list[dict[str, Any]] | None = None
     next_wave = (
         waves[state["imported_wave_count"]]
         if state["imported_wave_count"] < len(waves)
@@ -3567,12 +3636,20 @@ def _native_control_step_single(
         relay_receipt_path = relay_dispatch_path.with_name(
             f"{relay_dispatch_path.stem}-receipt.json"
         )
+        if confirm_rewrite_workers_stopped and not relay_receipt_path.is_file():
+            if not relay_dispatch_path.is_file():
+                raise ValueError("E_NATIVE_INTERRUPTED_REWRITE_INVALID: no existing relay")
+            sealed = seal_native_wave_relay(
+                work_dir, relay_dispatch_path, relay_ended=True,
+                confirm_rewrite_workers_stopped=True,
+            )
+            ready_results = sealed["counts"]["ready_tasks"]
         rebound_relay = (
-            resume_relay and require_runtime and _repair_ended_wave_relay(
+            resume_relay and not confirm_rewrite_workers_stopped and require_runtime and _repair_ended_wave_relay(
                 work_dir, manifest_path, manifest, results_dir, next_wave, tasks, plan_fingerprint,
             )
         )
-        if (resume_relay and require_runtime and not rebound_relay
+        if (resume_relay and not confirm_rewrite_workers_stopped and require_runtime and not rebound_relay
                 and relay_dispatch_path.is_file() and not relay_receipt_path.is_file()):
             # --resume-relay asserts that the old relay ended. Seal its actual
             # outputs once; ordinary waits never make this assertion.
@@ -3625,6 +3702,8 @@ def _native_control_step_single(
                     ready_results = 0
                 if ISOLATION_ISSUE in observed["issue_codes"]:
                     relay_issue = ISOLATION_ISSUE
+        budget_issue = _native_budget_issue(execution_contract, state, next_wave)
+        control_limit_hit = max_root_calls is not None and state["control_steps_in_wave"] > max_root_calls
         if (
             not relay_issue
             and
@@ -3641,7 +3720,7 @@ def _native_control_step_single(
             try:
                 relay_receipt = _validated_native_wave_relay_receipt(
                     work_dir, plan_fingerprint, next_wave, manifest=manifest,
-                    allow_runtime_repair=resume_relay,
+                    allow_runtime_repair=resume_relay and not confirm_rewrite_workers_stopped,
                 )
             except ValueError as exc:
                 code = str(exc)
@@ -3660,7 +3739,46 @@ def _native_control_step_single(
                         (code for code in relay_receipt["issue_codes"] if code in RUNTIME_ISSUES),
                         "E_NATIVE_WAVE_INCOMPLETE",
                     )
-                if resume_relay and relay_issue in RUNTIME_ISSUES:
+                if (
+                    resume_relay and not confirm_rewrite_workers_stopped
+                    and relay_issue == "E_NATIVE_WORKER_NOT_STARTED"
+                    and observed["issue_codes"] == ["E_NATIVE_WORKER_NOT_STARTED"]
+                    and existing_dispatch.get("launch_contract", {}).get("worker_dispatches")
+                    and guarded_host and not budget_issue and not control_limit_hit
+                ):
+                    # Use the original dispatch: its ledger and OMP admissions
+                    # exclude all started slots from the next relay's preflight.
+                    require_native_workers_ended(work_dir, relay_dispatch_path)
+                    unstarted = set(observed["unstarted_tasks"])
+                    jobs = [
+                        (task, (work_dir / binding["result"]).resolve())
+                        for task, binding in zip(tasks, existing_dispatch["task_bindings"], strict=True)
+                        if binding["task"] in unstarted
+                    ]
+                    if len(jobs) != len(unstarted) or not jobs or any(
+                        result != (results_dir / task["file"]).resolve() for task, result in jobs
+                    ):
+                        raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID: retry slot binding changed")
+                    resumed_tasks = [task for task, _ in jobs]
+                    for task in resumed_tasks:
+                        if not _native_task_dispatch_allowed(manifest, task):
+                            raise ValueError("E_NATIVE_DISPATCH_NOT_AUTHORIZED")
+                        _validate_manifest_task_file(manifest_path, manifest, task)
+                    for path, kind in (
+                        *((result, "unstarted-original") for _, result in jobs if result.exists()),
+                        (relay_receipt_path, "legacy"),
+                    ):
+                        original = path.read_bytes()
+                        archive = path.with_name(f"{path.name}.{kind}-{hashlib.sha256(original).hexdigest()}")
+                        if archive.exists() and archive.read_bytes() != original:
+                            raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID: retry archive changed")
+                        path.replace(archive)
+                    rebound_relay = True
+                elif (
+                    resume_relay and not confirm_rewrite_workers_stopped
+                    and relay_issue in RUNTIME_ISSUES
+                    and relay_issue not in {"E_NATIVE_WORKER_NOT_STARTED", "E_NATIVE_WORKER_MODEL_UNAVAILABLE"}
+                ):
                     # Reopen the same transport after repair. Preserve all result
                     # files, launches, successful shards, route and attempt counts.
                     relay_receipt_path.unlink()
@@ -3673,9 +3791,6 @@ def _native_control_step_single(
             state["last_progress_marker"] = ""
             ready_results = 0
             relay_issue = ""
-        budget_issue = _native_budget_issue(
-            manifest["execution_contract"], state, next_wave
-        )
         awaiting_live_relay = (
             relay_issue == "E_NATIVE_RELAY_RECEIPT_REQUIRED"
             and relay_dispatch_path.is_file()
@@ -3784,7 +3899,7 @@ def _native_control_step_single(
     )
     _atomic_json(state_path, state)
     selected_tasks = (
-        wave_tasks[next_wave]
+        (resumed_tasks or wave_tasks[next_wave])
         if action == "dispatch_isolated_wave_relay" and next_wave is not None
         else []
     )
@@ -3929,10 +4044,15 @@ def native_control_step(
     require_relay_receipt: bool = False,
     require_runtime: bool = False,
     resume_relay: bool = False,
+    confirm_rewrite_workers_stopped: bool = False,
 ) -> dict[str, Any]:
     """Advance a pass and let the core isolate only failed review rows."""
 
     root_manifest = _load_task_manifest(work_dir, manifest_path)
+    if confirm_rewrite_workers_stopped and (
+        not resume_relay or not require_runtime or root_manifest.get("pass_kind") != "rewrite"
+    ):
+        raise ValueError("E_NATIVE_INTERRUPTED_REWRITE_INVALID: require --resume-relay for an OMP rewrite wave")
     if root_manifest.get("pass_kind") == "review" and root_manifest.get("version") < TASK_MANIFEST_VERSION:
         raise ValueError("E_NATIVE_REVIEW_CALL_POLICY_REQUIRED")
     if (
@@ -3949,6 +4069,7 @@ def native_control_step(
             require_relay_receipt=require_relay_receipt,
             require_runtime=require_runtime,
             resume_relay=resume_relay,
+            confirm_rewrite_workers_stopped=confirm_rewrite_workers_stopped,
         )
 
     review_call_budget = _native_review_call_budget(work_dir, manifest_path, root_manifest)

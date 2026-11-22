@@ -91,6 +91,42 @@ All core context, translation, review, retry, correction, and native-pass ingest
 
 Pair verification reuses each document's validated active scope within the command. It reads, parses, indexes, and fingerprints a shared canonical basis once per resolved path, while each inventory still checks its own expected digest and occurrence/projection bindings. The attestation records the SHA-256 of the exact verified inputs. Reconciler preparation can reuse an unchanged projection baseline after hashing each distinct input once, without reparsing. A new pair verification still reads and validates the complete inputs, and downstream admission still checks freshness.
 
+### Deterministic SDK projection repair
+
+An activated SDK can supply `tools/reconcile_inventory.py`. Reconciler
+preparation runs it once over cached evidence before starting a model. The
+hook reads UTF-8 JSON on stdin with the keys `primary` and `independent`.
+Each contains a map from unresolved physical comparison key to a map of
+positive display binding IDs to `[physical comparison key, source SHA-256]`.
+Only validated active links are offered. The hook returns a JSON map from
+original comparison key to sorted binding IDs. Do not open game files or the
+network in the hook.
+
+Core accepts only complete, identical positive link sets from both methods.
+Neither a one-sided binding nor matching wording establishes a projection.
+The hook cannot retire more rows, change sources or rewrite existing
+projection IDs. Core writes a new inventory pair, verifies it once, and uses
+the saved attestation as the authoritative pair locator. Previous files and
+canonical identities are preserved. SDK consumers use the attested paths,
+not a filename heuristic.
+
+On `inventory_verified`, refresh status; no relay was prepared. If there are
+remaining gaps, the prepared relay is bound to the new pair and receives only
+the remaining repair work. A no-work result is cached for the unchanged pair,
+basis and hook. Missing hooks and unsupported or ambiguous gaps retain the
+normal isolated repair workflow.
+
+An isolated inventory reconciler receives `worker_execution` in its bound
+task. Use its exact `core_runtime.cli_argv` to identify the Core launcher
+instead of inferring a checkout or import path, and its `verify-inventory`
+argv with only the two complete path placeholders replaced. Use the bound
+transport and do not pass SDK-specific options to Core. A verification that
+reports incomplete scope can still support a partial result. If execution
+aborts before verifying the pair, leave the envelope unwritten and let the
+relay seal the ended attempt. Core reports `invalid_envelope_issue_codes`
+alongside `malformed_response` when the submitted issue codes fail validation;
+it never forwards rejected values or worker error text.
+
 ## Context execution gate
 
 The context state records sealed successful work; refusal, capacity, timeout, malformed output, or operational error remains non-success. Each task binds a configured native route. Worker counts and chunk sizes use safe defaults but honor explicit bounds and available host/model capacity. Completed fragments remain reusable; continue unfinished claims and available independent work without requiring a whole no-progress route cycle. Stale output cannot be resealed, and only core sealing writes successful context state after evidence validation.

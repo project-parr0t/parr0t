@@ -52,6 +52,10 @@ Every current candidate requires current-generation review evidence: triage for 
 
 Legacy manifests retain their original serialized contract and successes; continue pending targets under the current contract without resetting history or overwriting results.
 
+If the approved join is incomplete after native passes end, use `resume-native-review-queues` with the verified primary inventory, the joined approvals and the exact earlier collector `--queue` artifacts. Core excludes approved targets and emits only unambiguous latest snapshots with their recorded candidate generations and attempt histories. Missing and conflicting histories remain held; the command does not start a review or change eligibility on any route.
+
+After explicit user consent for one further fallback check on an exhausted cohort, prepare its Core-selected pending input with `prepare-native-pass --pass-kind strong_review --user-requested-additional-fallback-review` instead of `--output`. This binds one call per target to the ordered candidate snapshot and existing exact fallback route. The canonical manifest cannot be reissued with changed candidates, model, or output; automatic review splitting and global limit changes are not permitted.
+
 Fallback routes default to three total judge attempts per target when no route-specific count is configured. `routing.review_attempt_limits` records explicit totals. Preserve explicit initial user/template model and count selections; a missing host binding or incompatible authorized transport leaves the exact request pending, not semantic failure or route exhaustion. Translation retries and triage coverage are separate policies.
 
 Inspect or record an explicitly selected fallback model and its per-target total call count without changing provider mode or permissions:

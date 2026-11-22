@@ -94,6 +94,83 @@ def collect_reviewed_candidates(
             "records": len(segments), "artifact": destination.relative_to(work_dir).as_posix()}
 
 
+def _resume_review_queues(
+    work_dir: Path, source: Path, approved: Path, queues: list[Path], output: Path,
+) -> dict[str, Any]:
+    """Select only unapproved targets with one unambiguous latest queue state."""
+    require_control_plane_ready(work_dir)
+    work_dir = work_dir.resolve()
+    output = output.resolve()
+    for path in (source, approved, output, *queues):
+        path.resolve().relative_to(work_dir)
+    require_inventory_attestation(work_dir, source)
+    remaining = {segment.id: segment.source for segment in read_segments(source)}
+    for result in read_translation_results(approved):
+        if (remaining.get(result.segment_id) != result.source or result.status != "reviewed"
+                or result.acceptance_authority != "reviewer"
+                or result.candidate_digest != stable_hash(result.text)):
+            raise ValueError("E_NATIVE_REVIEW_ACCEPTED_RESULT_INVALID")
+        del remaining[result.segment_id]
+
+    queue_kinds = {
+        "strong-input.jsonl": "strong", "rewrite-input.jsonl": "rewrite",
+        "confirmation-input.jsonl": "confirmation", "fallback-input.jsonl": "fallback",
+        "unresolved-input.jsonl": "rewrite_retry", "awaiting-input.jsonl": "awaiting",
+    }
+
+    def supersedes(a: TranslationResult, b: TranslationResult) -> bool:
+        return (len(a.attempts) > len(b.attempts)
+                and a.attempts[:len(b.attempts)] == b.attempts
+                and a.candidate_generation >= b.candidate_generation
+                and (a.candidate_generation != b.candidate_generation
+                     or a.candidate_digest == b.candidate_digest))
+
+    latest: dict[str, list[tuple[str, Segment, TranslationResult]]] = {}
+    for path in queues:
+        kind = queue_kinds.get(path.name)
+        if kind is None or output.resolve() == path.resolve().parent:
+            raise ValueError("E_NATIVE_REVIEW_QUEUE_INVALID")
+        for segment in read_segments(path):
+            if segment.id not in remaining:
+                continue
+            if segment.source != remaining[segment.id] or REVIEW_STATE_KEY not in segment.metadata:
+                raise ValueError("E_NATIVE_REVIEW_QUEUE_INVALID")
+            _require_candidate_bindings([segment], "rewrite")
+            result = _bound_result(segment)
+            states = latest.setdefault(segment.id, [])
+
+            if any(supersedes(previous, result) for _, _, previous in states):
+                continue
+            states[:] = [(stage, item, previous) for stage, item, previous in states
+                         if not supersedes(result, previous)]
+            if not any(stage == kind and item == segment for stage, item, _ in states):
+                states.append((kind, segment, result))
+
+    groups: dict[str, list[Segment]] = {}
+    conflicting, missing = 0, 0
+    for target in remaining:
+        states = latest.get(target, [])
+        if not states:
+            missing += 1
+            continue
+        ready = [entry for entry in states if entry[0] != "awaiting"]
+        if (len(ready) == 1 and all(s == ready[0][1] for _, s, _ in states)
+                or len(states) == 1):
+            kind, segment, _ = (ready or states)[0]
+            groups.setdefault(kind, []).append(segment)
+        else:
+            conflicting += 1
+    if output.exists():
+        raise ValueError("E_NATIVE_REVIEW_OUTPUT_ALREADY_EXISTS")
+    output.mkdir(parents=True)
+    actions = {}
+    for kind, segments in groups.items():
+        path = output / (kind + ".jsonl")
+        _atomic_jsonl(path, (asdict(segment) for segment in segments))
+        actions[kind] = {"count": len(segments), "input": path.relative_to(work_dir).as_posix()}
+    return {"unreviewed": len(remaining), "missing": missing, "conflicting": conflicting, "queues": actions}
+
+
 def materialize_delivery_candidates(
     work_dir: Path, source: Path, approved: Path, pending: list[Path],
     translation_failures: Path, output: Path, *, include_unreviewed: bool = False,
@@ -154,7 +231,7 @@ def materialize_delivery_candidates(
             if not result.text.strip() or result.candidate_digest != stable_hash(result.text):
                 raise ValueError("E_NATIVE_REVIEW_CANDIDATE_STALE")
             result.status = "accepted_unreviewed"
-            result.acceptance_authority = "user"
+            result.acceptance_authority = "user_policy"
             result.review_outcome = "unresolved"
             result.metadata["delivery_review_status"] = "not_approved"
             result.metadata["delivery_inclusion_authority"] = "user"
@@ -390,6 +467,8 @@ def partition_native_review_routes(
                 # may return for confirmation within its configured call policy.
                 failed = bool(attempts and attempts[-1].status in {"error", "refused"})
                 unavailable = exhausted or failed
+            elif stage == "review-rewrite":
+                unavailable = any(item.operational is not True for item in attempts)
             else:
                 unavailable = bool(attempts)
             if not unavailable:
@@ -663,12 +742,16 @@ def collect_native_rewrite(
                      extra_patterns=extra_patterns, max_length_ratio=max_length_ratio)
                      if row["status"] == "success" else [])
         valid = row["status"] == "success" and not integrity
+        interrupted = row["provider"] == "native-control" and row.get("issues") in (
+            ["worker_not_started"], ["worker_interrupted"],
+        )
         result.attempts.append(AttemptRecord(
             "review-rewrite", row_provider, "success" if valid else "error",
             issues=[item.code for item in integrity] if integrity else list(row.get("issues", [])),
             ordinal=1 + sum(a.stage == "review-rewrite" and a.provider == row_provider
-                            for a in result.attempts),
+                            and a.operational is not True for a in result.attempts),
             candidate_generation=result.candidate_generation,
+            operational=True if interrupted else None,
         ))
         result.status = "failed"
         result.acceptance_authority = ""
