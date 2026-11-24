@@ -12,7 +12,10 @@ from .model_policy import (
 
 DEFAULT_REVIEW_FALLBACK_CALLS = 3
 JUDGE_STAGES = frozenset({"review", "review-confirm", "review-grace-retry", "review-refusal-retry"})
-REVIEW_SETTING_FIELDS = ("triage_max_calls", "strong_max_calls", "review_max_workers", "triage_max_workers", "strong_max_workers")
+REVIEW_SETTING_FIELDS = (
+    "triage_max_calls", "strong_max_calls", "review_max_rounds",
+    "review_max_workers", "triage_max_workers", "strong_max_workers",
+)
 TRIAGE_STAGES = frozenset({"review-triage", "review-triage-confirm", "review-triage-grace-retry", "review-triage-refusal-retry"})
 
 _ADDITIONAL_FALLBACK_ROOT = Path(".game-l10n/native/additional-fallback-review")
@@ -160,7 +163,11 @@ def review_policy_status(config: dict[str, Any], work_dir: Path | None = None) -
         "status": "native_binding_required" if pending else "configured",
         "default_fallback_max_calls": DEFAULT_REVIEW_FALLBACK_CALLS,
         "review_attempt_limits": dict(limits),
-        "review_limits": {key: routing[key] for key in REVIEW_SETTING_FIELDS if routing.get(key) is not None},
+        "review_max_rounds": routing.get("review_max_rounds", 2),
+        "review_limits": {
+            key: routing[key] for key in REVIEW_SETTING_FIELDS
+            if key != "review_max_rounds" and routing.get(key) is not None
+        },
         "defaulted_fallback_providers": defaulted,
         "requested_native_models": native_role_models(config),
         "model_authorizations": {

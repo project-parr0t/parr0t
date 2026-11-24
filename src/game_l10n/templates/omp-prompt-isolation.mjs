@@ -147,6 +147,43 @@ function boundRelay(prompt, workspace) {
   return { target, local, native, metadata };
 }
 
+function deterministicInventoryWorker(bound, workspace) {
+  if (bound.native || bound.metadata.worker_role !== "inventory_reconciler") return undefined;
+  const taskPath = path.resolve(workspace, bound.metadata.task_path);
+  if (path.dirname(taskPath) !== path.dirname(bound.target) || path.basename(taskPath) !== "task.json"
+      || realpathSync(taskPath) !== taskPath) throw new Error("inventory task path changed");
+  const bytes = readFileSync(taskPath);
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  if (digest !== bound.metadata.task_sha256) throw new Error("inventory task digest changed");
+  const task = JSON.parse(bytes.toString("utf8"));
+  const command = task.worker_execution?.deterministic_worker;
+  if (!command) return undefined;
+  const script = path.join(workspace, "tools", "reconcile_inventory_worker.py");
+  const cli = task.worker_execution.core_runtime?.cli_argv;
+  if (!Array.isArray(cli) || cli.length !== 4 || !path.isAbsolute(cli[0]) || !path.isAbsolute(cli[3])
+      || task.worker_execution.tool !== "parr0t_process"
+      || typeof command.script_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(command.script_sha256)) {
+    throw new Error("invalid deterministic inventory command binding");
+  }
+  const template = [...cli.slice(0, -1), script, "--workspace", workspace, "--core-entry", cli.at(-1),
+    "--relay", "<relay>", "--task-sha256", "<task-sha256>"];
+  if (!Array.isArray(command.argv) || JSON.stringify(command.argv) !== JSON.stringify(template)) {
+    throw new Error("deterministic inventory argv changed");
+  }
+  return {
+    script, sha256: command.script_sha256, used: false,
+    argv: template.map(arg => arg === "<relay>" ? bound.local : arg === "<task-sha256>" ? digest : arg),
+  };
+}
+
+function requireInventoryCommand(binding, input, workspace) {
+  if (!Array.isArray(input?.argv) || JSON.stringify(input.argv) !== JSON.stringify(binding.argv)
+      || (input.cwd !== undefined && realpathSync(input.cwd) !== workspace)) {
+    throw new Error("PARR0T_OMP_PROMPT_ISOLATION: exact deterministic inventory argv required");
+  }
+  if (binding.used) throw new Error("PARR0T_OMP_PROMPT_ISOLATION: inventory command already invoked");
+}
+
 function childReply({ local, native, metadata }, depth) {
   if (local.split("/").some(part => !/^[A-Za-z0-9._-]+$/.test(part))) return WITHHELD_REPLY;
   if (depth === 1) {
@@ -187,6 +224,7 @@ export default function promptIsolation(pi) {
   pi.registerFlag("parr0t-workspace", { description: "Absolute Parr0t workspace for prompt child communication boundaries", type: "string" });
   let relay;
   let reply = WITHHELD_REPLY;
+  let inventoryCommand;
   const ownedChildren = new Set();
   const lifecycle = createNativeRelayLifecycle({
     workspace,
@@ -195,6 +233,14 @@ export default function promptIsolation(pi) {
   });
   registerNativeProcess(pi, {
     async beforeExecute(params, ctx) {
+      if (inventoryCommand && ctx.agent?.kind === "sub" && ctx.agent.depth >= 2) {
+        requireInventoryCommand(inventoryCommand, params, realpathSync(workspace(ctx)));
+        inventoryCommand.used = true;
+        if (realpathSync(inventoryCommand.script) !== inventoryCommand.script
+            || createHash("sha256").update(readFileSync(inventoryCommand.script)).digest("hex") !== inventoryCommand.sha256) {
+          throw new Error("PARR0T_OMP_PROMPT_ISOLATION: deterministic inventory script changed");
+        }
+      }
       if (relay && ctx.agent?.kind === "sub" && ctx.agent.depth === 1) {
         const decision = await lifecycle.tool_call({ toolName: "parr0t_process", input: params }, ctx);
         if (decision?.block) throw new Error(decision.reason);
@@ -274,6 +320,14 @@ export default function promptIsolation(pi) {
     const blocks = (Array.isArray(event.systemPrompt) ? event.systemPrompt : [event.systemPrompt ?? ""]).map(stripCollaboration);
     if (!blocks.includes(POLICY)) blocks.push(POLICY);
     if (handoff) blocks.push(handoff);
+    if (bound && ctx.agent.depth >= 2) {
+      inventoryCommand = deterministicInventoryWorker(bound, realpathSync(workspace(ctx)));
+      if (inventoryCommand) blocks.push([
+        "Deterministic inventory worker. Do not inspect task, caches, source, or other artifacts.",
+        `Your only process call is parr0t_process with ${JSON.stringify({argv: inventoryCommand.argv})}.`,
+        "Do not replace it with an inline script, a verifier call, or a manually written envelope. Stop after it returns.",
+      ].join("\n"));
+    }
     return { systemPrompt: Array.isArray(event.systemPrompt) ? blocks : blocks.join("\n\n") };
   });
   pi.on("assistant_message", (event, ctx) => {
@@ -294,6 +348,12 @@ export default function promptIsolation(pi) {
     try {
       if (deniedCall(event.toolName, event.input, 0, ownedChildren)) return { ...DENIAL };
       if (toolName(event.toolName) === "yield") return { input: { data: reply } };
+      if (inventoryCommand && ctx.agent.depth >= 2) {
+        if (toolName(event.toolName) !== "parr0t_process") {
+          return { block: true, reason: "Only the bound deterministic inventory command is admitted." };
+        }
+        requireInventoryCommand(inventoryCommand, event.input, realpathSync(workspace(ctx)));
+      }
       if (relay) {
         const marker = `PARR0T_OMP_RELAY=${path.relative(realpathSync(workspace(ctx)), relay).split(path.sep).join("/")}`;
         if (toolName(event.toolName) === "task" || WRAPPERS.has(toolName(event.toolName))) {

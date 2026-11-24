@@ -9,6 +9,7 @@ from .errors import ConfigurationError
 
 NATIVE_ROLE_ROUTES = {
     "translation": "native-translation",
+    "translation-fallback": "native-translation-fallback",
     "triage": "native-triage",
     "strong-review": "native-strong-review",
     "context": "native-context",
@@ -94,7 +95,25 @@ def apply_native_role_models(config: dict[str, Any], models: dict[str, str]) -> 
     updated = deepcopy(config)
     routing = updated["routing"]
     for role in models:
-        key, index = _ROLE_SLOTS[role]
+        if role == "translation-fallback":
+            key = "translators"
+            routes = routing.get(key, [])
+            if not isinstance(routes, list):
+                raise ConfigurationError("E_MODEL_POLICY_ROLE_UNAVAILABLE: invalid translator routes")
+            route = NATIVE_ROLE_ROUTES[role]
+            if route in routes[1:]:
+                index = routes.index(route, 1)
+            else:
+                adapters = {provider["name"] for provider in updated.get("providers", [])
+                            if "translation_fallback" in provider.get("allowed_roles", [])}
+                slots = [i for i, value in enumerate(routes) if i > 0 and value in adapters]
+                if len(slots) != 1:
+                    raise ConfigurationError(
+                        "E_MODEL_POLICY_ROLE_UNAVAILABLE: expected one configured external translation fallback"
+                    )
+                index = slots[0]
+        else:
+            key, index = _ROLE_SLOTS[role]
         routes = routing.get(key)
         if routes is None:
             routes = routing[key] = []
@@ -106,7 +125,7 @@ def apply_native_role_models(config: dict[str, Any], models: dict[str, str]) -> 
             routes.append(route)
         else:
             routes[index] = route
-        if role == "translation" and previous != route:
+        if role in {"translation", "translation-fallback"} and previous != route:
             retries = routing.setdefault("translator_retries", {})
             if previous in retries:
                 retries.setdefault(route, retries[previous])

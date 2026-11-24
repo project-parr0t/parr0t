@@ -45,6 +45,13 @@ game-l10n filesystem-package --workspace <workspace> --payload <payload> --spec 
 game-l10n verify-filesystem-package --workspace <workspace> --package <patch.zip>
 ```
 
+For an activated locale-catalog adapter, the `locale_local_package`
+data-plane purpose binds the reviewed pack input and a workspace-owned
+`pack_local_locale.py` runner to an isolated build. Its sealed local ZIP is
+not a claim of image, font, or runtime completion.
+
+`verified_partial_local_package` is a separate, explicitly authorized local build from sealed, verified-only text and image payloads. Its README and release ID identify the incomplete scope; the local checkpoint covers only included text. It does not change the canonical inventory or attest complete localization.
+
 The generated ZIP layout is fixed:
 
 ```text
