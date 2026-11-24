@@ -388,11 +388,81 @@ class CustomNativeRouteTests(unittest.TestCase):
                           for s in read_segments(self.root / "review.jsonl")],
                          ["native-luna", "native-luna", "native-sol", "native-qwen"])
 
+    def escalate(self, source):
+        self.run_pass(source, "triage", [("fixture", "success", "REWRITE voice")],
+                      kind="review", tier="triage")
+        self.cli("collect-native-review", "--input", source, "--manifest", "triage/manifest.json",
+                 "--output", "triage-joined", "--tier", "triage")
+        return "triage-joined/strong-input.jsonl"
+
+    def test_public_prep_requires_collected_evidence_bound_to_the_whole_candidate(self):
+        from dataclasses import replace
+        from game_l10n.models import AttemptRecord
+        from game_l10n.native_review import _bound_result, _pending_segment
+        from game_l10n.store import stable_hash
+        self.config["routing"]["strong_review_sample_percent"] = 0
+
+        base = review_segment("fixture")
+        source = self.source("review.jsonl", [base])
+
+        def prepare(path, output, kind="strong_review"):
+            return self.cli("prepare-native-pass", "--input", path, "--output", output,
+                            "--pass-kind", kind)
+
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_REVIEW_EVIDENCE_REQUIRED"):
+            prepare(source, "untriaged")
+        result = _bound_result(base)
+        result.attempts.append(AttemptRecord("review-triage", "native-luna", "rewrite",
+                                             candidate_generation=1))
+        result.metadata.update(review_tier="strong_pending", strong_review_reasons=["triage_flagged"])
+        fake = self.source("hand-labelled.jsonl", [_pending_segment(base, result)])
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_REVIEW_EVIDENCE_REQUIRED"):
+            prepare(fake, "hand-labelled")
+        self.assertFalse((self.root / "untriaged/manifest.json").exists())
+        self.assertFalse((self.root / "hand-labelled/manifest.json").exists())
+
+        pending = self.escalate(source)
+        genuine = read_segments(self.root / pending)[0]
+        copied = self.source("renamed-subset.jsonl", [genuine])
+        prepared = prepare(copied, "prepared")
+        self.assertEqual(prepared["review_selection"], {
+            "routes": {"escalation": 1},
+            "selection_reasons": {"fallback_translation": 1, "triage_flagged": 1},
+        })
+        self.assertTrue(prepare(copied, "prepared")["cached"])
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_REVIEW_EVIDENCE_INVALID"):
+            prepare(copied, "wrong-phase", kind="rewrite")
+        rebound = replace(genuine, metadata=json.loads(json.dumps(genuine.metadata)))
+        for key in ("_parr0t_candidate", "_parr0t_review_state"):
+            binding = rebound.metadata[key]
+            if key == "_parr0t_candidate":
+                binding.update(text="DIFFERENT", generation=2, digest=stable_hash("DIFFERENT"))
+            else:
+                binding.update(candidate_generation=2, candidate_digest=stable_hash("DIFFERENT"))
+        for index, altered in enumerate((replace(genuine, id="foreign"), rebound)):
+            path = self.source(f"altered-{index}.jsonl", [altered])
+            with self.assertRaisesRegex(ValueError, "E_NATIVE_REVIEW_EVIDENCE_INVALID"):
+                prepare(path, f"rejected-{index}")
+            self.assertFalse((self.root / f"rejected-{index}/manifest.json").exists())
+
+
+    def test_explicit_no_triage_can_prepare_fresh_strong_review(self):
+        self.config["routing"]["review_triagers"] = []
+        source = self.source("no-triage.jsonl", [review_segment("fixture")])
+        _, manifest = self.run_pass(source, "review", [("fixture", "success", "OK")],
+                                    kind="review", tier="strong")
+        self.assertEqual(manifest["route_binding"]["provider"], "native-sol")
+
+
     def test_custom_review_failure_uses_next_native_judge_then_configured_rewriter(self):
-        source = self.source("review.jsonl", [review_segment("fixture")])
+        source = self.escalate(self.source("review.jsonl", [review_segment("fixture")]))
         self.run_pass(source, "strong", [("fixture", "refused", "")], kind="review", tier="strong")
         self.cli("collect-native-review", "--input", source, "--manifest", "strong/manifest.json",
                  "--output", "strong-joined", "--tier", "strong")
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_REVIEW_QUEUE_SUPERSEDED"):
+            self.cli("prepare-native-pass", "--input", source, "--output", "replay-primary",
+                     "--pass-kind", "strong_review")
+        self.assertFalse((self.root / "replay-primary/manifest.json").exists())
         fallback = "strong-joined/fallback-input.jsonl"
         self.run_pass(fallback, "fallback", [("fixture", "success", "REWRITE voice")],
                       kind="review", tier="strong")
@@ -411,12 +481,13 @@ class CustomNativeRouteTests(unittest.TestCase):
         self.assertEqual(accepted.text, "REVISED")
         self.assertEqual(accepted.candidate_generation, 2)
         self.assertEqual([(a.stage, a.provider) for a in accepted.attempts], [
+            ("review-triage", "native-luna"),
             ("review", "native-sol"), ("review", "native-qwen"),
             ("review-rewrite", "native-qwen"), ("review", "native-sol")])
 
     def test_custom_review_ok_uses_bound_qwen_identity_and_does_not_reopen_accepted_rows(self):
         self.config["routing"]["reviewers"] = ["native-qwen"]
-        source = self.source("review.jsonl", [review_segment("fixture")])
+        source = self.escalate(self.source("review.jsonl", [review_segment("fixture")]))
         self.run_pass(source, "review", [("fixture", "success", "OK")], kind="review", tier="strong")
         summary = self.cli("collect-native-review", "--input", source, "--manifest", "review/manifest.json",
                            "--output", "collected", "--tier", "strong")
@@ -425,10 +496,14 @@ class CustomNativeRouteTests(unittest.TestCase):
         self.assertEqual(accepted.reviewer, "native-qwen")
         self.assertEqual(accepted.attempts[-1].provider, "native-qwen")
         self.assertEqual(read_segments(self.root / "collected/fallback-input.jsonl"), [])
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_REVIEW_CANDIDATE_LOCKED"):
+            self.cli("prepare-native-pass", "--input", source, "--output", "reopened",
+                     "--pass-kind", "strong_review")
+        self.assertFalse((self.root / "reopened/manifest.json").exists())
 
     def test_native_route_selection_does_not_skip_earlier_external_judge(self):
         self.config["routing"]["reviewers"] = ["external-judge", "native-qwen"]
-        source = self.source("review.jsonl", [review_segment("fixture")])
+        source = self.escalate(self.source("review.jsonl", [review_segment("fixture")]))
         with self.assertRaisesRegex(ConfigurationError, "^E_NATIVE_ROUTE_INVALID:"):
             self.cli("prepare-native-pass", "--input", source, "--output", "tasks",
                      "--pass-kind", "review", "--review-tier", "strong", "--native-provider", "native-qwen")

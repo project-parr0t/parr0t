@@ -97,6 +97,26 @@ class PromptModelPolicyTests(unittest.TestCase):
                                  before["routing"]["review_attempt_limits"][previous])
         self.assertEqual(after["model_policy"]["native_roles"], models)
 
+    def test_translation_fallback_replaces_only_external_slot_preserving_retry_budget(self):
+        before = load_config(self.work)
+        before["routing"]["translator_retries"]["deepseek"] = 2
+        _write_config(self.work, before)
+        lock = (self.work / MODE_LOCK_PATH).read_bytes()
+        self.bind(role_models={"translation-fallback": self.model}, user_requested_models=True)
+        self.bind(role_models={"translation-fallback": self.model}, user_requested_models=True)
+        after = load_config(self.work)
+        self.assertEqual(after["routing"]["translators"],
+                         ["native-luna", "native-sol", "native-translation-fallback"])
+        self.assertEqual(after["routing"]["translator_retries"], {
+            **{route: retries for route, retries in before["routing"]["translator_retries"].items()
+               if route != "deepseek"},
+            "native-translation-fallback": 2,
+        })
+        self.assertEqual(after["providers"], before["providers"])
+        self.assertEqual(after["routing"]["reviewers"], before["routing"]["reviewers"])
+        self.assertEqual((self.work / MODE_LOCK_PATH).read_bytes(), lock)
+        self.assertEqual(launch_contract(self.work, "native-translation-fallback", ["fixture"])["model"], self.model)
+
     def test_partial_role_update_preserves_previous_user_choice_and_other_operator_bindings(self):
         configure_native_runtime(self.work, "omp", {"native-sol": "fixture/operator-sol"}, omp_isolation="prompt")
         self.bind(role_models={"translation": "fixture/translator"}, user_requested_models=True)

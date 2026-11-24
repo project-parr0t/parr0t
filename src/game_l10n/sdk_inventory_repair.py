@@ -69,7 +69,8 @@ def reconcile_cached_sdk_inventory(work_dir: Path, tool: tuple[Path, str]) -> di
             return None
         state = json.loads(state_path.read_bytes())
         if ("INVENTORY_SCOPE_PROJECTION_REQUIRED" not in state.get("issue_codes", ())
-                or "INVENTORY_SCOPE_CORRECTION_MISMATCH" in state["issue_codes"]):
+                or "INVENTORY_SCOPE_CORRECTION_MISMATCH" in state["issue_codes"]
+                or "INVENTORY_TEXT_SOURCE_ROUTE_MISMATCH" in state["issue_codes"]):
             return None
         inputs = state.get("constraint_inputs")
         if not isinstance(inputs, list) or not 2 <= len(inputs) <= 4:
