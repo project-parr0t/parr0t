@@ -44,8 +44,41 @@ The first saved attestation freezes the primary ID lineage in `.game-l10n/invent
 Physical comparison keys take precedence over method-specific raw ID overlap. Substantial evidenced comparison-key overlap routes remaining occurrences as ordinary gaps, not a new namespace loss. While a namespace mismatch remains unresolved, repair aliases in a separate generation before expanding the primary inventory; a union that merely makes both manifests equal cannot bypass that gate. Merely changed inputs do not reset the no-progress observation count.
 
 An exclusion has `reason_code` and `affects_user_visible_text`. If the latter is true, the inventory cannot pass. Inventory workers classify structure and player visibility only: subject matter, an anticipated safeguard response, or a content-policy guess is never an extraction exclusion. Raw literal presence proves neither display scope nor completeness. Cache each method's structural parse, physical provenance, categories, display bindings, and dependency evidence in a single source pass; derive its inventory from that cache. Account separately for raw occurrences, display-bound targets, unresolved display dependencies, and proven non-display occurrences. Preserve equal-valued physical occurrences and source order. Proven internal/control/debug-only occurrences may be excluded with categorical reasons, counts, and evidence fingerprints in existing `coverage.exclusions`; engine or module names alone never justify blanket exclusions. Retain player-visible system messages and uncertain dynamic display dependencies.
-New core-bound inventory tasks additionally require `coverage.display_scope` (`parr0t.display-scope.v1`) and per-target `metadata.display_scope_evidence`. The declaration contains non-negative `raw_occurrence_count`, `display_candidate_count`, `control_only_count`, and `unclassified_count`, plus an `evidence_fingerprint`; candidate count must equal segment count. Each target carries `display_scope_evidence.kind` as `positive_display_binding` or `possible_display_dependency`, and its own nonempty `evidence_fingerprint`. Raw-only, unclassified, and control-only records are accounting data, not translation targets; `declared_complete` cannot promote them into scope. Uncertain actual display candidates must be retained. Core verifies schema, accounting shape, counts, evidence presence, and inventory bindings; it cannot verify that SDK fingerprints truthfully describe engine behavior. Older snapshots without this declaration remain readable and are not retroactively held to the new sealing contract.
-Each new-contract target also carries a nonempty `metadata.display_binding_id`. Its scope evidence binds the exact UTF-8 source with `source_sha256` and uses a lowercase SHA-256 `evidence_fingerprint`. Control/lookup/index/script storage is not an active translation target, even when `display_projection_required=true`; preserve it and use a separate display-only projection. Control-only plus unclassified accounting cannot exceed raw occurrences. A fingerprint binds evidence identity, not its truth: the SDK remains responsible for the referenced render or dependency proof. Attestation and segment ingestion use the same declared-scope validator before context, translation or review.
+Fresh Core inventory tasks bind `parr0t.text-eligibility.v1` alongside the
+existing `coverage.display_scope` (`parr0t.display-scope.v1`) occurrence
+accounting. Each `coverage.text_source` declares exactly:
+
+| Field | Locale path | Display extraction |
+| --- | --- | --- |
+| `route` | `locale_data` | `display_extraction` |
+| `locale_probe` | `applicable` | `unavailable` |
+| `evidence_fingerprint` | SDK probe SHA-256 | SDK probe SHA-256 |
+| `screen_review` | `not_applicable` | `static` or explicitly `user_skipped` |
+| `pending_display_count` | `0` | nonnegative; `0` required for complete inventory |
+
+Locale jobs inventory only verified locale values. Display jobs inventory
+only positively established display values; analysis that finds an unresolved
+actual display dependency records it as pending, not as a segment. Unclassified
+raw strings remain private accounting data, not pending display dependencies
+without evidence. Both inventory methods must agree on the route.
+
+Each row binds `metadata.display_binding_id`, its exact UTF-8 `source_sha256`,
+and a lowercase SHA-256 `evidence_fingerprint`. Its `metadata.storage_role` and
+`metadata.display_scope_evidence.kind` are `locale_value`/`locale_value` for the
+locale path (evidence `binding_basis: locale_catalog`) and
+`display_value`/`positive_display_binding` for the display path (evidence
+`binding_basis: format_field` or `render_argument`). A digest identifies
+underlying evidence; it cannot turn a claim into actual SDK proof. The Core
+does not approve unknown fields, structural keys, or executable code as text.
+Previously attested inventories retain their original evidence contract.
+
+Only after the user's explicit approval for workspace-wide additional text
+screen review, record `game-l10n screen-review-policy --workspace <workspace>
+--mode skip --user-requested`. This is not a locale choice, visual/image
+authorization, runtime launch approval, extraction waiver, or translation
+review waiver. The default is no skip; an explicit `--mode required
+--user-requested` restores it for future tasks and new attestations. Sealing
+uses the task's bound approval. Eligibility evidence remains mandatory.
 
 
 An engine SDK may reduce display-candidate overcapture through the capability contract in `docs/engine-static-scope.md`. The inventory then records candidate, included, conservatively retained, and proven-unused counts in `coverage.static_scope`; included count must match its segment count. This denominator is display candidates, not every raw literal. Two differently implemented graph analyses must agree before an SDK removes a display candidate. Dynamic or indirect references retain the affected targets; absence of a direct reference is not proof of non-display. Reachability exclusions without scope tracking are invalid. Static reachability is not runtime observation and never satisfies the runtime coverage gate.
@@ -68,6 +101,8 @@ Inventory strings, including IDs, metadata values, and object keys, must contain
 Every attestation records a metadata-only reconciliation generation, gaps, identity gate, and progress. `incomplete` requires continuation and is not a terminal success. Reconcile from cached scans; mismatch, parser/layout repair, and newly found targets are actionable work, not a user decision or semantic exhaustion. Continue eligible repair and independent work without whole-wave/no-progress barriers. Stop for an actual external blocker, deterministic gate, or user stop; retain the checkpoint and exact remaining codes.
 
 The metadata-only `agreed_target_count` counts active comparison keys whose source, UI/display contract and localization authority agree across both methods. A lower complete blocker score is improvement. At an equal score, an unchanged blocker vector may also report `improved` when this agreement count grows and neither active denominator shrinks; a remaining completeness declaration does not erase that progress. Raw-occurrence growth and fingerprint churn alone do not qualify. Identical input fingerprints report `unchanged`; other uncredited input changes report `changed`. None of these observations grants static completion, waives proof, changes retry routes or creates a job limit.
+
+When an SDK provides `coverage.extraction_evidence`, the attestation reports aggregate scanned/reused file counts, extraction timings, and distinct unresolved dependency counts. The dependency keys bind a method-neutral physical observation, source bytes and reason; only when both methods supply keys can Core report common and one-method-only dependencies. Uncovered active display candidates are those not agreed by the pair, not unreviewed translations or omitted package entries. These diagnostics do not affect inventory identity, completeness or retry policy.
 
 ## Evidence-bound scope correction
 
@@ -126,6 +161,13 @@ aborts before verifying the pair, leave the envelope unwritten and let the
 relay seal the ended attempt. Core reports `invalid_envelope_issue_codes`
 alongside `malformed_response` when the submitted issue codes fail validation;
 it never forwards rejected values or worker error text.
+
+For an activated workspace SDK with `tools/reconcile_inventory_worker.py`,
+`prepare-data-plane-task --deterministic-inventory-worker` explicitly selects
+that runner in prompt OMP. The helper provides its exact argv and admits one
+invocation after verifying the runner digest. The worker cannot substitute
+inline Python or write a result with another tool. Ordinary reconciliation
+is unchanged when the option is absent; the option cannot rebind a live task.
 
 ## Context execution gate
 

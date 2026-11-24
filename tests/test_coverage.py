@@ -18,9 +18,10 @@ from game_l10n.coverage import (
     verify_inventory_pair,
 )
 
-from game_l10n.cli import _finalize_translation_results
+from game_l10n.cli import _finalize_translation_results, _public_inventory_gate
 from game_l10n.errors import ConfigurationError
 from game_l10n.failure_queue import load_failure_queue, update_failure_queue
+from game_l10n.inventory_constraints import observe_inventory_constraints
 from game_l10n.models import AttemptRecord, FailureCode, Segment, TranslationResult
 from game_l10n.store import stable_hash
 from game_l10n.workspace import initialize_workspace
@@ -125,6 +126,287 @@ class DisplayScopeContractTests(unittest.TestCase):
         payload["coverage"]["display_scope"]["unclassified_count"] = 2
         with self.assertRaises(ConfigurationError):
             validate_inventory_display_scope(payload, required=True)
+
+
+class TextEligibilityContractTests(unittest.TestCase):
+    @staticmethod
+    def inventory(method: str = "primary", *, locale: bool = False) -> dict:
+        return {
+            "schema": "parr0t.source-inventory.v1",
+            "method": method,
+            "implementation_fingerprint": f"{method}-implementation",
+            "coverage": {
+                "declared_complete": True,
+                "text_source": {
+                    "route": "locale_data" if locale else "display_extraction",
+                    "locale_probe": "applicable" if locale else "unavailable",
+                    "screen_review": "not_applicable" if locale else "static",
+                    "pending_display_count": 0,
+                    "evidence_fingerprint": sha256(method.encode()).hexdigest(),
+                },
+                "display_scope": {
+                    "schema": "parr0t.display-scope.v1",
+                    "raw_occurrence_count": 1,
+                    "display_candidate_count": 1,
+                    "control_only_count": 0,
+                    "unclassified_count": 0,
+                    "evidence_fingerprint": "synthetic-map",
+                },
+            },
+            "segments": [{"id": "target", "source": "SOURCE", "metadata": {
+                "storage_role": "locale_value" if locale else "display_value",
+                "display_binding_id": "synthetic-binding",
+                "display_scope_evidence": {
+                    "kind": "locale_value" if locale else "positive_display_binding",
+                    "binding_basis": "locale_catalog" if locale else "render_argument",
+                    "source_sha256": sha256(b"SOURCE").hexdigest(),
+                    "evidence_fingerprint": sha256(f"{method}-binding".encode()).hexdigest(),
+                },
+            }}],
+        }
+
+    def test_declaration_required_for_new_tasks_and_validated_on_legacy_reads(self) -> None:
+        payload = self.inventory()
+        validate_inventory_display_scope(payload, required_text_source=True, screen_review_skip=True)
+        declaration = payload["coverage"].pop("text_source")
+        with self.assertRaisesRegex(ConfigurationError, "requires a coverage.text_source"):
+            validate_inventory_display_scope(payload, required_text_source=True)
+        for invalid in (
+            None, {**declaration, "extra": True},
+            {**declaration, "evidence_fingerprint": "A" * 64},
+            {**declaration, "locale_probe": "applicable"},
+            {**declaration, "pending_display_count": False},
+        ):
+            with self.subTest(invalid=invalid):
+                payload["coverage"]["text_source"] = invalid
+                with self.assertRaises(ConfigurationError):
+                    validate_inventory_display_scope(payload)
+
+    def test_locale_targets_cannot_use_extraction_accounting_or_scope_controls(self) -> None:
+        payload = self.inventory(locale=True)
+        validate_inventory_display_scope(payload, required_text_source=True)
+        for field, count in (("raw_occurrence_count", 2), ("control_only_count", 1), ("unclassified_count", 1)):
+            with self.subTest(field=field):
+                scope = payload["coverage"]["display_scope"]
+                original = scope[field]
+                scope[field] = count
+                with self.assertRaisesRegex(ConfigurationError, "locale accounting"):
+                    validate_inventory_display_scope(payload)
+                scope[field] = original
+        for field in ("scope_correction", "static_scope"):
+            with self.subTest(field=field):
+                payload["coverage"][field] = None
+                with self.assertRaisesRegex(ConfigurationError, "cannot use scope correction or static scope"):
+                    validate_inventory_display_scope(payload)
+                del payload["coverage"][field]
+        payload["segments"] = self.inventory()["segments"]
+        with self.assertRaisesRegex(ConfigurationError, "locale value storage"):
+            validate_inventory_display_scope(payload)
+
+    def test_rows_require_route_storage_and_positive_structured_evidence(self) -> None:
+        for locale in (False, True):
+            with self.subTest(locale=locale):
+                payload = self.inventory(locale=locale)
+                row = payload["segments"][0]
+                row["metadata"]["storage_role"] = "lookup_key"
+                with self.assertRaisesRegex(ConfigurationError, "INVENTORY_ACTIVE_CONTROL_STORAGE"):
+                    validate_inventory_display_scope(payload)
+        payload = self.inventory()
+        row = payload["segments"][0]
+        row["storage_role"] = "lookup_key"
+        with self.assertRaisesRegex(ConfigurationError, "must appear only in metadata"):
+            validate_inventory_display_scope(payload)
+        del row["storage_role"]
+        evidence = row["metadata"]["display_scope_evidence"]
+        evidence["kind"] = "possible_display_dependency"
+        with self.assertRaisesRegex(ConfigurationError, "positive format or render binding"):
+            validate_inventory_display_scope(payload)
+        evidence["kind"] = "positive_display_binding"
+        evidence["binding_basis"] = "free-form claim"
+        with self.assertRaisesRegex(ConfigurationError, "positive format or render binding"):
+            validate_inventory_display_scope(payload)
+        evidence["binding_basis"] = "format_field"
+        validate_inventory_display_scope(payload)
+        row["source"] = "CHANGED SOURCE"
+        with self.assertRaisesRegex(ConfigurationError, "source-bound eligibility"):
+            validate_inventory_display_scope(payload)
+
+    def test_task_skip_proof_and_pending_completeness(self) -> None:
+        payload = self.inventory()
+        coverage = payload["coverage"]
+        declaration = coverage["text_source"]
+        declaration["screen_review"] = "user_skipped"
+        with self.assertRaisesRegex(ConfigurationError, "skip requires task approval"):
+            validate_inventory_display_scope(payload, required_text_source=True, screen_review_skip=False)
+        with self.assertRaisesRegex(ConfigurationError, "skip requires task approval"):
+            validate_inventory_display_scope(payload, required_text_source=True)
+        validate_inventory_display_scope(payload, required_text_source=True, screen_review_skip=True)
+        validate_inventory_display_scope(payload)
+        declaration["pending_display_count"] = 1
+        with self.assertRaisesRegex(ConfigurationError, "pending display text"):
+            validate_inventory_display_scope(payload)
+        coverage["declared_complete"] = False
+        validate_inventory_display_scope(payload)
+
+    def test_pair_route_mismatch_contributes_to_reconciliation_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary, independent = root / "primary.json", root / "independent.json"
+            primary.write_text(json.dumps(self.inventory(locale=True)), encoding="utf-8")
+            independent.write_text(json.dumps(self.inventory("independent")), encoding="utf-8")
+
+            result = save_inventory_attestation(root, primary, independent)
+            self.assertTrue(result["text_source_route_mismatch"])
+            self.assertIn("INVENTORY_TEXT_SOURCE_ROUTE_MISMATCH", result["issue_codes"])
+            self.assertFalse(result["static_complete"])
+            self.assertEqual(result["gap_score"], result["ui_composition_mismatch_count"] + 1)
+            self.assertTrue(result["reconciliation"]["gap_vector"]["text_source_route_mismatch"])
+
+            independent.write_text(json.dumps(self.inventory("independent", locale=True)), encoding="utf-8")
+            result = verify_inventory_pair(primary, independent)
+            self.assertFalse(result["text_source_route_mismatch"])
+            self.assertTrue(result["static_complete"])
+
+            same_routes = self.inventory(), self.inventory("independent")
+            for path, payload, pending in zip((primary, independent), same_routes, (1, 2), strict=True):
+                payload["coverage"]["declared_complete"] = False
+                payload["coverage"]["text_source"]["pending_display_count"] = pending
+                path.write_text(json.dumps(payload), encoding="utf-8")
+            result = verify_inventory_pair(primary, independent)
+            self.assertFalse(result["text_source_route_mismatch"])
+            self.assertEqual(result["issue_codes"], ["INVENTORY_NOT_DECLARED_COMPLETE"])
+
+    def test_workspace_attestations_require_skip_approval_but_pair_reads_do_not(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary, independent = root / "primary.json", root / "independent.json"
+            payload = self.inventory()
+            payload["coverage"]["text_source"]["screen_review"] = "user_skipped"
+            primary.write_text(json.dumps(payload), encoding="utf-8")
+            independent.write_text(json.dumps(self.inventory("independent")), encoding="utf-8")
+            self.assertTrue(verify_inventory_pair(primary, independent)["static_complete"])
+            with self.assertRaisesRegex(ConfigurationError, "skip requires task approval"):
+                save_inventory_attestation(root, primary, independent)
+            with self.assertRaisesRegex(ConfigurationError, "skip requires task approval"):
+                require_inventory_attestation(root, primary, config={
+                    "coverage": {"require_independent_inventory": False},
+                })
+
+
+class ExtractionEvidenceTests(unittest.TestCase):
+    @staticmethod
+    def evidence(*keys: str) -> dict:
+        return {"pending_display_keys": list(keys), "telemetry": {
+            "scanned_files": 2, "reused_files": 1, "managed_ms": 3.25,
+            "serialized_ms": 4, "inventory_ms": 5,
+        }}
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.primary = self.root / "primary.json"
+        self.independent = self.root / "independent.json"
+
+    @staticmethod
+    def write(path: Path, payload: dict) -> None:
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_extraction_summary_separates_unique_dependencies_and_compared_scope(self) -> None:
+        primary = TextEligibilityContractTests.inventory()
+        independent = TextEligibilityContractTests.inventory("independent")
+        primary["segments"].append({**primary["segments"][0], "id": "extra-synthetic-target"})
+        primary["coverage"]["display_scope"].update(raw_occurrence_count=2, display_candidate_count=2)
+        primary_evidence = self.evidence("a" * 64, "a" * 64, "b" * 64)
+        independent_evidence = self.evidence("a" * 64, "c" * 64, "d" * 64)
+        independent_evidence["telemetry"]["reused_files"] = 0
+        primary["coverage"]["extraction_evidence"] = primary_evidence
+        independent["coverage"]["extraction_evidence"] = independent_evidence
+        self.write(self.primary, primary)
+        self.write(self.independent, independent)
+        state = save_inventory_attestation(self.root, self.primary, self.independent)
+        self.assertFalse(state["static_complete"])
+        self.assertEqual(state["agreed_target_count"], 1)
+        expected = {
+            "common_unresolved_dependency_count": 1,
+            "primary_only_unresolved_dependency_count": 1,
+            "independent_only_unresolved_dependency_count": 2,
+            "primary": {
+                "unresolved_dependency_count": 2,
+                "uncovered_active_display_candidate_count": 1,
+                "telemetry": primary_evidence["telemetry"],
+            },
+            "independent": {
+                "unresolved_dependency_count": 3,
+                "uncovered_active_display_candidate_count": 0,
+                "telemetry": independent_evidence["telemetry"],
+            },
+        }
+        saved = json.loads((self.root / ".game-l10n" / "inventory-attestation.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["extraction_summary"], expected)
+        self.assertEqual(_public_inventory_gate(saved)["extraction_summary"], expected)
+
+    def test_absent_extraction_evidence_does_not_imply_an_empty_peer_set(self) -> None:
+        primary = TextEligibilityContractTests.inventory()
+        primary["coverage"]["extraction_evidence"] = self.evidence("a" * 64)
+        independent = TextEligibilityContractTests.inventory("independent")
+        del independent["coverage"]["text_source"]
+        del independent["coverage"]["display_scope"]
+        self.write(self.primary, primary)
+        self.write(self.independent, independent)
+        summary = verify_inventory_pair(self.primary, self.independent)["extraction_summary"]
+        self.assertEqual(set(summary), {"primary"})
+        self.assertEqual(summary["primary"]["unresolved_dependency_count"], 1)
+        independent["coverage"]["extraction_evidence"] = self.evidence()
+        self.write(self.independent, independent)
+        summary = verify_inventory_pair(self.primary, self.independent)["extraction_summary"]
+        self.assertEqual(summary["common_unresolved_dependency_count"], 0)
+        self.assertEqual(summary["primary_only_unresolved_dependency_count"], 1)
+        self.assertEqual(summary["independent_only_unresolved_dependency_count"], 0)
+        self.assertNotIn("uncovered_active_display_candidate_count", summary["independent"])
+
+    def test_extraction_evidence_changes_neither_source_identity_nor_completeness(self) -> None:
+        primary = TextEligibilityContractTests.inventory()
+        independent = TextEligibilityContractTests.inventory("independent")
+        self.write(self.primary, primary)
+        self.write(self.independent, independent)
+        baseline = save_inventory_attestation(self.root, self.primary, self.independent)
+        primary["coverage"]["extraction_evidence"] = self.evidence("a" * 64)
+        self.write(self.primary, primary)
+        self.assertEqual(inventory_fingerprint(primary), baseline["primary_fingerprint"])
+        self.assertTrue(require_inventory_attestation(self.root, self.primary)["static_complete"])
+        current = save_inventory_attestation(self.root, self.primary, self.independent)
+        for name in ("static_complete", "gap_score", "issue_codes", "identity_gate"):
+            self.assertEqual(current[name], baseline[name])
+        self.assertEqual(current["extraction_summary"]["primary"]["unresolved_dependency_count"], 1)
+        observation = observe_inventory_constraints(
+            self.root, {key: value for key, value in current.items() if key != "extraction_summary"},
+            {}, {}, {},
+        )
+        self.assertEqual(observation["gap_score"], current["gap_score"])
+
+    def test_malformed_extraction_evidence_is_rejected_without_payload_details(self) -> None:
+        primary = TextEligibilityContractTests.inventory()
+        self.write(self.independent, TextEligibilityContractTests.inventory("independent"))
+        valid = self.evidence()
+        for invalid in (
+            None,
+            {**valid, "extra": "PRIVATE-SYNTHETIC"},
+            {**valid, "pending_display_keys": "PRIVATE-SYNTHETIC"},
+            {**valid, "pending_display_keys": ["A" * 64]},
+            {**valid, "pending_display_keys": ["a" * 63]},
+            {**valid, "telemetry": {}},
+            {**valid, "telemetry": {**valid["telemetry"], "scanned_files": True}},
+            {**valid, "telemetry": {**valid["telemetry"], "reused_files": -1}},
+            {**valid, "telemetry": {**valid["telemetry"], "serialized_ms": float("inf")}},
+            {**valid, "telemetry": {**valid["telemetry"], "inventory_ms": "PRIVATE-SYNTHETIC"}},
+        ):
+            with self.subTest(invalid=invalid):
+                primary["coverage"]["extraction_evidence"] = invalid
+                self.write(self.primary, primary)
+                with self.assertRaises(ConfigurationError) as caught:
+                    verify_inventory_pair(self.primary, self.independent)
+                self.assertEqual(str(caught.exception), "Inventory coverage.extraction_evidence has an invalid shape")
 
 
 class CoverageTests(unittest.TestCase):

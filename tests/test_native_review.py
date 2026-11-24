@@ -66,6 +66,29 @@ class NativeReviewTests(unittest.TestCase):
         )
         self.assertEqual(list(groups), [""])
 
+    def test_authorized_alternate_judge_only_reviews_that_models_translations(self):
+        from game_l10n.models import AttemptRecord
+        from game_l10n.native_review import _bound_result, _pending_segment, partition_native_review_routes
+        fallback, alternate = "native-fallback", "native-alternate"
+        author, judge = "fixture/author", "fixture/judge"
+        direct = review_segment("ordinary")
+        routed = review_segment("requires-independent-judge")
+        routed.metadata["_parr0t_candidate"]["content_provenance_lineage"] = [{"model": author}]
+        policy = {"route_models": {fallback: author, alternate: judge},
+                  "candidate_model_routes": {author: alternate}, "attempt_limits": {alternate: 2}}
+        groups = partition_native_review_routes([direct, routed], [fallback], stage="review", **policy)
+        self.assertEqual(groups, {fallback: [direct], alternate: [routed]})
+        self.assertEqual(partition_native_review_routes([routed], [alternate], stage="review-triage", **policy),
+                         {alternate: [routed]})
+        result = _bound_result(routed)
+        result.attempts = [
+            AttemptRecord("review", alternate, "rewrite", model=judge, ordinal=i,
+                          candidate_generation=result.candidate_generation)
+            for i in (1, 2)
+        ]
+        self.assertEqual(list(partition_native_review_routes(
+            [_pending_segment(routed, result)], [fallback], stage="review", **policy)), [""])
+
     def test_new_exact_model_under_same_role_is_not_suppressed_by_old_failure_or_rewrite(self):
         from game_l10n.models import AttemptRecord
         from game_l10n.native_review import _bound_result, _pending_segment, partition_native_review_routes
@@ -90,6 +113,29 @@ class NativeReviewTests(unittest.TestCase):
             route_models={"configured-role": "fixture/new"},
         )
         self.assertEqual(list(groups), ["configured-role"])
+
+    def test_language_noop_allows_one_repair_without_reopening_other_rewrites(self):
+        from game_l10n.models import AttemptRecord
+        from game_l10n.native_review import _bound_result, _pending_segment, partition_native_review_routes
+
+        segments = []
+        for key in ("language-noop", "ordinary-noop", "repair-already-attempted"):
+            segment = review_segment(key, candidate="visible untranslated words")
+            result = _bound_result(segment)
+            result.attempts = [
+                AttemptRecord("review-rewrite", "native-rewrite", "success", candidate_generation=1),
+                AttemptRecord("review", "native-fallback", "approved", candidate_generation=1),
+            ]
+            if key != "ordinary-noop":
+                result.metadata["target_language_risk"] = ["target_script_absent"]
+            if key == "repair-already-attempted":
+                result.attempts.append(AttemptRecord("review-rewrite", "native-rewrite", "error",
+                                                     candidate_generation=1))
+            segments.append(_pending_segment(segment, result))
+        groups = partition_native_review_routes(segments, ["native-rewrite"], stage="review-rewrite")
+        self.assertEqual({k: [s.id for s in v] for k, v in groups.items()},
+                         {"native-rewrite": ["language-noop"],
+                          "": ["ordinary-noop", "repair-already-attempted"]})
 
     def test_mixed_pending_routes_partition_by_configured_policy_not_model_name(self):
         from game_l10n.models import AttemptRecord
@@ -306,7 +352,7 @@ class NativeReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             segments = []
-            for key in ["changed", "unchanged", "failed"]:
+            for key in ["changed", "unchanged", "failed", "untranslated"]:
                 base = review_segment(key)
                 result = _bound_result(base)
                 result.attempts = [
@@ -314,23 +360,45 @@ class NativeReviewTests(unittest.TestCase):
                     AttemptRecord("review", "native-sol", "rewrite", candidate_generation=1),
                 ]
                 result.metadata["rewrite_issues"] = ["voice"]
+                if key in {"changed", "untranslated"}:
+                    result.metadata["target_language_risk"] = ["target_script_absent"]
                 segments.append(_pending_segment(base, result))
             source = root / "source.jsonl"
             source.write_text("\n".join(json.dumps(asdict(s)) for s in segments) + "\n")
             segments = read_segments(source)
             tasks, results = root / "tasks", root / "results"
-            prepare_native_tasks(root, source, segments, tasks, pass_kind="rewrite")
+            prepare_native_tasks(root, source, segments, tasks, pass_kind="rewrite",
+                                 min_records=1, max_records=2, max_workers=1)
             results.mkdir()
-            rows = [{"target_id": s.id, "status": "success" if i < 2 else "error",
-                     "text": ["U", "T", ""][i], "issues": []}
+            rows = [{"target_id": s.id, "status": "success" if i != 2 else "error",
+                     "text": ["\ubc88\uc5ed", "T", "", "untranslated text"][i], "issues": []}
                     for i, s in enumerate(segments)]
-            write_semantic_result_rows(results / "task-0001.jsonl", rows)
+            write_semantic_result_rows(results / "task-0001.jsonl", rows[:2])
             import_native_wave(root, tasks / "manifest.json", results, 1)
             args = (root, source, tasks / "manifest.json", root / "collected")
-            summary = collect_native_rewrite(*args)
+            prefix_output = root / "prefix"
+            prefix = collect_native_rewrite(root, source, tasks / "manifest.json", prefix_output,
+                                            target_language="ko")
+            self.assertEqual((prefix["confirmation_pending"], prefix["awaiting"]), (2, 2))
+            write_semantic_result_rows(results / "task-0002.jsonl", rows[2:])
+            import_native_wave(root, tasks / "manifest.json", results, 2)
+            tail = root / "tail"
+            pending = prefix_output / "awaiting-input.jsonl"
+            collect_native_rewrite(root, source, tasks / "manifest.json", tail,
+                                   awaiting_input=pending, target_language="ko")
+            tail_rows = read_translation_results(tail / "results.json")
+            self.assertEqual([r.segment_id for r in tail_rows], ["failed", "untranslated"])
+            self.assertEqual(tail_rows[1].attempts[-1].issues, ["target_script_absent"])
+            self.assertEqual(read_segments(tail / "confirmation-input.jsonl"), [])
+            invalid = root / "reordered.jsonl"
+            invalid.write_text("\n".join(json.dumps(asdict(s)) for s in reversed(segments)) + "\n")
+            with self.assertRaisesRegex(ValueError, "E_NATIVE_REWRITE_AWAITING_INPUT_INVALID"):
+                collect_native_rewrite(root, source, tasks / "manifest.json", root / "invalid",
+                                       awaiting_input=invalid)
+            summary = collect_native_rewrite(*args, target_language="ko")
             self.assertEqual(summary["accepted"], 0)
             self.assertEqual(summary["confirmation_pending"], 2)
-            self.assertEqual(summary["unresolved"], 1)
+            self.assertEqual(summary["unresolved"], 2)
             confirmation = read_segments(root / "collected/confirmation-input.jsonl")
             self.assertEqual([_bound_result(s).candidate_generation for s in confirmation], [2, 1])
             self.assertTrue(all(len(_bound_result(s).attempts) == 3 for s in confirmation))
@@ -338,7 +406,7 @@ class NativeReviewTests(unittest.TestCase):
             self.assertEqual(pending.text, "T")
             self.assertEqual(pending.candidate_generation, 1)
             self.assertEqual(pending.attempts[-1].status, "error")
-            self.assertEqual(collect_native_rewrite(*args), summary)
+            self.assertEqual(collect_native_rewrite(*args, target_language="ko"), summary)
             self.assertTrue(all(r.status != "reviewed" and not r.acceptance_authority
                 for r in read_translation_results(root / "collected/results.json")))
             # A rewriter's output cannot be accepted without a fresh judge.
@@ -563,6 +631,159 @@ class NativeReviewTests(unittest.TestCase):
             self.assertEqual([read_segments(root / entry["input"]) for entry in resumed["queues"].values()],
                              [entry[-1] for entry in actual])
             self.assertEqual({path: path.read_bytes() for path in evidence}, evidence)
+
+    def test_resume_review_queues_coalesces_only_compatible_native_judgments(self):
+        from dataclasses import replace
+        from game_l10n.formats import write_results
+        from game_l10n.models import AttemptRecord
+        from game_l10n.native_review import (
+            _bound_result, _issue_review_queue, _lock_review_approvals, _pending_segment,
+            _resume_review_queues, _review_queue_parents,
+        )
+        from game_l10n.native_runtime import RUNTIME_PATH, RUNTIME_SCHEMA
+        from game_l10n.store import stable_hash
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            primary, shared, alternate = "native-primary", "native-shared", "native-alternate"
+            denied, model = "external-denied", "fixture/exact"
+            routing = {
+                "review_triagers": ["native-triage"], "reviewers": [primary, shared, denied],
+                "rewriters": [shared], "review_candidate_model_routes": {
+                    "fixture/author": shared, "fixture/other": alternate, "fixture/unbound": "native-missing",
+                },
+            }
+            (root / "game-l10n.json").write_text(json.dumps({
+                "routing": routing, "providers": [{"name": denied, "model": "fixture/api", "allowed_roles": []}],
+            }), encoding="utf-8")
+            runtime_path = root / RUNTIME_PATH
+            runtime_path.parent.mkdir(parents=True, exist_ok=True)
+            runtime = {"schema": RUNTIME_SCHEMA, "host": "codex", "control_generation": 1,
+                       "models": {primary: "fixture/primary", shared: model, alternate: model}}
+            runtime_path.write_text(json.dumps({**runtime, "fingerprint": stable_hash(runtime)}), encoding="utf-8")
+            authors = {"confirmation": "fixture/author", "alternate": "fixture/other", "unbound": "fixture/unbound"}
+            ids = ("fallback", "waiting", "confirmation", "alternate", "rewrite", "denied", "unbound",
+                   "exhausted", "approved", "locked", "stale", "conflict", "missing")
+            items = {key: replace(review_segment(key), previous="P", next="N") for key in ids}
+            for key, author in authors.items():
+                items[key].metadata["_parr0t_candidate"]["content_provenance_lineage"] = [{"model": author}]
+
+            def save(name, rows):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("".join(json.dumps(asdict(row)) + "\n" for row in rows), encoding="utf-8")
+                return path
+
+            def pending(item, *attempts, rewrite=False):
+                result = _bound_result(item)
+                result.attempts.extend(attempts)
+                if rewrite:
+                    result.metadata["rewrite_issues"] = ["voice"]
+                return _pending_segment(item, result)
+
+            def attempt(provider, status="error", stage="review"):
+                return AttemptRecord(stage, provider, status, candidate_generation=1,
+                                     model=runtime["models"].get(provider, "fixture/api"))
+
+            def issue(route, rows, parents=()):
+                _issue_review_queue(root, rows, route, stable_hash(route), _review_queue_parents(list(parents)))
+                return rows
+
+            inventory = save("inventory.jsonl", items.values())
+            initial = {s.id: s for s in issue("escalation", [pending(s) for s in items.values()])}
+            confirmation_parent = issue("rewrite", [
+                pending(initial["confirmation"], attempt(primary, "rewrite"), rewrite=True),
+            ], [initial["confirmation"]])
+            confirmation = issue("confirmation", [
+                pending(confirmation_parent[0], attempt(shared, "success", "review-rewrite")),
+            ], confirmation_parent)[0]
+            fallback_items = {
+                "fallback": [attempt(primary)],
+                "denied": [attempt(primary), attempt(shared)],
+                "exhausted": [attempt(primary), attempt(shared), attempt(denied)],
+                "conflict": [attempt(primary)],
+            }
+            fallback = issue("judge_fallback", [
+                pending(initial[key], *attempts) for key, attempts in fallback_items.items()
+            ], [initial[key] for key in fallback_items])
+            conflicting = issue("judge_fallback", [pending(initial["conflict"], attempt(primary, "refused"))],
+                                [initial["conflict"]])
+            rewrite = issue("rewrite", [pending(initial["rewrite"], attempt(primary, "rewrite"), rewrite=True)],
+                            [initial["rewrite"]])
+            issue("judge_fallback", [pending(initial["stale"], attempt(primary))], [initial["stale"]])
+
+            approved, locked = (_bound_result(items[key]) for key in ("approved", "locked"))
+            for result in (approved, locked):
+                result.status = "reviewed"
+                result.acceptance_authority = "reviewer"
+            approved_path = root / "approved.json"
+            write_results(approved_path, [approved])
+            _lock_review_approvals(root, [locked])
+            queues = [
+                save("confirmation-input.jsonl", [confirmation]), save("fallback-input.jsonl", fallback),
+                save("other/fallback-input.jsonl", conflicting), save("rewrite-input.jsonl", rewrite),
+                save("awaiting-input.jsonl", [initial["waiting"]]),
+                save("strong-input.jsonl", [initial[key] for key in
+                     ("waiting", "alternate", "unbound", "approved", "locked", "stale")]),
+            ]
+            with patch("game_l10n.native_review.require_inventory_attestation"):
+                summary = _resume_review_queues(root, inventory, approved_path, queues, root / "resume")
+            self.assertEqual((summary["unreviewed"], summary["missing"], summary["conflicting"]), (12, 3, 1))
+            rows_by_route = {
+                (entry["status"], entry.get("operation"), entry.get("provider")):
+                    [s.id for s in read_segments(root / entry["input"])]
+                for entry in summary["queues"].values() if entry["status"] != "repair_required"
+            }
+            self.assertEqual(rows_by_route, {
+                ("native_route_pending", "judge", shared): ["fallback", "confirmation"],
+                ("native_route_pending", "judge", alternate): ["alternate"],
+                ("native_route_pending", "rewrite", shared): ["rewrite"],
+                ("awaiting", None, None): ["waiting"],
+                ("routes_exhausted", "judge", None): ["exhausted"],
+            })
+            repairs = [s.id for entry in summary["queues"].values() if entry["status"] == "repair_required"
+                       for s in read_segments(root / entry["input"])]
+            self.assertEqual(repairs, ["denied", "unbound"])
+            action = next(entry for entry in summary["queues"].values()
+                          if entry.get("operation") == "judge" and entry.get("provider") == shared)
+            self.assertEqual(action["model"], model)
+            combined_path = root / action["input"]
+            combined = read_segments(combined_path)
+            self.assertEqual(combined, [fallback[0], confirmation])
+            prepared = prepare_native_tasks(
+                root, combined_path, combined, root / "tasks", pass_kind="review", review_tier="strong",
+                route_binding={"provider": shared, "model": model, "attempt": 1},
+            )
+            self.assertEqual(prepared["records"], 2)
+            self.assertEqual(prepared["review_selection"]["routes"], {"confirmation": 1, "judge_fallback": 1})
+            with patch("game_l10n.native_review.require_inventory_attestation"):
+                resumed = _resume_review_queues(root, inventory, approved_path, [combined_path, *reversed(queues)],
+                                                root / "resume-again")
+                self.assertEqual(resumed["conflicting"], 1)
+                self.assertEqual(read_segments(root / resumed["queues"][combined_path.parent.name]["input"]), combined)
+                tampered = save("tampered/judge.jsonl", [replace(combined[0], speaker="changed"), combined[1]])
+                with self.assertRaisesRegex(ValueError, "E_NATIVE_REVIEW_EVIDENCE_INVALID"):
+                    _resume_review_queues(root, inventory, approved_path, [tampered], root / "rejected")
+
+            # Separate source inputs can have real blank context at the seam.
+            # Combining those rows would have the ordinary reader change a seal.
+            isolated = [review_segment(key) for key in ("first-source", "second-source")]
+            isolated_source = save("isolated-inventory.jsonl", isolated)
+            isolated_parents = issue("escalation", [pending(s) for s in isolated])
+            isolated_fallbacks = issue("judge_fallback", [
+                pending(s, attempt(primary)) for s in isolated_parents
+            ], isolated_parents)
+            isolated_queues = [save(f"{s.id}/fallback-input.jsonl", [s]) for s in isolated_fallbacks]
+            empty_approved = root / "empty-approved.json"
+            write_results(empty_approved, [])
+            with patch("game_l10n.native_review.require_inventory_attestation"):
+                isolated_summary = _resume_review_queues(
+                    root, isolated_source, empty_approved, isolated_queues, root / "resume-isolated",
+                )
+            self.assertEqual(
+                [read_segments(root / entry["input"])[0] for entry in isolated_summary["queues"].values()],
+                isolated_fallbacks,
+            )
 
     def test_only_current_ok_is_accepted_and_other_targets_are_routed(self):
         with tempfile.TemporaryDirectory() as directory:

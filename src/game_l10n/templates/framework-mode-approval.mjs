@@ -67,24 +67,36 @@ function authority(ctx) {
   if (typeof session !== "string" || !session.trim()) fail("actual root session required");
   return { agent: ctx.agent.id, session };
 }
-function workspaceFor(input, ctx, getWorkspace) {
+function workspaceFor(input, bound, allowOtherWorkspace = false) {
   const supplied = input.workspace;
   if (supplied !== undefined && (typeof supplied !== "string" || !path.isAbsolute(supplied) || supplied.includes("\0"))) fail("absolute workspace required");
-  const bound = getWorkspace?.(ctx);
   if (bound !== undefined && (typeof bound !== "string" || !path.isAbsolute(bound))) fail("absolute bound workspace required");
   if (bound === undefined && supplied === undefined) fail("explicit absolute workspace required");
-  const workspace = realpathSync(bound ?? supplied);
+  const workspace = realpathSync(allowOtherWorkspace ? supplied ?? bound : bound ?? supplied);
   if (!statSync(workspace).isDirectory()) fail("workspace directory required");
-  if (supplied !== undefined && realpathSync(supplied) !== workspace) fail("workspace does not match bound helper");
+  if (!allowOtherWorkspace && supplied !== undefined && realpathSync(supplied) !== workspace) fail("workspace does not match bound helper");
   return workspace;
+}
+function exactSubagent(value) {
+  return typeof value === "string" && value.length <= 200 &&
+    /^[A-Za-z0-9_][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_][A-Za-z0-9_-]*)*$/.test(value) &&
+    value.trim() === value;
+}
+function sessionFile(ctx) {
+  const file = ctx.sessionManager.getSessionFile?.();
+  if (typeof file !== "string" || !path.isAbsolute(file) || file.includes("\0")
+      || path.extname(file) !== ".jsonl") fail("current persisted OMP session required for subagent transcripts");
+  return path.resolve(file);
 }
 function parameters(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)
-      || Object.keys(input).some(key => !["mode", "logs", "user_requested", "workspace"].includes(key))
+      || Object.keys(input).some(key => !["mode", "logs", "omp_subagents", "user_requested", "workspace"].includes(key))
       || !["localization", "pause", "analysis", "shutdown"].includes(input.mode)
       || input.user_requested !== true
       || (input.logs !== undefined && (!Array.isArray(input.logs) || input.logs.some(log => typeof log !== "string" || !log.trim() || log.includes("\0"))))
-      || (input.mode !== "analysis" && input.logs?.length)) fail("invalid lifecycle request: explicit user_requested assertion required");
+      || (input.omp_subagents !== undefined && (!Array.isArray(input.omp_subagents)
+        || !input.omp_subagents.every(exactSubagent) || new Set(input.omp_subagents).size !== input.omp_subagents.length))
+      || (input.mode !== "analysis" && (input.logs?.length || input.omp_subagents?.length))) fail("invalid lifecycle request: explicit user_requested assertion and exact analysis scope required");
 }
 function sessionParameters(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)
@@ -100,7 +112,7 @@ function checkRequest(tool, input, ctx, workspace) {
   authority(ctx);
   if (tool === TOOL) parameters(input);
   else sessionParameters(input);
-  workspaceFor(input, ctx, workspace === undefined ? undefined : () => workspace);
+  workspaceFor(input, workspace, tool === SESSION_TOOL);
 }
 // Called before either extension's role-specific tool policy, including root.
 export function checkFrameworkToolCall(event, ctx, workspace, depth = 0) {
@@ -277,39 +289,45 @@ export default function registerFrameworkModeApproval(pi, getWorkspace) {
   pi.registerTool({
     name: TOOL,
     label: "Parr0t Framework Mode (Root User Request)",
-    description: "Root-only lifecycle change bound to an explicit user request. Supply an absolute workspace in ordinary sessions; bound helpers default to their workspace and reject another workspace. Set user_requested:true only for the user's requested pause, analysis, shutdown or clean localization resume; no additional interactive dialog.",
+    description: "Root-only lifecycle change bound to an explicit user request. Supply an absolute workspace in ordinary sessions; bound helpers default to their workspace. In analysis, omp_subagents selects only the exact OMP child IDs the user approved for diagnostic snapshots. Set user_requested:true only for the exact user-requested action and scope.",
     loadMode: "essential",
-    parameters: z.object({ workspace: z.string().optional(), mode: z.string(), user_requested: z.boolean(), logs: z.array(z.string()).optional() }).strict(),
+    parameters: z.object({ workspace: z.string().optional(), mode: z.string(), user_requested: z.boolean(),
+      logs: z.array(z.string()).optional(), omp_subagents: z.array(z.string()).optional() }).strict(),
     async execute(_id, input, signal, _onUpdate, ctx) {
       const identity = authority(ctx);
       parameters(input);
       if (signal?.aborted) fail("request cancelled");
-      const workspace = workspaceFor(input, ctx, getWorkspace);
+      const workspace = workspaceFor(input, getWorkspace?.(ctx));
       const logs = (input.logs ?? []).map(log => path.resolve(workspace, log));
+      const subagents = input.omp_subagents?.slice() ?? [];
+      const ompTranscripts = subagents.length ? { session_file: sessionFile(ctx), subagents } : undefined;
       const current = revision(workspace);
       const request = { mode: input.mode };
       const after = authority(ctx);
-      if (identity.agent !== after.agent || identity.session !== after.session || workspaceFor(input, ctx, getWorkspace) !== workspace || revision(workspace) !== current) fail("host session or lifecycle changed during authorization");
+      if (identity.agent !== after.agent || identity.session !== after.session || workspaceFor(input, getWorkspace?.(ctx)) !== workspace
+          || revision(workspace) !== current || (ompTranscripts && sessionFile(ctx) !== ompTranscripts.session_file)) fail("host session or lifecycle changed during authorization");
       if (signal?.aborted) fail("request cancelled");
       const python = pythonFromPath();
       const id = randomBytes(16).toString("hex");
       const token = randomBytes(32).toString("hex");
       const record = { schema: "parr0t.framework-mode-approval.v1", workspace, session_id: identity.session, agent_id: identity.agent,
         agent_kind: "main", agent_depth: 0, ...request, revision: current, logs,
+        ...(ompTranscripts && { omp_transcripts: ompTranscripts }),
         token_sha256: createHash("sha256").update(token, "ascii").digest("hex"), expires_at: Math.floor(Date.now() / 1000) + 120 };
       const file = path.join(privateDirectory(workspace), `${id}.json`);
       writeFileSync(file, JSON.stringify(record), { flag: "wx", mode: 0o600 });
       const argv = ["framework-mode", "--workspace", workspace, "--mode", request.mode, "--user-requested", "--approval-stdin"];
       for (const log of logs) argv.push("--log", log);
+      for (const id of subagents) argv.push("--omp-subagent", id);
       try { return await invoke(python, argv, workspace, { id, token }, signal); }
       finally { try { unlinkSync(file); } catch (error) { if (error.code !== "ENOENT") throw error; } }
     },
   });
 }
 
-function currentRegistration(pi, ctx, workspace, identity, model, bound) {
+function currentRegistration(pi, ctx, workspace, identity, model, boundWorkspace) {
   const launch = process.env.PARR0T_OMP_CONTROL_DIRECTORY;
-  if (!bound || launch === undefined) return;
+  if (launch === undefined || boundWorkspace === undefined || realpathSync(boundWorkspace) !== workspace) return;
   if (!path.isAbsolute(launch)) fail("invalid current control launch");
   const directory = realpathSync(launch);
   if (path.dirname(directory) !== path.join(workspace, ".game-l10n", "omp-control")
@@ -337,19 +355,20 @@ export function registerParr0tSession(pi, getWorkspace) {
   pi.registerTool({
     name: SESSION_TOOL,
     label: "Parr0t Session (Root User Request)",
-    description: "Launch the official fresh Parr0t controller for the user's requested automation, preserving its request, checkpoints and actual readiness/error result. Requires an explicit absolute workspace in ordinary sessions. Defaults to this root's exact provider/model and thinking; when the host model is unavailable supply an exact model. Never launches a semantic worker from this caller.",
+    description: "Launch the official fresh Parr0t controller for the user's requested automation, preserving its request, checkpoints and actual readiness/error result. Supply an absolute workspace to select the target; bound roots default to their own workspace. Defaults to this root's exact provider/model and thinking; when the host model is unavailable supply an exact model. Never launches a semantic worker from this caller.",
     loadMode: "essential",
     parameters: z.object({ workspace: z.string().optional(), model: z.string().optional(), mode: z.string().optional(), user_requested: z.boolean() }).strict(),
     async execute(_id, input, signal, _onUpdate, ctx) {
       const identity = authority(ctx);
       sessionParameters(input);
-      const workspace = workspaceFor(input, ctx, getWorkspace);
+      const boundWorkspace = getWorkspace?.(ctx);
+      const workspace = workspaceFor(input, boundWorkspace, true);
       const currentModel = ctx.model;
       const model = input.model ?? (typeof currentModel?.provider === "string" && typeof currentModel?.id === "string"
         ? `${currentModel.provider}/${currentModel.id}` : undefined);
       if (!exactModel(model)) fail("host model unavailable: explicit exact model required");
       if (signal?.aborted) fail("request cancelled");
-      const existing = currentRegistration(pi, ctx, workspace, identity, model, getWorkspace !== undefined);
+      const existing = currentRegistration(pi, ctx, workspace, identity, model, boundWorkspace);
       if (existing) return existing;
       const argv = ["omp-session", "--workspace", workspace, "--model", model, "--mode", input.mode ?? "auto"];
       if (input.model === undefined) {
@@ -360,7 +379,7 @@ export function registerParr0tSession(pi, getWorkspace) {
         }
       }
       const after = authority(ctx);
-      if (identity.agent !== after.agent || identity.session !== after.session || workspaceFor(input, ctx, getWorkspace) !== workspace) fail("host session changed during authorization");
+      if (identity.agent !== after.agent || identity.session !== after.session || workspaceFor(input, getWorkspace?.(ctx), true) !== workspace) fail("host session changed during authorization");
       return await invoke(pythonFromPath(), argv, workspace, undefined, signal);
     },
   });

@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import createLifecycle, { publishHostModels } from "../src/game_l10n/templates/native-relay-lifecycle.mjs";
 
-async function fixture(run, { wave = false } = {}) {
+async function fixture(run, { reconciliation = false, wave = false } = {}) {
   const workspace = mkdtempSync(path.join(os.tmpdir(), "parr0t-lifecycle-state-"));
   try {
     const taskPath = path.join(workspace, "synthetic-task.json");
@@ -14,15 +14,18 @@ async function fixture(run, { wave = false } = {}) {
     writeFileSync(taskPath, taskBytes);
     const taskSha = createHash("sha256").update(taskBytes).digest("hex");
     const relayPath = path.join(workspace, "relay.json");
-    const keys = wave ? ["tasks/task-0001.jsonl", "tasks/task-0002.jsonl"] : ["worker-0", "worker-1", "finalizer"];
+    const keys = wave ? ["tasks/task-0001.jsonl", "tasks/task-0002.jsonl"]
+      : reconciliation ? ["worker-0"] : ["worker-0", "worker-1", "finalizer"];
     const dispatches = Object.fromEntries(keys.map((key, slot) => [key, {
       model: "synthetic/model:high", task_path: taskPath, task_sha256: taskSha, slot: wave ? key : slot,
       worker_prompt: `PARR0T_OMP_TASK=${key}\nSynthetic task ${taskPath} ${taskSha}`,
     }]));
     const relay = {
-      ...(wave ? { schema: "parr0t.native-wave-relay.v1" } : {}),
-      launch_contract: { model: "synthetic/model:high", worker_dispatches: dispatches },
-      execution_plan: { tracking_required: !wave },
+      ...(reconciliation ? {
+        schema: "parr0t.data-plane-relay.v4", worker_role: "inventory_reconciler",
+      } : wave ? { schema: "parr0t.native-wave-relay.v1" } : {}),
+      launch_contract: { host: "omp", tasks: keys, model: "synthetic/model:high", worker_dispatches: dispatches },
+      execution_plan: { tracking_required: !reconciliation && !wave },
       command_argv: {
         "capability-available": ["preflight"],
         "worker-started": Object.fromEntries(keys.map(key => [key, ["start", key, "<worker-id>"]])),
@@ -60,10 +63,15 @@ async function fixture(run, { wave = false } = {}) {
       const worker = make();
       const ctx = { agent: { id, kind: "sub", depth: 2, parentId: parent.agent.id } };
       await worker.before_agent_start({ prompt: dispatches[key].worker_prompt }, ctx);
-      return { end: event => worker.agent_end(event, ctx) };
+      return {
+        call: event => worker.tool_call(event, ctx),
+        result: event => worker.tool_result(event, ctx),
+        end: event => worker.agent_end(event, ctx),
+      };
     }
     const timingDir = path.join(workspace, "logs", "native-wave-timing");
-    await run({ dispatch, enter, lifecycle, make, parent, events, started, taskPath, taskBytes, keys, relaySha, timingDir,
+    const timingLog = path.join(workspace, "logs/inventory-reconciliation-timing.jsonl");
+    await run({ dispatch, enter, lifecycle, make, parent, events, started, taskPath, taskBytes, timingLog, keys, relaySha, timingDir,
       failPreflight: value => { failPreflight = value; } });
   } finally { rmSync(workspace, { recursive: true, force: true }); }
 }
@@ -125,6 +133,37 @@ test("context workers end independently and finalizer waits for every terminal e
     assert.deepEqual(events, ["start:0", "end:0", "start:1", "end:1", "finalizer-start", "finalizer-end"]);
     assert.equal(await lifecycle.tool_call({ toolName: "parr0t_process", input: { argv: ["seal-data-plane-task"] } }, parent), undefined);
   });
+});
+
+test("reconciliation timing records terminal work without recording tool data", async () => {
+  await fixture(async ({ dispatch, enter, lifecycle, parent, timingLog }) => {
+    await dispatch(["worker-0"], "dispatch");
+    const worker = await enter("worker-0", "PrivateWorkerIdentity");
+    const verify = ["verify-inventory", "--workspace", "PRIVATE_PATH"];
+    await worker.call({ toolCallId: "verify", toolName: "parr0t_process", input: { argv: verify } });
+    await worker.call({ toolCallId: "deferred", toolName: "write", input: {
+      path: "xd://parr0t_process", content: JSON.stringify({ argv: verify }),
+    } });
+    worker.result({ toolCallId: "verify", isError: true, content: "PRIVATE_OUTPUT" });
+    worker.result({ toolCallId: "deferred", isError: false });
+    await worker.call({ toolCallId: "interrupted", toolName: "read", input: { path: "PRIVATE_PATH" } });
+    await worker.end({ awaitingAsyncWork: true });
+    assert.equal(existsSync(timingLog), false);
+    await worker.end({});
+    await lifecycle.agent_end({}, parent);
+    const log = readFileSync(timingLog, "utf8");
+    const [child, relay] = log.trim().split("\n").map(line => JSON.parse(line));
+    assert.deepEqual(log.match(/PRIVATE_(PATH|OUTPUT)|PrivateWorkerIdentity/g), null);
+    assert.equal(child.event, "worker_ended");
+    assert.equal(child.tool_calls, 3);
+    assert.equal(child.unfinished_tool_calls, 1);
+    assert.equal(child.inventory_verify_calls, 2);
+    assert.ok(child.elapsed_ms >= child.observed_tool_ms);
+    assert.equal(child.provider_generation_ms, null);
+    assert.equal(relay.event, "relay_ended");
+    assert.equal(relay.relay_sha256, child.relay_sha256);
+    assert.equal(relay.provider_generation_ms, null);
+  }, { reconciliation: true });
 });
 
 test("pre-spawn failures remain recoverable and changed task bytes never record a start", async () => {

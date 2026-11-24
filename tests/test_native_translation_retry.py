@@ -98,6 +98,36 @@ class NativeTranslationRetryTests(unittest.TestCase):
                 )
             self.assertFalse((root / "retry" / STATE_NAME).exists())
 
+    def test_active_native_batch_can_finish_before_an_explicitly_rebound_future_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segments = [Segment("pending", "SOURCE")]
+            source, first, retry, state_dir = (
+                root / "source.jsonl", root / "first.jsonl", root / "retry.jsonl", root / "state",
+            )
+            _write_jsonl(source, [asdict(item) for item in segments])
+            _write_jsonl(first, [_result("pending", "refused")])
+            _write_jsonl(retry, [_result("pending", "refused", provider="native-sol")])
+            plan = [{**route, "max_retries": 0} for route in FIXTURE_ROUTE_PLAN] + [{
+                "provider": "native-translation-fallback", "model": "fixture/old", "max_retries": 0,
+            }]
+            baseline = start_native_translation_retries(
+                root, source, segments, first, state_dir, route_plan=plan,
+            )
+            self.assertEqual(baseline["next_provider"], "native-sol")
+            chosen = "fixture/rebound"
+            updated = [*plan[:-1], {**plan[-1], "model": chosen}]
+            with patch("game_l10n.workspace.load_config", return_value={}):
+                with self.assertRaisesRegex(NativeTranslationRetryError, "routes changed"):
+                    advance_native_translation_retries(root, state_dir, retry, route_plan=updated)
+            with patch("game_l10n.workspace.load_config", return_value={"model_policy": {
+                "source": "user_prompt", "native_roles": {"translation-fallback": chosen},
+            }}):
+                resumed = advance_native_translation_retries(root, state_dir, retry, route_plan=updated)
+            self.assertEqual(resumed["route_plan"], updated)
+            self.assertEqual((resumed["next_provider"], resumed["next_attempt"]),
+                             ("native-translation-fallback", 1))
+
     def test_operational_successor_preserves_semantic_cohorts_and_successes(self) -> None:
         policy = {
             "schema": "parr0t.execution-environment-policy.v1", "host": "omp",
@@ -468,6 +498,21 @@ class NativeTranslationRetryTests(unittest.TestCase):
             self.assertNotIn("root_source_artifact", checked)
             with self.assertRaisesRegex(NativeTranslationRetryError, "root inventory is unavailable"):
                 load_native_translation_retry_cohort_root_source(root, frozen)
+            from game_l10n.native_followup import collect_native_translation_candidates
+
+            receipt = root / frozen["export_path"]
+            cohort_source = root / exported["cohort_input"]
+            selected = root / "review.jsonl"
+            summary = collect_native_translation_candidates(
+                root, cohort_source, None, selected, retry_cohort=receipt,
+            )
+            self.assertEqual(summary["new_candidates"], 1)
+            self.assertEqual([item.id for item in read_segments(selected)], ["done"])
+            delta = root / "delta.jsonl"
+            collect_native_translation_candidates(
+                root, cohort_source, None, delta, retry_cohort=receipt, previous=(selected,),
+            )
+            self.assertEqual(delta.read_bytes(), b"")
 
     def test_missing_output_is_not_fabricated_operational_evidence_or_exhaustion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
