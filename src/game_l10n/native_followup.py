@@ -5,6 +5,7 @@ import json
 import os
 from dataclasses import asdict, replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Iterable
 
 from .content_source_policy import validate_content_source_policy
@@ -148,6 +149,69 @@ def _candidate_segment(segment: Segment, row: dict[str, Any]) -> Segment:
         candidate["content_provenance_lineage"] = [dict(provenance)]
     metadata[CANDIDATE_METADATA_KEY] = candidate
     return replace(segment, metadata=metadata)
+
+
+def collect_native_translation_candidates(
+    work_dir: Path, source: Path, manifest_path: Path | None, output: Path, *,
+    previous: Iterable[Path] = (), retry_cohort: Path | None = None,
+) -> dict[str, Any]:
+    """Freeze new validated successes, without advancing the retry ledger."""
+    from .formats import read_segments
+    from .native_pass import _load_task_manifest, merge_native_pass
+
+    previous = tuple(previous)
+    binding = manifest_path if manifest_path is not None else retry_cohort
+    if binding is None or (manifest_path is not None and retry_cohort is not None):
+        raise NativeFollowupError("E_NATIVE_TRANSLATION_PASS_REQUIRED")
+    for path in (source, binding, output, *previous):
+        _relative(work_dir, path)
+    if output.exists():
+        raise NativeFollowupError("E_NATIVE_REVIEW_OUTPUT_INVALID")
+    segments = read_segments(source)
+    if retry_cohort is not None:
+        from .control_plane import require_control_plane_ready
+        from .native_translation_retry import verify_native_translation_retry_cohort
+
+        require_control_plane_ready(work_dir)
+        receipt = json.loads(retry_cohort.read_text(encoding="utf-8"))
+        if (not isinstance(receipt, dict) or receipt.get("kind") != "successful"
+                or receipt.get("export_path") != _relative(work_dir, retry_cohort)
+                or not isinstance(receipt.get("results_artifact"), str)):
+            raise NativeFollowupError("E_NATIVE_TRANSLATION_SUCCESSFUL_COHORT_REQUIRED")
+        results_path = work_dir / receipt["results_artifact"]
+        verified = verify_native_translation_retry_cohort(
+            work_dir, receipt, source_path=source, results_path=results_path,
+        )
+        successes, failures = _load_primary_rows(
+            segments, results_path, content_source_policy=verified["content_source_policy"],
+            content_source_policies=verified["content_source_policies"],
+            retry_route_models={item["provider"]: item["model"] for item in verified["route_plan"]},
+        )
+        if failures:
+            raise NativeFollowupError("E_NATIVE_TRANSLATION_SUCCESSFUL_COHORT_REQUIRED")
+        candidates = {item.id: item for item in successes}
+        summary = {"missing": 0, "complete": True}
+    else:
+        manifest = _load_task_manifest(work_dir, manifest_path)
+        if manifest.get("pass_kind") != "translation":
+            raise NativeFollowupError("E_NATIVE_TRANSLATION_PASS_REQUIRED")
+        with TemporaryDirectory(dir=work_dir / ".game-l10n" / "native") as scratch:
+            merged = Path(scratch) / "merged.jsonl"
+            summary = merge_native_pass(work_dir, segments, merged, manifest_path=manifest_path)
+            accepted_rows = {row["target_id"]: row for row in _read_jsonl(merged)
+                             if row["status"] == "success"}
+        candidates = {item.id: _candidate_segment(item, accepted_rows[item.id])
+                      for item in segments if item.id in accepted_rows}
+    skipped = set()
+    for path in previous:
+        for item in read_segments(path):
+            if candidates.get(item.id) != item or item.id in skipped:
+                raise NativeFollowupError("E_NATIVE_TRANSLATION_PREVIOUS_CANDIDATE_INVALID")
+            skipped.add(item.id)
+    _atomic_jsonl(output, (asdict(item) for target, item in candidates.items() if target not in skipped))
+    return {"review_input": _relative(work_dir, output), "new_candidates": len(candidates) - len(skipped),
+            "previous_candidates": len(skipped), "missing": summary["missing"],
+            "complete": summary["complete"]}
 
 
 def _load_primary_rows(

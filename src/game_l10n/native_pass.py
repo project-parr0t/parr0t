@@ -29,6 +29,7 @@ from .native_runtime import (
     _relay_command_argv,
     _relay_worker_dispatches,
     _unstarted_launch_ledger,
+    _WAVE_WORKER_DISPATCH_REVISION,
     launch_contract,
     native_launch_summary,
     native_runtime,
@@ -84,6 +85,7 @@ OPERATIONAL_RESULT_ISSUES = {
     "worker_not_started",
     "worker_interrupted",
 }
+WAVE_OUTPUT_FORMAT_INSTRUCTION = "Use one UTF-8 JSON object per physical line"
 
 
 def _normalized_language_binding(binding: dict[str, Any] | None) -> dict[str, Any]:
@@ -1367,7 +1369,6 @@ def prepare_native_tasks(
         raise ValueError("Control-turn budget limits require explicit user approval")
     if not segments:
         raise ValueError("Ordered source contains no segments")
-    _require_candidate_bindings(segments, pass_kind)
     ids = [segment.id for segment in segments]
     if len(ids) != len(set(ids)):
         raise ValueError("Ordered source contains duplicate target IDs")
@@ -1384,6 +1385,58 @@ def prepare_native_tasks(
     task_min_records = min(min_records, task_max_records)
     manifest_path = output_dir / "manifest.json"
     execution_namespace = output_dir.resolve().relative_to(work_dir.resolve()).as_posix()
+    review_selection = None
+    if pass_kind in {"review", "rewrite"}:
+        from .native_review import (
+            _bound_result, _review_admission, _review_candidate_locked, _review_failed_route,
+            _review_queue_superseded, partition_native_review_routes,
+        )
+
+        stage = ("review-rewrite" if pass_kind == "rewrite"
+                 else "review-triage" if review_tier == "triage" else "review")
+        review_selection = _review_admission(work_dir, segments, routing, stage=stage)
+        if routing.get("review_triagers"):
+            if not manifest_path.is_file():
+                if any(_review_candidate_locked(work_dir, s) for s in segments):
+                    raise ValueError("E_NATIVE_REVIEW_CANDIDATE_LOCKED")
+                if any(_review_queue_superseded(work_dir, s) for s in segments):
+                    raise ValueError("E_NATIVE_REVIEW_QUEUE_SUPERSEDED")
+            if stage == "review-rewrite":
+                max_rewrites = max(0, routing.get("review_max_rounds", 2) - 1)
+                if any(sum(a.stage.startswith("review-rewrite") and a.status == "success"
+                           for a in _bound_result(s).attempts) >= max_rewrites for s in segments):
+                    raise ValueError("E_NATIVE_REWRITE_LIMIT_REACHED")
+            route_models = {
+                item["name"]: item["model"] for item in config.get("providers", [])
+                if isinstance(item.get("model"), str) and item["model"]
+            }
+            route_models.update((native_runtime(work_dir) or {}).get("models", {}))
+            groups = partition_native_review_routes(
+                segments, routing.get(role, []), stage=stage, route_models=route_models,
+                attempt_limits=routing.get("review_attempt_limits", {}),
+                tier_limit=(routing.get("triage_max_calls" if stage == "review-triage" else "strong_max_calls")
+                            if pass_kind == "review" else None),
+                candidate_model_routes=routing.get("review_candidate_model_routes"),
+            )
+            expected_model = route_models.get(provider)
+            if (not provider.startswith("native-")
+                    or (route_binding or {}).get("attempt", 1) != 1
+                    or (expected_model and (route_binding or {}).get("model", expected_model) != expected_model)):
+                raise ValueError("E_NATIVE_ROUTE_INVALID")
+            if list(groups) != [provider]:
+                additional = (list(groups) == [""] and stage == "review"
+                              and provider in routing.get(role, [])[1:]
+                              and all(_review_failed_route(s, provider, expected_model or "") for s in segments)
+                              and _additional_fallback_review_budget(work_dir, manifest_path, {
+                                  "source_fingerprint": fingerprint, "records": len(segments),
+                                  "route_binding": route_binding, "execution_namespace": execution_namespace,
+                                  "execution_contract": {"review_tier": review_tier},
+                              }) == 1)
+                if not additional:
+                    raise ValueError("E_NATIVE_ROUTE_INVALID: requested route is not the next candidate route")
+            route_binding = {"provider": provider, "attempt": 1,
+                             **({"model": expected_model} if expected_model else
+                                {"model": route_binding["model"]} if route_binding and "model" in route_binding else {})}
     if manifest_path.is_file():
         manifest = _load_task_manifest(work_dir, manifest_path)
         preserve_legacy_unbound_policy = (
@@ -1458,6 +1511,7 @@ def prepare_native_tasks(
                     "records": len(segments),
                     "tasks": len(task_rows),
                     "pass_kind": pass_kind,
+                    **({"review_selection": review_selection} if review_selection is not None else {}),
                     "max_records": max_records,
                     "min_records": min_records,
                     "max_material_tokens": max_material_tokens,
@@ -1637,6 +1691,7 @@ def prepare_native_tasks(
         "records": len(segments),
         "tasks": len(tasks),
         "pass_kind": pass_kind,
+        **({"review_selection": review_selection} if review_selection is not None else {}),
         "max_records": max_records,
         "min_records": min_records,
         "max_material_tokens": max_material_tokens,
@@ -1940,13 +1995,26 @@ def import_native_wave(
     dispatch = _wave_relay_dispatch_path(work_dir, plan_fingerprint, wave)
     runtime = native_runtime(work_dir) or {}
     guarded_host = runtime.get("host") == "omp" and runtime.get("transport", "collaboration") == "collaboration"
+    blocked_started_slots = None
     if dispatch.is_file() and (guarded_host or "launch_contract" in json.loads(dispatch.read_text(encoding="utf-8"))):
         isolation_summary = native_launch_summary(work_dir, dispatch)
         if ISOLATION_ISSUE in isolation_summary["issue_codes"]:
             raise ValueError(ISOLATION_ISSUE)
         receipt = _validated_native_wave_relay_receipt(work_dir, plan_fingerprint, wave, manifest=manifest)
         if receipt["issue_codes"]:
-            raise ValueError("E_NATIVE_WORKER_NOT_STARTED: runtime repair must precede import")
+            if (receipt["issue_codes"] != ["E_NATIVE_WORKER_MODEL_UNAVAILABLE"]
+                    or isolation_summary.get("model_failure_code") != "host_dispatch_denied"
+                    or not receipt["counts"]["ready_tasks"] or not isolation_summary["started_workers"]):
+                raise ValueError("E_NATIVE_WORKER_NOT_STARTED: runtime repair must precede import")
+            require_native_workers_ended(work_dir, dispatch, require_terminal_evidence=True)
+            payload = json.loads(dispatch.read_bytes())
+            not_started = set(isolation_summary["unstarted_tasks"])
+            blocked_started_slots = {
+                Path(row["result"]).name
+                for row in payload["task_bindings"]
+                if row["task"] not in not_started
+                and (work_dir / row["result"]).resolve().parent == source_dir.resolve()
+            }
         if receipt.get("recovery") == INTERRUPTED_REWRITE_RECOVERY:
             payload = json.loads(dispatch.read_text(encoding="utf-8"))
             if any((work_dir / item["result"]).resolve().parent != source_dir.resolve()
@@ -1962,6 +2030,10 @@ def import_native_wave(
     errors: list[ValueError] = []
     source_binding_invalid = False
     for task in tasks:
+        if blocked_started_slots is not None and (
+            task["file"] not in blocked_started_slots or not (source_dir / task["file"]).is_file()
+        ):
+            continue
         try:
             expected_ids = _validate_manifest_task_file(manifest_path, manifest, task)
             destination = _manifest_shard_path(work_dir, manifest, task)
@@ -2010,7 +2082,7 @@ def import_native_wave(
             _atomic_jsonl(destination, rows)
     if errors:
         raise errors[0]
-    receipt = _write_wave_receipt(work_dir, manifest, tasks, wave)
+    receipt = None if blocked_started_slots is not None else _write_wave_receipt(work_dir, manifest, tasks, wave)
 
     records = sum(len(rows) for _, rows in planned)
     success = sum(row["status"] == "success" for _, rows in planned for row in rows)
@@ -2025,7 +2097,7 @@ def import_native_wave(
             destination.resolve().relative_to(work_dir.resolve()).as_posix()
             for destination, _ in planned
         ],
-        "receipt": receipt.resolve().relative_to(work_dir.resolve()).as_posix(),
+        "receipt": receipt.resolve().relative_to(work_dir.resolve()).as_posix() if receipt else "",
     }
 
 
@@ -2063,7 +2135,7 @@ def _write_wave_relay_dispatch(
     wave: int,
     tasks: list[dict[str, Any]],
     plan_fingerprint: str,
-    *, legacy_results: list[dict[str, str]] | None = None,
+    *, legacy_results: list[dict[str, str]] | None = None, upgrade_unobserved: bool = False,
 ) -> str:
     """Write the only dispatch artifact the root may give to a wave relay."""
 
@@ -2122,6 +2194,16 @@ def _write_wave_relay_dispatch(
                 "route_binding.provider alias. Obey the manifest's one semantic batch contract "
                 "and return only the prescribed metadata/artifact path, never source or "
                 "translated text."
+                f" {WAVE_OUTPUT_FORMAT_INSTRUCTION}, without an enclosing array, "
+                "record wrapper, or Markdown fences. The only status values are "
+                "'success', 'refused', 'error', and 'invalid'; use an empty text string "
+                "for non-success and a JSON array of strings for issues. "
+                "The provenance object has these exact fields: "
+                '{{"schema":"parr0t.content-provenance.v1","mode":"direct_model",'
+                '"model":"<route_binding.model>","route":"<route_binding.provider>",'
+                '"policy_digest":"<task row content_source_policy.policy_digest>",'
+                '"external_sources_used":[]}}. Substitute the actual values; '
+                "the external sources list is empty when none were used."
             ),
             "terminal_seal_command": (
                 "game-l10n seal-native-wave-relay --workspace <workspace> "
@@ -2130,9 +2212,31 @@ def _write_wave_relay_dispatch(
             "final_response": "workspace_relative_relay_receipt_path_only",
         },
     }
+    if manifest["pass_kind"] == "review":
+        unsigned["relay_contract"]["worker_message_template"] += (
+            f"\nJudge the existing candidate in segment.metadata.{CANDIDATE_METADATA_KEY}.text "
+            "against the source and the bound context. Do not translate, rewrite, or echo the candidate. "
+            "For a completed judgment use row status 'success' and put only one compact verdict in "
+            "row text: 'OK' or 'REWRITE <comma-separated issue codes>'. Allowed issue codes: "
+            "meaning, omission, addition, voice, register, terminology, consistency, formatting, "
+            "fluency, literalism, reference_loss, tone_rhythm, function, condition, unit, "
+            "knowledge_order, length_risk, slot_composition. Use at most four codes. "
+            "For a refusal or operational error use the corresponding row status and empty text."
+        )
+    elif manifest["pass_kind"] == "rewrite":
+        unsigned["relay_contract"]["worker_message_template"] += (
+            "\nRewrite only the bound candidate to address the recorded findings. "
+            "Read the findings in segment.metadata._parr0t_review_state.metadata. "
+            "If target_language_risk reports missing target script or mixed-language contamination, "
+            "translate the affected visible wording into the locked target language; do not return the "
+            "unchanged source as a successful correction. Preserve bound identifiers, markup, and controls. "
+            "Return the corrected candidate, not a verdict or an explanation, in a successful row's text."
+        )
     path = _wave_relay_dispatch_path(work_dir, plan_fingerprint, wave)
     previous = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
     previous_launch = previous.get("launch_contract") if isinstance(previous, dict) else None
+    if previous is not None and not upgrade_unobserved:
+        unsigned["relay_contract"]["worker_message_template"] = previous["relay_contract"]["worker_message_template"]
     if legacy_results is None and isinstance(previous_launch, dict):
         legacy_results = previous_launch.get("legacy_results", [])
     launch = launch_contract(
@@ -2156,6 +2260,9 @@ def _write_wave_relay_dispatch(
                 zero_launch_tasks_action="seal_existing_results_without_dispatch",
             )
         if "worker_prompt" in launch and "message_isolation" in launch and (previous is None or (isinstance(previous_launch, dict) and "worker_dispatches" in previous_launch)):
+            if (previous_launch is None or upgrade_unobserved
+                    or previous_launch.get("worker_dispatch_revision") == _WAVE_WORKER_DISPATCH_REVISION):
+                launch["worker_dispatch_revision"] = _WAVE_WORKER_DISPATCH_REVISION
             for binding, task in zip(bindings, tasks):
                 binding["task_sha256"] = task["sha256"]
             launch["worker_dispatches"] = _relay_worker_dispatches(work_dir, path, unsigned, launch)
@@ -3339,11 +3446,11 @@ def _native_review_call_budget(work_dir: Path, manifest_path: Path, manifest: di
               or (manifest.get("content_source_policy") or {}).get("task_kind") == "triage")
     runtime = native_runtime(work_dir) if provider.startswith("native-") else None
     model = (manifest.get("route_binding") or {}).get("model") or (runtime or {}).get("models", {}).get(provider, "")
-    limit = (routing.get("triage_max_calls") if triage else review_call_limit(
-        provider, routing.get("reviewers", [provider] if provider else []),
+    limit = review_call_limit(
+        provider, routing.get("review_triagers" if triage else "reviewers", [provider]),
         routing.get("review_attempt_limits", {}), model=model,
-        tier_limit=routing.get("strong_max_calls"),
-    ))
+        tier_limit=routing.get("triage_max_calls" if triage else "strong_max_calls"),
+    )
     if limit is None:
         return None
     from .models import AttemptRecord
@@ -3635,6 +3742,22 @@ def _native_control_step_single(
     plan_fingerprint = _native_control_plan_fingerprint(manifest)
     state_path = _native_control_state_path(work_dir, manifest, plan_fingerprint)
     state = _load_native_control_state(state_path, manifest, plan_fingerprint)
+    review_segments = []
+    if (manifest["pass_kind"] in {"review", "rewrite"}
+            and state["checkpoint_initialized"] is not True):
+        config_path = work_dir / "game-l10n.json"
+        config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
+        routing = config.get("routing", {})
+        if routing.get("review_triagers"):
+            from .native_review import _review_admission, _review_candidate_locked, _review_queue_superseded
+
+            stage = ("review-rewrite" if manifest["pass_kind"] == "rewrite"
+                     else "review-triage" if manifest["execution_contract"].get("review_tier") == "triage"
+                     else "review")
+            review_segments = _manifest_task_segments(manifest_path, manifest)
+            _review_admission(work_dir, review_segments, routing, stage=stage)
+            if stage == "review-triage" and (manifest.get("route_binding") or {}).get("provider") != routing["review_triagers"][0]:
+                raise ValueError("E_NATIVE_REVIEW_TRIAGE_ROUTE_INVALID")
     _record_native_usage(
         state,
         usage_event_id=usage_event_id,
@@ -3650,6 +3773,11 @@ def _native_control_step_single(
         imported_waves, imported_tasks = _imported_native_waves(
             work_dir, manifest_path, manifest
         )
+        if review_segments and not imported_tasks:
+            if any(_review_candidate_locked(work_dir, s) for s in review_segments):
+                raise ValueError("E_NATIVE_REVIEW_CANDIDATE_LOCKED")
+            if any(_review_queue_superseded(work_dir, s) for s in review_segments):
+                raise ValueError("E_NATIVE_REVIEW_QUEUE_SUPERSEDED")
         state["checkpoint_initialized"] = True
         state["imported_wave_count"] = len(imported_waves)
         state["imported_tasks"] = imported_tasks
@@ -3830,6 +3958,22 @@ def _native_control_step_single(
                     rebound_relay = True
                 elif (
                     resume_relay and not confirm_rewrite_workers_stopped
+                    and relay_issue == "E_NATIVE_RELAY_PREFLIGHT_REQUIRED"
+                    and not observed["launch_observed"] and not observed["started_workers"]
+                    and existing_dispatch.get("launch_contract", {}).get("worker_dispatches")
+                    and guarded_host and not budget_issue and not control_limit_hit
+                ):
+                    require_native_workers_ended(work_dir, relay_dispatch_path)
+                    original = relay_receipt_path.read_bytes()
+                    archive = relay_receipt_path.with_name(
+                        f"{relay_receipt_path.name}.legacy-{hashlib.sha256(original).hexdigest()}"
+                    )
+                    if archive.exists() and archive.read_bytes() != original:
+                        raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID: retry archive changed")
+                    relay_receipt_path.replace(archive)
+                    rebound_relay = True
+                elif (
+                    resume_relay and not confirm_rewrite_workers_stopped
                     and relay_issue in RUNTIME_ISSUES
                     and relay_issue not in {
                         "E_NATIVE_WORKER_NOT_STARTED", "E_NATIVE_WORKER_MODEL_UNAVAILABLE",
@@ -3864,6 +4008,14 @@ def _native_control_step_single(
         elif relay_issue:
             action = "repair_native_runtime" if relay_issue in RUNTIME_ISSUES else "checkpoint_and_stop"
             issue_codes = [relay_issue]
+            if (relay_issue == "E_NATIVE_WORKER_MODEL_UNAVAILABLE" and ready_results
+                    and observed.get("model_failure_code") == "host_dispatch_denied"
+                    and observed["started_workers"] and relay_receipt_path.is_file()):
+                try:
+                    import_summary = import_native_wave(work_dir, manifest_path, results_dir, next_wave)
+                except ValueError:
+                    # The sealed blocker remains authoritative; invalid or live siblings never grant import.
+                    pass
         elif budget_issue and ready_results != len(tasks):
             action = "checkpoint_and_stop"
             issue_codes = [budget_issue]
@@ -3988,6 +4140,7 @@ def _native_control_step_single(
             next_wave,
             selected_tasks,
             plan_fingerprint,
+            upgrade_unobserved=unobserved_relay,
         )
         if selected_tasks and next_wave is not None and not rebound_relay
         else ""
@@ -4002,6 +4155,14 @@ def _native_control_step_single(
         # A host repair must not require the parent to reconstruct a task.
         relay_dispatch = relay_dispatch_path.resolve().relative_to(work_dir.resolve()).as_posix()
         selected_tasks = wave_tasks[next_wave]
+    model_repair = None
+    if action == "repair_native_runtime" and "E_NATIVE_WORKER_MODEL_UNAVAILABLE" in issue_codes:
+        launch = native_launch_summary(work_dir, relay_dispatch_path)
+        model_repair = {
+            "scope": "host", "model": launch["model"],
+            "failure_code": launch.get("model_failure_code"),
+            "started_workers": launch["started_workers"],
+        }
     imported_material_tokens = sum(
         int(task.get("estimated_material_tokens", 0))
         for wave in imported_waves
@@ -4034,7 +4195,7 @@ def _native_control_step_single(
             {"scope": "host", "required_capability": "nested_native_dispatch",
              "retry_after": "actual_host_tool_surface_change",
              "automatic_rotation_allowed": False, "isolation_relaxation_allowed": False}
-            if set(issue_codes) & {"E_NATIVE_DISPATCH_UNAVAILABLE", ISOLATION_ISSUE} else None
+            if set(issue_codes) & {"E_NATIVE_DISPATCH_UNAVAILABLE", ISOLATION_ISSUE} else model_repair
         ),
         "relay": (
             {

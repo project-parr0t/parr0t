@@ -129,7 +129,7 @@ def observe_inventory_constraints(
     verified = verify_inventory_pair(primary, independent)
     _validate_scope_correction_history(work_dir, verified, attestation)
     if any(attestation.get(key) != value for key, value in verified.items()
-           if key != "constraint_inputs"):
+           if key not in {"constraint_inputs", "extraction_summary"}):
         raise ValueError("inventory attestation")
     return _observe_verified_constraints(
         work_dir, verified, config, sdk_activation, runtime,

@@ -18,7 +18,7 @@ class FrameworkApprovalTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        root = Path(temporary.name)
+        root = Path(temporary.name).resolve()
         self.workspace = root / "synthetic workspace"
         sdk = root / "sdk"
         sdk.mkdir()

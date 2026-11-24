@@ -625,6 +625,7 @@ def _state_summary(work_dir: Path, state_dir: Path, state: dict[str, Any]) -> di
         "native_exhausted_input": _relative(work_dir, state_dir / "native-exhausted-targets.jsonl"),
         "native_exhausted_results": _relative(work_dir, state_dir / "native-exhausted-results.jsonl"),
         "repair_input": _relative(work_dir, state_dir / "repair-targets.jsonl"),
+        "output_repair_max_records": _pending_output_repair_cap(state),
         "repair_results": _relative(work_dir, state_dir / "repair-results.jsonl"),
         "native_exhausted_count": sum(
             row["action"] == "external_fallback"
@@ -930,9 +931,13 @@ def load_native_translation_retry_cohort_successes(
                 policy = validate_content_source_policy(event.get("content_source_policy"))
                 if policies.get(policy["policy_digest"]) != policy:
                     raise NativeTranslationRetryError("Native retry historical policy revision changed")
-            elif kind == "approved_route_extension":
+            elif kind in {"approved_route_extension", "worker_output_contract_repair", "worker_output_shard_repair"}:
                 fields.add("target_ids")
                 targets = event.get("target_ids")
+                if kind == "worker_output_shard_repair":
+                    fields.add("max_records")
+                    if type(event.get("max_records")) is not int or event["max_records"] < 1:
+                        raise NativeTranslationRetryError("Native retry historical shard bound is invalid")
                 if (
                     not isinstance(targets, list) or not targets
                     or not all(isinstance(target, str) and target in segment_by_id for target in targets)
@@ -1244,6 +1249,26 @@ def start_native_translation_retries(
     }
 
 
+def _can_update_unstarted_translation_fallback(
+    work_dir: Path, state: dict[str, Any], selected: list[dict[str, Any]],
+) -> bool:
+    from .model_policy import NATIVE_ROLE_ROUTES, native_role_bindings
+    from .workspace import load_config
+
+    previous = state["route_plan"]
+    route = NATIVE_ROLE_ROUTES["translation-fallback"]
+    if (
+        len(previous) != len(selected) or len(previous) < 2
+        or previous[:-1] != selected[:-1] or previous[-1]["provider"] != route
+        or not isinstance(selected[-1].get("model"), str)
+        or selected[-1] != {**previous[-1], "model": selected[-1].get("model")}
+        or state["next_provider"] == route
+        or any(event.get("provider") == route for event in state["history"])
+    ):
+        return False
+    return native_role_bindings(load_config(work_dir)).get(route) == selected[-1]["model"]
+
+
 def advance_native_translation_retries(
     work_dir: Path, state_dir: Path, attempt_results: Path, *,
     route_plan: Iterable[dict[str, Any]] | None = None,
@@ -1257,10 +1282,12 @@ def advance_native_translation_retries(
                 "Native translation retry paths must stay inside the workspace"
             )
     state = _load_state(work_dir, state_dir)
-    if route_plan is not None and not _route_plans_match(
-        state["route_plan"], _validated_route_plan(route_plan)
-    ):
-        raise NativeTranslationRetryError("Configured native translation routes changed")
+    if route_plan is not None:
+        selected = _validated_route_plan(route_plan)
+        if not _route_plans_match(state["route_plan"], selected):
+            if not _can_update_unstarted_translation_fallback(work_dir, state, selected):
+                raise NativeTranslationRetryError("Configured native translation routes changed")
+            state["route_plan"] = selected
     if state["next_action"] != "native_retry":
         raise NativeTranslationRetryError("No native translation retry is pending")
     source_segments = _bound_source_segments(work_dir, state)

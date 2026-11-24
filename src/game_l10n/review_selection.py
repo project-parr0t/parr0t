@@ -6,6 +6,7 @@ from typing import Any
 
 from .models import Segment
 from .store import stable_hash
+from .validators import _DEFAULT_PROTECTED_RE
 
 
 REVIEW_SELECTION_POLICY_VERSION = 1
@@ -207,6 +208,8 @@ def target_language_review_reasons(
         and all(character in "0123456789abcdef" for character in evidence)
     ):
         return []
+    # Placeholder names and markup attributes are not rendered prose.
+    text = _DEFAULT_PROTECTED_RE.sub(" ", text)
     target_script_count = len(expected.findall(text))
     if target_script_count:
         latin_letters = sum(
