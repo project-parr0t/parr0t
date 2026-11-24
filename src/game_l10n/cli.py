@@ -1751,17 +1751,33 @@ def cmd_engine_media_bindings_status(args: argparse.Namespace) -> int:
             or sidecar.read_text(encoding="ascii") != hashlib.sha256(artifact.read_bytes()).hexdigest()):
         raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID")
     metadata = _verify_engine_media_binding_probe(work_dir, artifact, task)
-    if args.verify_fonts:
-        from .font_coverage import _font_glyph_coverage
+    verify_final_text = getattr(args, "verify_fonts_against_final_text", False)
+    if args.verify_fonts or verify_final_text:
+        from .font_coverage import _font_probe_counts, _text_codepoints
         import struct
         import zlib
+
+        final_codepoints = None
+        if verify_final_text:
+            config = load_config(work_dir)
+            completion, issue = _read_status_object(
+                work_dir / ".game-l10n/completion-attestation.json",
+                label="COMPLETION_ATTESTATION", expected_schema=COMPLETION_SCHEMA,
+            )
+            if (issue or completion is None or not _completion_state_valid(completion)
+                    or not completion["static_completion"] or not completion["semantic_completion"]
+                    or completion["target_language"]["binding"] != language_binding(work_dir, config)
+                    or _completion_result_issue(work_dir, completion)):
+                raise ConfigurationError("E_FONT_PROBE_REQUIRES_FINALIZED_TEXT")
+            rows = read_translation_results(Path(completion["result_artifact"]["path"]))
+            final_codepoints = _text_codepoints(row.text for row in rows)
 
         fonts = {}
         for item in metadata["references"]:
             if item["kind"] == "font" and item["exists"]:
                 name = item["path"]
                 try:
-                    fonts[name] = {"status": "verified", "glyphs": _font_glyph_coverage(Path(name))}
+                    fonts[name] = {"status": "verified", **_font_probe_counts(Path(name), final_codepoints)}
                 except (OSError, ValueError, struct.error, zlib.error):
                     fonts[name] = {"status": "format_unverified"}
         metadata["font_coverage"] = fonts
@@ -4999,6 +5015,8 @@ def build_parser() -> argparse.ArgumentParser:
     media_status.add_argument("--workspace", required=True)
     media_status.add_argument("--relay", required=True)
     media_status.add_argument("--verify-fonts", action="store_true")
+    media_status.add_argument("--verify-fonts-against-final-text", action="store_true",
+                              help="Compare sealed font references with the finalized glyph set without changing bindings")
     media_status.set_defaults(func=cmd_engine_media_bindings_status)
 
     extractor_check = sub.add_parser(
