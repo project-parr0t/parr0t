@@ -20,6 +20,26 @@ function writeRecord(file, record) {
   renameSync(temporary, file);
 }
 
+function recordWaveTiming(current, event, startedAt, endedAt, task) {
+  try {
+    const logs = path.join(realpathSync(current.workspace), "logs");
+    mkdirSync(logs, { recursive: true, mode: 0o700 });
+    if (realpathSync(logs) !== logs) return;
+    const directory = path.join(logs, "native-wave-timing");
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    if (realpathSync(directory) !== directory) return;
+    const task_sha256 = task === undefined ? undefined : sha256(task);
+    const key = task_sha256 === undefined ? current.fingerprint : `${current.fingerprint}-${task_sha256}`;
+    // The event itself is the exclusive claim; no log scans or separate markers.
+    writeFileSync(path.join(directory, `${key}.json`), JSON.stringify({
+      schema: "parr0t.native-wave-timing.v1", relay_sha256: current.fingerprint, task_sha256, event,
+      elapsed_ms: Math.round(endedAt - startedAt), provider_generation_ms: null,
+    }) + "\n", { flag: "wx", mode: 0o600 });
+  } catch {
+    // Timing is diagnostic only and cannot change lifecycle outcomes.
+  }
+}
+
 // Catalog metadata is resolution evidence, never a per-call model grant.
 export function publishHostModels(ctx, workspace) {
   if (ctx.agent?.kind !== "main" || ctx.agent.depth !== 0) return;
@@ -61,6 +81,7 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
   const handlers = {};
   let bound;
   let worker;
+  let relayClock;
   const calls = new Map();
 
   function load(ctx) {
@@ -85,6 +106,18 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
   function requireRecord(record, current, task) {
     if (record.schema !== SCHEMA || record.relay_sha256 !== current.fingerprint || record.task !== task
         || !["reserved", "started", "ending", "ended", "failed"].includes(record.state)) throw new Error("admission binding changed");
+  }
+  function waveSettled(current) {
+    let ended = false;
+    for (const task of Object.keys(current.dispatches)) {
+      let record;
+      try { ({ record } = recordFor(task, current)); }
+      catch (error) { if (error.code === "ENOENT") continue; throw error; }
+      requireRecord(record, current, task);
+      if (["reserved", "started", "ending"].includes(record.state)) return false;
+      ended ||= record.state === "ended";
+    }
+    return ended;
   }
 
   function singleWorkerHandoff(current) {
@@ -144,6 +177,10 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
     const task = marker(event.prompt, "PARR0T_OMP_TASK");
     if (ctx.agent.depth === 1) {
       if (task) throw new Error("PARR0T_NATIVE_LIFECYCLE: relay cannot impersonate a worker");
+      if (current.relay.schema === "parr0t.native-wave-relay.v1"
+          && (relayClock?.current.fingerprint !== current.fingerprint || relayClock.agentId !== ctx.agent.id)) {
+        relayClock = { current, agentId: ctx.agent.id, startedAt: performance.now() };
+      }
       return singleWorkerHandoff(current);
     }
     if (!task || !Object.hasOwn(current.dispatches, task)) throw new Error("PARR0T_NATIVE_LIFECYCLE: exact worker binding required");
@@ -165,7 +202,11 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
       if (eventArgv) await command(eventArgv, ctx);
       await flushContextEnds(current, ctx);
     }
-    worker = { task, file, current, dispatch };
+    const startedAt = worker?.current.fingerprint === current.fingerprint && worker.task === task
+      ? worker.startedAt
+      : record.state === "reserved" && current.relay.schema === "parr0t.native-wave-relay.v1"
+        ? performance.now() : undefined;
+    worker = { task, file, current, startedAt };
   };
 
   handlers.before_subagent_spawn = (event, ctx) => {
@@ -271,8 +312,23 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
   };
 
   handlers.agent_end = async (event, ctx) => {
-    if (!worker || event.willContinue || event.awaitingAsyncWork) return;
-    const { task, file, current, dispatch } = worker;
+    if (event.willContinue || event.awaitingAsyncWork) return;
+    if (!worker) {
+      if (relayClock?.agentId !== ctx.agent?.id || ctx.agent?.depth !== 1) return;
+      const endedAt = performance.now();
+      const { current, startedAt } = relayClock;
+      relayClock = undefined;
+      try {
+        if (load(ctx)?.fingerprint === current.fingerprint && waveSettled(current)) {
+          recordWaveTiming(current, "relay_ended", startedAt, endedAt);
+        }
+      } catch {
+        // Missing or changed lifecycle evidence is not a settled wave.
+      }
+      return;
+    }
+    const { task, file, current, startedAt } = worker;
+    const endedAt = startedAt === undefined ? undefined : performance.now();
     const record = JSON.parse(readFileSync(file, "utf8"));
     requireRecord(record, current, task);
     if (record.worker_id !== ctx.agent.id || record.state !== "started") throw new Error("PARR0T_NATIVE_LIFECYCLE: terminal worker identity changed");
@@ -284,6 +340,7 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
       if (eventArgv) await command(eventArgv, ctx);
       writeRecord(file, { ...record, state: "ended" });
     }
+    if (startedAt !== undefined) recordWaveTiming(current, "worker_ended", startedAt, endedAt, task);
     worker = undefined;
   };
   return handlers;

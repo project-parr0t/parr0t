@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 import secrets
 import re
+import sys
 import time
 from typing import Callable
 
@@ -40,9 +41,14 @@ def _workers(value: dict, keys: set[str], model: str) -> list[dict]:
     return projected
 
 
+def _generation_ms(value: object) -> int | float | None:
+    return value if type(value) in (int, float) and 0 <= value <= sys.float_info.max else None
+
+
 def _drive(client: NativeHostClient, state_path: Path, identity: dict, tasks: list[dict],
            *, started: Callable[[list[dict]], None] | None = None,
-           progress: Callable[..., None] | None = None, poll_seconds: float = 1.0) -> dict:
+           progress: Callable[..., None] | None = None, poll_seconds: float = 1.0,
+           observe_generation: bool = False) -> dict:
     if not math.isfinite(poll_seconds) or poll_seconds < 0:
         raise ValueError("E_NATIVE_BROKER_POLL_INVALID")
     request_id = "wave-" + stable_hash(identity)
@@ -91,6 +97,11 @@ def _drive(client: NativeHostClient, state_path: Path, identity: dict, tasks: li
                     or not math.isfinite(usage["provider_cost_usd"]) or usage["provider_cost_usd"] < 0):
                 raise ValueError("E_NATIVE_HOST_USAGE_INVALID")
             state["usage"] = {key: usage[key] for key in ("input_tokens", "provider_cost_usd")}
+        if observe_generation and value["status"] == "completed":
+            # Only explicit provider time on a terminal, validated host reply.
+            generation_ms = _generation_ms(value.get("provider_generation_ms"))
+            if generation_ms is not None:
+                state["provider_generation_ms"] = generation_ms
         _write(state_path, state)
         previous_ids = {row["task_key"]: row["worker_id"] for row in rows}
         completed = sum(row["status"] in {"completed", "failed"} for row in rows)
@@ -225,6 +236,7 @@ def _run_native_broker(work_dir: Path, relay_path: Path, *, poll_seconds: float 
     state_dir = work_dir / ".game-l10n/native/broker" / binding[:24]
     with exclusive_file_lock(state_dir / "broker.lock", issue_code="E_NATIVE_BROKER_ALREADY_RUNNING"):
         admission = state_dir / "admission.json"
+        started_at = None
         if admission.is_file():
             planned = json.loads(admission.read_text())
             if (planned.get("binding") != binding or not isinstance(planned.get("groups"), list)
@@ -236,10 +248,15 @@ def _run_native_broker(work_dir: Path, relay_path: Path, *, poll_seconds: float 
                 raise ValueError("E_NATIVE_BROKER_STATE_CHANGED")
             groups = planned["groups"]
         else:
-            _write(admission, {"binding": binding, "groups": groups})
+            if wave:
+                started_at = time.perf_counter_ns()
+            planned = {"binding": binding, "groups": groups}
+            _write(admission, planned)
         record_native_launch(work_dir, relay_path, event="capability-available")
         finished_records = 0
         failed_records = 0
+        provider_generation_ms = None
+        generation_known = wave
         for index, group in enumerate(groups):
             if not group:
                 continue
@@ -288,9 +305,15 @@ def _run_native_broker(work_dir: Path, relay_path: Path, *, poll_seconds: float 
                     progress(completed_records=finished_records + counts["completed_records"],
                              failed_records=failed_records + counts["failed_records"])
             result = _drive(client, state_path, identity, tasks, started=started,
-                            progress=report, poll_seconds=poll_seconds)
+                            progress=report, poll_seconds=poll_seconds, observe_generation=wave)
             if result["status"] != "completed":
                 return {"status": "pending", "issue_codes": result["issue_codes"]}
+            if generation_known:
+                reported = _generation_ms(result.get("provider_generation_ms"))
+                if reported is None:
+                    generation_known = False
+                else:
+                    provider_generation_ms = (provider_generation_ms or 0) + reported
             if wave and result.get("usage") is not None:
                 control_path = _native_control_state_path(work_dir, manifest, relay["plan_fingerprint"])
                 control = _load_native_control_state(control_path, manifest, relay["plan_fingerprint"])
@@ -309,7 +332,22 @@ def _run_native_broker(work_dir: Path, relay_path: Path, *, poll_seconds: float 
                         slot=None if task == "finalizer" else int(task[7:]))
         if wave:
             from .native_pass import seal_native_wave_relay
-            return seal_native_wave_relay(work_dir, relay_path, relay_ended=True)
+            sealed = seal_native_wave_relay(work_dir, relay_path, relay_ended=True)
+            elapsed_ms = planned.get("elapsed_ms")
+            # A restart cannot reconstruct the original monotonic interval.
+            if type(elapsed_ms) is not int or elapsed_ms < 0:
+                elapsed_ms = None
+            if started_at is not None:
+                elapsed_ms = round((time.perf_counter_ns() - started_at) / 1_000_000)
+                try:
+                    _write(admission, {**planned, "elapsed_ms": elapsed_ms})
+                except OSError:
+                    pass  # Diagnostic persistence must not invalidate a seal.
+            sealed["timing"] = {
+                "elapsed_ms": elapsed_ms,
+                "provider_generation_ms": _generation_ms(provider_generation_ms) if generation_known else None,
+            }
+            return sealed
         from .data_plane_task import seal_data_plane_task
         return seal_data_plane_task(work_dir, relay_path, worker_ended=True)
 
