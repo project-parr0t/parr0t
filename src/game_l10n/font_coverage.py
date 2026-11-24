@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import struct
 import zlib
+from collections.abc import Iterable
 from pathlib import Path
 from typing import BinaryIO
+from unicodedata import category
 
 
 _RANGES = {
@@ -115,7 +117,24 @@ def _supported(cmap: bytes, wanted: set[int]) -> set[int]:
 
 
 def _font_glyph_coverage(path: Path) -> dict[str, dict[str, int]]:
+    return _font_probe_counts(path)["glyphs"]
+
+
+def _text_codepoints(texts: Iterable[str]) -> set[int]:
+    return {ord(char) for text in texts for char in text if category(char)[0] not in {"C", "Z"}}
+
+
+def _font_probe_counts(path: Path, final_codepoints: set[int] | None = None) -> dict:
     wanted = set().union(*_RANGES.values())
+    if final_codepoints is not None:
+        wanted.update(final_codepoints)
     covered = _supported(_cmap(path), wanted)
-    return {role: {"supported": sum(cp in covered for cp in points), "total": len(points)}
-            for role, points in _RANGES.items()}
+    counts = {"glyphs": {role: {"supported": sum(cp in covered for cp in points), "total": len(points)}
+                         for role, points in _RANGES.items()}}
+    if final_codepoints is not None:
+        supported = len(covered & final_codepoints)
+        counts["final_text_glyphs"] = {
+            "unique_codepoints": len(final_codepoints), "supported": supported,
+            "missing": len(final_codepoints) - supported,
+        }
+    return counts
