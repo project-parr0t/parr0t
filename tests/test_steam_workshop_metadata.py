@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "sync_steam_workshop_metadata.py"
@@ -120,6 +123,59 @@ class SteamWorkshopMetadataTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.MetadataError, "exactly match"):
                 MODULE.require_steam_api_approval(library, "0" * 64)
             self.assertEqual(MODULE.require_steam_api_approval(library, digest.upper()), digest)
+
+    def test_full_release_reads_back_english_and_korean_only(self) -> None:
+        selected = tuple(sorted(MODULE.SUPPORTED_LOCALES))
+        plan = MODULE.MetadataPlan(1, 2, 3, "Test title", "Test description", selected)
+        with mock.patch.object(MODULE, "SteamMetadataClient") as factory, redirect_stdout(io.StringIO()):
+            client = factory.return_value.__enter__.return_value
+            MODULE.synchronize(plan, Path("unused.dll"), selected)
+            self.assertEqual(
+                client.method_calls,
+                [*(mock.call.update(plan, locale) for locale in selected),
+                 mock.call.verify(plan, "english"), mock.call.verify(plan, "koreana")],
+            )
+
+    def test_rate_limit_stops_updates_and_readback(self) -> None:
+        selected = ("english", "koreana", "japanese")
+        plan = MODULE.MetadataPlan(1, 2, 3, "Test title", "Test description", selected)
+        with mock.patch.object(MODULE, "SteamMetadataClient") as factory, redirect_stdout(io.StringIO()):
+            client = factory.return_value.__enter__.return_value
+            client.update.side_effect = [None, MODULE.MetadataError("Steam returned EResult 84")]
+            with self.assertRaisesRegex(MODULE.MetadataError, "EResult 84"):
+                MODULE.synchronize(plan, Path("unused.dll"), selected)
+            self.assertEqual(client.method_calls, [
+                mock.call.update(plan, "english"), mock.call.update(plan, "koreana"),
+            ])
+
+    def test_native_sends_wait_after_completion_and_stop_on_offline(self) -> None:
+        client = object.__new__(MODULE.SteamMetadataClient)
+        client._dll = mock.Mock()
+        client._ugc = client._user = client._utils = 1
+        client._next_request_at = 0.0
+        client._dll.SteamAPI_ISteamUser_BLoggedOn.side_effect = [True, True, False]
+        client._dll.SteamAPI_ISteamUtils_IsAPICallCompleted.return_value = True
+        times = []
+        now = 10.0
+
+        def advance(delay: float) -> None:
+            nonlocal now
+            now += delay
+
+        def send(_ugc: int) -> int:
+            times.append(now)
+            return len(times)
+
+        with mock.patch.object(MODULE.time, "monotonic", side_effect=lambda: now), mock.patch.object(
+            MODULE.time, "sleep", side_effect=advance
+        ):
+            first = client._send(send)
+            advance(0.4)
+            client._wait_for_completion(first)
+            client._send(send)
+            with self.assertRaisesRegex(MODULE.MetadataError, "offline"):
+                client._send(send)
+        self.assertEqual(times, [10.0, 11.4])
 
 if __name__ == "__main__":
     unittest.main()
