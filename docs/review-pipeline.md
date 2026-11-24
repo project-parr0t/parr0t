@@ -41,14 +41,20 @@ For native App review, compact output alone is not enough: each bounded review t
 
 Native review uses `prepare-native-pass --pass-kind review --review-tier triage|strong` with core-bound routes and task manifests. Packing values are configurable safe defaults, not universal hard ceilings; honor positive explicit bounds and host/model capacity. Each worker returns ordered categorical verdicts for its bound task in one semantic call.
 
+For a completed native judgment, worker JSONL uses a `success` row with only the compact verdict (`OK` or `REWRITE` with issue codes) in its `text` field. The semantic judge does not emit a translation; rewrite passes put the corrected candidate in `text` instead.
+
 Core imports valid results independently, locks successes, and retains missing or failed targets for continuation. Failed-subset manifests preserve provider/attempt bindings and cumulative usage. Review splitting follows the manifest's serialized depth and configurable optimization policy; do not impose hidden depth or amplification clamps. Repair-needed or not-yet-attempted targets are not semantic exhaustion.
 
 Workers consume only their bound payload and focused context, not the complete source or prior result set.
 
 Every current candidate requires current-generation review evidence: triage for unselected candidates and strong approval for selected ones. With no `review_triagers` route, all candidates go through `reviewers`.
 
+With a configured triager, Core requires collector-issued queue evidence for strong review, targeted rewrites, and confirmation. That evidence binds the exact candidate generation and digest and traces it back to the triage decision; a queue name or hand-supplied escalation label is not evidence. The preparation response exposes aggregate queue routes and selection reasons, not candidate content. Fallback selection remains ordered and failed-only, and a previously approved candidate does not get a new review dispatch.
+
 `routing.review_max_rounds` and route/tier call limits are configured policy with safe defaults. User-selected limits replace model-name caps; preserve explicit existing values, including a configured Sol limit, and do not add a Sol-specific ceiling. Operational/native admission errors do not prove a provider attempt; dispatch counts are not measured usage.
 
+Use `review-policy --review-max-rounds <N> --user-requested` to record an explicit round limit without changing any per-model call ceiling. The limit includes the original candidate, so `N` allows up to `N - 1` successful rewrites of unresolved candidates. Each corrected candidate still requires current-generation review within the remaining call limits.
+When a native rewrite addresses a target-language finding, Core checks visible prose again before queuing confirmation. Protected placeholders, markup and control codes do not count as prose and still undergo exact integrity checks. If an earlier rewrite was recorded as successful but left the same candidate generation, a later judgment with a language finding allows one targeted correction on that route. A correction that still fails the language check stays pending without spending a judge call.
 
 Legacy manifests retain their original serialized contract and successes; continue pending targets under the current contract without resetting history or overwriting results.
 
@@ -59,6 +65,10 @@ When a route chain is configured, ready snapshots share a continuation queue onl
 An API route blocked by authentication before a request starts remains pending. It does not consume a call, enter the follow-up cache, or replace a prior recorded result.
 
 After explicit user consent for one further fallback check on an exhausted cohort, prepare its Core-selected pending input with `prepare-native-pass --pass-kind strong_review --user-requested-additional-fallback-review` instead of `--output`. This binds one call per target to the ordered candidate snapshot and existing exact fallback route. The canonical manifest cannot be reissued with changed candidates, model, or output; automatic review splitting and global limit changes are not permitted.
+`collect-native-rewrite --awaiting-input <previous-output>/awaiting-input.jsonl` advances only the missing targets from an earlier collection. Supply the same full `--input` and manifest to validate provenance, and write to a new output directory so prior confirmation inputs and decisions remain unchanged.
+
+`collect-native-translation-candidates` freezes verified successes from imported shards of an active translation pass without advancing the retry ledger. Pass the bound ordered input and manifest. Repeat `--previous` for the immutable review inputs already emitted by the same pass to exclude them from the new input and keep pending sibling waves independent.
+For already collected retries, `--retry-cohort <lineage.json>` can replace `--manifest` when `--input` is the corresponding immutable successful cohort source. Earlier exact candidate inputs from its constituent passes can be excluded with `--previous`.
 
 Fallback routes default to three total judge attempts per target when no route-specific count is configured. `routing.review_attempt_limits` records explicit totals. Preserve explicit initial user/template model and count selections; a missing host binding or incompatible authorized transport leaves the exact request pending, not semantic failure or route exhaustion. Translation retries and triage coverage are separate policies.
 
@@ -70,6 +80,8 @@ game-l10n review-policy --workspace <workspace> --fallback-model <exact-requeste
 ```
 
 `review-policy` binds an explicitly selected model and count to a configured fallback route (or to the selected native review-fallback role) without changing provider mode or permissions. Presets supply defaults, not immutable topology. Missing host binding or incompatible transport preserves the exact request pending; advertised availability is not permission. A selection never implicitly changes API/native execution.
+
+When a user explicitly authorizes a separate strong judge for candidates authored by an exact model, `routing.review_candidate_model_routes` maps that original author model to one already-bound reviewer route. It replaces the strong-review chain only for those candidates, leaves triage and unrelated candidates unchanged, and rejects an unbound or same-model replacement. Existing per-model call accounting still applies.
 
 Record only tier values supplied by the user or starting template. Omitted values retain safe defaults. Positive worker counts and task sizes are bounded by actual host/model capacity and resource-safe scheduling, not arbitrary universal caps. User call limits replace model-name caps; existing selected limits remain unchanged.
 

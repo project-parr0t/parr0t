@@ -1,21 +1,28 @@
 """Read-only, text-free discovery of existing native controller bindings."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from collections import Counter
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from .native_pass import (
+    ALLOWED_STATUSES,
     NATIVE_REVIEW_SPLIT_CHAIN_SCHEMA,
     NATIVE_WAVE_RECEIPT_SCHEMA,
     NATIVE_WAVE_RELAY_SCHEMA,
+    OPERATIONAL_RESULT_ISSUES,
     _load_native_control_state,
     _load_task_manifest,
     _manifest_shard_path,
     _native_control_plan_fingerprint,
     _native_control_state_path,
+    _read_jsonl,
     _review_split_chain_path,
+    _validate_manifest_rows,
+    _validate_manifest_task_file,
     _wave_receipt_path,
     _wave_relay_dispatch_path,
 )
@@ -432,3 +439,94 @@ def native_resume_status(work_dir: Path, *, manifest_path: Path | None = None) -
         output.update(status="invalid", selected=None, candidates=[],
                       issue_codes=["E_NATIVE_RESUME_METADATA_INVALID"])
     return output
+
+
+def _rejected_jsonl_shape(body: bytes) -> str:
+    try:
+        if isinstance(json.loads(body.decode("utf-8-sig")), list):
+            return "json_array"
+    except ValueError:
+        pass
+    for line in body.splitlines():
+        if not line.strip():
+            continue
+        if line.lstrip().startswith(b"```"):
+            return "markdown_fence"
+        try:
+            row = json.loads(line.decode("utf-8-sig"))
+        except ValueError:
+            return "invalid_json_line"
+        if not isinstance(row, dict):
+            return "non_object_row"
+        target = row.get("target_id")
+        if not isinstance(target, str) or not target:
+            return "missing_target_id"
+        status = row.get("status")
+        if not isinstance(status, str) or status not in ALLOWED_STATUSES:
+            return "invalid_status"
+        text = row.get("text", "")
+        if not isinstance(text, str) or (status == "success" and not text.strip()):
+            return "invalid_text"
+        issues = row.get("issues", [])
+        if not isinstance(issues, list) or any(not isinstance(issue, str) for issue in issues):
+            return "invalid_issues"
+    return "other_schema_error"
+
+
+def native_translation_failure_counts(work_dir: Path, manifest_path: Path) -> dict:
+    """Classify imported translation failures without exposing any result rows."""
+    checkpoint = native_resume_status(work_dir, manifest_path=manifest_path)
+    selected = checkpoint["selected"]
+    if checkpoint["status"] != "ready" or selected["pass_kind"] != "translation":
+        raise ValueError("E_NATIVE_RESUME_TRANSLATION_CHECKPOINT_REQUIRED")
+    root = work_dir.resolve()
+    manifest_path = root / selected["manifest"]
+    counts: Counter[str] = Counter()
+    rejected_shapes: Counter[str] = Counter()
+    try:
+        manifest = _manifest(root, selected["manifest"])
+        tasks = manifest["tasks"]
+        waves = sorted({task["wave"] for task in tasks})
+        imported = set(waves[:selected["counts"]["imported_waves"]])
+        latest_wave = max(imported, default=0)
+        results = root / selected["results_dir"]
+        bound_segments = {}
+        for task in tasks:
+            if task["wave"] not in imported:
+                continue
+            expected = _validate_manifest_task_file(manifest_path, manifest, task)
+            shard = _manifest_shard_path(root, manifest, task)
+            rows = _validate_manifest_rows(
+                root, manifest, _read_jsonl(shard), bound_segments=bound_segments,
+            )
+            if [row["target_id"] for row in rows] != expected:
+                raise ValueError
+            if task["wave"] == latest_wave and any(
+                row["provider"] == "native-control"
+                and row["issues"] == ["worker_result_schema_invalid"] for row in rows
+            ):
+                prefix = f"{task['file']}.ended-original-"
+                archives = list(results.glob(f"{prefix}*"))
+                if len(archives) == 1:
+                    archive = _contained(root, _relative(root, archives[0]))
+                    original = archive.read_bytes()
+                    if archive.name != prefix + hashlib.sha256(original).hexdigest():
+                        raise ValueError
+                    rejected_shapes[_rejected_jsonl_shape(original)] += 1
+                else:
+                    rejected_shapes["archive_missing_or_ambiguous"] += 1
+            for row in rows:
+                status = row["status"]
+                if status == "refused":
+                    counts["fallback_required"] += 1
+                elif status == "error" and row["provider"] == "native-control":
+                    code, *rest = row["issues"] or [""]
+                    counts[code if not rest and code in OPERATIONAL_RESULT_ISSUES else "error"] += 1
+                else:
+                    counts[status] += 1
+    except (_ResumeIssue, OSError, ValueError, KeyError, TypeError):
+        raise ValueError("E_NATIVE_RESUME_IMPORTED_RESULTS_INVALID") from None
+    return {
+        "waves": len(imported), "records": sum(counts.values()), "counts": dict(counts),
+        "latest_wave_rejected_task_shapes": dict(rejected_shapes),
+    }
