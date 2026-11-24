@@ -60,6 +60,36 @@ The repository choice in the private game workspace is unrelated. `disabled` pro
 
 Extraction, context analysis, translation, packing, and SDK promotion remain blocked until both selection and activation are valid. For `reuse`/`extend`, use the selected branch's engine commands; the generic workspace `run-tool` command is reserved for a bound `derive-new` or `private-new` adapter.
 
+## Read-only locale applicability probe
+
+For a standalone user-requested locale verification, activate the exact SDK
+and prepare the existing isolated discovery role with its separate purpose:
+
+```text
+game-l10n prepare-data-plane-task --workspace <workspace> --worker-role source_probe --purpose locale_applicability
+```
+
+The worker verifies the active loader, source catalog, target route, and a
+value-only reversible apply path without running or writing to the game.
+It writes the task-bound categorical result and envelope at the assigned
+locations; only the sealed receipt is parent-visible. `applicable` requires
+all four checks; `unavailable` requires a disproved route; missing evidence
+stays `inconclusive`. Core routes a pending canonical probe back to
+`verify_locale_applicability` before starting either inventory and binds the
+previous categorical checks into an inconclusive retry. Repair the unresolved
+checks using new evidence rather than repeating the same test. Both fresh
+inventory methods must match the sealed route and evidence fingerprint.
+For a malformed result wrapper, Core may reuse an ended worker's separately
+valid, exact-task locale proof, archive the bad wrapper and receipt, and seal
+the corrected metadata without re-running the probe. An invalid proof still
+requires a new authorized attempt.
+An active source-catalog slot can be a target route for a reversible target-language
+overlay only when a bounded fixture proves selection, exact value lookup,
+unchanged game logic, and restoration. This does not authorize opening a
+target-language catalog or searching for an existing patch.
+The probe does not check existing target-language translation, extract
+fallback strings, or replace discovery evidence.
+
 ## Extractor preparation before either inventory
 
 Exact selection and activation precede preparation. An `extend`, `derive-new`,

@@ -108,6 +108,10 @@ class ReviewSelectionTests(unittest.TestCase):
             ),
             ["target_script_contamination"],
         )
+        tokens = '<font="Author Font Medium">{PLAYER_VISIBLE_LABEL}</font>'
+        self.assertEqual(target_language_review_reasons(f"{tokens} \uc800\uc7a5", "ko"), [])
+        self.assertEqual(target_language_review_reasons(f"{tokens} Save game", "ko"),
+                         ["target_script_absent"])
 
 
     def test_dialogue_risk_and_uncertainty_route_strong_review(self) -> None:

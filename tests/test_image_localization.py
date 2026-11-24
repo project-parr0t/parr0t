@@ -45,6 +45,35 @@ class ImageLocalizationTests(unittest.TestCase):
                 self.assertEqual(result["hangul_syllables"], {"supported": 1, "total": 11172})
                 self.assertEqual(result["digits"], {"supported": 10, "total": 10})
 
+    def test_media_object_reference_is_bound_to_its_exact_archive(self):
+        from game_l10n.image_localization import _verify_engine_media_binding_probe
+
+        with tempfile.TemporaryDirectory() as directory:
+            work, game, _ = self._fixture(Path(directory).resolve())
+            first = game / "first.bin"
+            second = game / "second.bin"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            row = {"root_index": 0, "relative_path": first.name, "archive_sha256": digest(b"first"),
+                   "entry": "", "object_id": 42, "kind": "font"}
+            report = work / "media.json"
+            payload = {"schema": "parr0t.engine-media-bindings.v1", "task_id": "synthetic",
+                       "references": [], "unresolved_bindings": 1, "container_bindings": [row]}
+            task = {
+                "task_id": "synthetic", "source_roots": [str(game)],
+                "bound_local_assets": [{"path": str(p), "sha256": digest(p.read_bytes())} for p in (first, second)],
+                "engine_media_binding_contract": {
+                    "container_binding_fields": sorted(row), "container_binding_kinds": ["font", "ui_image"],
+                },
+            }
+            report.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(_verify_engine_media_binding_probe(work, report, task)["container_binding_counts"],
+                             {"font": 1, "ui_image": 0})
+            row["relative_path"] = second.name
+            report.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ConfigurationError, "ENGINE_MEDIA_BINDINGS_INVALID"):
+                _verify_engine_media_binding_probe(work, report, task)
+
     def _fixture(self, root: Path) -> tuple[Path, Path, Path]:
         work = root / "work"
         game = root / "game"

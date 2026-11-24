@@ -57,6 +57,114 @@ class ControlPlaneContractTests(unittest.TestCase):
         self.assertIn("constraint_unsatisfiable", ISSUE_CODES_BY_STAGE["translation"])
         self.assertNotIn("constraint_unsatisfiable", TERMINAL_ROUTE_STATUSES)
 
+    def test_locale_probe_seals_only_task_bound_applicability_without_replacing_discovery(self) -> None:
+        for valid in (False, True):
+            with self.subTest(valid=valid), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                sdk, game, work = root / "sdk", root / "game", root / "work"
+                sdk.mkdir()
+                game.mkdir()
+                initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+                establish_control_plane_entry(work)
+                config = load_config(work)
+                config["sdk_selection"]["inventory_fingerprint"] = "synthetic-selection"
+                original_config = (work / "game-l10n.json").read_bytes()
+                output = work / ".game-l10n/data-plane/locale_applicability"
+                from game_l10n.locale_probe import CHECKS, SCHEMA
+
+                with patch("game_l10n.workspace.require_sdk_activation", return_value={"status": "active"}):
+                    prepared = prepare_data_plane_task(
+                        work, output, worker_role="source_probe", config=config,
+                        sdk_activation={"status": "active"}, purpose="locale_applicability",
+                    )
+                    relay_path = work / prepared["relay_path"]
+                    relay = json.loads(relay_path.read_bytes())
+                    task = json.loads((work / relay["task_path"]).read_bytes())
+                    artifact = task["output_artifact"]
+                    (work / artifact).write_text(json.dumps({
+                        "schema": SCHEMA, "task_id": task["task_id"] if valid else "unbound",
+                        "outcome": "applicable", "checks": dict.fromkeys(CHECKS, "verified"),
+                        "evidence_sha256": "1" * 64,
+                    }), encoding="utf-8")
+                    (work / relay["expected_envelope"]).write_text(json.dumps({
+                        "schema": "parr0t.control-envelope.v2", "worker_role": "source_probe",
+                        "stage": "discovery", "status": "success", "target_ids": [],
+                        "counts": {"total": 1, "success": 1}, "issue_codes": [],
+                        "artifact_paths": [artifact], "queue_transitions": [], "route_evidence_path": "",
+                    }), encoding="utf-8")
+                    sealed = seal_data_plane_task(work, relay_path, worker_ended=True)
+                self.assertEqual(sealed["issue_codes"], [
+                    "locale_applicability_applicable" if valid else "malformed_response",
+                ])
+                self.assertEqual((work / "game-l10n.json").read_bytes(), original_config)
+                self.assertFalse((work / ".game-l10n/data-plane/source_probe/receipt.json").exists())
+
+    def test_inconclusive_locale_probe_routes_repair_instead_of_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk, game, work = root / "sdk", root / "game", root / "work"
+            sdk.mkdir()
+            game.mkdir()
+            initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+            establish_control_plane_entry(work)
+            record_sdk_selection(work, "private-new", target_engine="fixture-engine", target_version="1.0")
+            config = load_config(work)
+            activation = {"target": {"engine": "fixture-engine"}}
+            stage_dir = work / ".game-l10n/data-plane/locale_applicability"
+            with (
+                patch("game_l10n.cli.require_sdk_activation", return_value=activation),
+                patch("game_l10n.workspace.require_sdk_activation", return_value=activation),
+                patch("game_l10n.cli.preparation_state", return_value={"status": "not_required"}),
+            ):
+                from game_l10n.locale_probe import CHECKS, SCHEMA
+
+                def seal(outcome: str, checks: dict[str, str], *, malformed_wrapper: bool = False) -> None:
+                    prepared = prepare_data_plane_task(
+                        work, stage_dir, worker_role="source_probe", config=config,
+                        sdk_activation=activation, purpose="locale_applicability",
+                    )
+                    relay_path = work / prepared["relay_path"]
+                    relay = json.loads(relay_path.read_bytes())
+                    task = json.loads((work / relay["task_path"]).read_bytes())
+                    if outcome == "unavailable":
+                        self.assertEqual(task["previous_locale_checks"], dict.fromkeys(CHECKS, "unresolved"))
+                    artifact = task["output_artifact"]
+                    (work / artifact).write_text(json.dumps({
+                        "schema": SCHEMA, "task_id": task["task_id"], "outcome": outcome,
+                        "checks": checks, "evidence_sha256": "1" * 64,
+                    }), encoding="utf-8")
+                    partial = outcome == "inconclusive"
+                    (work / relay["expected_envelope"]).write_text(json.dumps({
+                        "schema": "parr0t.control-envelope.v2", "worker_role": "source_probe",
+                        "stage": "discovery", "status": "partial" if partial else "success",
+                        "target_ids": [], "counts": {"total": 1, "success": int(not partial and not malformed_wrapper),
+                                                     "pending": int(partial or malformed_wrapper)},
+                        "issue_codes": [], "artifact_paths": [artifact], "queue_transitions": [],
+                        "route_evidence_path": "",
+                    }), encoding="utf-8")
+                    expected = "malformed_response" if malformed_wrapper else "locale_applicability_" + outcome
+                    self.assertEqual(seal_data_plane_task(work, relay_path, worker_ended=True)["issue_codes"], [expected])
+
+                def status() -> dict:
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        self.assertEqual(main(["status", "--workspace", str(work)]), 0)
+                    return json.loads(output.getvalue())
+
+                seal("inconclusive", dict.fromkeys(CHECKS, "unresolved"))
+                self.assertEqual(status()["next_actions"], ["verify_locale_applicability"])
+                self.assertNotIn("evidence_fingerprint", status()["locale_applicability"])
+                checks = dict.fromkeys(CHECKS, "unresolved")
+                checks["loader_binding"] = "disproved"
+                seal("unavailable", checks, malformed_wrapper=True)
+                recovered = prepare_data_plane_task(
+                    work, stage_dir, worker_role="source_probe", config=config,
+                    sdk_activation=activation, purpose="locale_applicability",
+                )
+                self.assertFalse(recovered["dispatch_allowed"])
+                self.assertEqual(recovered["issue_codes"], ["locale_applicability_unavailable"])
+                self.assertEqual(status()["next_actions"], ["unpack_and_extract_ordered_script"])
+
     def test_failed_discovery_receipt_blocks_sdk_activation_until_recovered(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -189,13 +297,19 @@ class ControlPlaneContractTests(unittest.TestCase):
 
 
     def _sealed_inventory_pair(
-        self, root: Path, *, namespace_mismatch: bool = True, primary_success: bool = False
+        self, root: Path, *, namespace_mismatch: bool = True, primary_success: bool = False,
+        request_skip: bool = False, approved_skip: bool = False,
     ):
         game, sdk, work = root / "game", root / "sdk", root / "work"
         game.mkdir()
         sdk.mkdir()
         initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
         establish_control_plane_entry(work)
+        if approved_skip:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(main([
+                    "screen-review-policy", "--workspace", str(work), "--mode", "skip", "--user-requested",
+                ]), 0)
         config = load_config(work)
         relays = {}
         for role, method in (("primary_inventory", "primary"), ("independent_inventory", "independent")):
@@ -215,8 +329,10 @@ class ControlPlaneContractTests(unittest.TestCase):
                     "id": f"{prefix}-{index}", "source": source,
                     "metadata": {
                         "display_binding_id": f"display-{index}",
+                        "storage_role": "display_value",
                         "display_scope_evidence": {
                             "kind": "positive_display_binding",
+                            "binding_basis": "format_field",
                             "evidence_fingerprint": "a" * 64,
                             "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
                         },
@@ -228,6 +344,12 @@ class ControlPlaneContractTests(unittest.TestCase):
                 "implementation_fingerprint": f"{method}-implementation",
                 "coverage": {
                     "declared_complete": complete, "exclusions": [],
+                    "text_source": {
+                        "route": "display_extraction", "locale_probe": "unavailable",
+                        "evidence_fingerprint": "b" * 64,
+                        "screen_review": "user_skipped" if request_skip else "static",
+                        "pending_display_count": 0 if complete else 1,
+                    },
                     "display_scope": {
                         "schema": "parr0t.display-scope.v1",
                         "raw_occurrence_count": 2, "display_candidate_count": 2,
@@ -245,16 +367,24 @@ class ControlPlaneContractTests(unittest.TestCase):
                 "artifact_paths": [task["output_artifact"]],
                 "queue_transitions": [], "route_evidence_path": "",
             }), encoding="utf-8")
-            self.assertEqual(
-                seal_data_plane_task(work, relay_path, worker_ended=True)["status"],
-                "success" if complete else "partial",
-            )
+            sealed = seal_data_plane_task(work, relay_path, worker_ended=True)
+            if request_skip and not approved_skip:
+                self.assertEqual(sealed["issue_codes"], ["inventory_display_scope_required"])
+            else:
+                self.assertEqual(sealed["status"], "success" if complete else "partial")
             relays[role] = relay_path
         # Historical inventories predate the extractor-preparation barrier.
         # Selecting a deficient SDK must preserve their evidence, not authorize a new scan.
         record_sdk_selection(work, "private-new", target_engine="fixture-engine", target_version="1")
         config = load_config(work)
         return work, config, relays
+
+    def test_inventory_seal_requires_explicit_approval_for_skipping_screen_review(self) -> None:
+        for approved in (False, True):
+            with self.subTest(approved=approved), tempfile.TemporaryDirectory() as directory:
+                self._sealed_inventory_pair(
+                    Path(directory), primary_success=True, request_skip=True, approved_skip=approved,
+                )
 
     def _inventory_status(self, work: Path):
         output = io.StringIO()

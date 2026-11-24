@@ -118,6 +118,11 @@ class PromptNativeReviewTests(unittest.TestCase):
         self.bind()
         policy = self.cli("review-policy")
         self.assertEqual(policy["status"], "configured")
+        rounds = self.cli("review-policy", "--review-max-rounds", "5", "--user-requested")
+        self.assertEqual(rounds["review_max_rounds"], 5)
+        self.assertEqual(rounds["review_limits"], policy["review_limits"])
+        self.assertEqual(rounds["review_attempt_limits"], policy["review_attempt_limits"])
+        self.assertEqual(rounds["requested_native_models"], policy["requested_native_models"])
         config = load_config(self.root)
         self.assertEqual(config["provider_preset"], "codex-app-deepseek")
         self.assertEqual(config["execution_mode"], self.before["execution_mode"])
@@ -169,6 +174,7 @@ class PromptNativeReviewTests(unittest.TestCase):
                                 "--input", fallback_input, "--output", "fallback", expected_exit=1)
         self.assertEqual(redirect["action"], "prepare_native_pass")
         self.assertEqual(redirect["routes"], [{"provider": "native-review-fallback", "count": 8}])
+        self.assertEqual(redirect["review_selection"]["routes"], {"judge_fallback": 8})
 
         def fallback_response(target, count):
             index = int(target.rsplit("-", 1)[1])
@@ -210,6 +216,9 @@ class PromptNativeReviewTests(unittest.TestCase):
         self.assertEqual(config["providers"], self.before["providers"])
         self.assertEqual(config["model_policy"]["native_roles"]["strong-review"], "fixture/exact-strong")
         source = self.source("overridden.jsonl", [review_segment("fixture", candidate="\ub300\uc0c1")])
+        self.run_review(source, "triage", "triage", lambda *_: ("success", "REWRITE voice"))
+        self.collect(source, "triage", "triage-joined", "triage")
+        source = "triage-joined/strong-input.jsonl"
         manifest, calls, launches, _, _ = self.run_review(
             source, "overridden", "strong", lambda *_: ("success", "OK"))
         self.assertEqual(manifest["route_binding"]["provider"], "native-strong-review")
@@ -219,7 +228,7 @@ class PromptNativeReviewTests(unittest.TestCase):
         accepted = read_translation_results(self.root / "overridden-joined/accepted.json")
         self.assertEqual(accepted[0].reviewer, "native-strong-review")
 
-    def test_external_followup_requires_current_overridden_primary_failure(self):
+    def test_external_followup_requires_collected_overridden_primary_failure(self):
         base = review_segment("fixture", candidate="\ub300\uc0c1")
         result = _bound_result(base)
         result.attempts.append(AttemptRecord("review", "native-strong-review", "error",
@@ -232,34 +241,49 @@ class PromptNativeReviewTests(unittest.TestCase):
             config=OrchestratorConfig(["deepseek"], ["deepseek"], require_review=False,
                                       review_attempt_limits={"deepseek": 1}),
         )
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_REVIEW_EVIDENCE_REQUIRED"):
+            process_native_review_followup(
+                self.root, self.root / source, self.root / "hand-labelled", orchestrator,
+                operation="judge", deadline_epoch=0,
+            )
+
+        self.cli("native-runtime", "--host", "omp", "--role-model",
+                 "strong-review=fixture/exact-strong", "--user-requested-models")
+        source = self.source("candidates.jsonl", [base])
+        self.run_review(source, "triage", "triage", lambda *_: ("success", "REWRITE voice"))
+        self.collect(source, "triage", "triage-joined", "triage")
+        strong = "triage-joined/strong-input.jsonl"
+        self.run_review(strong, "primary", "strong", lambda *_: ("refused", ""))
+        self.collect(strong, "primary", "primary-joined", "strong")
+        failed = self.root / "primary-joined/fallback-input.jsonl"
         summary = process_native_review_followup(
-            self.root, self.root / source, self.root / "followup", orchestrator,
-            operation="judge", deadline_epoch=0,
-            primary_review_provider="native-strong-review", primary_review_limit=None,
+            self.root, failed, self.root / "followup", orchestrator, operation="judge", deadline_epoch=0,
         )
         self.assertEqual((summary["executed"], summary["unresolved"]), (0, 1))
-        with self.assertRaisesRegex(ValueError, "PRIMARY_BARRIER_REQUIRED"):
-            process_native_review_followup(
-                self.root, self.root / source, self.root / "wrong-primary", orchestrator,
-                operation="judge", deadline_epoch=0,
-            )
-        result.attempts[-1].status = "rewrite"
-        source = self.source("not-failed.jsonl", [_pending_segment(base, result)])
-        with self.assertRaisesRegex(ValueError, "FALLBACK_NOT_FAILED"):
-            process_native_review_followup(
-                self.root, self.root / source, self.root / "not-failed", orchestrator,
-                operation="judge", deadline_epoch=0,
-                primary_review_provider="native-strong-review", primary_review_limit=None,
-            )
-        result.attempts[-1].status = "error"
-        result.attempts[-1].candidate_generation = 0
-        source = self.source("stale-primary.jsonl", [_pending_segment(base, result)])
-        with self.assertRaisesRegex(ValueError, "PRIMARY_BARRIER_REQUIRED"):
-            process_native_review_followup(
-                self.root, self.root / source, self.root / "stale", orchestrator,
-                operation="judge", deadline_epoch=0,
-                primary_review_provider="native-strong-review", primary_review_limit=None,
-            )
+        self.assertEqual(summary["review_selection"]["routes"], {"judge_fallback": 1})
+
+    def test_authorized_additional_fallback_preserves_audited_exhaustion(self):
+        from game_l10n.native_pass import _native_review_call_budget
+
+        self.cli("review-policy", "--fallback-model", self.fallback_model,
+                 "--max-calls", "1", "--user-requested")
+        self.bind()
+        source = self.source("candidates.jsonl", [review_segment("fixture")])
+        self.run_review(source, "triage", "triage", lambda *_: ("success", "REWRITE voice"))
+        self.collect(source, "triage", "triage-joined", "triage")
+        strong = "triage-joined/strong-input.jsonl"
+        self.run_review(strong, "primary", "strong", lambda *_: ("refused", ""))
+        self.collect(strong, "primary", "primary-joined", "strong")
+        fallback = "primary-joined/fallback-input.jsonl"
+        self.run_review(fallback, "fallback", "strong", lambda *_: ("refused", ""))
+        self.collect(fallback, "fallback", "fallback-joined", "strong")
+        exhausted = "fallback-joined/fallback-input.jsonl"
+        prepared = self.cli("prepare-native-pass", "--input", exhausted,
+                            "--pass-kind", "strong_review", "--user-requested-additional-fallback-review")
+        self.assertEqual(prepared["additional_calls_per_target"], 1)
+        self.assertEqual(prepared["review_selection"]["routes"], {"judge_fallback": 1})
+        path = Path(prepared["manifest"])
+        self.assertEqual(_native_review_call_budget(self.root, path, json.loads(path.read_text())), 1)
 
 
     def test_runtime_rejects_duplicate_or_malformed_role_arguments(self):
