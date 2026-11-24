@@ -980,11 +980,18 @@ def _operational_failure_path(relay_path: Path, task_id: str) -> Path:
     return relay_path.with_name(f"operational-failure-{task_id}.json")
 
 
+ENGINE_MEDIA_BINDINGS_PURPOSE = "engine_media_bindings"
+_PURPOSE_ROLES = {
+    EXTRACTOR_PREPARATION_PURPOSE: "source_probe",
+    ENGINE_MEDIA_BINDINGS_PURPOSE: "image_ui_inventory",
+}
+
+
 def data_plane_receipt_path(work_dir: Path, worker_role: str, *, purpose: str = "") -> Path:
     """Keep each bound purpose's lifecycle separate from its worker role."""
     if worker_role not in DATA_PLANE_PROFILES:
         raise ConfigurationError("E_DATA_PLANE_TASK_ROLE: unsupported data-plane role")
-    if purpose and (worker_role != "source_probe" or purpose != EXTRACTOR_PREPARATION_PURPOSE):
+    if purpose and _PURPOSE_ROLES.get(purpose) != worker_role:
         raise ConfigurationError("E_DATA_PLANE_TASK_PURPOSE: unsupported bound worker purpose")
     return work_dir / ".game-l10n" / "data-plane" / (purpose or worker_role) / "receipt.json"
 
@@ -2220,9 +2227,10 @@ def prepare_data_plane_task(
     profile = DATA_PLANE_PROFILES.get(worker_role)
     if profile is None:
         raise ConfigurationError("E_DATA_PLANE_TASK_ROLE: unsupported data-plane role")
-    if purpose and (worker_role != "source_probe" or purpose != EXTRACTOR_PREPARATION_PURPOSE):
-        raise ConfigurationError("E_DATA_PLANE_TASK_PURPOSE: unsupported bound worker purpose")
-    if purpose:
+    data_plane_receipt_path(work_dir, worker_role, purpose=purpose)
+    if purpose == ENGINE_MEDIA_BINDINGS_PURPOSE and not inspection_assets:
+        raise ConfigurationError("E_IMAGE_INSPECTION_ASSET_REQUIRED")
+    if purpose == EXTRACTOR_PREPARATION_PURPOSE:
         profile = {**profile, "artifact": EXTRACTOR_ATTESTATION_PATH}
     if purpose or (
         worker_role in {"primary_inventory", "independent_inventory"}
@@ -2277,18 +2285,14 @@ def prepare_data_plane_task(
             from .image_localization import require_image_inspection_requested
 
             require_image_inspection_requested(work_dir)
-        image_state = public_image_localization_state(work_dir)
-        required_state = (
-            "scope_required"
-            if worker_role == "image_ui_inventory"
-            else "localization_required"
-        )
-        if image_state.get("status") not in ({required_state, "scope_incomplete"} if worker_role == "image_ui_inventory" else {required_state}) and not (
-            worker_role == "image_ui_inventory" and image_state.get("status") == "inspection_only"
-        ):
-            raise ConfigurationError(
-                "E_IMAGE_TASK_STATE: image data-plane task is not the next required action"
+        if purpose != ENGINE_MEDIA_BINDINGS_PURPOSE:
+            image_state = public_image_localization_state(work_dir)
+            allowed_states = (
+                {"scope_required", "scope_incomplete", "inspection_only"}
+                if worker_role == "image_ui_inventory" else {"localization_required"}
             )
+            if image_state.get("status") not in allowed_states:
+                raise ConfigurationError("E_IMAGE_TASK_STATE: image data-plane task is not the next required action")
 
     artifact_relative = profile["artifact"]
     if worker_role == "context_analyzer":
@@ -2663,6 +2667,8 @@ def prepare_data_plane_task(
     envelope = (
         output_dir / f"control-envelope.g{control_generation}.attempt-{attempt}{revision_suffix}.json"
     ).resolve()
+    if purpose == ENGINE_MEDIA_BINDINGS_PURPOSE:
+        artifact = envelope.with_name(envelope.name.replace("control-envelope.", "engine-media-bindings.", 1))
     relay_max_workers = 1
     worker_delegation_allowed = False
     private_payload: dict[str, Any] = {
@@ -2702,6 +2708,16 @@ def prepare_data_plane_task(
     }
     if purpose:
         private_payload["purpose"] = purpose
+    if purpose == ENGINE_MEDIA_BINDINGS_PURPOSE:
+        private_payload["engine_media_binding_contract"] = {
+            "schema": "parr0t.engine-media-bindings.v1",
+            "result_fields": ["schema", "task_id", "references", "unresolved_bindings"],
+            "reference_fields": ["root_index", "relative_path", "kind", "evidence_sha256"],
+            "kinds": ["binding_metadata", "ui_image", "font"],
+            "evidence_sha256": "sha256 of a supplied bound seed proving the exact reference",
+            "unresolved_bindings": "nonnegative integer, without source strings or snippets",
+        }
+    elif purpose == EXTRACTOR_PREPARATION_PURPOSE:
         if ((config.get("extractor_requirements") or {}).get("source_metadata") or {}).get("image_candidate_discovery"):
             private_payload["requirements"].extend([
                 "obey_the_exact_image_candidate_discovery_output_contract_in_extractor_requirements",
@@ -3231,6 +3247,15 @@ def prepare_data_plane_task(
                 "do_not_translate_review_apply_pack_install_launch_or_delegate",
             ]
         )
+    elif purpose == ENGINE_MEDIA_BINDINGS_PURPOSE:
+        private_payload["requirements"].extend([
+            "derive_exact_UI_image_atlas_and_font_references_from_bound_local_seed_metadata_only",
+            "report_exact_active_runtime_metadata_references_needed_next_as_binding_metadata",
+            "use_known_engine_layout_only_when_supported_by_the_active_SDK_and_seed_metadata",
+            "no_listing_tree_scan_OCR_opening_or_testing_unbound_files_or_target_locale_assets",
+            "do_not_translate_or_assert_visual_scope_complete_from_this_binding_probe",
+            "write_only_engine_media_binding_contract_at_output_artifact_and_standard_control_envelope",
+        ])
     elif worker_role == "image_ui_inventory":
         private_payload["requirements"].extend(
             [
@@ -4401,6 +4426,12 @@ def _seal_bound_data_plane_task(
                 "E_DATA_PLANE_RESULT_INVALID: context state path left the workspace"
             )
         _atomic_json(state_path, context_state)
+    elif task.get("purpose") == ENGINE_MEDIA_BINDINGS_PURPOSE:
+        if result["status"] in {"success", "partial"}:
+            from .image_localization import _verify_engine_media_binding_probe
+
+            _verify_engine_media_binding_probe(work_dir, artifact_path, task)
+            _atomic_bytes(artifact_path.with_suffix(".sha256.txt"), _digest(artifact_path).encode("ascii"))
     elif result["worker_role"] == "image_ui_inventory" and result["status"] == "success":
         discovery = None
         if task.get("input_image_candidates"):
