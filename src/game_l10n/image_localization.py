@@ -820,7 +820,7 @@ def verify_image_localization_results(
         raise ConfigurationError(
             "E_IMAGE_SCOPE_REQUIRED: verify a current nonempty UI-image inventory first"
         )
-    inventory_resolved, inventory, _, _ = _validate_inventory(
+    inventory_resolved, inventory, _, source_bindings = _validate_inventory(
         work_dir, inventory_path, game_roots
     )
     if (
@@ -909,6 +909,14 @@ def verify_image_localization_results(
             or not _is_sha256(integrity.get("evidence_sha256"))
         ):
             raise ConfigurationError("E_IMAGE_LOCALIZATION_RESULT_INVALID: image integrity proof is incomplete")
+        if source["format"].casefold() == "png":
+            from .image_region_pixels import verify_rgba_png_preservation
+
+            original = (source_bindings.roots[source["source_root_index"]] / source["relative_path"]).resolve()
+            verify_rgba_png_preservation(
+                original, output, source["source_sha256"], localized["output_sha256"],
+                (source["width"], source["height"]), [region["bbox"] for region in source["text_regions"]],
+            )
         output_digests.append(
             {
                 "id": source["id"],
