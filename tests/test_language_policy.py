@@ -28,7 +28,7 @@ class TargetLanguagePolicyTests(unittest.TestCase):
         return config
 
     def test_missing_policy_defaults_to_locked_korean(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+        with tempfile.TemporaryDirectory() as directory:
             work = Path(directory) / "work"
             config = self._config(work)
             policy = require_target_language_policy(work, config)
@@ -39,14 +39,14 @@ class TargetLanguagePolicyTests(unittest.TestCase):
             self.assertEqual(binding["policy_revision"], 0)
 
     def test_direct_config_change_cannot_change_target_language(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+        with tempfile.TemporaryDirectory() as directory:
             work = Path(directory) / "work"
             config = self._config(work, target="en")
             with self.assertRaisesRegex(ConfigurationError, "TARGET_LANGUAGE_DRIFT"):
                 require_target_language_policy(work, config)
 
     def test_explicit_user_policy_changes_config_and_lock_together(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+        with tempfile.TemporaryDirectory() as directory:
             work = Path(directory) / "work"
             self._config(work)
             with self.assertRaisesRegex(ConfigurationError, "AUTHORIZATION_REQUIRED"):

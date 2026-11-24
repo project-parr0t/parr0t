@@ -575,12 +575,36 @@ def _load_state(work_dir: Path, state_dir: Path, *, cohort: str | None = None) -
     return state
 
 
+def _pending_output_repair_cap(state: dict[str, Any]) -> int | None:
+    if state["next_action"] != "native_retry":
+        return None
+    binding = {
+        "route_index": state["route_index"], "attempt": state["next_attempt"], "action": "native_retry",
+    }
+    pending = {target for target, row in state.get("target_progress", {}).items() if row == binding}
+    cap = None
+    for event in reversed(state["history"]):
+        if not pending:
+            break
+        targets = pending.intersection(event.get("target_ids", ()))
+        if targets and event.get("event") == "worker_output_contract_repair":
+            bound = event.get("max_records")
+            if bound is not None:
+                cap = bound if cap is None else min(cap, bound)
+        if "provider" in event or event.get("event") in {
+            "worker_output_contract_repair", "approved_route_extension",
+        }:
+            pending.difference_update(targets)
+    return cap
+
+
 def _state_summary(work_dir: Path, state_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
     pending_count = state["pending_count"] if "pending_count" in state else len(_read_jsonl(work_dir / state["pending_artifact"]))
     candidate_count = state["candidate_count"] if "candidate_count" in state else len(_read_jsonl(work_dir / state["candidate_artifact"]))
     # A transport repair retains its semantic ordinal but needs fresh output
     # locations; reusing that ordinal's completed manifest would replay errors.
     run_name = f"run-{len(state['history']):04d}"
+    repair_cap = _pending_output_repair_cap(state)
     return {
         "schema": RETRY_SCHEMA,
         "state": _relative(work_dir, state_dir / STATE_NAME),
@@ -633,6 +657,7 @@ def _state_summary(work_dir: Path, state_dir: Path, state: dict[str, Any]) -> di
             if "primary_lineage" in state
             else {}
         ),
+        **({"incomplete_output_max_records": repair_cap} if repair_cap is not None else {}),
         "native_pass_output": _relative(work_dir, state_dir / "native-passes" / run_name),
         "native_pass_results": _relative(work_dir, state_dir / "native-passes" / (run_name + "-results")),
     }
@@ -1349,18 +1374,117 @@ def revise_native_translation_retry_content(
     }
 
 
+def _sealed_incomplete_output_targets(
+    work_dir: Path, state_dir: Path, state: dict[str, Any], source_segments: list[Segment],
+) -> list[str]:
+    from .native_pass import (
+        OPERATIONAL_RESULT_ISSUES, _imported_native_waves, _load_task_manifest,
+        _manifest_shard_path, _native_control_plan_fingerprint, _validate_manifest_task_file,
+        _validated_native_wave_relay_receipt, _wave_receipt_path,
+    )
+
+    repair_issues = OPERATIONAL_RESULT_ISSUES - {"worker_not_started", "worker_interrupted"}
+    pending = {
+        target: binding for target, binding in state.get("target_progress", {}).items()
+        if binding["action"] == "repair_native_runtime"
+    }
+    if not pending:
+        return []
+    segments = {segment.id: segment for segment in source_segments}
+    repaired = set()
+    primary = state.get("primary_lineage")
+    history = state["history"]
+    for index in range(len(history) - 1, -1, -1):
+        if not pending:
+            break
+        event = history[index]
+        if "provider" not in event:
+            continue
+        # Older attempts cannot supply evidence for a more recent outcome.
+        matching = pending.keys() & set(event["target_ids"])
+        if not matching:
+            continue
+        binding = {key: event[key] for key in ("provider", "model", "attempt")}
+        eligible = set()
+        for target in matching:
+            current = pending.pop(target)
+            route = state["route_plan"][current["route_index"]]
+            if {"provider": route["provider"], "model": route["model"], "attempt": current["attempt"]} == binding:
+                eligible.add(target)
+        eligible.intersection_update(event.get("incomplete_execution_target_ids", ()))
+        eligible.difference_update(event.get("semantic_attempt_consumed_ids", ()))
+        if not eligible or (index == 0 and primary is None):
+            continue
+        failures = {
+            row["target_id"]: row
+            for row in _read_jsonl(work_dir / event["result_artifact"], expected_sha256=event["result_sha256"])
+            if row["target_id"] in eligible and row.get("status") == "error"
+            and row.get("provider") == "native-control" and len(row.get("issues", [])) == 1
+            and row["issues"][0] in repair_issues
+        }
+        if not failures:
+            continue
+        manifest_path = (
+            work_dir / primary["manifest"] if index == 0
+            else state_dir / "native-passes" / f"run-{index:04d}" / "manifest.json"
+        )
+        if not manifest_path.is_file():
+            continue
+        manifest = _load_task_manifest(work_dir, manifest_path)
+        if (
+            manifest.get("pass_kind") != "translation" or manifest.get("route_binding") != binding
+            or manifest.get("execution_namespace") != _relative(work_dir, manifest_path.parent)
+            or manifest["source_fingerprint"] != stable_hash_sequence(
+                asdict(segments[target]) for target in event["target_ids"]
+            )
+        ):
+            raise NativeTranslationRetryError("E_NATIVE_RETRY_SHARD_BINDING_INVALID")
+        waves: dict[int, list[dict[str, Any]]] = {}
+        for task in manifest["tasks"]:
+            waves.setdefault(task["wave"], []).append(task)
+        # Do not let control's legacy receipt upgrade manufacture missing
+        # evidence during an explicit repair.
+        if not all(_wave_receipt_path(work_dir, manifest, tasks, wave).is_file() for wave, tasks in waves.items()):
+            continue
+        imported_waves, _ = _imported_native_waves(work_dir, manifest_path, manifest)
+        plan_fingerprint = _native_control_plan_fingerprint(manifest)
+        for wave in imported_waves:
+            matching_rows = set()
+            for task in waves[wave]:
+                ids = _validate_manifest_task_file(manifest_path, manifest, task)
+                targets = failures.keys() & set(ids)
+                if not targets:
+                    continue
+                shard = _manifest_shard_path(work_dir, manifest, task)
+                rows = _read_jsonl(shard)
+                if [row.get("target_id") for row in rows] != ids:
+                    raise NativeTranslationRetryError("E_NATIVE_RETRY_SHARD_BINDING_INVALID")
+                matching_rows.update(row["target_id"] for row in rows if row == failures.get(row["target_id"]))
+            if matching_rows:
+                receipt = _validated_native_wave_relay_receipt(work_dir, plan_fingerprint, wave, manifest=manifest)
+                if not receipt["issue_codes"]:
+                    repaired.update(matching_rows)
+    return [segment.id for segment in source_segments if segment.id in repaired]
+
+
 def repair_native_translation_retries(
     work_dir: Path, state_dir: Path, *, route_plan: Iterable[dict[str, Any]],
+    retry_failed_output: bool = False, incomplete_output_max_records: int | None = None,
 ) -> dict[str, Any]:
-    """Bind an explicitly approved route extension for operationally unfinished targets."""
+    """Retry proved worker-output failures or bind an approved route extension."""
     from .native_runtime import active_execution_environment_policy
 
     work_dir, state_dir = work_dir.resolve(), state_dir.resolve()
     _relative(work_dir, state_dir)
     state = _load_state(work_dir, state_dir)
+    if incomplete_output_max_records is not None and (
+        not retry_failed_output or type(incomplete_output_max_records) is not int
+        or incomplete_output_max_records < 1
+    ):
+        raise NativeTranslationRetryError("E_NATIVE_RETRY_SHARD_BOUND_INVALID")
     active_manifest = work_dir / _state_summary(work_dir, state_dir, state)["native_pass_output"] / "manifest.json"
-    if state["next_action"] == "native_retry" and active_manifest.exists():
-        raise NativeTranslationRetryError("E_NATIVE_RETRY_ATTEMPT_ACTIVE: collect the current bound attempt before revising routes")
+    if (retry_failed_output or state["next_action"] == "native_retry") and active_manifest.exists():
+        raise NativeTranslationRetryError("E_NATIVE_RETRY_ATTEMPT_ACTIVE: collect the current bound attempt before repair")
     plan = _validated_route_plan(route_plan)
     if any("model" not in route for route in plan):
         raise NativeTranslationRetryError("E_NATIVE_RETRY_ROUTE_BINDING_REQUIRED: each approved route needs its exact model")
@@ -1370,6 +1494,33 @@ def repair_native_translation_retries(
     _validated_translation_predecessor(
         work_dir, (state.get("primary_lineage") or {}).get("translation_predecessor"), route_plan=plan,
     )
+    if retry_failed_output:
+        if plan != previous:
+            raise NativeTranslationRetryError("E_NATIVE_RETRY_OUTPUT_ROUTE_EXTENSION_CONFLICT")
+        source_segments = _bound_source_segments(work_dir, state)
+        targets = _sealed_incomplete_output_targets(work_dir, state_dir, state, source_segments)
+        if not targets:
+            return {**_state_summary(work_dir, state_dir, state), "repaired_count": 0}
+        run_name = f"run-{len(state['history']) + 1:04d}"
+        native_passes = state_dir / "native-passes"
+        if any((native_passes / name).exists() for name in (run_name, f"{run_name}-results")):
+            raise NativeTranslationRetryError("E_NATIVE_RETRY_ATTEMPT_ACTIVE: repair namespace already exists")
+        progress = state["target_progress"]
+        for target in targets:
+            progress[target]["action"] = "native_retry"
+        event = {
+            "event": "worker_output_contract_repair", "target_ids": targets,
+            "execution_complete": False, "success_count": 0,
+        }
+        if incomplete_output_max_records is not None:
+            event["max_records"] = incomplete_output_max_records
+        state["history"].append(event)
+        candidates = {row["target_id"]: row for row in _read_jsonl(work_dir / state["candidate_artifact"])}
+        pending = _select_pending_cohort(state, source_segments)
+        return {
+            **_write_stage(work_dir, state_dir, source_segments, candidates, pending, state),
+            "repaired_count": len(targets),
+        }
     policy = active_execution_environment_policy(work_dir)
     progress = state.get("target_progress", {})
     failure_codes = {}
