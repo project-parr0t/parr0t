@@ -40,6 +40,7 @@ class NativeBrokerTests(unittest.TestCase):
         self.worker_limit = 2
         self.host_id = "fixture-host"
         self.behavior = "complete"
+        self.wave_telemetry = {"worker_elapsed_ms": 917}
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -112,6 +113,8 @@ class NativeBrokerTests(unittest.TestCase):
                     fixture.executions[key] = {"request_id": key, "status": "completed", "workers": workers,
                         "usage": {"input_tokens": 20, "provider_cost_usd": 0.001},
                         "raw_response": "PRIVATE HOST PROSE MUST NOT ESCAPE"}
+                    if any(task.get("manifest") for task in payload["tasks"]):
+                        fixture.executions[key].update(fixture.wave_telemetry)
                 self.send(fixture.executions[key])
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -168,6 +171,9 @@ class NativeBrokerTests(unittest.TestCase):
         relay = self.root / step["relay"]["dispatch"]
         result = run_native_broker(self.root, relay, poll_seconds=0)
         self.assertFalse(result["issue_codes"])
+        self.assertIs(type(result["timing"]["elapsed_ms"]), int)
+        self.assertGreaterEqual(result["timing"]["elapsed_ms"], 0)
+        self.assertIsNone(result["timing"]["provider_generation_ms"])
         self.assertEqual(native_launch_summary(self.root, relay)["observed_model_workers"], 2)
         count = self.posts()
         again = run_native_broker(self.root, relay, poll_seconds=0)
@@ -183,6 +189,7 @@ class NativeBrokerTests(unittest.TestCase):
     def test_lost_response_reconciles_without_duplicate_start(self):
         step = self.prepare()
         relay = self.root / step["relay"]["dispatch"]
+        self.wave_telemetry["provider_generation_ms"] = 27.5
         original = NativeHostClient.request
 
         def lose_once(client, method, path, payload=None):
@@ -195,7 +202,9 @@ class NativeBrokerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "E_NATIVE_HOST_TRANSPORT_ERROR"):
                 run_native_broker(self.root, relay, poll_seconds=0)
         count = self.posts()
-        run_native_broker(self.root, relay, poll_seconds=0)
+        recovered = run_native_broker(self.root, relay, poll_seconds=0)
+        self.assertEqual(recovered["timing"], {"elapsed_ms": None, "provider_generation_ms": 27.5})
+        self.assertEqual(run_native_broker(self.root, relay, poll_seconds=0), recovered)
         self.assertEqual(self.posts(), count)
 
     def test_failed_worker_does_not_discard_peer_success(self):
@@ -281,12 +290,14 @@ class NativeBrokerTests(unittest.TestCase):
             complete = original(client, request_id, payload, reconcile=reconcile)
             value = json.loads(json.dumps(complete))
             value["status"] = "running"
+            value["provider_generation_ms"] = 284
             for row in value["workers"]:
                 row.update(status="running", observed_model=None)
             return value
 
         with patch.object(NativeHostClient, "wave", running):
-            run_native_broker(self.root, relay, poll_seconds=0)
+            result = run_native_broker(self.root, relay, poll_seconds=0)
+        self.assertIsNone(result["timing"]["provider_generation_ms"])
         self.assertEqual(native_launch_summary(self.root, relay)["observed_model_workers"], 2)
 
     def test_concurrent_broker_is_rejected_without_stale_lock_files(self):
@@ -355,6 +366,21 @@ class NativeBrokerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "E_NATIVE_HOST_REPLY_INVALID"):
                 _drive(client, path, identity, [{"task_key": "probe"}], poll_seconds=0)
         self.assertEqual(json.loads(path.read_text())["status"], "requested")
+
+    def test_malformed_provider_generation_stays_unknown_without_failing_wave(self):
+        client = NativeHostClient(native_host_profile(self.root, "fixture-host"))
+        for index, value in enumerate((True, "17", -1, float("inf"), float("nan"), {"ms": 17})):
+            with self.subTest(value=value):
+                identity = {"model": "fixture/luna", "test": index}
+                reply = {"request_id": "wave-" + stable_hash(identity), "status": "completed",
+                         "provider_generation_ms": value, "workers": [
+                             {"task_key": "task", "worker_id": "worker-1",
+                              "model": "fixture/luna", "status": "completed"}]}
+                with patch.object(client, "wave", return_value=reply):
+                    result = _drive(client, self.root / f"execution-{index}.json", identity,
+                                    [{"task_key": "task"}], observe_generation=True, poll_seconds=0)
+                self.assertEqual(result["status"], "completed")
+                self.assertNotIn("provider_generation_ms", result)
 
     def test_explicit_transport_change_uses_fresh_manifest_on_same_host_and_model(self):
         profile = native_host_profile(self.root, "fixture-host")

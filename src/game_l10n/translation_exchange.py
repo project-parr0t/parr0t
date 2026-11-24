@@ -271,6 +271,14 @@ def _begin_fallback_usage_event(
     _atomic_json(path, state)
 
 
+def _authentication_blocked(result: TranslationResult) -> bool:
+    continuation = result.metadata.get("continuation")
+    return result.metadata.get("provider_authentication_blocked") is True or (
+        isinstance(continuation, dict)
+        and continuation.get("issue_code") == "provider_authentication_blocked"
+    )
+
+
 def _result_usage(results: list[TranslationResult]) -> tuple[dict[str, int], bool]:
     totals = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
     complete = True
@@ -278,7 +286,8 @@ def _result_usage(results: list[TranslationResult]) -> tuple[dict[str, int], boo
         if result.from_cache:
             continue
         if not result.attempts:
-            complete = False
+            if not _authentication_blocked(result):
+                complete = False
             continue
         for attempt in result.attempts:
             usage = attempt.usage if isinstance(attempt.usage, dict) else {}
@@ -1807,6 +1816,7 @@ def process_translation_exchange(
     processed = 0
     run_success = 0
     run_failed = 0
+    authentication_unstarted = 0
     issue_code = ""
     for offset in range(0, len(segments), wave_size):
         wave = segments[offset : offset + wave_size]
@@ -1853,6 +1863,14 @@ def process_translation_exchange(
                 valid = result.status in {"translated", "reviewed", "accepted_unreviewed"} and _valid_success_text(
                     requests_by_id[result.segment_id], result.text
                 )
+                if (not valid and _authentication_blocked(result)
+                        and sum(record.status != "queued" and record.provider != "deterministic-validator"
+                                for record in result.attempts)
+                        <= len(prior_failures.get(result.segment_id, {}).get("attempt_lineage", ()))):
+                    # A route-level block is not a new target attempt. Keep
+                    # its previous failure row, or leave it unstarted.
+                    authentication_unstarted += 1
+                    continue
                 binding = _result_adapter_binding(result, adapter_ledger, success=valid) if adapter_ledger is not None else (route, model, [])
                 actual_route, actual_model, lineage = binding
                 if resuming and result.segment_id in prior_failures:
@@ -1982,9 +2000,9 @@ def process_translation_exchange(
         report_progress(
             completed_records=processed,
             translation_completed=run_success,
-            fallback_pending=max(0, len(pending_rows) - processed),
+            fallback_pending=max(0, len(pending_rows) - processed + authentication_unstarted),
             failed_records=run_failed,
-            attempts=processed,
+            attempts=processed - authentication_unstarted,
         )
         if issue_code:
             break
@@ -1998,6 +2016,8 @@ def process_translation_exchange(
     ) if continuation is not None else None
     if native_continuation is not None and issue_code == "E_FALLBACK_OPERATIONAL_ROUTES_EXHAUSTED":
         issue_code = ""
+    if authentication_unstarted and issue_code in {"", "E_FALLBACK_OPERATIONAL_ROUTES_EXHAUSTED"}:
+        issue_code = "E_FALLBACK_PROVIDER_AUTHENTICATION_BLOCKED"
     capacity_failures = [
         {"target_id": row["target_id"], "route": row["route"], "model": row.get("model", "")}
         for row in retained_failures.values()
@@ -2093,6 +2113,7 @@ def process_translation_exchange(
         "next_action": "prepare_native_pass" if native_continuation is not None else collection["next_action"],
         "collection": collection,
         "operationally_blocked": len(operationally_blocked),
+        **({"authentication_unstarted": authentication_unstarted} if authentication_unstarted else {}),
         "issue_code": issue_code,
         "continuation_repair_target_ids": continuation_repairs,
         "capacity_repair": {

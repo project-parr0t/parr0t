@@ -10,6 +10,12 @@ from unittest.mock import patch
 from game_l10n.formats import read_segments
 from game_l10n.content_source_policy import create_content_source_grant, direct_model_provenance
 from game_l10n.models import Segment
+from game_l10n.native_pass import (
+    merge_native_pass,
+    native_control_step,
+    prepare_native_tasks,
+    seal_native_wave_relay,
+)
 from game_l10n.native_runtime import configure_native_runtime
 from game_l10n.native_translation_retry import (
     STATE_NAME,
@@ -186,6 +192,103 @@ class NativeTranslationRetryTests(unittest.TestCase):
                     root, root / eligible["cohort_lineage"]["export_path"],
                     root / eligible["cohort_input"], root / eligible["cohort_results"],
                     route_plan=extended,
+                )
+
+    def test_explicit_output_retry_requires_sealed_import_and_keeps_primary_ordinal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segments = [
+                Segment("locked", "LOCKED"), Segment("missing", "MISSING"),
+                Segment("malformed", "MALFORMED"), Segment("not-started", "NOT STARTED"),
+            ]
+            source, first, state_dir = root / "source.jsonl", root / "first.jsonl", root / "retry"
+            _write_jsonl(source, [asdict(item) for item in segments])
+            tasks, results = root / "tasks", root / "results"
+            manifest_path = tasks / "manifest.json"
+            binding = {"provider": "native-luna", "model": FIXTURE_MODELS["native-luna"], "attempt": 1}
+            prepare_native_tasks(
+                root, source, segments, tasks, max_records=1, min_records=1, max_workers=4,
+                route_binding=binding,
+            )
+            step = native_control_step(root, manifest_path, results)
+            for file in sorted(tasks.glob("task-*.jsonl")):
+                target = json.loads(file.read_text(encoding="utf-8"))["target_id"]
+                if target == "locked":
+                    _write_jsonl(results / file.name, [_result(target, "success", "LOCKED TARGET")])
+                elif target == "malformed":
+                    (results / file.name).write_text("{invalid result\n", encoding="utf-8")
+                elif target == "not-started":
+                    row = {**_result(target, "error", provider="native-control"), "issues": ["worker_not_started"]}
+                    (results / file.name).write_text(json.dumps(row) + "\n", encoding="utf-8")
+            seal_native_wave_relay(root, root / step["relay"]["dispatch"], relay_ended=True)
+            collected = native_control_step(root, manifest_path, results, require_relay_receipt=True)
+            self.assertEqual(collected["action"], "aggregate_completed_pass")
+            merge_native_pass(root, segments, first, manifest_path=manifest_path)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            policy = manifest["content_source_policy"]
+            lineage = {
+                "manifest": "tasks/manifest.json",
+                "manifest_contract_fingerprint": manifest["contract_fingerprint"],
+                "source_fingerprint": manifest["source_fingerprint"],
+                "execution_namespace": manifest["execution_namespace"],
+                "content_source_policy_digest": policy["policy_digest"],
+                "route_binding": binding,
+            }
+            state = start_native_translation_retries(
+                root, source, segments, first, state_dir, route_plan=FIXTURE_ROUTE_PLAN,
+                content_policy=policy, primary_lineage=lineage,
+            )
+            self.assertEqual(state["next_action"], "repair_native_runtime")
+            locked = (root / state["successful_results"]).read_bytes()
+            original = (state_dir / STATE_NAME).read_bytes()
+            self.assertEqual(
+                repair_native_translation_retries(root, state_dir, route_plan=FIXTURE_ROUTE_PLAN)["repaired_count"],
+                0,
+            )
+            receipt, = (root / ".game-l10n" / "native" / "waves").glob("*.json")
+            receipt_bytes = receipt.read_bytes()
+            receipt.unlink()
+            self.assertEqual(repair_native_translation_retries(
+                root, state_dir, route_plan=FIXTURE_ROUTE_PLAN, retry_failed_output=True,
+            )["repaired_count"], 0)
+            self.assertFalse(receipt.exists())
+            self.assertEqual((state_dir / STATE_NAME).read_bytes(), original)
+            receipt.write_bytes(receipt_bytes)
+
+            with self.assertRaisesRegex(NativeTranslationRetryError, "OUTPUT_ROUTE_EXTENSION_CONFLICT"):
+                repair_native_translation_retries(
+                    root, state_dir, retry_failed_output=True, route_plan=[
+                        *FIXTURE_ROUTE_PLAN,
+                        {"provider": "native-extra", "model": "fixture/extra", "max_retries": 0},
+                    ],
+                )
+            repaired = repair_native_translation_retries(
+                root, state_dir, route_plan=FIXTURE_ROUTE_PLAN,
+                retry_failed_output=True, incomplete_output_max_records=1,
+            )
+            self.assertEqual(repaired["repaired_count"], 2)
+            self.assertEqual(repaired["incomplete_output_max_records"], 1)
+            self.assertEqual((repaired["next_provider"], repaired["next_attempt"]), ("native-luna", 1))
+            self.assertEqual(repaired["route_plan"], FIXTURE_ROUTE_PLAN)
+            self.assertEqual(repaired["repair_needed_count"], 1)
+            self.assertNotEqual(repaired["native_pass_output"], state["native_pass_output"])
+            self.assertNotEqual(repaired["native_pass_results"], state["native_pass_results"])
+            self.assertEqual((root / repaired["successful_results"]).read_bytes(), locked)
+            self.assertEqual(
+                [segment.id for segment in read_segments(root / repaired["pending_input"])],
+                ["missing", "malformed"],
+            )
+            history = json.loads((state_dir / STATE_NAME).read_bytes())["history"]
+            self.assertEqual(history[0]["semantic_attempt_consumed_ids"], ["locked"])
+            self.assertFalse(repaired["provider_attempt_consumed"])
+            prepared = root / repaired["native_pass_output"]
+            prepare_native_tasks(
+                root, root / repaired["pending_input"], read_segments(root / repaired["pending_input"]),
+                prepared, max_records=1, route_binding=binding,
+            )
+            with self.assertRaisesRegex(NativeTranslationRetryError, "ATTEMPT_ACTIVE"):
+                repair_native_translation_retries(
+                    root, state_dir, route_plan=FIXTURE_ROUTE_PLAN, retry_failed_output=True,
                 )
 
     def test_versioned_grant_revision_preserves_locked_candidates_and_ordinals(self) -> None:
