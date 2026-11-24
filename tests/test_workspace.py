@@ -2270,6 +2270,35 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(verified["reconciliation"]["generation"], before["reconciliation"]["generation"] + 1)
             self.assertEqual(verified["primary_identity_binding"], before["primary_identity_binding"])
 
+    def test_prompt_reconciler_binds_activated_runner_only_on_request(self) -> None:
+        from game_l10n.native_runtime import configure_native_runtime
+        from game_l10n.omp_isolation import ISOLATION_ENV
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ):
+            os.environ.pop(ISOLATION_ENV, None)
+            root = Path(directory)
+            sdk, game, work = root / "sdk", root / "game", root / "work with spaces"
+            sdk.mkdir()
+            game.mkdir()
+            initialize_workspace(work, sdk, game_roots=[game], git_choice="disabled")
+            establish_control_plane_entry(work)
+            record_sdk_selection(work, "private-new", target_engine="fixture-engine", target_version="1.0")
+            runner = work / "tools" / "reconcile_inventory_worker.py"
+            runner.write_text("print('synthetic activated runner')\n", encoding="utf-8")
+            activation = activate_workspace_adapter(work)
+            write_verified_inventory(work)
+            configure_native_runtime(work, "omp", {}, omp_isolation="prompt")
+            output = work / ".game-l10n" / "data-plane" / "inventory_reconciler"
+            inputs = {"worker_role": "inventory_reconciler", "config": load_config(work), "sdk_activation": activation}
+            prepared = prepare_data_plane_task(work, output, **inputs, deterministic_inventory_worker=True)
+            relay = json.loads((work / prepared["relay_path"]).read_bytes())
+            task = json.loads((work / relay["task_path"]).read_bytes())
+            command = task["worker_execution"]["deterministic_worker"]
+            self.assertEqual(command["script_sha256"], hashlib.sha256(runner.read_bytes()).hexdigest())
+            self.assertEqual(Path(command["argv"][3]), runner.resolve())
+            with self.assertRaisesRegex(ConfigurationError, "cannot change the bound worker execution"):
+                prepare_data_plane_task(work, output, **inputs)
+
     def test_legacy_active_control_storage_routes_to_isolated_inventory_repair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

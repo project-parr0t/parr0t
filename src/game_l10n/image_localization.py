@@ -239,21 +239,27 @@ def _verify_engine_media_binding_probe(work_dir: Path, path: Path, task: dict[st
     _, payload = _load_workspace_json(work_dir, path, label="ENGINE_MEDIA_BINDINGS")
     references = payload.get("references")
     unresolved = payload.get("unresolved_bindings")
-    if (set(payload) != {"schema", "task_id", "references", "unresolved_bindings"}
+    contract = task.get("engine_media_binding_contract", {})
+    container_fields = contract.get("container_binding_fields")
+    fields = {"schema", "task_id", "references", "unresolved_bindings"}
+    if "container_bindings" in payload and container_fields:
+        fields.add("container_bindings")
+    if (set(payload) != fields
             or payload["schema"] != "parr0t.engine-media-bindings.v1"
             or payload["task_id"] != task["task_id"]
             or not isinstance(references, list) or len(references) > 256
             or type(unresolved) is not int or unresolved < 0):
         raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID")
     roots = [Path(root).resolve() for root in task["source_roots"]]
-    seeds = set()
+    bound_archives = {}
     for entry in task["bound_local_assets"]:
         source = Path(entry["path"])
         if not source.is_file() or _sha256(source) != entry["sha256"]:
             raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID: bound seed changed")
-        seeds.add(entry["sha256"])
-    if not seeds:
+        bound_archives[source] = entry["sha256"]
+    if not bound_archives:
         raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID: bound seed required")
+    seeds = set(bound_archives.values())
     kinds = {
         "binding_metadata": {".js", ".json", ".html", ".css", ".xml", ".atlas", ".fnt"},
         "ui_image": {".png", ".webp", ".jpg", ".jpeg", ".bmp", ".gif"},
@@ -275,7 +281,32 @@ def _verify_engine_media_binding_probe(work_dir: Path, path: Path, task: dict[st
             raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID")
         seen.add(resolved)
         bindings.append({"path": str(resolved), "kind": kind, "exists": resolved.is_file()})
-    return {"references": bindings, "unresolved_bindings": unresolved}
+    result = {"references": bindings, "unresolved_bindings": unresolved}
+    if "container_bindings" in fields:
+        rows = payload["container_bindings"]
+        counts = dict.fromkeys(contract["container_binding_kinds"], 0)
+        seen_objects = set()
+        if not isinstance(rows, list) or len(rows) > 256:
+            raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID")
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != set(container_fields):
+                raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID")
+            index, object_id, kind = row["root_index"], row["object_id"], row["kind"]
+            if (type(index) is not int or not 0 <= index < len(roots)
+                    or type(object_id) is not int or not object_id
+                    or not isinstance(kind, str) or kind not in counts
+                    or not _is_sha256(row["archive_sha256"])):
+                raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID")
+            archive = roots[index] / _safe_relative(row["relative_path"])
+            entry = _safe_relative(row["entry"]) if row["entry"] != "" else ""
+            identity = (archive, entry, object_id, kind)
+            if (archive.resolve() != archive or identity in seen_objects
+                    or bound_archives.get(archive) != row["archive_sha256"]):
+                raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID")
+            seen_objects.add(identity)
+            counts[kind] += 1
+        result["container_binding_counts"] = counts
+    return result
 
 
 def _load_workspace_json(work_dir: Path, path: Path, *, label: str) -> tuple[Path, dict[str, Any]]:

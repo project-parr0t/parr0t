@@ -1,10 +1,13 @@
 """Withdraw localization-only instructions without treating diagnostics as translation."""
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import shutil
+import stat
 import tempfile
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -79,7 +82,7 @@ def require_localization_mode(work_dir: Path) -> None:
         )
 
 
-def _snapshot_log(work_dir: Path, source: Path) -> dict[str, Any]:
+def _snapshot_log(work_dir: Path, source: Path, *, compressed: bool = False) -> dict[str, Any]:
     directory = work_dir / DIAGNOSTIC_LOG_DIRECTORY
     temporary = None
     try:
@@ -89,7 +92,8 @@ def _snapshot_log(work_dir: Path, source: Path) -> dict[str, Any]:
         source = source.resolve()
         if not source.is_file():
             raise OSError("not a regular log file")
-        with source.open("rb") as original, tempfile.NamedTemporaryFile(
+        open_source = gzip.open if compressed else open
+        with open_source(source, "rb") as original, tempfile.NamedTemporaryFile(
             mode="w+b", dir=directory, delete=False,
         ) as snapshot:
             temporary = Path(snapshot.name)
@@ -98,7 +102,7 @@ def _snapshot_log(work_dir: Path, source: Path) -> dict[str, Any]:
             snapshot.seek(0)
             digest = hashlib.file_digest(snapshot, "sha256").hexdigest()
         temporary.replace(directory / f"{digest}.log")
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, EOFError, zlib.error) as exc:
         raise ConfigurationError("E_DIAGNOSTIC_LOG_UNAVAILABLE: selected log cannot be snapshotted") from exc
     finally:
         if temporary is not None:
@@ -106,23 +110,58 @@ def _snapshot_log(work_dir: Path, source: Path) -> dict[str, Any]:
     return {"path": f"{DIAGNOSTIC_LOG_DIRECTORY}/{digest}.log", "sha256": digest, "bytes": size}
 
 
+def _omp_transcript_path(session_file: Path, subagent_id: str) -> Path:
+    """Resolve only the approved OMP artifact; never enumerate session files."""
+    try:
+        if not stat.S_ISREG(session_file.lstat().st_mode):
+            raise OSError("invalid root session")
+        artifacts = session_file.resolve(strict=True).with_suffix("")
+        if not stat.S_ISDIR(artifacts.lstat().st_mode) or artifacts.resolve(strict=True) != artifacts:
+            raise OSError("redirected OMP artifact directory")
+        parts = subagent_id.split(".")
+        for depth in range(1, len(parts)):
+            artifacts /= ".".join(parts[:depth])
+            if not stat.S_ISDIR(artifacts.lstat().st_mode) or artifacts.resolve(strict=True) != artifacts:
+                raise OSError("redirected OMP child artifact directory")
+        found = None
+        for suffix in (".jsonl", ".jsonl.gz"):
+            candidate = artifacts / (subagent_id + suffix)
+            try:
+                metadata = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            if (found is not None or not stat.S_ISREG(metadata.st_mode)
+                    or candidate.resolve(strict=True) != candidate):
+                raise OSError("ambiguous or redirected OMP transcript")
+            found = candidate
+        if found is None:
+            raise FileNotFoundError("OMP transcript is absent")
+        return found
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigurationError(
+            "E_OMP_DIAGNOSTIC_TRANSCRIPT_UNAVAILABLE: exact approved subagent transcript unavailable"
+        ) from exc
+
+
 def change_framework_mode(
     work_dir: Path, mode: str, *, user_requested: bool = False,
-    logs: list[Path] | None = None, approval: dict | None = None,
+    logs: list[Path] | None = None, omp_subagents: list[str] | None = None,
+    approval: dict | None = None,
 ) -> dict[str, Any]:
     if user_requested is not True:
         raise ConfigurationError("E_FRAMEWORK_USER_REQUEST_REQUIRED: explicit user request required")
     require_framework_approval_proof(approval)
     if not isinstance(mode, str) or mode not in {"localization", "pause", "analysis", "shutdown"}:
         raise ConfigurationError("E_FRAMEWORK_MODE_INVALID: select localization, pause, analysis or shutdown")
-    if mode != "analysis" and logs:
+    if mode != "analysis" and (logs or omp_subagents):
         raise ConfigurationError("E_FRAMEWORK_ANALYSIS_REQUIRED: log access requires analysis mode")
     if not (work_dir / "game-l10n.json").is_file():
         raise ConfigurationError("E_FRAMEWORK_WORKSPACE_REQUIRED: initialized private workspace required")
     with _framework_session_lock(work_dir):
         previous = framework_session_state(work_dir)
-        consume_framework_approval(
-            work_dir, mode, revision=previous["revision"], logs=logs, approval=approval,
+        session_file = consume_framework_approval(
+            work_dir, mode, revision=previous["revision"], logs=logs,
+            omp_subagents=omp_subagents, approval=approval,
         )
         if mode == "localization":
             resume_clean_control_plane(work_dir)
@@ -136,7 +175,7 @@ def change_framework_mode(
         _atomic_json(work_dir / FRAMEWORK_SESSION_PATH, state)
         control_issue = ""
         try:
-            if logs:
+            if logs or session_file is not None:
                 _record_control_plane_incident(work_dir, "parent_opened_data_plane", "control_plane_leak")
             else:
                 suspend_control_plane(work_dir)
@@ -147,6 +186,13 @@ def change_framework_mode(
         source = selected if selected.is_absolute() else work_dir / selected
         binding = _snapshot_log(work_dir, source)
         snapshots[binding["sha256"]] = binding
+    omp_subagent_logs = {}
+    if session_file is not None:
+        for subagent_id in omp_subagents or []:
+            source = _omp_transcript_path(session_file, subagent_id)
+            binding = _snapshot_log(work_dir, source, compressed=source.suffix == ".gz")
+            snapshots[binding["sha256"]] = binding
+            omp_subagent_logs[subagent_id] = binding
     with _framework_session_lock(work_dir):
         if framework_session_state(work_dir) != state:
             raise ConfigurationError(
@@ -154,7 +200,10 @@ def change_framework_mode(
             )
         state = {**state, "logs": list(snapshots.values())}
         _atomic_json(work_dir / FRAMEWORK_SESSION_PATH, state)
-    return {"framework_session": state, "control_plane_issue": control_issue}
+    return {
+        "framework_session": state, "control_plane_issue": control_issue,
+        **({"omp_subagent_logs": omp_subagent_logs} if omp_subagent_logs else {}),
+    }
 
 
 def diagnostic_log_bytes(work_dir: Path, relative: Path) -> bytes:

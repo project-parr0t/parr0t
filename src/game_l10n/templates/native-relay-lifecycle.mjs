@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 const SCHEMA = "parr0t.omp-native-admission.v1";
@@ -38,6 +38,40 @@ function recordWaveTiming(current, event, startedAt, endedAt, task) {
   } catch {
     // Timing is diagnostic only and cannot change lifecycle outcomes.
   }
+}
+
+function isReconciliation({ relay }) {
+  return relay.schema === "parr0t.data-plane-relay.v4" && relay.worker_role === "inventory_reconciler";
+}
+
+function relayTiming(current, event, fields) {
+  try {
+    const directory = path.join(realpathSync(current.workspace), "logs");
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    if (realpathSync(directory) !== directory) return;
+    const file = path.join(directory, "inventory-reconciliation-timing.jsonl");
+    if (lstatSync(file, { throwIfNoEntry: false })?.isFile() === false) return;
+    appendFileSync(file, JSON.stringify({
+      schema: "parr0t.inventory-reconciliation-timing.v1",
+      relay_sha256: current.fingerprint, event, ...fields,
+    }) + "\n", { mode: 0o600 });
+  } catch {
+    // Timing is diagnostic only and never changes admission or completion.
+  }
+}
+
+function verifiesInventory(event) {
+  let input = event.input;
+  if (event.toolName === "write" &&
+      ["xd://parr0t_process", "xd://parr0t_exec"].includes(input?.path)) {
+    try { input = JSON.parse(input.content); } catch { return false; }
+  } else if (!["parr0t_process", "parr0t_exec"].includes(event.toolName)) {
+    return false;
+  }
+  const argv = input?.argv;
+  if (!Array.isArray(argv)) return false;
+  const flag = argv.indexOf("--workspace");
+  return flag > 0 && argv[flag - 1] === "verify-inventory";
 }
 
 // Catalog metadata is resolution evidence, never a per-call model grant.
@@ -81,8 +115,9 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
   const handlers = {};
   let bound;
   let worker;
-  let relayClock;
   const calls = new Map();
+  let relayClock;
+  let workerTiming;
 
   function load(ctx) {
     const file = relayPath(ctx);
@@ -177,7 +212,7 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
     const task = marker(event.prompt, "PARR0T_OMP_TASK");
     if (ctx.agent.depth === 1) {
       if (task) throw new Error("PARR0T_NATIVE_LIFECYCLE: relay cannot impersonate a worker");
-      if (current.relay.schema === "parr0t.native-wave-relay.v1"
+      if ((isReconciliation(current) || current.relay.schema === "parr0t.native-wave-relay.v1")
           && (relayClock?.current.fingerprint !== current.fingerprint || relayClock.agentId !== ctx.agent.id)) {
         relayClock = { current, agentId: ctx.agent.id, startedAt: performance.now() };
       }
@@ -207,6 +242,12 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
       : record.state === "reserved" && current.relay.schema === "parr0t.native-wave-relay.v1"
         ? performance.now() : undefined;
     worker = { task, file, current, startedAt };
+    if (isReconciliation(current) && !workerTiming) {
+      workerTiming = {
+        startedAt: performance.now(), tools: new Map(), toolWindowStart: 0,
+        toolMs: 0, toolCalls: 0, verifyMs: 0, verifyCalls: 0,
+      };
+    }
   };
 
   handlers.before_subagent_spawn = (event, ctx) => {
@@ -217,6 +258,12 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
   };
 
   handlers.tool_call = async (event, ctx) => {
+    if (workerTiming && event.toolCallId && !workerTiming.tools.has(event.toolCallId)) {
+      const startedAt = performance.now();
+      if (!workerTiming.tools.size) workerTiming.toolWindowStart = startedAt;
+      workerTiming.tools.set(event.toolCallId, { startedAt, verify: verifiesInventory(event) });
+      workerTiming.toolCalls++;
+    }
     if (!bound || ctx.agent?.kind !== "sub" || ctx.agent.depth !== 1) return;
     const created = [];
     try {
@@ -298,6 +345,16 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
   };
 
   handlers.tool_result = (event) => {
+    const timed = workerTiming?.tools.get(event.toolCallId);
+    if (timed) {
+      const endedAt = performance.now();
+      workerTiming.tools.delete(event.toolCallId);
+      if (!workerTiming.tools.size) workerTiming.toolMs += endedAt - workerTiming.toolWindowStart;
+      if (timed.verify) {
+        workerTiming.verifyCalls++;
+        workerTiming.verifyMs += endedAt - timed.startedAt;
+      }
+    }
     const call = calls.get(event.toolCallId);
     if (!call) return;
     calls.delete(event.toolCallId);
@@ -320,7 +377,11 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
       relayClock = undefined;
       try {
         if (load(ctx)?.fingerprint === current.fingerprint && waveSettled(current)) {
-          recordWaveTiming(current, "relay_ended", startedAt, endedAt);
+          if (isReconciliation(current)) {
+            relayTiming(current, "relay_ended", { elapsed_ms: Math.round(endedAt - startedAt), provider_generation_ms: null });
+          } else {
+            recordWaveTiming(current, "relay_ended", startedAt, endedAt);
+          }
         }
       } catch {
         // Missing or changed lifecycle evidence is not a settled wave.
@@ -328,7 +389,7 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
       return;
     }
     const { task, file, current, startedAt } = worker;
-    const endedAt = startedAt === undefined ? undefined : performance.now();
+    const endedAt = startedAt === undefined && !workerTiming ? undefined : performance.now();
     const record = JSON.parse(readFileSync(file, "utf8"));
     requireRecord(record, current, task);
     if (record.worker_id !== ctx.agent.id || record.state !== "started") throw new Error("PARR0T_NATIVE_LIFECYCLE: terminal worker identity changed");
@@ -341,6 +402,17 @@ export default function createNativeRelayLifecycle({ workspace, relayPath, execu
       writeRecord(file, { ...record, state: "ended" });
     }
     if (startedAt !== undefined) recordWaveTiming(current, "worker_ended", startedAt, endedAt, task);
+    if (workerTiming) {
+      const { startedAt, tools, toolWindowStart, toolMs, toolCalls, verifyCalls, verifyMs } = workerTiming;
+      relayTiming(current, "worker_ended", {
+        elapsed_ms: Math.round(endedAt - startedAt),
+        provider_generation_ms: null,
+        observed_tool_ms: Math.round(toolMs + (tools.size ? endedAt - toolWindowStart : 0)),
+        tool_calls: toolCalls, unfinished_tool_calls: tools.size,
+        inventory_verify_calls: verifyCalls, inventory_verify_ms: Math.round(verifyMs),
+      });
+      workerTiming = undefined;
+    }
     worker = undefined;
   };
   return handlers;

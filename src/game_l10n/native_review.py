@@ -36,10 +36,194 @@ from .review_selection import (
     strong_review_selection_reasons, target_language_review_reasons,
 )
 from .review_policy import JUDGE_STAGES, judge_calls, review_call_limit, review_worker_limit
-from .store import stable_hash
+from .store import stable_hash, stable_hash_sequence
 from .validators import validate_integrity
 
 REVIEW_STATE_KEY = "_parr0t_review_state"
+_REVIEW_RECEIPTS = Path(".game-l10n/native/review-queue-receipts")
+_REVIEW_TRANSITIONS = Path(".game-l10n/native/review-queue-transitions")
+_REVIEW_APPROVALS = Path(".game-l10n/native/review-approvals")
+_REVIEW_FOLLOWUP_CACHE = Path(".game-l10n/native/review-followup-cache")
+_REVIEW_ROUTES = {
+    "review": {"escalation", "confirmation", "judge_fallback"},
+    "review-rewrite": {"rewrite", "rewrite_retry"},
+}
+_REVIEW_PARENTS = {
+    "escalation": (),
+    "confirmation": _REVIEW_ROUTES["review-rewrite"],
+    "judge_fallback": _REVIEW_ROUTES["review"],
+    "rewrite": _REVIEW_ROUTES["review"],
+    "rewrite_retry": _REVIEW_ROUTES["review-rewrite"],
+}
+_SELECTION_REASONS = frozenset({
+    "high_risk_category", "explicit_high_risk_flag", "deterministic_sample",
+    "context_reference_cue", "fallback_translation", "dialogue_register_shift",
+    "dialogue_consistency_risk", "dialogue_context_uncertain", "target_script_absent",
+    "target_script_contamination", "triage_unresolved", "triage_flagged", "integrity_invalid",
+})
+
+
+def _review_receipt_path(work_dir: Path, key: str, *, directory: Path = _REVIEW_RECEIPTS) -> Path:
+    if not isinstance(key, str) or len(key) != 64 or any(c not in "0123456789abcdef" for c in key):
+        raise ValueError("E_NATIVE_REVIEW_EVIDENCE_INVALID")
+    path = work_dir.resolve() / directory / (key + ".json")
+    if path.resolve() != path:
+        raise ValueError("E_NATIVE_REVIEW_EVIDENCE_INVALID")
+    return path
+
+
+def _review_queue_parents(segments: list[Segment]) -> dict[str, str]:
+    return {segment.id: segment.metadata[REVIEW_STATE_KEY]["queue_receipt"] for segment in segments}
+
+
+def _queue_transition_path(work_dir: Path, target: str, receipt: str) -> Path:
+    return _review_receipt_path(work_dir, stable_hash([target, receipt]), directory=_REVIEW_TRANSITIONS)
+
+
+def _review_queue_superseded(work_dir: Path, segment: Segment) -> bool:
+    key = segment.metadata.get(REVIEW_STATE_KEY, {}).get("queue_receipt")
+    return bool(key and _queue_transition_path(work_dir, segment.id, key).is_file())
+
+
+def _issue_review_queue(
+    work_dir: Path, segments: list[Segment], route: str, predecessor: str,
+    parents: dict[str, str],
+) -> None:
+    """Attest the exact collected rows, independently of the user-supplied queue path."""
+    if not segments:
+        return
+    receipt = {
+        "schema": "parr0t.native-review-queue.v1",
+        "route": route,
+        "predecessor": predecessor,
+        "entries": {segment.id: {"binding": stable_hash(asdict(segment)), "parent": parents.get(segment.id)}
+                    for segment in segments},
+    }
+    key = stable_hash(receipt)
+    path = _review_receipt_path(work_dir, key)
+    if not path.exists():
+        _atomic_json(path, receipt)
+    for segment in segments:
+        segment.metadata[REVIEW_STATE_KEY]["queue_receipt"] = key
+        parent = parents.get(segment.id)
+        if parent is not None:
+            transition = _queue_transition_path(work_dir, segment.id, parent)
+            if not transition.exists():
+                _atomic_json(transition, {"first_successor": key})
+
+
+def _review_admission(
+    work_dir: Path, segments: list[Segment], routing: dict[str, Any], *, stage: str,
+    queue_routes: dict[str, str] | None = None,
+) -> dict[str, dict[str, int]]:
+    _require_candidate_bindings(segments, "rewrite")
+    route_counts: Counter[str] = Counter()
+    reason_counts: Counter[str] = Counter()
+    receipts: dict[str, dict[str, Any]] = {}
+
+    def load(key: str) -> dict[str, Any]:
+        if key not in receipts:
+            path = _review_receipt_path(work_dir, key)
+            try:
+                receipt = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                raise ValueError("E_NATIVE_REVIEW_EVIDENCE_INVALID") from None
+            if (not isinstance(receipt, dict) or stable_hash(receipt) != key
+                    or receipt.get("schema") != "parr0t.native-review-queue.v1"
+                    or not isinstance(receipt.get("entries"), dict)
+                    or not isinstance(receipt.get("route"), str)
+                    or receipt["route"] not in _REVIEW_PARENTS):
+                raise ValueError("E_NATIVE_REVIEW_EVIDENCE_INVALID")
+            receipts[key] = receipt
+        return receipts[key]
+
+    def entry(receipt: dict[str, Any], target: str) -> dict[str, Any]:
+        value = receipt["entries"].get(target)
+        if not isinstance(value, dict):
+            raise ValueError("E_NATIVE_REVIEW_EVIDENCE_INVALID")
+        return value
+
+    for segment in segments:
+        if not routing.get("review_triagers"):
+            route_counts["no_triage" if stage != "review-triage" else "triage"] += 1
+            continue
+        if stage == "review-triage":
+            if REVIEW_STATE_KEY in segment.metadata:
+                raise ValueError("E_NATIVE_REVIEW_TRIAGE_INPUT_INVALID")
+            route_counts["triage"] += 1
+            continue
+        state = segment.metadata.get(REVIEW_STATE_KEY)
+        key = state.get("queue_receipt") if isinstance(state, dict) else None
+        if not isinstance(key, str):
+            raise ValueError("E_NATIVE_REVIEW_EVIDENCE_REQUIRED")
+        receipt = load(key)
+        route = receipt.get("route")
+        unsealed = replace(segment, metadata={
+            **segment.metadata,
+            REVIEW_STATE_KEY: {k: v for k, v in state.items() if k != "queue_receipt"},
+        })
+        current = entry(receipt, segment.id)
+        if (route not in _REVIEW_ROUTES[stage]
+                or current.get("binding") != stable_hash(asdict(unsealed))):
+            raise ValueError("E_NATIVE_REVIEW_EVIDENCE_INVALID")
+        parent = current.get("parent")
+        previous_route = route
+        seen = {key}
+        while previous_route != "escalation":
+            if not isinstance(parent, str) or parent in seen:
+                raise ValueError("E_NATIVE_REVIEW_EVIDENCE_INVALID")
+            seen.add(parent)
+            ancestor = load(parent)
+            if ancestor["route"] not in _REVIEW_PARENTS[previous_route]:
+                raise ValueError("E_NATIVE_REVIEW_EVIDENCE_INVALID")
+            previous_route = ancestor["route"]
+            parent = entry(ancestor, segment.id).get("parent")
+        if parent is not None:
+            raise ValueError("E_NATIVE_REVIEW_EVIDENCE_INVALID")
+        if queue_routes is not None:
+            queue_routes[segment.id] = route
+        route_counts[route] += 1
+        reason_counts.update(reason for reason in state["metadata"].get("strong_review_reasons", ())
+                             if reason in _SELECTION_REASONS)
+    return {"routes": dict(sorted(route_counts.items())), "selection_reasons": dict(sorted(reason_counts.items()))}
+
+
+def _review_approval_path(
+    work_dir: Path, target: str, source: str, generation: int, digest: str,
+) -> Path:
+    return _review_receipt_path(
+        work_dir, stable_hash([target, source, generation, digest]), directory=_REVIEW_APPROVALS,
+    )
+
+
+def _review_candidate_locked(work_dir: Path, segment: Segment) -> bool:
+    candidate = segment.metadata[CANDIDATE_METADATA_KEY]
+    return _review_approval_path(
+        work_dir, segment.id, segment.source, candidate["generation"], candidate["digest"],
+    ).is_file()
+
+
+def _last_review_attempt(result: TranslationResult) -> AttemptRecord | None:
+    return next((a for a in reversed(result.attempts)
+                 if a.stage in JUDGE_STAGES and a.operational is not True
+                 and a.candidate_generation == result.candidate_generation), None)
+
+
+def _review_failed_route(segment: Segment, provider: str, model: str) -> bool:
+    result = _bound_result(segment)
+    last = _last_review_attempt(result)
+    return bool(last and last.provider == provider and (not model or last.model == model)
+                and (last.status in {"error", "refused", "rewrite"}
+                     or (last.status == "approved" and result.metadata.get("rewrite_issues"))))
+
+
+def _lock_review_approvals(work_dir: Path, results: list[TranslationResult]) -> None:
+    for result in results:
+        path = _review_approval_path(
+            work_dir, result.segment_id, result.source, result.candidate_generation, result.candidate_digest,
+        )
+        if not path.exists():
+            _atomic_json(path, {"schema": "parr0t.native-review-approval.v1"})
 
 
 def collect_reviewed_candidates(
@@ -120,6 +304,13 @@ def _resume_review_queues(
     combined = {"judge", "review-rewrite"}
     queue_kinds.update({kind + ".jsonl": kind for kind in (*queue_kinds.values(), *combined)})
     rewrite_kinds = {"rewrite", "rewrite_retry", "review-rewrite"}
+    config_path = work_dir / "game-l10n.json"
+    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
+    routing = config.get("routing", {})
+    audited = bool(routing.get("review_triagers"))
+    receipt_kinds = {"escalation": "strong", "judge_fallback": "fallback",
+                     "confirmation": "confirmation", "rewrite": "rewrite", "rewrite_retry": "rewrite_retry"}
+    mixed_stages = {"judge.jsonl": "review", "review-rewrite.jsonl": "review-rewrite"}
 
     def operation_for(kind: str) -> str:
         return "rewrite" if kind in rewrite_kinds else "judge"
@@ -134,15 +325,30 @@ def _resume_review_queues(
     latest: dict[str, list[tuple[str, Segment, TranslationResult]]] = {}
     for path in queues:
         kind = queue_kinds.get(path.name)
-        if kind is None or output.resolve() == path.resolve().parent:
+        mixed_stage = mixed_stages.get(path.name) if audited else None
+        if mixed_stage is not None:
+            kind = None
+        if (kind is None and mixed_stage is None) or output.resolve() == path.resolve().parent:
             raise ValueError("E_NATIVE_REVIEW_QUEUE_INVALID")
-        for segment in read_segments(path):
-            if segment.id not in remaining:
-                continue
-            if (segment.source != remaining[segment.id]
-                    or (kind != "awaiting" and REVIEW_STATE_KEY not in segment.metadata)):
+        queued = [segment for segment in read_segments(path) if segment.id in remaining]
+        queue_routes: dict[str, str] | None = {} if mixed_stage else None
+        if audited and kind != "awaiting":
+            stage = mixed_stage or ("review-rewrite" if kind in {"rewrite", "rewrite_retry"} else "review")
+            receipt_counts = _review_admission(
+                work_dir, queued, routing, stage=stage, queue_routes=queue_routes,
+            )["routes"]
+            if mixed_stage is None and any(receipt_kinds[route] != kind for route in receipt_counts):
                 raise ValueError("E_NATIVE_REVIEW_QUEUE_INVALID")
-            _require_candidate_bindings([segment], "rewrite")
+        for segment in queued:
+            row_kind = receipt_kinds[queue_routes[segment.id]] if queue_routes is not None else kind
+            if (segment.source != remaining[segment.id]
+                    or (row_kind != "awaiting" and REVIEW_STATE_KEY not in segment.metadata)):
+                raise ValueError("E_NATIVE_REVIEW_QUEUE_INVALID")
+            if not audited or row_kind == "awaiting":
+                _require_candidate_bindings([segment], "rewrite")
+            if audited and (_review_candidate_locked(work_dir, segment)
+                            or _review_queue_superseded(work_dir, segment)):
+                continue
             result = _bound_result(segment)
             states = latest.setdefault(segment.id, [])
 
@@ -150,16 +356,21 @@ def _resume_review_queues(
                 continue
             states[:] = [(stage, item, previous) for stage, item, previous in states
                          if not supersedes(result, previous)]
-            operation = operation_for(kind)
-            if kind in combined:
-                if any(item == segment and stage != "awaiting" and operation_for(stage) == operation
-                       for stage, item, _ in states):
-                    continue
-            elif kind != "awaiting":
-                states[:] = [(stage, item, previous) for stage, item, previous in states
-                             if not (stage in combined and item == segment and operation_for(stage) == operation)]
-            if not any(stage == kind and item == segment for stage, item, _ in states):
-                states.append((kind, segment, result))
+            if audited:
+                if not any(stage == row_kind and item == segment for stage, item, _ in states):
+                    states.append((row_kind, segment, result))
+            else:
+                operation = operation_for(kind)
+                if kind in combined:
+                    if any(item == segment and stage != "awaiting" and operation_for(stage) == operation
+                           for stage, item, _ in states):
+                        continue
+                elif kind != "awaiting":
+                    states[:] = [(stage, item, previous) for stage, item, previous in states
+                                 if not (stage in combined and item == segment
+                                         and operation_for(stage) == operation)]
+                if not any(stage == kind and item == segment for stage, item, _ in states):
+                    states.append((kind, segment, result))
 
     selected: list[tuple[str, Segment, TranslationResult]] = []
     conflicting, missing = 0, 0
@@ -172,92 +383,147 @@ def _resume_review_queues(
         if (len(ready) == 1 and all(s == ready[0][1] for _, s, _ in states)
                 or len(states) == 1):
             kind, segment, result = (ready or states)[0]
-            # An identical awaiting snapshot is already attached to a pass;
-            # only newer evidence may supersede that attachment.
+            # An exact copy in an awaiting artifact is already attached to a
+            # pending pass. A newer receipt can still supersede that evidence.
             selected.append(("awaiting" if len(ready) != len(states) else kind, segment, result))
         else:
             conflicting += 1
 
-    config_path = work_dir / "game-l10n.json"
-    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
-    routing = config.get("routing", {})
-    routes = {"judge": routing.get("reviewers"), "rewrite": routing.get("rewriters")}
+    groups: dict[str, tuple[Path, dict[str, Any], list[Segment]]] = {}
     adapters = {item["name"]: item for item in config.get("providers", [])}
     external_roles = config.get("native_workflow", {}).get("external_provider_roles")
-    native_models, requested_models = {}, {}
-    if any(routes.values()):
+    route_models = {name: item["model"] for name, item in adapters.items()
+                    if isinstance(item.get("model"), str) and item["model"]}
+    max_rewrites = max(0, routing.get("review_max_rounds", 2) - 1)
+    if audited:
         from .model_policy import native_role_bindings
         from .native_runtime import native_runtime
 
         native_models = (native_runtime(work_dir) or {}).get("models", {})
         requested_models = native_role_bindings(config)
-    route_models = {name: item["model"] for name, item in adapters.items()
-                    if isinstance(item.get("model"), str) and item["model"]}
-    route_models.update(native_models)
-    max_rewrites = max(0, routing.get("review_max_rounds", 2) - 1)
-    eligible: dict[str, list[Segment]] = {"judge": [], "rewrite": []}
-    holds: dict[str, str] = {}
-    for kind, segment, result in selected:
-        if kind == "awaiting":
-            continue
-        operation = operation_for(kind)
-        if routes[operation] is None:
-            continue  # Keep legacy queues usable when no route policy was supplied.
-        if not routes[operation]:
-            holds[segment.id] = "routes_exhausted"
-            continue
-        if operation == "rewrite":
-            if sum(a.stage.startswith("review-rewrite") and a.status == "success"
-                   for a in result.attempts) >= max_rewrites:
-                holds[segment.id] = "routes_exhausted"
-                continue
-            if not result.metadata.get("rewrite_issues"):
-                holds[segment.id] = "repair_required"
-                continue
-        eligible[operation].append(segment)
+        route_models.update(native_models)
+        attempt_limits = routing.get("review_attempt_limits", {})
+        candidate_model_routes = routing.get("review_candidate_model_routes")
 
-    next_routes = {
-        segment.id: provider
-        for operation, segments in eligible.items() if segments
-        for provider, items in partition_native_review_routes(
-            segments, routes[operation], route_models=route_models,
-            stage="review" if operation == "judge" else "review-rewrite",
-            attempt_limits=routing.get("review_attempt_limits", {}),
-            tier_limit=routing.get("strong_max_calls") if operation == "judge" else None,
-        ).items()
-        for segment in items
-    }
-    groups: dict[str, tuple[Path, dict[str, str], list[Segment]]] = {}
-    for kind, segment, _ in selected:
-        key, path, details = kind, Path(kind + ".jsonl"), {}
-        if kind == "awaiting":
-            details = {"status": "awaiting"}
-        else:
-            operation = operation_for(kind)
-            if routes[operation] is not None:
-                status = holds.get(segment.id)
-                provider = next_routes.get(segment.id, "")
-                model = route_models.get(provider, "")
-                if status is None:
-                    if not provider:
-                        status = "routes_exhausted"
-                    elif provider.startswith("native-"):
-                        status = ("native_route_pending" if provider in native_models
-                                  and requested_models.get(provider, model) == model else "repair_required")
-                    else:
-                        role = "selective_rewrite" if operation == "rewrite" else "judge_fallback"
-                        adapter = adapters.get(provider, {})
-                        authorized = ((external_roles is None or role in external_roles)
-                                      and ("allowed_roles" not in adapter or role in adapter["allowed_roles"]))
-                        status = "external_route_required" if model and authorized else "repair_required"
-                details = {"operation": operation, "status": status}
+        def cohort(kind: str, result: TranslationResult) -> tuple[str, Path, dict[str, Any]]:
+            if kind == "awaiting":
+                return kind, Path("awaiting.jsonl"), {"status": "awaiting"}
+            rewrite = kind in {"rewrite", "rewrite_retry"}
+            operation = "rewrite" if rewrite else "judge"
+            stage = "review-rewrite" if rewrite else "review"
+            routes = routing.get("rewriters" if rewrite else "reviewers", [])
+            details = {"operation": operation}
+            if rewrite and sum(a.stage.startswith(stage) and a.status == "success"
+                               for a in result.attempts) >= max_rewrites:
+                status = "routes_exhausted"
+            elif rewrite and not result.metadata.get("rewrite_issues"):
+                status = "repair_required"
+            else:
+                provider = _next_native_review_route(
+                    result, routes, stage=stage, route_models=route_models,
+                    attempt_limits=attempt_limits, tier_limit=None if rewrite else routing.get("strong_max_calls"),
+                    candidate_model_routes=candidate_model_routes,
+                )
+                model = route_models.get(provider) if provider else None
+                if provider is None:
+                    status = "repair_required"
+                elif not provider:
+                    status = "routes_exhausted"
+                elif provider.startswith("native-"):
+                    status = ("native_route_pending" if provider in native_models
+                              and requested_models.get(provider, model) == model else "repair_required")
+                else:
+                    role = "selective_rewrite" if rewrite else "judge_fallback"
+                    adapter = adapters.get(provider, {})
+                    authorized = (
+                        provider in routes and (external_roles is None or role in external_roles)
+                        and ("allowed_roles" not in adapter or role in adapter["allowed_roles"])
+                    )
+                    status = "external_route_required" if model and authorized else "repair_required"
                 if status in {"native_route_pending", "external_route_required"}:
                     key = stable_hash([operation, provider, model])
-                    path = Path(key) / ("review-rewrite.jsonl" if operation == "rewrite" else "judge.jsonl")
-                    details.update(provider=provider, model=model)
-                else:
-                    key, path = f"{status}:{kind}", Path(status) / path
-        groups.setdefault(key, (path, details, []))[2].append(segment)
+                    filename = "review-rewrite.jsonl" if rewrite else "judge.jsonl"
+                    return key, Path(key) / filename, {
+                        **details, "status": status, "provider": provider, "model": model,
+                    }
+            # Retain unusable evidence separately for repair or explicit fallback approval.
+            return f"{status}:{kind}", Path(status) / (kind + ".jsonl"), {**details, "status": status}
+
+        for kind, segment, result in selected:
+            key, path, details = cohort(kind, result)
+            groups.setdefault(key, (path, details, []))[2].append(segment)
+    else:
+        routes = {"judge": routing.get("reviewers"), "rewrite": routing.get("rewriters")}
+        native_models, requested_models = {}, {}
+        if any(routes.values()):
+            from .model_policy import native_role_bindings
+            from .native_runtime import native_runtime
+
+            native_models = (native_runtime(work_dir) or {}).get("models", {})
+            requested_models = native_role_bindings(config)
+        route_models.update(native_models)
+        eligible: dict[str, list[Segment]] = {"judge": [], "rewrite": []}
+        holds: dict[str, str] = {}
+        for kind, segment, result in selected:
+            if kind == "awaiting":
+                continue
+            operation = operation_for(kind)
+            if routes[operation] is None:
+                continue  # Keep legacy queues usable when no route policy was supplied.
+            if not routes[operation]:
+                holds[segment.id] = "routes_exhausted"
+                continue
+            if operation == "rewrite":
+                if sum(a.stage.startswith("review-rewrite") and a.status == "success"
+                       for a in result.attempts) >= max_rewrites:
+                    holds[segment.id] = "routes_exhausted"
+                    continue
+                if not result.metadata.get("rewrite_issues"):
+                    holds[segment.id] = "repair_required"
+                    continue
+            eligible[operation].append(segment)
+
+        next_routes = {
+            segment.id: provider
+            for operation, segments in eligible.items() if segments
+            for provider, items in partition_native_review_routes(
+                segments, routes[operation], route_models=route_models,
+                stage="review" if operation == "judge" else "review-rewrite",
+                attempt_limits=routing.get("review_attempt_limits", {}),
+                tier_limit=routing.get("strong_max_calls") if operation == "judge" else None,
+            ).items()
+            for segment in items
+        }
+        for kind, segment, _ in selected:
+            key, path, details = kind, Path(kind + ".jsonl"), {}
+            if kind == "awaiting":
+                details = {"status": "awaiting"}
+            else:
+                operation = operation_for(kind)
+                if routes[operation] is not None:
+                    status = holds.get(segment.id)
+                    provider = next_routes.get(segment.id, "")
+                    model = route_models.get(provider, "")
+                    if status is None:
+                        if not provider:
+                            status = "routes_exhausted"
+                        elif provider.startswith("native-"):
+                            status = ("native_route_pending" if provider in native_models
+                                      and requested_models.get(provider, model) == model else "repair_required")
+                        else:
+                            role = "selective_rewrite" if operation == "rewrite" else "judge_fallback"
+                            adapter = adapters.get(provider, {})
+                            authorized = ((external_roles is None or role in external_roles)
+                                          and ("allowed_roles" not in adapter or role in adapter["allowed_roles"]))
+                            status = "external_route_required" if model and authorized else "repair_required"
+                    details = {"operation": operation, "status": status}
+                    if status in {"native_route_pending", "external_route_required"}:
+                        key = stable_hash([operation, provider, model])
+                        path = Path(key) / ("review-rewrite.jsonl" if operation == "rewrite" else "judge.jsonl")
+                        details.update(provider=provider, model=model)
+                    else:
+                        key, path = f"{status}:{kind}", Path(status) / path
+            groups.setdefault(key, (path, details, []))[2].append(segment)
     if output.exists():
         raise ValueError("E_NATIVE_REVIEW_OUTPUT_ALREADY_EXISTS")
     output.mkdir(parents=True)
@@ -542,6 +808,7 @@ def partition_native_review_routes(
     route_models: dict[str, str] | None = None,
     attempt_limits: dict[str, int] | None = None,
     tier_limit: int | None = None,
+    candidate_model_routes: dict[str, str] | None = None,
 ) -> dict[str, list[Segment]]:
     """Partition pending candidates in configured route order, preserving source order.
 
@@ -550,40 +817,71 @@ def partition_native_review_routes(
     """
     groups: dict[str, list[Segment]] = {route: [] for route in routes}
     groups[""] = []
+    models = route_models if route_models is not None else {}
+    limits = attempt_limits if attempt_limits is not None else {}
     for segment in segments:
-        result = _bound_result(segment)
-        selected = ""
-        current_attempts = [
-            item for item in result.attempts
-            if item.candidate_generation == result.candidate_generation
-        ]
-        for route in routes:
-            model = (route_models or {}).get(route, "")
-            attempts = [item for item in current_attempts
-                        if item.provider == route
-                        and (not model or not item.model or item.model == model)
-                        and (item.stage in JUDGE_STAGES if stage == "review"
-                             else item.stage == stage or item.stage.startswith(stage + "-"))]
-            if stage == "review":
-                limit = review_call_limit(
-                    route, routes, attempt_limits or {}, model=model, tier_limit=tier_limit
-                )
-                exhausted = limit is not None and judge_calls(
-                    result.attempts, route, model=model
-                ) >= limit
-                # A failed route advances to its successor; a flagged candidate
-                # may return for confirmation within its configured call policy.
-                failed = bool(attempts and attempts[-1].status in {"error", "refused"})
-                unavailable = exhausted or failed
-            elif stage == "review-rewrite":
-                unavailable = any(item.operational is not True for item in attempts)
-            else:
-                unavailable = bool(attempts)
-            if not unavailable:
-                selected = route
-                break
-        groups[selected].append(segment)
+        selected = _next_native_review_route(
+            _bound_result(segment), routes, stage=stage, route_models=models,
+            attempt_limits=limits, tier_limit=tier_limit, candidate_model_routes=candidate_model_routes,
+        )
+        if selected is None:
+            raise ValueError("E_INDEPENDENT_REVIEW_ROUTE_INVALID")
+        groups.setdefault(selected, []).append(segment)
     return {route: items for route, items in groups.items() if items}
+
+
+def _next_native_review_route(
+    result: TranslationResult, routes: list[str], *, stage: str, route_models: dict[str, str],
+    attempt_limits: dict[str, int], tier_limit: int | None,
+    candidate_model_routes: dict[str, str] | None,
+) -> str | None:
+    if stage == "review":
+        last = _last_review_attempt(result)
+        if last and last.status == "approved" and not result.metadata.get("rewrite_issues"):
+            return ""
+        if candidate_model_routes:
+            lineage = result.metadata.get("content_provenance_lineage") or [
+                result.metadata.get("content_provenance", {})
+            ]
+            authored_model = lineage[0].get("model")
+            if authored_model in candidate_model_routes:
+                override = candidate_model_routes[authored_model]
+                override_model = route_models.get(override)
+                if not override_model or override_model == authored_model:
+                    return None
+                routes = [override]
+    current_attempts = [
+        item for item in result.attempts
+        if item.candidate_generation == result.candidate_generation
+    ]
+    for route in routes:
+        model = route_models.get(route, "")
+        attempts = [item for item in current_attempts
+                    if item.provider == route
+                    and (not model or not item.model or item.model == model)
+                    and (item.stage in JUDGE_STAGES if stage == "review"
+                         else item.stage == stage or item.stage.startswith(stage + "-"))]
+        if stage == "review":
+            limit = review_call_limit(route, routes, attempt_limits, model=model, tier_limit=tier_limit)
+            exhausted = limit is not None and judge_calls(result.attempts, route, model=model) >= limit
+            # A failed route advances to its successor; a flagged candidate
+            # may return for confirmation within its configured call policy.
+            failed = bool(attempts and attempts[-1].status in {"error", "refused"})
+            unavailable = exhausted or failed
+        elif stage == "review-rewrite":
+            spent = [item for item in attempts if item.operational is not True]
+            # A recorded success in the current generation did not change the
+            # candidate. Retry once only if a later judgment left a language finding.
+            language_noop = (len(spent) == 1 and spent[0].status == "success"
+                             and result.metadata.get("target_language_risk")
+                             and any(item.stage in JUDGE_STAGES
+                                     for item in current_attempts[current_attempts.index(spent[0]) + 1:]))
+            unavailable = bool(spent) and not language_noop
+        else:
+            unavailable = bool(attempts)
+        if not unavailable:
+            return route
+    return ""
 
 
 def select_native_review_route(
@@ -591,10 +889,12 @@ def select_native_review_route(
     route_models: dict[str, str] | None = None,
     attempt_limits: dict[str, int] | None = None,
     tier_limit: int | None = None,
+    candidate_model_routes: dict[str, str] | None = None,
 ) -> str:
     groups = partition_native_review_routes(
         segments, routes, stage=stage, route_models=route_models,
         attempt_limits=attempt_limits, tier_limit=tier_limit,
+        candidate_model_routes=candidate_model_routes,
     )
     if len(groups) != 1:
         raise ValueError("E_NATIVE_ROUTE_PARTITION_REQUIRED: partition pending role routes before dispatch")
@@ -640,6 +940,16 @@ def collect_native_review(
         )
     ):
         raise ValueError("E_CONTENT_SOURCE_POLICY_IMMUTABLE")
+    config_path = work_dir / "game-l10n.json"
+    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
+    routing = config.get("routing", {})
+    if routing.get("review_triagers"):
+        if tier == "triage" and bound_tier != "triage":
+            raise ValueError("E_NATIVE_REVIEW_TIER_INVALID")
+        if tier == "triage" and (manifest.get("route_binding") or {}).get("provider") != routing["review_triagers"][0]:
+            raise ValueError("E_NATIVE_REVIEW_TRIAGE_ROUTE_INVALID")
+        _review_admission(work_dir, segments, routing,
+                          stage="review-triage" if tier == "triage" else "review")
     # No overwrite of any prepared input or prior result. Repeated collection
     # is deterministic and never starts a worker or consumes another attempt.
     if output.resolve() in {source.resolve().parent, manifest_path.resolve().parent}:
@@ -659,18 +969,19 @@ def collect_native_review(
     from .native_runtime import native_runtime
     runtime = native_runtime(work_dir)
     route_models = dict((runtime or {}).get("models", {}))
-    config_path = work_dir / "game-l10n.json"
-    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
     route_models.update({
         item["name"]: item["model"] for item in config.get("providers", [])
         if isinstance(item.get("model"), str) and item["model"]
     })
-    routing = config.get("routing", {})
     routes = routing.get("review_triagers" if tier == "triage" else "reviewers", [])
     rows_by_id = {row["target_id"]: row for row in rows}
     for segment in segments:
         row = rows_by_id.get(segment.id)
         if row is None or (row["status"] != "success" and not summary["review_split_complete"]):
+            awaiting.append(segment)
+            continue
+        if (routing.get("review_triagers") and row["status"] != "success"
+                and row.get("issues") == ["worker_not_started"]):
             awaiting.append(segment)
             continue
         result = _bound_result(segment)
@@ -679,6 +990,7 @@ def collect_native_review(
         provider = (manifest.get("route_binding") or {}).get("provider") or (
             row.get("provider") or next(iter(routes), "native-worker")
         )
+        model = (manifest.get("route_binding") or {}).get("model") or route_models.get(provider, "")
         stage = "review-triage" if tier == "triage" else "review"
         verdict = None
         if row["status"] == "success":
@@ -696,10 +1008,10 @@ def collect_native_review(
         issue_counts.update(dict.fromkeys(issues, 1))
         result.attempts.append(AttemptRecord(
             stage, provider, status, issues=issues,
-            ordinal=judge_calls(result.attempts, provider, stage_prefix=stage)
+            ordinal=judge_calls(result.attempts, provider, model=model, stage_prefix=stage)
                     + int(row.get("native_review_attempts", row.get("semantic_attempts", 1))),
             candidate_generation=result.candidate_generation,
-            model=(manifest.get("route_binding") or {}).get("model") or route_models.get(provider, ""),
+            model=model,
         ))
         integrity = validate_integrity(segment, result.text, glossary or [],
             extra_patterns=extra_patterns, max_length_ratio=max_length_ratio)
@@ -712,11 +1024,11 @@ def collect_native_review(
         result.metadata["review_category"] = review_category(segment)
         limit = review_call_limit(
             provider, routes or [provider], routing.get("review_attempt_limits", {}),
-            model=(manifest.get("route_binding") or {}).get("model") or route_models.get(provider, ""),
+            model=model,
             tier_limit=routing.get("triage_max_calls" if tier == "triage" else "strong_max_calls"),
         )
         limit_reached = limit is not None and judge_calls(
-            result.attempts, provider, stage_prefix=stage
+            result.attempts, provider, model=model, stage_prefix=stage
         ) >= limit
         result.status = "failed"
         if tier == "triage":
@@ -778,6 +1090,13 @@ def collect_native_review(
         result.metadata["review_tier"] = tier
         accepted.append(result)
     write_results(output / "accepted.json", accepted)
+    if routing.get("review_triagers"):
+        _lock_review_approvals(work_dir, accepted)
+        predecessor = stable_hash(manifest)
+        parents = {} if tier == "triage" else _review_queue_parents(segments)
+        _issue_review_queue(work_dir, strong, "escalation", predecessor, parents)
+        _issue_review_queue(work_dir, rewrite, "rewrite", predecessor, parents)
+        _issue_review_queue(work_dir, fallback, "judge_fallback", predecessor, parents)
     for name, items in (("strong-input.jsonl", strong), ("rewrite-input.jsonl", rewrite),
                         ("fallback-input.jsonl", fallback), ("awaiting-input.jsonl", awaiting)):
         _atomic_jsonl(output / name, (asdict(item) for item in items))
@@ -802,6 +1121,8 @@ def collect_native_rewrite(
     work_dir: Path, source: Path, manifest_path: Path, output: Path, *,
     glossary: list[Any] | None = None, extra_patterns: list[str] | None = None,
     max_length_ratio: float = 4.0, review_max_rounds: int = 2,
+    awaiting_input: Path | None = None,
+    target_language: str = "",
 ) -> dict[str, Any]:
     """Bind native corrections to their history, requiring a separate judge next.
 
@@ -812,11 +1133,24 @@ def collect_native_rewrite(
     work_dir = work_dir.resolve()
     for path in (source, manifest_path, output):
         path.resolve().relative_to(work_dir)
-    segments = read_segments(source)
+    ordered_source = read_segments(source)
+    segments = ordered_source
+    if awaiting_input is not None:
+        awaiting_input.resolve().relative_to(work_dir)
+        segments = read_segments(awaiting_input)
+        pending_ids = {segment.id for segment in segments}
+        if segments != [segment for segment in ordered_source if segment.id in pending_ids]:
+            raise ValueError("E_NATIVE_REWRITE_AWAITING_INPUT_INVALID")
+        if output.resolve() == awaiting_input.resolve().parent:
+            raise ValueError("E_NATIVE_REVIEW_OUTPUT_INVALID")
     _require_candidate_bindings(segments, "rewrite")
     manifest = _load_task_manifest(work_dir, manifest_path)
     if manifest.get("pass_kind") != "rewrite":
         raise ValueError("E_NATIVE_REWRITE_PASS_REQUIRED")
+    config_path = work_dir / "game-l10n.json"
+    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
+    routing = config.get("routing", {})
+    _review_admission(work_dir, ordered_source, routing, stage="review-rewrite")
     if output.resolve() in {source.resolve().parent, manifest_path.resolve().parent}:
         raise ValueError("E_NATIVE_REVIEW_OUTPUT_INVALID")
     initial = []
@@ -824,7 +1158,7 @@ def collect_native_rewrite(
         result = _bound_result(segment)
         if result.candidate_digest != stable_hash(result.text):
             raise ValueError("E_NATIVE_REVIEW_CANDIDATE_STALE")
-        native = [a for a in result.attempts if a.stage == "review"
+        native = [a for a in result.attempts if a.stage in JUDGE_STAGES
                   and a.candidate_generation == result.candidate_generation]
         if not native or not result.metadata.get("rewrite_issues"):
             raise ValueError("E_NATIVE_REVIEW_REWRITE_NOT_FLAGGED")
@@ -834,7 +1168,7 @@ def collect_native_rewrite(
         initial.append(result)
     output.mkdir(parents=True, exist_ok=True)
     merged = output / "native-corrections.jsonl"
-    summary = merge_native_pass(work_dir, segments, merged, manifest_path=manifest_path)
+    summary = merge_native_pass(work_dir, ordered_source, merged, manifest_path=manifest_path)
     rows = _read_jsonl(merged)
     provider = (manifest.get("route_binding") or {}).get("provider")
     confirmation, unresolved, results, awaiting = [], [], [], []
@@ -849,13 +1183,16 @@ def collect_native_rewrite(
         integrity = (validate_integrity(segment, row["text"], glossary or [],
                      extra_patterns=extra_patterns, max_length_ratio=max_length_ratio)
                      if row["status"] == "success" else [])
-        valid = row["status"] == "success" and not integrity
+        language = (target_language_review_reasons(row["text"], target_language, segment.metadata)
+                    if row["status"] == "success" and result.metadata.get("target_language_risk")
+                    else [])
+        valid = row["status"] == "success" and not integrity and not language
         interrupted = row["provider"] == "native-control" and row.get("issues") in (
             ["worker_not_started"], ["worker_interrupted"],
         )
         result.attempts.append(AttemptRecord(
             "review-rewrite", row_provider, "success" if valid else "error",
-            issues=[item.code for item in integrity] if integrity else list(row.get("issues", [])),
+            issues=[item.code for item in integrity] + language if integrity or language else list(row.get("issues", [])),
             ordinal=1 + sum(a.stage == "review-rewrite" and a.provider == row_provider
                             and a.operational is not True for a in result.attempts),
             candidate_generation=result.candidate_generation,
@@ -901,6 +1238,11 @@ def collect_native_rewrite(
             unresolved.append(_pending_segment(segment, result))
         results.append(result)
     write_results(output / "results.json", results)
+    if routing.get("review_triagers"):
+        predecessor = stable_hash(manifest)
+        parents = _review_queue_parents(segments)
+        _issue_review_queue(work_dir, confirmation, "confirmation", predecessor, parents)
+        _issue_review_queue(work_dir, unresolved, "rewrite_retry", predecessor, parents)
     for name, items in (("confirmation-input.jsonl", confirmation),
                         ("unresolved-input.jsonl", unresolved), ("awaiting-input.jsonl", awaiting)):
         _atomic_jsonl(output / name, (asdict(item) for item in items))
@@ -960,17 +1302,35 @@ def process_native_review_followup(
             primary_review_provider = NATIVE_ROLE_ROUTES["strong-review"]
     primary_model = runtime_models.get(primary_review_provider, "")
     stage = "review" if operation == "judge" else "review-rewrite"
+    routing = config.get("routing", {})
+    audited = bool(routing.get("review_triagers"))
+    review_selection = _review_admission(work_dir, segments, routing, stage=stage)
+    if audited:
+        routes = routing.get("reviewers" if operation == "judge" else "rewriters", [])
+        if not routes:
+            raise ValueError("E_NATIVE_REVIEW_ROUTE_REQUIRED: configure the requested review role")
 
     def next_route(segment: Segment, result: TranslationResult) -> str:
         groups = partition_native_review_routes(
             [_pending_segment(segment, result)], routes, stage=stage,
             route_models=runtime_models,
-            attempt_limits=orchestrator.config.review_attempt_limits,
-            tier_limit=orchestrator.config.strong_max_calls,
+            attempt_limits=(routing.get("review_attempt_limits", {}) if audited
+                            else orchestrator.config.review_attempt_limits),
+            tier_limit=(routing.get("strong_max_calls") if audited
+                        else orchestrator.config.strong_max_calls) if operation == "judge" else None,
+            candidate_model_routes=routing.get("review_candidate_model_routes"),
         )
         return next(iter(groups))
 
+    def needs_rewrite(result: TranslationResult, route: str) -> bool:
+        if not result.metadata.get("rewrite_issues") or not route:
+            return False
+        last = _last_review_attempt(result)
+        return last is not None and last.provider == route
+
     def external_provider(route: str) -> Any:
+        if route.startswith("native-") and audited:
+            raise ValueError("E_NATIVE_REVIEW_NATIVE_FALLBACK_REQUIRED: prepare the configured native role route")
         try:
             return orchestrator.registry.get(route)
         except ConfigurationError:
@@ -979,12 +1339,17 @@ def process_native_review_followup(
             raise
 
     results_path = output / "results.json"
-    saved = read_translation_results(results_path) if results_path.is_file() else []
+    cache_path = (_review_receipt_path(
+        work_dir, stable_hash(output.resolve().relative_to(work_dir).as_posix()),
+        directory=_REVIEW_FOLLOWUP_CACHE,
+    ) if audited else results_path)
+    saved = read_translation_results(cache_path) if cache_path.is_file() else []
     cached = {item.segment_id: item for item in saved}
     if len(cached) != len(saved) or not set(cached) <= {s.id for s in segments}:
         raise ValueError("E_NATIVE_REVIEW_FOLLOWUP_CACHE_INVALID")
     providers: dict[str, Any] = {}
     prepared: list[tuple[Segment, TranslationResult, str]] = []
+    blocked = 0
     for segment in segments:
         result = _bound_result(segment)
         native = [a for a in result.attempts
@@ -992,14 +1357,24 @@ def process_native_review_followup(
                   and a.stage in JUDGE_STAGES
                   and a.candidate_generation == result.candidate_generation
                   and (not primary_model or a.model == primary_model)]
-        if not native or result.status == "reviewed":
+        if not audited and (not native or result.status == "reviewed"):
             raise ValueError("E_NATIVE_REVIEW_PRIMARY_BARRIER_REQUIRED")
         if operation == "rewrite" and not result.metadata.get("rewrite_issues"):
             raise ValueError("E_NATIVE_REVIEW_REWRITE_NOT_FLAGGED")
-        if (operation == "judge" and native[-1].status not in {"error", "refused"}
+        if (not audited and operation == "judge" and native[-1].status not in {"error", "refused"}
                 and (primary_review_limit is None
                      or judge_calls(native, primary_review_provider) < primary_review_limit)):
             raise ValueError("E_NATIVE_REVIEW_FALLBACK_NOT_FAILED")
+        if (not audited and operation == "judge" and native[-1].status == "approved"
+                and not result.metadata.get("rewrite_issues")):
+            raise ValueError("E_NATIVE_REVIEW_FALLBACK_NOT_FAILED")
+        prior = cached.get(segment.id)
+        if audited and (
+            (_review_candidate_locked(work_dir, segment) and (prior is None or prior.status != "reviewed"))
+            or (prior is None and _review_queue_superseded(work_dir, segment))
+        ):
+            blocked += 1
+            continue
         route = next_route(segment, result)
         provider = external_provider(route) if route else None
         fingerprint = stable_hash({
@@ -1007,7 +1382,6 @@ def process_native_review_followup(
             "provider": provider.fingerprint() if provider is not None else None,
             "context": asdict(orchestrator.context_pack) if orchestrator.context_pack is not None else None,
         })
-        prior = cached.get(segment.id)
         if prior and (prior.source != segment.source or
                       prior.metadata.get("native_review_request_fingerprint") != fingerprint):
             raise ValueError("E_NATIVE_REVIEW_FOLLOWUP_CACHE_STALE")
@@ -1018,6 +1392,8 @@ def process_native_review_followup(
                 route = ""
             else:
                 route = next_route(segment, result)
+                if audited and operation == "judge" and needs_rewrite(result, route):
+                    route = ""
                 provider = external_provider(route) if route else None
         providers[segment.id] = provider
         prepared.append((segment, result, fingerprint))
@@ -1035,6 +1411,8 @@ def process_native_review_followup(
         clean = replace(segment, metadata={k: v for k, v in segment.metadata.items()
                         if k not in {CANDIDATE_METADATA_KEY, REVIEW_STATE_KEY}})
         result.metadata["native_review_request_fingerprint"] = fingerprint
+        if audited and operation == "judge":
+            result.metadata.pop("rewrite_issues", None)
         result.status = "failed"
         if operation == "judge":
             verdict = orchestrator._judge_with_refusal_retry(
@@ -1127,15 +1505,19 @@ def process_native_review_followup(
             break
         chunk = pending[offset:offset + wave_size]
         with ThreadPoolExecutor(max_workers=wave_size) as pool:
-            completed = [result for result in pool.map(run, chunk) if result is not None]
-        authentication_pending += len(chunk) - len(completed)
+            outcomes = list(pool.map(run, chunk))
+        completed = [result for result in outcomes if result is not None]
+        authentication_pending += len(outcomes) - len(completed)
         if not completed:
             continue
         for result in completed:
             cached[result.segment_id] = result
         executed += len(completed)
-        _atomic_json(results_path, {"results": [cached[s.id].to_dict() for s in segments
-                                                if s.id in cached]})
+        payload = {"results": [cached[s.id].to_dict() for s in segments if s.id in cached]}
+        _atomic_json(cache_path, payload)
+        if audited:
+            _lock_review_approvals(work_dir, [item for item in completed if item.status == "reviewed"])
+            _atomic_json(results_path, payload)
         if progress_callback is not None:
             try:
                 progress_callback(
@@ -1154,11 +1536,17 @@ def process_native_review_followup(
                 )
             except (TypeError, ValueError, OSError):
                 pass
+    if audited and saved and not executed:
+        # The Core cache is the authority even if its public projection was
+        # interrupted between the two atomic writes.
+        _atomic_json(results_path, {"results": [item.to_dict() for item in saved]})
     accepted, rewrite, confirmation, unresolved = [], [], [], []
-    for segment, initial, _ in prepared:
+    fallback = []
+    awaiting = []
+    for segment, _, _ in prepared:
         result = cached.get(segment.id)
         if result is None:
-            unresolved.append(segment)
+            (awaiting if audited else unresolved).append(segment)
             continue
         if result.status == "reviewed" and target_language_review_reasons(
             result.text, orchestrator.project.target_language, segment.metadata
@@ -1178,7 +1566,7 @@ def process_native_review_followup(
                 "provider": next(
                     (attempt.provider for attempt in reversed(result.attempts)
                      if attempt.stage.startswith("review-rewrite") and attempt.status == "success"),
-                    providers[segment.id].name,
+                    result.translator,
                 ),
             }
             current = result.metadata.get("content_provenance")
@@ -1208,18 +1596,38 @@ def process_native_review_followup(
             confirmation.append(
                 _pending_segment(replace(segment, metadata=metadata), result)
             )
-        elif operation == "judge" and result.metadata.get("rewrite_issues"):
-            rewrite.append(_pending_segment(segment, result))
+        elif operation == "judge":
+            if not audited:
+                (rewrite if result.metadata.get("rewrite_issues") else unresolved).append(
+                    _pending_segment(segment, result)
+                )
+            elif needs_rewrite(result, next_route(segment, result)):
+                rewrite.append(_pending_segment(segment, result))
+            else:
+                fallback.append(_pending_segment(segment, result))
         else:
             unresolved.append(_pending_segment(segment, result))
     write_results(output / "accepted.json", accepted)
+    if audited:
+        _lock_review_approvals(work_dir, accepted)
+        predecessor = stable_hash_sequence(asdict(segment) for segment in segments)
+        parents = _review_queue_parents(segments)
+        _issue_review_queue(work_dir, rewrite, "rewrite", predecessor, parents)
+        _issue_review_queue(work_dir, confirmation, "confirmation", predecessor, parents)
+        _issue_review_queue(work_dir, fallback, "judge_fallback", predecessor, parents)
+        _issue_review_queue(work_dir, unresolved, "rewrite_retry", predecessor, parents)
+        _atomic_jsonl(output / "awaiting-input.jsonl", (asdict(item) for item in awaiting))
+        _atomic_jsonl(output / "fallback-input.jsonl", (asdict(item) for item in fallback))
     for name, items in (("rewrite-input.jsonl", rewrite),
                         ("confirmation-input.jsonl", confirmation),
                         ("unresolved-input.jsonl", unresolved)):
         _atomic_jsonl(output / name, (asdict(item) for item in items))
     return {"records": len(segments), "executed": executed, "cached": len(saved),
             "accepted": len(accepted), "rewrite_pending": len(rewrite),
-            "confirmation_pending": len(confirmation), "unresolved": len(unresolved),
+            **({"fallback_pending": len(fallback), "awaiting": len(awaiting),
+                "locked_or_superseded": blocked,
+                "review_selection": review_selection} if audited else {}),
+            "confirmation_pending": len(confirmation), "unresolved": len(unresolved) + len(awaiting),
             "deadline_pending": len(pending) - executed - authentication_pending,
             "authentication_pending": authentication_pending,
             "output": output.relative_to(work_dir).as_posix()}
