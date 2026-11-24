@@ -20,6 +20,9 @@ For automatic loose-asset inventory, Core discovers and hash-binds image/font ca
 When the approved scope forbids recursive image enumeration, start an `image_ui_inventory` relay with `--purpose engine_media_bindings` and exact, known metadata seeds passed as `--inspection-asset`. `engine-media-bindings-status --relay <relay>` exposes only sealed references and unresolved counts. Bind only the resulting in-scope assets in follow-up relays. The metadata probe does not establish visual completeness or `no_targets`.
 
 Add `--verify-fonts` to that status command for deterministic Unicode cmap coverage of the sealed local font references. It reports counts only and does not install, copy, or replace fonts; a character map is not evidence of in-engine layout.
+`--verify-fonts-against-final-text` additionally reports unique supported and
+missing codepoint counts for the current hash-bound finalized text. It checks
+only sealed font references and does not change the selected font.
 
 An activated SDK may report embedded image and font object bindings against the exact supplied archive path and digest. The sealed status exposes object counts only; those counts do not verify glyph coverage, decode original pixels, or establish image-translation eligibility.
 
@@ -44,6 +47,11 @@ Each `parr0t.image-ui-results.v1` row binds the original asset and every confirm
 - atlas layout, rotation, region placement, and animation references are preserved or proved inapplicable;
 - pixels outside declared text regions are unchanged;
 - each declared region has a result with source lineage and preserved placeholders/control data.
+
+For noninterlaced 8-bit RGBA PNG, Core also compares the decoded samples against
+the exact source digest and rejects changes outside the verified rectangles,
+regardless of the worker's integrity flags. Other formats still require the
+selected SDK's format-specific evidence.
 
 Independent visual review is reported distinctly from user-accepted unreviewed work. A worker cannot claim user acceptance. If the user explicitly accepts exact unreviewed assets, record that bounded decision after scope verification:
 
