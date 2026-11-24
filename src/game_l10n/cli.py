@@ -4626,7 +4626,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     review_queues = sub.add_parser(
         "resume-native-review-queues",
-        help="Recover only unapproved targets from existing private native review queues",
+        help="Recover unapproved targets and group ready review work by its next exact route",
     )
     review_queues.add_argument("--workspace", required=True)
     review_queues.add_argument("--input", required=True, help="Independently verified primary inventory")

@@ -162,14 +162,21 @@ class ReviewPolicyTests(unittest.TestCase):
             lock = threading.Lock()
             def handler(role, expected, verdict):
                 barrier = threading.Barrier(expected)
+                first = True
                 def run(**kwargs):
+                    nonlocal first
+                    verdict_result = {"verdict": verdict, "issues": ["meaning"] if verdict == "rewrite" else []}
                     with lock:
+                        if first:
+                            # An exact binding's initial request must finish before its peers enter.
+                            first = False
+                            return verdict_result
                         active[role] += 1
                         peak[role] = max(peak[role], active[role])
                     barrier.wait(timeout=5)
                     with lock:
                         active[role] -= 1
-                    return {"verdict": verdict, "issues": ["meaning"] if verdict == "rewrite" else []}
+                    return verdict_result
                 return run
             translator = ScriptedProvider("translator", lambda **_: {"status": "success", "text": "\ub300\uc0c1", "reason": ""})
             weak = ScriptedProvider("weak", handler("weak", 3, "rewrite"))
@@ -181,6 +188,7 @@ class ReviewPolicyTests(unittest.TestCase):
                     defer_fallbacks_until_primary_complete=True, use_style_memory=False),
                 project=ProjectContext("TEST", "en", "ko"), work_dir=Path(directory),
             )
+            self.assertEqual(orchestrator.translate_many([Segment("initial", "Initial source")])[0].status, "reviewed")
             results = orchestrator.translate_many([Segment(f"fixture-{index}", f"Source {index}") for index in range(6)])
             self.assertTrue(all(result.status == "reviewed" for result in results))
             self.assertEqual(peak, {"weak": 3, "strong": 2})
