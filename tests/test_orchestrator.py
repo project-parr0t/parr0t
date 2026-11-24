@@ -23,6 +23,31 @@ from game_l10n.store import stable_hash
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_auth_block_is_shared_across_roles_but_does_not_block_a_healthy_route(self):
+        def reject(**_):
+            raise ProviderFailure("authentication_error", retryable=False)
+
+        def accept(*, schema_name, **_):
+            if schema_name == "game_translation_review_judge":
+                return {"verdict": "ok", "issues": []}
+            return {"status": "success", "text": "\ud569\uc131 \ubc88\uc5ed"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            blocked = ScriptedProvider("blocked", reject)
+            healthy = ScriptedProvider("healthy", accept)
+            engine = LocalizationOrchestrator(
+                registry=ProviderRegistry({"blocked": blocked, "healthy": healthy}),
+                config=OrchestratorConfig(["blocked", "healthy"], ["blocked", "healthy"],
+                                          max_workers=4, use_style_memory=False),
+                project=ProjectContext("SYNTHETIC", "ja", "ko"), work_dir=Path(directory).resolve(),
+            )
+            segments = [Segment(f"s-{i}", "SYNTHETIC SOURCE") for i in range(6)]
+            translations = engine.translate_many(segments)
+            self.assertEqual([(row.status, row.translator, row.reviewer) for row in translations],
+                             [("reviewed", "healthy", "healthy")] * 6)
+            self.assertEqual((blocked.call_count, healthy.call_count), (1, 12))
+            self.assertEqual(sum(a.provider == "blocked" for row in translations for a in row.attempts), 1)
+
     def test_repaired_transport_does_not_hide_an_unknown_prefix_before_operational_counter(self):
         class Repairable(ScriptedProvider):
             revision = 0

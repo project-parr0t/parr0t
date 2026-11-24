@@ -57,6 +57,10 @@ from .review_policy import (
 from .validators import preflight_constraint_issues, validate_integrity
 
 
+class _ProviderAuthenticationBlocked(Exception):
+    """This execution already observed authentication failure; no call started."""
+
+
 @dataclass(slots=True)
 class OrchestratorConfig:
     translator_chain: list[str]
@@ -173,6 +177,8 @@ class LocalizationOrchestrator:
         self._progress_attempts = 0
         self._provider_cooldown_lock = threading.Lock()
         self._provider_cooldowns: dict[str, float] = {}
+        self._provider_auth_condition = threading.Condition()
+        self._provider_auth: dict[tuple[str, str], str] = {}
         semantic_config = asdict(config)
         semantic_config.pop("max_workers", None)
         semantic_config.pop("review_attempt_limits", None)
@@ -595,6 +601,47 @@ class LocalizationOrchestrator:
             return FailureCode.MALFORMED_RESPONSE.value, True
         return FailureCode.PROVIDER_ERROR.value, True
 
+    @staticmethod
+    def _provider_auth_key(provider: ModelProvider) -> tuple[str, str]:
+        return provider.name, stable_hash(provider.fingerprint())
+
+    def _invoke_provider(self, provider: ModelProvider, call: Callable, **kwargs):
+        """Single-flight the first request for each exact binding, not the workload."""
+        key = self._provider_auth_key(provider)
+        condition = self._provider_auth_condition
+        with condition:
+            condition.wait_for(lambda: self._provider_auth.get(key) != "probing")
+            state = self._provider_auth.get(key)
+            if state == "blocked":
+                raise _ProviderAuthenticationBlocked()
+            if state is None:
+                self._provider_auth[key] = "probing"
+        try:
+            response = call(**kwargs)
+        except BaseException as exc:
+            authenticated_failure = (
+                isinstance(exc, ProviderFailure) and exc.code == FailureCode.AUTHENTICATION_ERROR.value
+            )
+            with condition:
+                if authenticated_failure:
+                    self._provider_auth[key] = "blocked"
+                elif state is None:
+                    self._provider_auth.pop(key)
+                if authenticated_failure or state is None:
+                    condition.notify_all()
+            raise
+        if state is None:
+            with condition:
+                self._provider_auth[key] = "ready"
+                condition.notify_all()
+        return response
+
+    @staticmethod
+    def _authentication_pending(result: TranslationResult) -> bool:
+        return result.metadata.get("provider_authentication_blocked") is True or any(
+            attempt.issue_code == FailureCode.AUTHENTICATION_ERROR.value for attempt in result.attempts
+        )
+
     def _can_grace_retry(self, code: str, ordinal: int) -> bool:
         return ordinal <= self.config.grace_retries and code in self.config.grace_retry_codes
 
@@ -633,7 +680,8 @@ class LocalizationOrchestrator:
             retry_feedback,
         )
         return self._translation_envelope(
-            provider.generate_json(
+            self._invoke_provider(
+                provider, provider.generate_json,
                 system=system,
                 user=user,
                 schema=TRANSLATION_SCHEMA,
@@ -664,7 +712,8 @@ class LocalizationOrchestrator:
             plain_verdict,
         )
         return self._review_verdict_envelope(
-            provider.generate_review_verdict(
+            self._invoke_provider(
+                provider, provider.generate_review_verdict,
                 system=system,
                 user=user,
                 schema=REVIEW_JUDGE_SCHEMA,
@@ -697,7 +746,8 @@ class LocalizationOrchestrator:
             retry_feedback,
         )
         return self._translation_envelope(
-            provider.generate_json(
+            self._invoke_provider(
+                provider, provider.generate_json,
                 system=system,
                 user=user,
                 schema=REVIEW_REWRITE_SCHEMA,
@@ -735,8 +785,10 @@ class LocalizationOrchestrator:
                 ]
         elif previous and previous[-1].retryable is None and previous[-1].operational is False:
             retry_stage = "translate-status-retry"
-        allowed, _ = self._route_eligibility(result, provider.name, "translate")
+        allowed, issue = self._route_eligibility(result, provider.name, "translate")
         if not allowed:
+            if issue == "provider_authentication_blocked":
+                result.metadata["provider_authentication_blocked"] = True
             return None
         while True:
             self._require_execution()
@@ -769,6 +821,9 @@ class LocalizationOrchestrator:
                         operational=False,
                     ),
                 )
+            except _ProviderAuthenticationBlocked:
+                result.metadata["provider_authentication_blocked"] = True
+                return None
             except Exception as exc:
                 duration = int((time.monotonic() - started) * 1000)
                 code, retryable = self._failure(exc)
@@ -908,8 +963,10 @@ class LocalizationOrchestrator:
         retry_stage = f"{stage_prefix}-grace-retry"
         if pending and pending[-1].status == "refused":
             retry_stage = f"{stage_prefix}-refusal-retry"
-        allowed, _ = self._route_eligibility(result, provider.name, stage_prefix)
+        allowed, issue = self._route_eligibility(result, provider.name, stage_prefix)
         if not allowed:
+            if issue == "provider_authentication_blocked":
+                result.metadata["provider_authentication_blocked"] = True
             return None
         while True:
             self._require_execution()
@@ -953,6 +1010,9 @@ class LocalizationOrchestrator:
                         operational=False,
                     ),
                 )
+            except _ProviderAuthenticationBlocked:
+                result.metadata["provider_authentication_blocked"] = True
+                return None
             except Exception as exc:
                 duration = int((time.monotonic() - started) * 1000)
                 code, retryable = self._failure(exc)
@@ -1047,8 +1107,10 @@ class LocalizationOrchestrator:
                     {"code": code, "detail": "Previously recorded deterministic validation failure"}
                     for code in rejection.issues
                 ]
-        allowed, _ = self._route_eligibility(result, provider.name, "review-rewrite")
+        allowed, issue = self._route_eligibility(result, provider.name, "review-rewrite")
         if not allowed:
+            if issue == "provider_authentication_blocked":
+                result.metadata["provider_authentication_blocked"] = True
             return None
         while True:
             self._require_execution()
@@ -1086,6 +1148,9 @@ class LocalizationOrchestrator:
                         operational=False,
                     ),
                 )
+            except _ProviderAuthenticationBlocked:
+                result.metadata["provider_authentication_blocked"] = True
+                return None
             except Exception as exc:
                 duration = int((time.monotonic() - started) * 1000)
                 code, retryable = self._failure(exc)
@@ -1475,7 +1540,8 @@ class LocalizationOrchestrator:
 
         if candidate is None:
             if not result.errors:
-                result.errors.append("All translation routes were exhausted")
+                result.errors.append("Provider authentication requires repair" if self._authentication_pending(result)
+                                     else "All translation routes were exhausted")
         elif not self.config.require_review:
             self._accept_translation_candidate(result, segment, candidate)
         else:
@@ -1487,16 +1553,20 @@ class LocalizationOrchestrator:
                     result, segment, candidate, anchors
                 )
             if result.status != "reviewed":
-                result.errors.append("All review routes were exhausted")
-                self._accept_after_review_refusal(result, segment, candidate)
+                if self._authentication_pending(result):
+                    result.errors.append("Provider authentication requires repair")
+                else:
+                    result.errors.append("All review routes were exhausted")
+                    self._accept_after_review_refusal(result, segment, candidate)
 
         if result.status in {"translated", "reviewed", "accepted_unreviewed"}:
+            result.metadata.pop("provider_authentication_blocked", None)
             self.store.put(cache_key, result)
             self._remember_result(segment, result)
             return result
-        if self.config.preserve_source_on_failure or (
-            candidate is not None
-            and self.config.review_refusal_policy == "source_preserve"
+        if not self._authentication_pending(result) and (
+            self.config.preserve_source_on_failure
+            or (candidate is not None and self.config.review_refusal_policy == "source_preserve")
         ):
             result.text = segment.source
             result.status = "source_preserved"
@@ -1569,21 +1639,27 @@ class LocalizationOrchestrator:
         if needs_strong_review:
             candidate = self._run_strong_review(result, segment, candidate, anchors)
         if result.status == "reviewed":
+            result.metadata.pop("provider_authentication_blocked", None)
             self._remember(segment, result.text)
             self.audit.append(
                 {"segment_id": result.segment_id, "stage": "complete", "status": result.status}
             )
             return result
 
-        result.errors.append("All review routes were exhausted for existing candidate")
-        if self._accept_after_review_refusal(result, segment, candidate):
-            return result
+        if self._authentication_pending(result):
+            result.errors.append("Provider authentication requires repair")
+        else:
+            result.errors.append("All review routes were exhausted for existing candidate")
+            if self._accept_after_review_refusal(result, segment, candidate):
+                return result
         return self._preserve_or_fail_existing(segment, result)
 
     def _preserve_or_fail_existing(
         self, segment: Segment, result: TranslationResult
     ) -> TranslationResult:
-        if self.config.preserve_source_on_failure or self.config.review_refusal_policy == "source_preserve":
+        if not self._authentication_pending(result) and (
+            self.config.preserve_source_on_failure or self.config.review_refusal_policy == "source_preserve"
+        ):
             result.text = segment.source
             result.status = "source_preserved"
             result.resolution_code = FailureCode.SOURCE_PRESERVED.value
@@ -1978,6 +2054,7 @@ class LocalizationOrchestrator:
                 if self._accept_translation_candidate(
                     result, items[index], candidates[index]
                 ):
+                    result.metadata.pop("provider_authentication_blocked", None)
                     self.store.put(cache_keys[index], result)
                     self._remember_result(items[index], result)
                 else:
@@ -2037,6 +2114,7 @@ class LocalizationOrchestrator:
                         elif outcome == "strong":
                             strong_pending.append(index)
                         else:
+                            result.metadata.pop("provider_authentication_blocked", None)
                             self.store.put(cache_keys[index], result)
                             self._remember_result(items[index], result)
                     triage_pending = sorted(next_triage_pending)
@@ -2126,6 +2204,7 @@ class LocalizationOrchestrator:
                     result.review_outcome = review_outcome
                     result.acceptance_authority = "reviewer"
                     result.metadata["review_tier"] = "strong"
+                    result.metadata.pop("provider_authentication_blocked", None)
                     self.store.put(cache_keys[index], result)
                     self._remember_result(items[index], result)
                 pending_review = sorted(next_pending)
@@ -2170,6 +2249,9 @@ class LocalizationOrchestrator:
         for index in sorted(failed_translation | failed_review):
             result = results[index]
             assert result is not None
+            if self._authentication_pending(result):
+                result.errors.append("Provider authentication requires repair")
+                continue
             if index in failed_translation:
                 if index not in preflight_failures:
                     result.errors.append("All translation routes were exhausted")
@@ -2353,6 +2435,9 @@ class LocalizationOrchestrator:
                              if item.operational is True and item.ordinal > semantic_maximum}
         if later_operational and max(later_operational) - semantic_maximum != len(later_operational):
             return False, "historical_failure_evidence_unknown"
+        with self._provider_auth_condition:
+            if self._provider_auth.get((provider_name, fingerprint)) == "blocked":
+                return False, "provider_authentication_blocked"
         if role == "translate":
             limit = self._translation_attempt_limit(provider_name)
         elif role == "review":
@@ -2454,6 +2539,7 @@ class LocalizationOrchestrator:
                 if code in {
                     "historical_route_binding_unknown", "historical_failure_evidence_unknown",
                     "operational_route_unchanged", "candidate_lineage_repair_required",
+                    "provider_authentication_blocked",
                 }:
                     issue = code
                 continue
@@ -2632,6 +2718,7 @@ class LocalizationOrchestrator:
             result = self._result_from_state(prior.to_dict()) if prior is not None else TranslationResult(
                 segment.id, segment.source, metadata=segment.metadata.copy(),
             )
+            result.metadata.pop("provider_authentication_blocked", None)
             anchors = self._anchors(segment)
             while True:
                 continuation = self.continuation_status(segment, result)
