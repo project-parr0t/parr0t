@@ -17,6 +17,11 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _CONTROL_ROLES = {"shared_control_value", "lookup_key", "index", "script_operand"}
 DISPLAY_SCOPE_SCHEMA = "parr0t.display-scope.v1"
 DISPLAY_SCOPE_EVIDENCE_FIELD = "display_scope_evidence"
+TEXT_ELIGIBILITY_CONTRACT = "parr0t.text-eligibility.v1"
+_TEXT_SOURCE_FIELDS = {
+    "route", "locale_probe", "evidence_fingerprint", "screen_review", "pending_display_count",
+}
+_ROW_ELIGIBILITY_FIELDS = {"storage_role", "display_binding_id", DISPLAY_SCOPE_EVIDENCE_FIELD}
 
 
 class ActiveControlStorageError(ConfigurationError):
@@ -62,6 +67,16 @@ class _BasisSnapshot:
     fingerprint: str
 
 
+def _inventory_source_fingerprint(payload: dict[str, Any]) -> str:
+    identity = {key: payload[key] for key in (
+        "schema", "method", "implementation_fingerprint", "coverage", "segments"
+    )}
+    coverage = identity["coverage"]
+    if "extraction_evidence" in coverage:
+        identity["coverage"] = {key: value for key, value in coverage.items() if key != "extraction_evidence"}
+    return stable_hash(identity)
+
+
 def _read_basis(path: Path, expected_sha256: str) -> _BasisSnapshot:
     try:
         raw = path.read_bytes()
@@ -78,9 +93,7 @@ def _read_basis(path: Path, expected_sha256: str) -> _BasisSnapshot:
             or not isinstance(original.get("coverage"), dict)):
         raise _invalid()
     rows = _rows_by_key(original.get("segments"))
-    fingerprint = stable_hash({key: original[key] for key in (
-        "schema", "method", "implementation_fingerprint", "coverage", "segments"
-    )})
+    fingerprint = _inventory_source_fingerprint(original)
     return _BasisSnapshot(digest, original, rows, fingerprint)
 
 
@@ -257,17 +270,87 @@ def inventory_scope(
     }
 
 
+def _validate_text_source(
+    coverage: Any, *, required: bool, screen_review_skip: bool | None,
+) -> str | None:
+    if not isinstance(coverage, dict) or "text_source" not in coverage:
+        if required:
+            raise ConfigurationError("Inventory requires a coverage.text_source declaration")
+        return None
+    declaration = coverage["text_source"]
+    if not isinstance(declaration, dict) or declaration.keys() != _TEXT_SOURCE_FIELDS:
+        raise ConfigurationError("Inventory coverage.text_source has an invalid shape")
+    route = declaration["route"]
+    fingerprint = declaration["evidence_fingerprint"]
+    pending = declaration["pending_display_count"]
+    screen_review = declaration["screen_review"]
+    if not isinstance(fingerprint, str) or _SHA256.fullmatch(fingerprint) is None:
+        raise ConfigurationError("Inventory text source requires a lowercase SHA-256 evidence fingerprint")
+    if type(pending) is not int or pending < 0:
+        raise ConfigurationError("Inventory pending_display_count must be a non-negative integer")
+    if not isinstance(coverage.get("declared_complete"), bool):
+        raise ConfigurationError("Inventory coverage.declared_complete must be boolean")
+    if route == "locale_data":
+        if (declaration["locale_probe"] != "applicable"
+                or screen_review != "not_applicable" or pending != 0):
+            raise ConfigurationError(
+                "Inventory locale data requires an applicable locale probe and no screen review or pending display text"
+            )
+        if "scope_correction" in coverage or "static_scope" in coverage:
+            raise ConfigurationError("Inventory locale data cannot use scope correction or static scope")
+    elif route == "display_extraction":
+        if (declaration["locale_probe"] != "unavailable"
+                or screen_review not in ("static", "user_skipped")):
+            raise ConfigurationError(
+                "Inventory display extraction requires an unavailable locale probe and a screen review disposition"
+            )
+        if (screen_review == "user_skipped" and (required or screen_review_skip is not None)
+                and screen_review_skip is not True):
+            raise ConfigurationError("Inventory screen review skip requires task approval")
+        if coverage["declared_complete"] and pending:
+            raise ConfigurationError("Complete inventory cannot have pending display text")
+    else:
+        raise ConfigurationError("Inventory text source route is invalid")
+    return route
+
+
+def _validate_row_eligibility(
+    row: dict[str, Any], metadata: dict[str, Any], evidence: dict[str, Any], *, locale: bool,
+) -> None:
+    # Segment readers merge top-level extras over metadata; eligibility cannot be overridden.
+    if not _ROW_ELIGIBILITY_FIELDS.isdisjoint(row):
+        raise ConfigurationError("Inventory target eligibility fields must appear only in metadata")
+    if locale:
+        if (metadata.get("storage_role") != "locale_value" or evidence.get("kind") != "locale_value"
+                or evidence.get("binding_basis") != "locale_catalog"):
+            raise ConfigurationError("Inventory locale targets require locale value storage and catalog evidence")
+    elif (metadata.get("storage_role") != "display_value"
+            or evidence.get("kind") != "positive_display_binding"
+            or evidence.get("binding_basis") not in ("format_field", "render_argument")):
+        raise ConfigurationError(
+            "Inventory display targets require display value storage and a positive format or render binding"
+        )
+
+
 def _validate_active_display_scope(
     payload: dict[str, Any], active_rows: list[dict[str, Any]], *, required: bool = False,
+    required_text_source: bool = False, screen_review_skip: bool | None = None,
 ) -> None:
     """Check declared eligibility before attestation or any segment consumer."""
     coverage = payload.get("coverage")
-    required = required or (isinstance(coverage, dict) and coverage.get("scope_correction") is not None)
+    route = _validate_text_source(
+        coverage, required=required_text_source, screen_review_skip=screen_review_skip,
+    )
+    required = required or route is not None or (
+        isinstance(coverage, dict) and coverage.get("scope_correction") is not None
+    )
     tracking = coverage.get("display_scope") if isinstance(coverage, dict) else None
     if tracking is None and not required:
         return
     if not isinstance(tracking, dict) or tracking.get("schema") != DISPLAY_SCOPE_SCHEMA:
         raise ConfigurationError("Inventory requires a valid coverage.display_scope declaration")
+    if route is not None and not isinstance(active_rows, list):
+        raise ConfigurationError("Inventory segments must be a list")
     for key in ("raw_occurrence_count", "display_candidate_count", "control_only_count", "unclassified_count"):
         value = tracking.get(key)
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -281,19 +364,39 @@ def _validate_active_display_scope(
         raise ConfigurationError("Inventory display scope requires an evidence_fingerprint")
     if tracking["display_candidate_count"] != len(active_rows):
         raise ConfigurationError("Inventory display candidate count must match segments")
+    locale = route == "locale_data"
+    if locale and (tracking["control_only_count"] or tracking["unclassified_count"]
+                   or tracking["raw_occurrence_count"] != len(active_rows)):
+        raise ConfigurationError("Inventory locale accounting must count only active locale values")
+    evidence_error = (
+        "Every inventory target requires display binding or dependency evidence" if route is None
+        else "Every inventory target requires source-bound eligibility evidence"
+    )
     for row in active_rows:
         metadata = row.get("metadata", {}) if isinstance(row, dict) else {}
         evidence = metadata.get(DISPLAY_SCOPE_EVIDENCE_FIELD) if isinstance(metadata, dict) else None
         if (
             not isinstance(evidence, dict)
-            or evidence.get("kind") not in {"positive_display_binding", "possible_display_dependency"}
+            or (route is None and evidence.get("kind") not in (
+                "positive_display_binding", "possible_display_dependency",
+            ))
             or not isinstance(evidence.get("evidence_fingerprint"), str)
             or _SHA256.fullmatch(evidence["evidence_fingerprint"]) is None
             or not isinstance(row.get("source"), str)
-            or evidence.get("source_sha256") != sha256(row["source"].encode("utf-8")).hexdigest()
             or not isinstance(metadata.get("display_binding_id"), str)
             or not metadata["display_binding_id"].strip()
         ):
-            raise ConfigurationError("Every inventory target requires display binding or dependency evidence")
-        if metadata.get("storage_role") in _CONTROL_ROLES:
+            raise ConfigurationError(evidence_error)
+        try:
+            source_digest = sha256(row["source"].encode("utf-8")).hexdigest()
+        except UnicodeEncodeError as exc:
+            raise ConfigurationError(
+                "E_INVENTORY_INVALID_UNICODE: inventory strings must contain Unicode scalar values"
+            ) from exc
+        if evidence.get("source_sha256") != source_digest:
+            raise ConfigurationError(evidence_error)
+        storage_role = metadata.get("storage_role")
+        if isinstance(storage_role, str) and storage_role in _CONTROL_ROLES:
             raise ActiveControlStorageError()
+        if route is not None:
+            _validate_row_eligibility(row, metadata, evidence, locale=locale)

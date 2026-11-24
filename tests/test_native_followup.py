@@ -27,6 +27,50 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 class NativeFollowupTests(unittest.TestCase):
+    def test_collect_partial_translation_successes_without_restarting_review(self) -> None:
+        from game_l10n.native_followup import collect_native_translation_candidates
+        from game_l10n.native_pass import import_native_wave, prepare_native_tasks
+        from tests import write_semantic_result_rows
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / "source.jsonl"
+            segments = [Segment(key, "Source") for key in ("ready", "next", "failed")]
+            _write_jsonl(source, [asdict(segment) for segment in segments])
+            segments = read_segments(source)
+            tasks, results = root / ".game-l10n/native/tasks", root / "results"
+            prepare_native_tasks(
+                root, source, segments, tasks, min_records=1, max_records=1, max_workers=1,
+                route_binding={"provider": "native-fixture", "model": "fixture/exact", "attempt": 1},
+            )
+            results.mkdir()
+            manifest = tasks / "manifest.json"
+            binding = json.loads(manifest.read_text(encoding="utf-8"))
+            for i, segment in enumerate(segments, 1):
+                success = segment.id != "failed"
+                write_semantic_result_rows(results / f"task-{i:04}.jsonl", [{
+                    "target_id": segment.id, "status": "success" if success else "error",
+                    "text": "Translation" if success else "", "issues": [],
+                }], manifest=binding)
+            import_native_wave(root, manifest, results, 1)
+            first = root / "prefix.jsonl"
+            summary = collect_native_translation_candidates(root, source, manifest, first)
+            self.assertEqual((summary["new_candidates"], summary["missing"]), (1, 2))
+            self.assertEqual([item.id for item in read_segments(first)], ["ready"])
+            import_native_wave(root, manifest, results, 2)
+            import_native_wave(root, manifest, results, 3)
+            second = root / "tail.jsonl"
+            summary = collect_native_translation_candidates(root, source, manifest, second,
+                                                            previous=(first,))
+            self.assertTrue(summary["complete"])
+            self.assertEqual([item.id for item in read_segments(second)], ["next"])
+            stale = asdict(read_segments(first)[0])
+            stale["metadata"][CANDIDATE_METADATA_KEY]["text"] = "Edited"
+            _write_jsonl(root / "stale.jsonl", [stale])
+            with self.assertRaisesRegex(ValueError, "E_NATIVE_TRANSLATION_PREVIOUS_CANDIDATE_INVALID"):
+                collect_native_translation_candidates(root, source, manifest, root / "invalid.jsonl",
+                                                      previous=(root / "stale.jsonl",))
+
     def test_frozen_subset_keeps_root_lineage_and_historical_success_policy(self) -> None:
         from game_l10n.content_source_policy import (
             content_source_policy, create_content_source_grant, direct_model_provenance,

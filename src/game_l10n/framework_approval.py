@@ -26,6 +26,8 @@ _FIELDS = {
     "schema", "workspace", "session_id", "agent_id", "agent_kind", "agent_depth",
     "mode", "revision", "logs", "token_sha256", "expires_at",
 }
+_OMP_TRANSCRIPT_FIELD = "omp_transcripts"
+_OMP_SUBAGENT_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_][A-Za-z0-9_-]*)*")
 
 
 def _deny() -> ConfigurationError:
@@ -77,9 +79,9 @@ def read_framework_approval(stream: BinaryIO | TextIO) -> dict[str, str]:
 
 def consume_framework_approval(
     work_dir: Path, mode: str, *, revision: int, logs: list[Path] | None,
-    approval: dict | None,
-) -> None:
-    """Verify and rename one approval while the caller holds the lifecycle lock."""
+    omp_subagents: list[str] | None = None, approval: dict | None,
+) -> Path | None:
+    """Consume one approval and return its OMP session anchor, if selected."""
     require_framework_approval_proof(approval)
     try:
         workspace = work_dir.resolve(strict=True)
@@ -88,30 +90,33 @@ def consume_framework_approval(
         # final symlink. The host uses exclusive creation with mode 0600.
         for parent in (workspace / ".game-l10n", directory):
             metadata = parent.lstat()
-            if not stat.S_ISDIR(metadata.st_mode) or parent.is_symlink():
+            if (not stat.S_ISDIR(metadata.st_mode) or parent.is_symlink()
+                    or parent.resolve(strict=True) != parent):
                 raise ValueError("redirected approval directory")
-            if not parent.resolve(strict=True).is_relative_to(workspace):
-                raise ValueError("outside approval directory")
         path = directory / f"{approval['id']}.json"
         consumed = directory / f"{approval['id']}.consumed.json"
         if os.path.lexists(consumed):
             raise ValueError("approval already consumed")
         metadata = path.lstat()
-        if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+        if (not stat.S_ISREG(metadata.st_mode) or path.is_symlink()
+                or path.resolve(strict=True) != path):
             raise ValueError("invalid approval file")
-        if not path.resolve(strict=True).is_relative_to(directory):
-            raise ValueError("outside approval file")
         with path.open("rb") as handle:
             raw = handle.read(_RECORD_LIMIT + 1)
         if len(raw) > _RECORD_LIMIT:
             raise ValueError("invalid approval size")
         record = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
         selected = [os.path.abspath(workspace / value) for value in logs or []]
+        subagents = omp_subagents or []
+        fields = _FIELDS | {_OMP_TRANSCRIPT_FIELD} if subagents else _FIELDS
         now = int(time.time())
         if (
-            not isinstance(record, dict) or set(record) != _FIELDS
+            not isinstance(record, dict) or set(record) != fields
             or record["schema"] != FRAMEWORK_APPROVAL_SCHEMA
-            or record["workspace"] != str(workspace)
+            or not isinstance(record["workspace"], str)
+            or not Path(record["workspace"]).is_absolute()
+            or os.path.normpath(record["workspace"]) != record["workspace"]
+            or Path(record["workspace"]).resolve(strict=True) != workspace
             or not isinstance(record["session_id"], str) or not record["session_id"].strip()
             or not isinstance(record["agent_id"], str) or not record["agent_id"].strip()
             or record["agent_kind"] != "main"
@@ -128,6 +133,23 @@ def consume_framework_approval(
             )
         ):
             raise ValueError("approval binding mismatch")
+        session_file = None
+        if subagents:
+            selection = record[_OMP_TRANSCRIPT_FIELD]
+            if (
+                mode != "analysis"
+                or not isinstance(selection, dict) or set(selection) != {"session_file", "subagents"}
+                or selection["subagents"] != subagents
+                or any(not isinstance(item, str) or len(item) > 200
+                       or _OMP_SUBAGENT_ID.fullmatch(item) is None for item in subagents)
+                or len(set(subagents)) != len(subagents)
+                or not isinstance(selection["session_file"], str) or "\0" in selection["session_file"]
+            ):
+                raise ValueError("transcript approval binding mismatch")
+            session_file = Path(selection["session_file"])
+            if not session_file.is_absolute() or session_file.suffix != ".jsonl":
+                raise ValueError("invalid OMP session anchor")
         path.rename(consumed)
+        return session_file
     except (OSError, ValueError, TypeError, RuntimeError, RecursionError) as exc:
         raise _deny() from exc

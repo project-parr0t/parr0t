@@ -5,6 +5,7 @@ import { accessSync, constants, existsSync, mkdtempSync, mkdirSync, readFileSync
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { gzipSync } from "node:zlib";
 import guard from "../src/game_l10n/templates/omp-isolation-guard.mjs";
 import prompt from "../src/game_l10n/templates/omp-prompt-isolation.mjs";
 import { hasFrameworkExposure } from "../src/game_l10n/templates/framework-mode-approval.mjs";
@@ -76,7 +77,7 @@ async function fixture(factory) {
   await root.emit("session_start");
   return { workspace, root };
 }
-function native(workspace, args, proof) {
+function native(workspace, args, proof, verb = "framework-mode") {
   let python;
   for (const executable of process.platform === "win32" ? ["python.exe", "python3.exe"] : ["python3", "python"]) {
     for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
@@ -90,7 +91,7 @@ function native(workspace, args, proof) {
     if (python) break;
   }
   if (!python) throw new Error("Native Python is required for the synthetic integration suite");
-  return spawnSync(python, ["-I", "-B", entry, "framework-mode", "--workspace", workspace, ...args], {
+  return spawnSync(python, ["-I", "-B", entry, verb, "--workspace", workspace, ...args], {
     cwd: workspace, shell: false, windowsHide: true, encoding: "utf8", input: proof === undefined ? undefined : JSON.stringify(proof),
   });
 }
@@ -152,6 +153,60 @@ for (const [label, factory] of [["guarded", guard], ["prompt", prompt]]) {
       expect(snapshot(workspace)).toEqual(beforeReplay);
     });
 
+    test("only explicitly selected OMP child transcripts become revocable diagnostic snapshots", async () => {
+      const { workspace, root } = await fixture(factory);
+      const sessionFile = path.join(workspace, "omp", "synthetic-root.jsonl");
+      const artifacts = sessionFile.slice(0, -".jsonl".length);
+      writeJson(sessionFile, { type: "session", id: root.ctx.sessionManager.getSessionId() });
+      mkdirSync(artifacts);
+      root.ctx.sessionManager.getSessionFile = () => sessionFile;
+      const plain = '{"type":"message","text":"synthetic relay"}\n';
+      const archived = '{"type":"message","text":"synthetic nested worker"}\n';
+      writeFileSync(path.join(artifacts, "Relay.jsonl"), plain);
+      mkdirSync(path.join(artifacts, "Relay", "Relay.Worker"), { recursive: true });
+      writeFileSync(path.join(artifacts, "Relay", "Relay.Worker.jsonl.gz"), gzipSync(archived));
+      writeFileSync(path.join(artifacts, "Relay", "Relay.Worker", "Relay.Worker.Leaf.jsonl"), "synthetic leaf\n");
+      writeFileSync(path.join(artifacts, "Relay.Worker.jsonl.gz"), gzipSync("wrong flat artifact\n"));
+      writeFileSync(path.join(artifacts, "Sibling.jsonl"), "unselected synthetic sibling\n");
+      const scope = ["Relay", "Relay.Worker", "Relay.Worker.Leaf"];
+
+      const before = snapshot(workspace);
+      for (const request of [
+        { mode: "analysis", omp_subagents: scope, user_requested: false },
+        { mode: "analysis", omp_subagents: ["Relay", "../Sibling"] },
+        { mode: "analysis", omp_subagents: ["*"] },
+        { mode: "pause", omp_subagents: scope },
+      ]) {
+        await expect(root.approve(request)).rejects.toThrow();
+      }
+      const unapproved = native(workspace, ["--mode", "analysis", "--user-requested", "--omp-subagent", "Relay"]);
+      expect(unapproved.status).not.toBe(0);
+      expect(snapshot(workspace)).toEqual(before);
+
+      const result = await root.approve({ mode: "analysis", omp_subagents: scope });
+      expect(result.isError).toBe(false);
+      expect(result.details.stdout).not.toContain("synthetic relay");
+      const bindings = JSON.parse(result.details.stdout).omp_subagent_logs;
+      expect(Object.keys(bindings)).toEqual(scope);
+      expect(readFileSync(path.join(workspace, ".game-l10n/control-plane-state.json"), "utf8")).toContain('"rotation_required"');
+      for (const [id, expected] of [["Relay", plain], ["Relay.Worker", archived], ["Relay.Worker.Leaf", "synthetic leaf\n"]]) {
+        const read = native(workspace, ["--input", bindings[id].path], undefined, "diagnostic-log");
+        expect(read.status).toBe(0);
+        expect(read.stdout).toBe(expected);
+      }
+      const unselected = native(workspace, ["--input", path.join(artifacts, "Sibling.jsonl")], undefined, "diagnostic-log");
+      expect(unselected.status).not.toBe(0);
+      expect(unselected.stdout).not.toContain("synthetic sibling");
+
+      const rebound = await root.approve({ mode: "analysis", omp_subagents: ["Relay"] });
+      expect(rebound.isError).toBe(false);
+      expect(native(workspace, ["--input", bindings["Relay.Worker"].path], undefined, "diagnostic-log").status).not.toBe(0);
+      const missing = await root.approve({ mode: "analysis", omp_subagents: ["Relay", "Absent"] });
+      expect(missing.isError).toBe(true);
+      expect(missing.details.stderr).toContain("E_OMP_DIAGNOSTIC_TRANSCRIPT_UNAVAILABLE");
+      expect(native(workspace, ["--input", bindings.Relay.path], undefined, "diagnostic-log").status).not.toBe(0);
+    }, 30_000);
+
     test("confirmed shutdown revokes approved analysis grants without enabling localization", async () => {
       const { workspace, root } = await fixture(factory);
       writeFileSync(path.join(workspace, "synthetic-source.log"), "Synthetic diagnostic bytes.\n");
@@ -175,6 +230,9 @@ for (const [label, factory] of [["guarded", guard], ["prompt", prompt]]) {
       const cases = [
         [{}, ["--mode", "shutdown"]],
         [{}, ["--mode", "analysis", "--log", path.join(workspace, "different.log")]],
+        [{ omp_transcripts: { session_file: path.join(workspace, "fixture.jsonl"), subagents: ["Relay"] } },
+          ["--mode", "analysis", "--omp-subagent", "Sibling"]],
+        [{}, ["--mode", "analysis", "--omp-subagent", "Relay"]],
         [{ workspace: other }, ["--mode", "analysis"]],
         [{ revision: 999 }, ["--mode", "analysis"]],
         [{ expires_at: Math.floor(Date.now() / 1000) - 1 }, ["--mode", "analysis"]],
