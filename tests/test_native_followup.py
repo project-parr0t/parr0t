@@ -57,11 +57,20 @@ class NativeFollowupTests(unittest.TestCase):
             summary = collect_native_translation_candidates(root, source, manifest, first)
             self.assertEqual((summary["new_candidates"], summary["missing"]), (1, 2))
             self.assertEqual([item.id for item in read_segments(first)], ["ready"])
+            pending = root / "unstarted.jsonl"
+            projected = collect_native_translation_candidates(
+                root, source, manifest, root / "already-reviewed.jsonl", previous=(first,), pending_output=pending,
+            )
+            self.assertEqual((projected["new_candidates"], projected["pending_targets"]), (0, 2))
+            self.assertEqual([item.id for item in read_segments(pending)], ["next", "failed"])
             import_native_wave(root, manifest, results, 2)
             import_native_wave(root, manifest, results, 3)
             second = root / "tail.jsonl"
-            summary = collect_native_translation_candidates(root, source, manifest, second,
-                                                            previous=(first,))
+            failed = root / "failed-targets.jsonl"
+            summary = collect_native_translation_candidates(
+                root, source, manifest, second, previous=(first,), pending_output=failed,
+            )
+            self.assertEqual([item.id for item in read_segments(failed)], ["failed"])
             self.assertTrue(summary["complete"])
             self.assertEqual([item.id for item in read_segments(second)], ["next"])
             stale = asdict(read_segments(first)[0])

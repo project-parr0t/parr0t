@@ -234,6 +234,24 @@ For a sealed zero-start OMP wave denied by host policy (`host_dispatch_denied`),
 
 If a sealed host-policy denial accompanies verified ended starts and valid sibling output, `native-pass-step` checkpoints only the exact admitted, ended sibling results. The wave remains at `repair_native_runtime`; this partial import neither completes the wave nor authorizes another attempt at a blocked slot.
 
+For an unclear OMP model name, read the effective `cfg://modelRoles`,
+`cfg://task/perCallModelAllow`, and `cfg://task/agentModelOverrides` first.
+Run `native-model-match --workspace <workspace> --requested <name>` with
+`--eligible-model <exact-selector>` for each applicable observed grant and
+optionally `--provider <exact-provider>`. Bind `exact` directly.
+`confirmation_required` includes the nearest eligible selectors but no
+selected model: ask the user, and bind only the ID they choose. `pending`
+preserves the request without a match. Catalog entries and matcher inputs
+never authorize a dispatch; OMP still checks the live host grant.
+
+A changed exact model cannot be dispatched under a historical manifest.
+Keep the old launch evidence and imported shards. After the old relay has
+ended, `collect-native-translation-candidates --pending-output <new-input>`
+exports the ordered complement of validated successes, including unstarted
+targets without counting them as attempts. Use that input for a fresh
+manifest under the approved binding; continue review of the old successes
+without redispatching them.
+
 When multiple unfinished checkpoints remain, status returns `select_native_checkpoint` and validated candidate paths instead of choosing by modification time. Select the intended existing binding with `native-resume-status --manifest <candidate-manifest>` or `status --native-manifest <candidate-manifest>`. For a split review chain, `step_command` retains the root manifest and root results directory; `current_child` only describes the core-owned active subset. Do not resume a child as a replacement for the complete pass.
 
 Manifest compatibility is independent of control generation: v6/v7 checkpoints retain their original contracts, namespace presence, imported results, and usage. Readable v4/v5 metadata is not executable by the current deterministic scheduler. A noncanonical present contract, conflicting path binding, or unknown state must not be repaired by silently regenerating the manifest. Lookup does not authorize a provider/model change, bypass SDK/context/completion gates, or establish `local_patch_ready`.

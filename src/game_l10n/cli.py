@@ -1818,6 +1818,15 @@ def cmd_native_runtime(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_native_model_match(args: argparse.Namespace) -> int:
+    from .native_host import match_omp_model
+
+    result = match_omp_model(Path(args.workspace).resolve(), args.requested,
+                             provider=args.provider, eligible=args.eligible_model)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def cmd_configure_native_host(args: argparse.Namespace) -> int:
     result = configure_native_host(Path(args.workspace).resolve(), args.host, args.endpoint, args.api_key_env)
     print(json.dumps(result))
@@ -2719,6 +2728,8 @@ def cmd_collect_native_translation_candidates(args: argparse.Namespace) -> int:
         retry_cohort=_path_in_workspace(work_dir, args.retry_cohort, must_exist=True)
         if args.retry_cohort else None,
         previous=(_path_in_workspace(work_dir, path, must_exist=True) for path in args.previous),
+        pending_output=_path_in_workspace(work_dir, args.pending_output)
+        if getattr(args, "pending_output", None) else None,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -4600,6 +4611,14 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Bind changed, revalidated OMP operator policy identity; never grants a model")
     native_host.set_defaults(func=cmd_native_runtime)
 
+    native_match = sub.add_parser("native-model-match", help="Find an exact OMP selector or candidates requiring confirmation")
+    native_match.add_argument("--workspace", required=True)
+    native_match.add_argument("--requested", required=True)
+    native_match.add_argument("--provider", help="Restrict results to this exact OMP provider")
+    native_match.add_argument("--eligible-model", action="append", default=[],
+                              help="Exact selector observed in effective operator grants; repeat to restrict candidates")
+    native_match.set_defaults(func=cmd_native_model_match)
+
     register_host = sub.add_parser("configure-native-host", help="Register an existing native worker API service")
     register_host.add_argument("--workspace", required=True)
     register_host.add_argument("--host", required=True)
@@ -4722,6 +4741,8 @@ def build_parser() -> argparse.ArgumentParser:
     translation_collect.add_argument("--output", required=True, help="New ordered review input")
     translation_collect.add_argument("--previous", action="append", default=[],
                                      help="Earlier review input from the same manifest; repeat to skip its targets")
+    translation_collect.add_argument("--pending-output",
+                                     help="Export unsuccessful or unstarted targets for a newly authorized model pass")
     translation_collect.set_defaults(func=cmd_collect_native_translation_candidates)
 
     native_review = sub.add_parser("collect-native-review")

@@ -39,7 +39,7 @@ def host_model_snapshot(work_dir: Path) -> dict | None:
             or any(
                 not isinstance(row, dict) or set(row) != {"provider", "id", "selector"}
                 or not exact_native_model(row["provider"]) or "/" in row["provider"]
-                or not exact_native_model(row["id"])
+                or not isinstance(row["id"], str) or not row["id"]
                 or row["selector"] != row["provider"] + "/" + row["id"]
                 for row in value["models"]
             )
@@ -48,6 +48,9 @@ def host_model_snapshot(work_dir: Path) -> dict | None:
             raise ValueError()
     except (OSError, ValueError, TypeError, KeyError):
         raise ValueError("E_NATIVE_HOST_MODELS_INVALID") from None
+    # OMP publishes its entire registry, including non-concrete aliases.
+    # An unrelated alias must not invalidate exact selectable entries.
+    value["models"] = [row for row in value["models"] if exact_native_model(row["id"])]
     return value
 
 
@@ -83,6 +86,60 @@ def resolve_native_model(work_dir: Path, host: str, model: str) -> str:
     if "/" in model:
         return model  # Explicit qualified choices do not require catalog membership.
     raise ValueError("E_NATIVE_MODEL_METADATA_REQUIRED: no exact host model identity match")
+
+
+def match_omp_model(
+    work_dir: Path, requested: str, *, provider: str | None, eligible: list[str]
+) -> dict:
+    """Match catalog identities within the controller's observed host grants."""
+    from difflib import SequenceMatcher
+    from .model_policy import exact_native_model
+
+    requested = requested.strip()
+    if (not requested or any(ord(char) < 32 for char in requested)
+            or (provider is not None and (not exact_native_model(provider) or "/" in provider))
+            or not all(exact_native_model(model) and "/" in model for model in eligible)):
+        raise ValueError("E_NATIVE_MODEL_MATCH_INVALID")
+    snapshot = host_model_snapshot(work_dir)
+    # Use only exact selectors observed in effective policy. A catalog entry
+    # alone is not a grant, and an unlisted effort suffix is not a match.
+    allowed = set(eligible)
+    rows = {
+        (model, row["id"] + model[len(row["selector"]):])
+        for row in (snapshot or {}).get("models", [])
+        if provider is None or row["provider"] == provider
+        for model in allowed
+        if model == row["selector"] or model.startswith((row["selector"] + ":", row["selector"] + "@"))
+    }
+    if any(selector == requested for selector, _ in rows):
+        return {"status": "exact", "model": requested, "candidates": []}
+    exact = sorted({selector for selector, identity in rows if identity == requested})
+    if len(exact) == 1:
+        return {"status": "exact", "model": exact[0], "candidates": []}
+    if exact:
+        return {"status": "confirmation_required", "model": None, "candidates": exact}
+
+    def normalize(value: str) -> str:
+        return re.sub(r"[\W_]+", "", value.casefold())
+
+    request_key = normalize(requested)
+    if not request_key:
+        raise ValueError("E_NATIVE_MODEL_MATCH_INVALID")
+
+    requested_base = requested.split("@", 1)[0].rsplit(":", 1)[0]
+
+    def similarity(row: tuple[str, str]) -> float:
+        selector, identity = row
+        names = {normalize(value) for value in (selector, identity, identity.rsplit("/", 1)[-1])}
+        if requested_base in {selector, identity}:
+            return 1.0  # Same identity without the ungranted effort/upstream qualifier.
+        return 0.99 * max(SequenceMatcher(None, request_key, value, autojunk=False).ratio() for value in names)
+
+    candidates = list(dict.fromkeys(selector for selector, _ in sorted(
+        rows, key=lambda row: (-similarity(row), row[0])
+    )))[:3]
+    return {"status": "confirmation_required" if candidates else "pending",
+            "model": None, "candidates": candidates}
 
 
 def _write(path: Path, value: dict) -> None:

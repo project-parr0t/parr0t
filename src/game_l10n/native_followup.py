@@ -154,6 +154,7 @@ def _candidate_segment(segment: Segment, row: dict[str, Any]) -> Segment:
 def collect_native_translation_candidates(
     work_dir: Path, source: Path, manifest_path: Path | None, output: Path, *,
     previous: Iterable[Path] = (), retry_cohort: Path | None = None,
+    pending_output: Path | None = None,
 ) -> dict[str, Any]:
     """Freeze new validated successes, without advancing the retry ledger."""
     from .formats import read_segments
@@ -167,6 +168,10 @@ def collect_native_translation_candidates(
         _relative(work_dir, path)
     if output.exists():
         raise NativeFollowupError("E_NATIVE_REVIEW_OUTPUT_INVALID")
+    if pending_output is not None:
+        _relative(work_dir, pending_output)
+        if manifest_path is None or pending_output.exists() or pending_output == output:
+            raise NativeFollowupError("E_NATIVE_TRANSLATION_PENDING_OUTPUT_INVALID")
     segments = read_segments(source)
     if retry_cohort is not None:
         from .control_plane import require_control_plane_ready
@@ -209,9 +214,13 @@ def collect_native_translation_candidates(
                 raise NativeFollowupError("E_NATIVE_TRANSLATION_PREVIOUS_CANDIDATE_INVALID")
             skipped.add(item.id)
     _atomic_jsonl(output, (asdict(item) for target, item in candidates.items() if target not in skipped))
-    return {"review_input": _relative(work_dir, output), "new_candidates": len(candidates) - len(skipped),
-            "previous_candidates": len(skipped), "missing": summary["missing"],
-            "complete": summary["complete"]}
+    result = {"review_input": _relative(work_dir, output), "new_candidates": len(candidates) - len(skipped),
+              "previous_candidates": len(skipped), "missing": summary["missing"],
+              "complete": summary["complete"]}
+    if pending_output is not None:
+        _atomic_jsonl(pending_output, (asdict(item) for item in segments if item.id not in candidates))
+        result.update(pending_input=_relative(work_dir, pending_output), pending_targets=len(segments) - len(candidates))
+    return result
 
 
 def _load_primary_rows(

@@ -47,7 +47,10 @@ def _startup_prompt(
         "user-request --workspace를 사용해 요청 바인딩을 검증한 뒤 상태에 맞는 진입 절차를 수행하라. "
         "OMP 모델은 카탈로그 등록과 실제 호스트 승인이 별개다. read cfg://modelRoles, "
         "read cfg://task/perCallModelAllow, read cfg://task/agentModelOverrides로 현재 정책을 "
-        "확인한 뒤 native-runtime을 바인딩하라. 실제 호스트의 승인 거부를 가용성 부족·번역 거부로 "
+        "확인하라. 모델 이름을 해석해야 하면 실제로 승인된 정확한 ID들만 --eligible-model로 "
+        "제공하여 native-model-match를 실행하라. exact만 자동 바인딩한다. confirmation_required이면 "
+        "제안된 ID를 사용자에게 보여 주고 선택을 받은 뒤에만 바인딩한다. pending이면 선택을 보존한다. "
+        "확정한 모델만 native-runtime에 바인딩하라. 실제 호스트의 승인 거부를 가용성 부족·번역 거부로 "
         "오인하지 말고, 승인 복구 후 변경된 호스트 정책 지문으로 새 작업을 준비하라. "
         +
         (

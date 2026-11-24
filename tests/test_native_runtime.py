@@ -489,6 +489,32 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(resolve_native_model(self.root, "omp", "fixture/org/model@upstream:high"),
                          "fixture/org/model@upstream:high")
 
+    def test_match_uses_exact_host_grants_and_requires_confirmation_for_nearby_id(self) -> None:
+        from game_l10n.native_host import MODEL_SNAPSHOT_PATH, MODEL_SNAPSHOT_SCHEMA, match_omp_model
+
+        path = self.root / MODEL_SNAPSHOT_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "schema": MODEL_SNAPSHOT_SCHEMA, "host": "omp", "session_id": "fixture", "process_id": 1,
+            "models": [{"provider": provider, "id": identity, "selector": f"{provider}/{identity}"}
+                       for provider, identity in (("approved", "luna-v6"), ("other", "luna-v6"),
+                                                  ("approved", "luna-v5"), ("cursor", "default"))],
+        }), encoding="utf-8")
+        eligible = ["approved/luna-v6", "approved/luna-v5", "approved/luna-v5:high", "cursor/default"]
+        self.assertEqual(match_omp_model(self.root, "luna-v6", provider=None, eligible=eligible)["model"],
+                         "approved/luna-v6")
+        self.assertEqual(match_omp_model(self.root, "luna-v5:high", provider="approved", eligible=eligible)["model"],
+                         "approved/luna-v5:high")
+        nearby = match_omp_model(self.root, "luna-v6:high", provider="approved", eligible=eligible)
+        self.assertEqual((nearby["status"], nearby["model"]), ("confirmation_required", None))
+        self.assertEqual(nearby["candidates"][0], "approved/luna-v6")
+        self.assertEqual(match_omp_model(self.root, "luna-v6", provider="other", eligible=eligible)["status"],
+                         "pending")
+        ambiguous = match_omp_model(self.root, "luna-v6", provider=None,
+                                    eligible=[*eligible, "other/luna-v6"])
+        self.assertIsNone(ambiguous["model"])
+        self.assertEqual(ambiguous["candidates"], ["approved/luna-v6", "other/luna-v6"])
+
     def test_missing_host_metadata_never_guesses_a_provider_prefix(self) -> None:
         with self.assertRaisesRegex(ValueError, "E_NATIVE_MODEL_METADATA_REQUIRED"):
             configure_native_runtime(self.root, "omp", {"native-custom": "gpt-6.1-sol"})
@@ -652,6 +678,22 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(archive.read_bytes(), original)
         record_native_launch(self.root, relay, event="capability-available")
         self.assertEqual(self.step()["action"], "wait_for_active_wave")
+
+    def test_changed_model_cannot_rewrite_an_ended_dispatch_or_receipt(self) -> None:
+        original_model = "openai-codex/gpt-6-luna:high"
+        configure_native_runtime(self.root, "omp", {"native-luna": original_model})
+        prepare_native_tasks(
+            self.root, self.source, self.segments, self.tasks, max_records=1, max_workers=2,
+            route_binding={"provider": "native-luna", "model": original_model, "attempt": 1},
+        )
+        relay = self.root / self.step()["relay"]["dispatch"]
+        record_native_launch(self.root, relay, event="model-unavailable", failure_code="host_dispatch_denied")
+        receipt = self.root / seal_native_wave_relay(self.root, relay, relay_ended=True)["receipt"]
+        original = (relay.read_bytes(), receipt.read_bytes())
+        configure_native_runtime(self.root, "omp", {"native-luna": "openai-codex/gpt-6-luna"})
+        with self.assertRaisesRegex(ValueError, "E_NATIVE_MODEL_REPLAN_REQUIRED"):
+            self.step(resume_relay=True)
+        self.assertEqual((relay.read_bytes(), receipt.read_bytes()), original)
 
     def test_ended_preflight_without_admission_can_redispatch_same_slots(self) -> None:
         _, relay, payload = self.prepare()

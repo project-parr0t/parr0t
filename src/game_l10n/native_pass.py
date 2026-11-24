@@ -2244,6 +2244,9 @@ def _write_wave_relay_dispatch(
         _configured_manifest_provider(work_dir, manifest),
         [binding["task"] for binding in bindings],
     )
+    model = (manifest.get("route_binding") or {}).get("model")
+    if launch is not None and model is not None and launch.get("model") != model:
+        raise ValueError("E_NATIVE_MODEL_REPLAN_REQUIRED: prepare pending targets with the new exact model")
     _preserve_legacy_launch_fields(launch, previous_launch)
     if launch is not None:
         if "message_isolation" in launch:
@@ -2889,6 +2892,10 @@ def _validated_native_wave_relay_receipt(
         or dispatch_revision not in {None, RELAY_DISPATCH_REVISION}
     ):
         raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID")
+    model = (manifest.get("route_binding") or {}).get("model")
+    contract = dispatch.get("launch_contract")
+    if model is not None and isinstance(contract, dict) and contract.get("model") != model:
+        raise ValueError("E_NATIVE_RELAY_RECEIPT_INVALID: launch model differs from the manifest")
     runtime = native_runtime(work_dir) or {}
     omp_host = runtime.get("host") == "omp" and runtime.get("transport", "collaboration") == "collaboration"
     launch = launch_evidence
@@ -3799,6 +3806,11 @@ def _native_control_step_single(
     )
 
     if next_wave is not None:
+        route = manifest.get("route_binding") or {}
+        if require_runtime and route.get("model") is not None and (
+            native_runtime(work_dir, required=True)["models"].get(route["provider"]) != route["model"]
+        ):
+            raise ValueError("E_NATIVE_MODEL_REPLAN_REQUIRED: prepare pending targets with the new exact model")
         tasks = wave_tasks[next_wave]
         ready_paths = [
             results_dir / task["file"]
