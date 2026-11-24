@@ -112,5 +112,12 @@ It preserves JSON keys, MZ control tokens and bytes outside the selected
 script spans. Game-specific loader and receiver evidence stays in the
 workspace, not in the SDK.
 
+`edge_control.restore_missing_edge_control` can recover one uniquely located
+missing source-owned message control at the beginning or end of a candidate.
+It preserves prose, operand values and control order; ambiguous or internal
+omissions are rejected. Its return value is not a review or pack approval.
+For any changed candidate, retain prior attempts and obtain current-generation
+approval through Core before packing.
+
 Validate the SDK with:
-`python -m unittest tests.test_rpg_maker_mz_text_inventory tests.test_rpg_maker_mz_cache_reconciliation tests.test_rpg_maker_mz_consumer_usage -v`.
+`python -m unittest tests.test_rpg_maker_mz_text_inventory tests.test_rpg_maker_mz_cache_reconciliation tests.test_rpg_maker_mz_consumer_usage tests.test_rpg_maker_mz_edge_control -v`.
