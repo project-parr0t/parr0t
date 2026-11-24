@@ -1,9 +1,11 @@
 """Synthetic v22 Player metadata; never use installed assets or a decoder."""
 import hashlib
 from pathlib import Path
+import stat
 import struct
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -109,16 +111,33 @@ class UnityMediaTests(unittest.TestCase):
                 media.FormatError, 'MEDIA_METADATA_SIZE_UNSUPPORTED'):
             media.scene_metadata_references(self.root, scene)
 
-    def test_scene_rejects_symlink_even_when_digest_matches(self):
+    def test_scene_rejects_link_even_when_digest_matches(self):
         raw = serialized([], [])
         outside = self.root.parent / 'outside'
         outside.write_bytes(raw)
+        path = self.root / 'level0'
+        binding = media.FileBinding(path.name, hashlib.sha256(raw).hexdigest())
         try:
-            (self.root / 'level0').symlink_to(outside)
-        except (OSError, NotImplementedError) as exc:
-            self.skipTest(f'symlink creation unavailable: {exc}')
-        with self.assertRaisesRegex(media.FormatError, 'MEDIA_SOURCE_NOT_REGULAR'):
-            media.scene_metadata_references(self.root, media.FileBinding('level0', hashlib.sha256(raw).hexdigest()))
+            path.symlink_to(outside)
+        except OSError as exc:
+            if sys.platform != 'win32' or getattr(exc, 'winerror', None) != 1314:
+                raise
+            # Exercise the Windows file-reparse check without requiring
+            # SeCreateSymbolicLinkPrivilege on a standard account.
+            path.write_bytes(raw)
+            lstat = Path.lstat
+            reparse = SimpleNamespace(st_mode=lstat(path).st_mode,
+                                      st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+            def file_reparse(candidate):
+                return reparse if candidate == path else lstat(candidate)
+
+            with patch.object(Path, 'lstat', file_reparse), self.assertRaisesRegex(
+                    media.FormatError, 'MEDIA_SOURCE_NOT_REGULAR'):
+                media.scene_metadata_references(self.root, binding)
+        else:
+            with self.assertRaisesRegex(media.FormatError, 'MEDIA_SOURCE_NOT_REGULAR'):
+                media.scene_metadata_references(self.root, binding)
 
     def test_texture_selects_exact_companion_and_preserves_repeated_bindings(self):
         name = 'synthetic.assets'
