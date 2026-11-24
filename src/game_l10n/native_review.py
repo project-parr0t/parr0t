@@ -97,7 +97,7 @@ def collect_reviewed_candidates(
 def _resume_review_queues(
     work_dir: Path, source: Path, approved: Path, queues: list[Path], output: Path,
 ) -> dict[str, Any]:
-    """Select only unapproved targets with one unambiguous latest queue state."""
+    """Recover unambiguous evidence and coalesce ready targets on their next exact route."""
     require_control_plane_ready(work_dir)
     work_dir = work_dir.resolve()
     output = output.resolve()
@@ -117,6 +117,12 @@ def _resume_review_queues(
         "confirmation-input.jsonl": "confirmation", "fallback-input.jsonl": "fallback",
         "unresolved-input.jsonl": "rewrite_retry", "awaiting-input.jsonl": "awaiting",
     }
+    combined = {"judge", "review-rewrite"}
+    queue_kinds.update({kind + ".jsonl": kind for kind in (*queue_kinds.values(), *combined)})
+    rewrite_kinds = {"rewrite", "rewrite_retry", "review-rewrite"}
+
+    def operation_for(kind: str) -> str:
+        return "rewrite" if kind in rewrite_kinds else "judge"
 
     def supersedes(a: TranslationResult, b: TranslationResult) -> bool:
         return (len(a.attempts) > len(b.attempts)
@@ -133,7 +139,8 @@ def _resume_review_queues(
         for segment in read_segments(path):
             if segment.id not in remaining:
                 continue
-            if segment.source != remaining[segment.id] or REVIEW_STATE_KEY not in segment.metadata:
+            if (segment.source != remaining[segment.id]
+                    or (kind != "awaiting" and REVIEW_STATE_KEY not in segment.metadata)):
                 raise ValueError("E_NATIVE_REVIEW_QUEUE_INVALID")
             _require_candidate_bindings([segment], "rewrite")
             result = _bound_result(segment)
@@ -143,10 +150,18 @@ def _resume_review_queues(
                 continue
             states[:] = [(stage, item, previous) for stage, item, previous in states
                          if not supersedes(result, previous)]
+            operation = operation_for(kind)
+            if kind in combined:
+                if any(item == segment and stage != "awaiting" and operation_for(stage) == operation
+                       for stage, item, _ in states):
+                    continue
+            elif kind != "awaiting":
+                states[:] = [(stage, item, previous) for stage, item, previous in states
+                             if not (stage in combined and item == segment and operation_for(stage) == operation)]
             if not any(stage == kind and item == segment for stage, item, _ in states):
                 states.append((kind, segment, result))
 
-    groups: dict[str, list[Segment]] = {}
+    selected: list[tuple[str, Segment, TranslationResult]] = []
     conflicting, missing = 0, 0
     for target in remaining:
         states = latest.get(target, [])
@@ -156,18 +171,111 @@ def _resume_review_queues(
         ready = [entry for entry in states if entry[0] != "awaiting"]
         if (len(ready) == 1 and all(s == ready[0][1] for _, s, _ in states)
                 or len(states) == 1):
-            kind, segment, _ = (ready or states)[0]
-            groups.setdefault(kind, []).append(segment)
+            kind, segment, result = (ready or states)[0]
+            # An identical awaiting snapshot is already attached to a pass;
+            # only newer evidence may supersede that attachment.
+            selected.append(("awaiting" if len(ready) != len(states) else kind, segment, result))
         else:
             conflicting += 1
+
+    config_path = work_dir / "game-l10n.json"
+    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
+    routing = config.get("routing", {})
+    routes = {"judge": routing.get("reviewers"), "rewrite": routing.get("rewriters")}
+    adapters = {item["name"]: item for item in config.get("providers", [])}
+    external_roles = config.get("native_workflow", {}).get("external_provider_roles")
+    native_models, requested_models = {}, {}
+    if any(routes.values()):
+        from .model_policy import native_role_bindings
+        from .native_runtime import native_runtime
+
+        native_models = (native_runtime(work_dir) or {}).get("models", {})
+        requested_models = native_role_bindings(config)
+    route_models = {name: item["model"] for name, item in adapters.items()
+                    if isinstance(item.get("model"), str) and item["model"]}
+    route_models.update(native_models)
+    max_rewrites = max(0, routing.get("review_max_rounds", 2) - 1)
+    eligible: dict[str, list[Segment]] = {"judge": [], "rewrite": []}
+    holds: dict[str, str] = {}
+    for kind, segment, result in selected:
+        if kind == "awaiting":
+            continue
+        operation = operation_for(kind)
+        if routes[operation] is None:
+            continue  # Keep legacy queues usable when no route policy was supplied.
+        if not routes[operation]:
+            holds[segment.id] = "routes_exhausted"
+            continue
+        if operation == "rewrite":
+            if sum(a.stage.startswith("review-rewrite") and a.status == "success"
+                   for a in result.attempts) >= max_rewrites:
+                holds[segment.id] = "routes_exhausted"
+                continue
+            if not result.metadata.get("rewrite_issues"):
+                holds[segment.id] = "repair_required"
+                continue
+        eligible[operation].append(segment)
+
+    next_routes = {
+        segment.id: provider
+        for operation, segments in eligible.items() if segments
+        for provider, items in partition_native_review_routes(
+            segments, routes[operation], route_models=route_models,
+            stage="review" if operation == "judge" else "review-rewrite",
+            attempt_limits=routing.get("review_attempt_limits", {}),
+            tier_limit=routing.get("strong_max_calls") if operation == "judge" else None,
+        ).items()
+        for segment in items
+    }
+    groups: dict[str, tuple[Path, dict[str, str], list[Segment]]] = {}
+    for kind, segment, _ in selected:
+        key, path, details = kind, Path(kind + ".jsonl"), {}
+        if kind == "awaiting":
+            details = {"status": "awaiting"}
+        else:
+            operation = operation_for(kind)
+            if routes[operation] is not None:
+                status = holds.get(segment.id)
+                provider = next_routes.get(segment.id, "")
+                model = route_models.get(provider, "")
+                if status is None:
+                    if not provider:
+                        status = "routes_exhausted"
+                    elif provider.startswith("native-"):
+                        status = ("native_route_pending" if provider in native_models
+                                  and requested_models.get(provider, model) == model else "repair_required")
+                    else:
+                        role = "selective_rewrite" if operation == "rewrite" else "judge_fallback"
+                        adapter = adapters.get(provider, {})
+                        authorized = ((external_roles is None or role in external_roles)
+                                      and ("allowed_roles" not in adapter or role in adapter["allowed_roles"]))
+                        status = "external_route_required" if model and authorized else "repair_required"
+                details = {"operation": operation, "status": status}
+                if status in {"native_route_pending", "external_route_required"}:
+                    key = stable_hash([operation, provider, model])
+                    path = Path(key) / ("review-rewrite.jsonl" if operation == "rewrite" else "judge.jsonl")
+                    details.update(provider=provider, model=model)
+                else:
+                    key, path = f"{status}:{kind}", Path(status) / path
+        groups.setdefault(key, (path, details, []))[2].append(segment)
     if output.exists():
         raise ValueError("E_NATIVE_REVIEW_OUTPUT_ALREADY_EXISTS")
     output.mkdir(parents=True)
     actions = {}
-    for kind, segments in groups.items():
-        path = output / (kind + ".jsonl")
-        _atomic_jsonl(path, (asdict(segment) for segment in segments))
-        actions[kind] = {"count": len(segments), "input": path.relative_to(work_dir).as_posix()}
+    for key, (relative, details, segments) in groups.items():
+        # The segment reader fills empty context from neighbors. Split only
+        # where new adjacency would change a recovered row on the next read.
+        starts = [0]
+        for index in range(1, len(segments)):
+            previous, current = segments[index - 1], segments[index]
+            if (not previous.next and current.source) or (not current.previous and previous.source):
+                starts.append(index)
+        starts.append(len(segments))
+        for start, end in zip(starts, starts[1:]):
+            part = key if not start else f"{key}:{start}"
+            path = output / relative if not start else output / relative.parent / str(start) / relative.name
+            _atomic_jsonl(path, (asdict(segments[index]) for index in range(start, end)))
+            actions[part] = {"count": end - start, "input": path.relative_to(work_dir).as_posix(), **details}
     return {"unreviewed": len(remaining), "missing": missing, "conflicting": conflicting, "queues": actions}
 
 
@@ -915,8 +1023,12 @@ def process_native_review_followup(
         prepared.append((segment, result, fingerprint))
     output.mkdir(parents=True, exist_ok=True)
 
-    def run(item: tuple[Segment, TranslationResult, str]) -> TranslationResult:
-        segment, result, fingerprint = item
+    def run(item: tuple[Segment, TranslationResult, str]) -> TranslationResult | None:
+        segment, original, fingerprint = item
+        result = (replace(original, metadata=dict(original.metadata), attempts=list(original.attempts),
+                          errors=list(original.errors)) if segment.id in cached else original)
+        prior_attempts = len(result.attempts)
+        result.metadata.pop("provider_authentication_blocked", None)
         provider = providers[segment.id]
         # Do not retransmit internal review history or duplicate the candidate
         # inside metadata. The adapter receives one focused target request.
@@ -982,6 +1094,9 @@ def process_native_review_followup(
                     )
                 result.metadata["review_tier"] = "strong_pending"
                 result.metadata["native_confirmation_pending"] = True
+        if (result.metadata.get("provider_authentication_blocked") is True
+                and len(result.attempts) == prior_attempts):
+            return None
         return result
 
     pending = [
@@ -990,7 +1105,7 @@ def process_native_review_followup(
         and item[1].status != "reviewed"
         and item[1].metadata.get("native_confirmation_pending") is not True
     ]
-    executed = 0
+    executed = authentication_pending = 0
     if progress_callback is not None:
         try:
             progress_callback(
@@ -1012,7 +1127,10 @@ def process_native_review_followup(
             break
         chunk = pending[offset:offset + wave_size]
         with ThreadPoolExecutor(max_workers=wave_size) as pool:
-            completed = list(pool.map(run, chunk))
+            completed = [result for result in pool.map(run, chunk) if result is not None]
+        authentication_pending += len(chunk) - len(completed)
+        if not completed:
+            continue
         for result in completed:
             cached[result.segment_id] = result
         executed += len(completed)
@@ -1102,5 +1220,6 @@ def process_native_review_followup(
     return {"records": len(segments), "executed": executed, "cached": len(saved),
             "accepted": len(accepted), "rewrite_pending": len(rewrite),
             "confirmation_pending": len(confirmation), "unresolved": len(unresolved),
-            "deadline_pending": len(pending) - executed,
+            "deadline_pending": len(pending) - executed - authentication_pending,
+            "authentication_pending": authentication_pending,
             "output": output.relative_to(work_dir).as_posix()}

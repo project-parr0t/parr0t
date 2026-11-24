@@ -144,6 +144,8 @@ Segment loading classifies known input fields once per file and only reconstruct
 
 When native usage telemetry is available, the bound relay/provider adapter records aggregate input, cached-input, output, reasoning, event, and worker counts in the core-owned private ledger or sealed receipt. Root reads only that metadata. `input_tokens_known=false` and `telemetry_status=unmeasured` mean that a displayed numeric zero is only the legacy accumulator default, never evidence of zero use; `estimated_material_tokens_*` is workload size, not billed usage. Missing telemetry is unknown; never reconstruct it from `.codex/sessions`, chat transcripts, agent trees, nested-worker status/output, semantic-worker logs, or terminal previews. Per-worker accounting must be emitted at the event boundary. A high cached-input ratio diagnoses replayed history but does not authorize ending an incomplete job or inventing a turn limit. Keep later semantic work in fresh no-history workers and continue through the deterministic checkpoint.
 
+Native timing keeps relay elapsed time separate from provider generation time. OMP records monotonic relay and worker elapsed time in the host timing log but has no provider-generation measurement. The native host broker accepts only an explicit generation metric from the bound host; missing metrics and a lost start clock are reported as unknown. Parallel provider durations cannot be subtracted from relay wall time to estimate waiting.
+
 ## API fallback input budget
 
 One translation, judgment, or rewrite request contains one target plus a focused projection of the already prepared context. Never attach a complete context pack, exchange bundle, inventory, prior result set, or application plan to `Segment.metadata`; typed context is supplied separately and only target-relevant glossary, relationship, feature, screen, knowledge, and reference evidence is projected. Stable job-wide fields precede target-specific fields so a compatible provider may reuse a common prefix.
@@ -153,6 +155,8 @@ Provider-specific per-request preflight limits are configured safety defaults, d
 Record provider-reported total input, cached input, cache-miss input, output, and reasoning usage when available. A cache hit is useful telemetry, not permission to send redundant context. Do not create a job-local API loop that bypasses the configured adapter and these limits.
 
 Translation fallback uses the configured adapter's per-request safeguards. Optional user-set whole-job ceilings and usage accounting apply only to the dimensions the user actually chose; no baseline is required for an unbounded dimension. Preserve completed rows, pending work, and uncertain usage evidence across interruption. Partial imports do not block independent eligible bundles, while a repair-needed or unattempted target is not evidence that semantic routes were exhausted.
+
+Within one execution the first request for an exact API provider binding is single-flight. An observed authentication failure blocks further requests for that binding, not other authorized routes. Only the failed request is an attempt; unstarted targets remain pending and do not exhaust a semantic route or authorize source preservation.
 
 ## Proportional safety baseline
 
