@@ -111,6 +111,58 @@ class DataPlaneAssetTests(unittest.TestCase):
                     sdk_activation={"status": "active"}, inspection_assets=[game],
                 )
 
+    def test_media_binding_probe_seals_only_seed_references(self) -> None:
+        import contextlib
+        import io
+        from argparse import Namespace
+        from game_l10n.cli import cmd_engine_media_bindings_status
+
+        with tempfile.TemporaryDirectory() as directory:
+            work, game, _, config = self._fixture(Path(directory).resolve())
+            seed = game / "registry.json"
+            seed.write_text('{"ui": "fixture-ui/title.png"}', encoding="utf-8")
+            record_image_localization_policy(work, requested=True, user_requested=True)
+            role, purpose = "image_ui_inventory", data_plane_task.ENGINE_MEDIA_BINDINGS_PURPOSE
+            output = data_plane_task.data_plane_receipt_path(work, role, purpose=purpose).parent
+            activation = {"status": "active"}
+            with patch("game_l10n.workspace.require_sdk_activation", return_value=activation):
+                with self.assertRaisesRegex(ConfigurationError, "INSPECTION_ASSET_REQUIRED"):
+                    prepare_data_plane_task(
+                        work, output, worker_role=role, config=config, sdk_activation=activation, purpose=purpose,
+                    )
+                prepared = prepare_data_plane_task(
+                    work, output, worker_role=role, config=config, sdk_activation=activation,
+                    purpose=purpose, inspection_assets=[seed],
+                )
+            relay = work / prepared["relay_path"]
+            task = json.loads((output / "task.json").read_text(encoding="utf-8"))
+            artifact = work / task["output_artifact"]
+            artifact.write_text(json.dumps({
+                "schema": "parr0t.engine-media-bindings.v1", "task_id": task["task_id"],
+                "references": [{"root_index": 0, "relative_path": "fixture-ui/title.png", "kind": "ui_image",
+                                "evidence_sha256": hashlib.sha256(seed.read_bytes()).hexdigest()}],
+                "unresolved_bindings": 1,
+            }), encoding="utf-8")
+            (work / task["output_envelope"]).write_text(json.dumps({
+                "schema": "parr0t.control-envelope.v2", "worker_role": role,
+                "stage": "image_inventory", "status": "success", "target_ids": [],
+                "counts": {"total": 1, "success": 1}, "issue_codes": [],
+                "artifact_paths": [task["output_artifact"]], "queue_transitions": [], "route_evidence_path": "",
+            }), encoding="utf-8")
+            self.assertEqual(seal_data_plane_task(work, relay, worker_ended=True)["status"], "success")
+            self.assertEqual(public_image_localization_state(work)["status"], "scope_required")
+            args = Namespace(workspace=str(work), relay=str(relay), verify_fonts=False)
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(cmd_engine_media_bindings_status(args), 0)
+            metadata = json.loads(stdout.getvalue())
+            self.assertEqual(metadata["references"], [
+                {"path": str(game / "fixture-ui/title.png"), "kind": "ui_image", "exists": True},
+            ])
+            self.assertEqual(metadata["unresolved_bindings"], 1)
+            seed.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ConfigurationError, "bound seed changed"):
+                cmd_engine_media_bindings_status(args)
+
     def test_full_request_automatically_binds_candidates_and_holds_unchanged_opaque_sources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             work, game, inventory, config = self._fixture(Path(directory))

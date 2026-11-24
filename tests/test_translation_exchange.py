@@ -27,6 +27,48 @@ def _digest(value: str) -> str:
 
 
 class TranslationExchangeTests(unittest.TestCase):
+    def test_auth_failure_holds_unstarted_targets_without_creating_failure_attempts(self):
+        from game_l10n.errors import ProviderFailure
+        from game_l10n.models import ProjectContext
+        from game_l10n.orchestrator import LocalizationOrchestrator, OrchestratorConfig
+        from game_l10n.providers import ProviderRegistry, ScriptedProvider
+
+        def reject(**_):
+            raise ProviderFailure("authentication_error", retryable=False)
+
+        class Adapter(ScriptedProvider):
+            def fingerprint(self):
+                return {**super().fingerprint(), "model": "fixture/blocked"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            targets = [Segment(f"s-{i}", "SYNTHETIC SOURCE") for i in range(8)]
+            bundle = root / "exchange"
+            prepare_translation_exchange(
+                root, targets, bundle, exchange_id="synthetic-auth", mode="fallback",
+                source_queue="translation_fallback_pending",
+            )
+            adapter = Adapter("synthetic-api", reject)
+            engine = LocalizationOrchestrator(
+                registry=ProviderRegistry({adapter.name: adapter}),
+                config=OrchestratorConfig([adapter.name], [], require_review=False, max_workers=4,
+                                          use_style_memory=False, preserve_source_on_failure=True,
+                                          defer_fallbacks_until_primary_complete=True),
+                project=ProjectContext("SYNTHETIC", "ja", "ko"), work_dir=root,
+            )
+            result = process_translation_exchange(
+                root, bundle, engine.translate_many, route=adapter.name,
+                route_models={adapter.name: "fixture/blocked"},
+                wave_size=4,
+            )
+            self.assertEqual(adapter.call_count, 1)
+            self.assertEqual((result["failure_count"], result["pending_count"]), (1, 7))
+            self.assertEqual(result["issue_code"], "E_FALLBACK_PROVIDER_AUTHENTICATION_BLOCKED")
+            self.assertEqual(result["authentication_unstarted"], 7)
+            [attempt] = json.loads((bundle / FAILURE_NAME).read_text())["attempt_lineage"]
+            self.assertEqual((attempt["ordinal"], attempt["operational"], attempt["issue_code"]),
+                             (1, True, "authentication_error"))
+
     def test_completed_external_scope_issues_collection_not_job_completion(self):
         from game_l10n.control_plane import establish_control_plane_entry
         from game_l10n.formats import read_segments

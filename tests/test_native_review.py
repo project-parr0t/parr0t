@@ -447,6 +447,123 @@ class NativeReviewTests(unittest.TestCase):
             self.assertEqual(set(summary["queues"]), {"fallback"})
             self.assertEqual(read_segments(output / "fallback.jsonl"), read_segments(later)[:1])
 
+    def test_resume_review_queues_coalesces_only_exact_ready_routes(self):
+        from dataclasses import replace
+        from game_l10n.formats import write_results
+        from game_l10n.models import AttemptRecord
+        from game_l10n.native_review import _bound_result, _pending_segment, _resume_review_queues
+        from game_l10n.native_runtime import RUNTIME_PATH, RUNTIME_SCHEMA
+        from game_l10n.store import stable_hash
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            primary, shared, alternate, unbound = (
+                "native-primary", "native-shared", "native-alternate", "native-unbound",
+            )
+            allowed, denied = "external-allowed", "external-denied"
+            judges = [primary, shared, alternate, unbound, allowed, denied]
+            models = {primary: "fixture/primary", shared: "fixture/exact", alternate: "fixture/exact"}
+            (root / "game-l10n.json").write_text(json.dumps({
+                "routing": {"reviewers": judges, "rewriters": [shared], "strong_max_calls": 2,
+                            "review_attempt_limits": {primary: 1}},
+                "native_workflow": {"external_provider_roles": ["judge_fallback"]},
+                "providers": [
+                    {"name": allowed, "model": "fixture/api", "allowed_roles": ["judge_fallback"]},
+                    {"name": denied, "model": "fixture/api", "allowed_roles": []},
+                ],
+            }), encoding="utf-8")
+            runtime = {"schema": RUNTIME_SCHEMA, "host": "codex", "control_generation": 1, "models": models}
+            runtime_path = root / RUNTIME_PATH
+            runtime_path.parent.mkdir(parents=True)
+            runtime_path.write_text(json.dumps({**runtime, "fingerprint": stable_hash(runtime)}), encoding="utf-8")
+
+            ids = ("fallback", "waiting", "confirmation", "alternate", "rewrite", "denied", "unbound",
+                   "exhausted", "approved", "context-edge", "conflict", "missing", "api", "unstarted",
+                   "rewrite-retry")
+            items = {key: replace(review_segment(key), previous="P", next="N") for key in ids}
+
+            def save(name, rows):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("".join(json.dumps(asdict(row)) + "\n" for row in rows), encoding="utf-8")
+                return path
+
+            def pending(item, *attempts, rewrite=False):
+                result = _bound_result(item)
+                result.attempts.extend(attempts)
+                if rewrite:
+                    result.metadata["rewrite_issues"] = ["voice"]
+                return _pending_segment(item, result)
+
+            def fail(provider, status="error"):
+                return AttemptRecord("review", provider, status, candidate_generation=1,
+                                     model=models.get(provider, "" if provider == unbound else "fixture/api"))
+
+            fallback = pending(items["fallback"], fail(primary))
+            waiting = pending(items["waiting"])
+            prior = pending(items["confirmation"], fail(primary, "rewrite"), rewrite=True)
+            rewritten = replace(items["confirmation"], metadata={
+                "_parr0t_candidate": {"text": "R", "generation": 2, "digest": stable_hash("R"),
+                                       "provider": shared},
+            })
+            confirmation = pending(rewritten, fail(primary, "rewrite"), AttemptRecord(
+                "review-rewrite", shared, "success", candidate_generation=1, model=models[shared],
+            ))
+            edge = pending(replace(items["context-edge"], previous=""), fail(primary))
+            other_route = pending(items["alternate"], *map(fail, judges[:2]))
+            rewrite = pending(items["rewrite"], fail(primary, "rewrite"), rewrite=True)
+            retry = pending(items["rewrite-retry"], fail(primary, "rewrite"), AttemptRecord(
+                "review-rewrite", shared, "error", candidate_generation=1,
+                model=models[shared], operational=True,
+            ), rewrite=True)
+            api = pending(items["api"], *map(fail, judges[:4]))
+            forbidden = pending(items["denied"], *map(fail, judges[:5]))
+            missing_binding = pending(items["unbound"], *map(fail, judges[:3]))
+            exhausted = pending(items["exhausted"], *map(fail, judges))
+            approved = _bound_result(items["approved"])
+            approved.status, approved.acceptance_authority = "reviewed", "reviewer"
+            approved_path = root / "approved.json"
+            write_results(approved_path, [approved])
+            inventory = save("inventory.jsonl", items.values())
+            queues = [
+                save("confirmation-input.jsonl", [confirmation]),
+                save("fallback-input.jsonl", [other_route, forbidden, missing_binding, exhausted,
+                                             fallback, api, pending(items["conflict"], fail(primary))]),
+                save("other/fallback-input.jsonl", [edge, pending(items["conflict"], fail(primary, "refused"))]),
+                save("rewrite-input.jsonl", [prior, rewrite]),
+                save("unresolved-input.jsonl", [retry]),
+                save("strong-input.jsonl", [waiting, pending(items["approved"])]),
+                save("awaiting-input.jsonl", [waiting, items["unstarted"]]),
+            ]
+            evidence = {path: path.read_bytes() for path in [inventory, approved_path, *queues]}
+            with patch("game_l10n.native_review.require_inventory_attestation"):
+                summary = _resume_review_queues(root, inventory, approved_path, queues, root / "resume")
+            self.assertEqual((summary["unreviewed"], summary["missing"], summary["conflicting"]), (14, 1, 1))
+            actual = [
+                (entry["status"], entry.get("operation"), entry.get("provider"), entry.get("model"),
+                 entry["count"], read_segments(root / entry["input"]))
+                for entry in summary["queues"].values()
+            ]
+            self.assertEqual(actual, [
+                ("native_route_pending", "judge", shared, models[shared], 2, [fallback, confirmation]),
+                ("native_route_pending", "judge", shared, models[shared], 1, [edge]),
+                ("awaiting", None, None, None, 2, [waiting, items["unstarted"]]),
+                ("native_route_pending", "judge", alternate, models[alternate], 1, [other_route]),
+                ("native_route_pending", "rewrite", shared, models[shared], 2, [rewrite, retry]),
+                ("repair_required", "judge", None, None, 2, [forbidden, missing_binding]),
+                ("routes_exhausted", "judge", None, None, 1, [exhausted]),
+                ("external_route_required", "judge", allowed, "fixture/api", 1, [api]),
+            ])
+            resumed_paths = [root / entry["input"] for entry in summary["queues"].values()]
+            with patch("game_l10n.native_review.require_inventory_attestation"):
+                resumed = _resume_review_queues(
+                    root, inventory, approved_path, [*resumed_paths, *reversed(queues)], root / "resume-again",
+                )
+            self.assertEqual((resumed["missing"], resumed["conflicting"]), (1, 1))
+            self.assertEqual([read_segments(root / entry["input"]) for entry in resumed["queues"].values()],
+                             [entry[-1] for entry in actual])
+            self.assertEqual({path: path.read_bytes() for path in evidence}, evidence)
+
     def test_only_current_ok_is_accepted_and_other_targets_are_routed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -702,6 +819,59 @@ class NativeReviewTests(unittest.TestCase):
                 self.assertEqual(pending.candidate_generation, 1)
                 self.assertFalse(pending.acceptance_authority)
                 self.assertEqual([a.provider for a in pending.attempts[-2:]], calls)
+
+    def test_unstarted_authentication_block_does_not_write_review_checkpoint(self):
+        from game_l10n.models import (
+            AgentEnvelope, AgentStatus, AttemptRecord, ReviewVerdict, ReviewVerdictEnvelope,
+        )
+        from game_l10n.native_review import _bound_result, process_native_review_followup
+
+        for operation in ("judge", "rewrite"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                blocked = {"external-a", "external-b"}
+                stage = "review" if operation == "judge" else "review-rewrite"
+
+                def respond(result, provider, *args):
+                    if provider.name in blocked:
+                        result.metadata["provider_authentication_blocked"] = True
+                        result.errors.append("fixture unstarted")
+                        return None
+                    if provider.name == "external-a":
+                        # An actual attempted failure is still recorded, even with the marker.
+                        result.metadata["provider_authentication_blocked"] = True
+                        result.attempts.append(AttemptRecord(stage, provider.name, "error", candidate_generation=1))
+                        return None
+                    status = "approved" if operation == "judge" else "success"
+                    result.attempts.append(AttemptRecord(stage, provider.name, status, candidate_generation=1))
+                    return (ReviewVerdictEnvelope(ReviewVerdict.OK) if operation == "judge"
+                            else AgentEnvelope(AgentStatus.SUCCESS, "REVISED"))
+
+                source, fake = self._followup_fixture(root, operation=operation, attempts=[],
+                    routes=["external-a", "external-b"], response=respond)
+                output = root / "out"
+
+                def followup():
+                    return process_native_review_followup(root, source, output, fake, operation=operation)
+
+                def counts(summary):
+                    return (summary["executed"], summary["authentication_pending"], summary["deadline_pending"])
+
+                self.assertEqual(counts(followup()), (0, 1, 0))
+                self.assertFalse((output / "results.json").exists())
+                self.assertEqual(read_segments(output / "unresolved-input.jsonl"), read_segments(source))
+                blocked.remove("external-a")
+                self.assertEqual(counts(followup()), (1, 0, 0))
+                checkpoint = (output / "results.json").read_bytes()
+                self.assertEqual(counts(followup()), (0, 1, 0))
+                self.assertEqual((output / "results.json").read_bytes(), checkpoint)
+                pending = _bound_result(read_segments(output / "unresolved-input.jsonl")[0])
+                self.assertEqual([a.provider for a in pending.attempts], ["configured-primary", "external-a"])
+                self.assertEqual(pending.errors, [])
+                blocked.remove("external-b")
+                recovered = followup()
+                self.assertEqual(counts(recovered), (1, 0, 0))
+                self.assertEqual(recovered["accepted" if operation == "judge" else "confirmation_pending"], 1)
 
     def test_exhausted_rewrite_history_stays_pending_without_provider_lookup(self):
         from game_l10n.models import AttemptRecord

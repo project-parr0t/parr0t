@@ -54,6 +54,10 @@ Legacy manifests retain their original serialized contract and successes; contin
 
 If the approved join is incomplete after native passes end, use `resume-native-review-queues` with the verified primary inventory, the joined approvals and the exact earlier collector `--queue` artifacts. Core excludes approved targets and emits only unambiguous latest snapshots with their recorded candidate generations and attempt histories. Missing and conflicting histories remain held; the command does not start a review or change eligibility on any route.
 
+When a route chain is configured, ready snapshots share a continuation queue only if they have the same operation, next provider and exact model. Core keeps inventory order and splits a queue if joining rows would change their bound adjacent context. Awaiting snapshots stay separate; exhausted routes and routes needing binding or permission repair are not ready to dispatch. Keep using the original collector artifacts as recovery evidence.
+
+An API route blocked by authentication before a request starts remains pending. It does not consume a call, enter the follow-up cache, or replace a prior recorded result.
+
 After explicit user consent for one further fallback check on an exhausted cohort, prepare its Core-selected pending input with `prepare-native-pass --pass-kind strong_review --user-requested-additional-fallback-review` instead of `--output`. This binds one call per target to the ordered candidate snapshot and existing exact fallback route. The canonical manifest cannot be reissued with changed candidates, model, or output; automatic review splitting and global limit changes are not permitted.
 
 Fallback routes default to three total judge attempts per target when no route-specific count is configured. `routing.review_attempt_limits` records explicit totals. Preserve explicit initial user/template model and count selections; a missing host binding or incompatible authorized transport leaves the exact request pending, not semantic failure or route exhaustion. Translation retries and triage coverage are separate policies.
