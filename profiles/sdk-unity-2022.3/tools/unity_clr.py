@@ -4,6 +4,7 @@ Only public binary-format machinery is shared. Each scanner constructs its own
 image, table rows, method bodies and evidence from the immutable input bytes.
 No dependency imports, runtime loading, or assembly execution occur here.
 """
+import hashlib
 import struct
 
 
@@ -267,6 +268,49 @@ class Image:
         data = self.streams.get('#Blob', b'')
         size, start = compressed(data, offset)
         return take(data, start, size)
+
+    def assembly_binding(self, reference=0):
+        """A CLR identity key and the full public key when present."""
+        if reference:
+            major, minor, build, rev, flags, key_index, name, culture, hash_index = self.row(35, reference)
+            if flags & 0x100 or self.blob(hash_index):  # retargetable or additional hash constraint
+                return None
+        else:
+            if len(self.rows.get(32, ())) != 1:
+                return None
+            _, major, minor, build, rev, flags, key_index, name, culture = self.row(32, 1)
+        key = self.blob(key_index)
+        name, culture = self.string(name), self.string(culture)
+        if not name or not name.isascii() or not culture.isascii():
+            return None
+        full_key = key if flags & 1 else b''
+        if flags & 1:
+            if not key:
+                return None
+            token = hashlib.sha1(key, usedforsecurity=False).digest()[-8:][::-1]
+        else:
+            if len(key) not in ((0, 8) if reference else (0,)):
+                return None
+            token = key
+        return (name.lower(), (major, minor, build, rev), culture.lower(), flags & 0xe00, token), full_key
+
+    def type_ref_scope(self, rid):
+        seen = set()
+        while True:
+            require(rid not in seen and len(seen) < 64, 'CLR_TYPE_REFERENCE_SCOPE')
+            seen.add(rid)
+            scope, index = self.coded('ResolutionScope', self.row(1, rid)[0])
+            if scope != 1 or not index:
+                return scope, index
+            rid = index
+
+    def bound_type_ref(self, rid):
+        """Only top-level types scoped to an explicit, non-retargetable AssemblyRef."""
+        resolution, name, namespace = self.row(1, rid)
+        scope, reference = self.coded('ResolutionScope', resolution)
+        binding = self.assembly_binding(reference) if scope == 35 and reference else None
+        if binding:
+            return binding, self.string(namespace), self.string(name)
 
     def user_strings(self):
         data = self.streams.get('#US', b'')

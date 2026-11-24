@@ -16,9 +16,9 @@ import struct
 import unity_raw as raw_reader
 
 FormatError = raw_reader.FormatError
-_UI_TYPES = frozenset({'UnityEngine.UI.Text', 'UnityEngine.UI.InputField',
-                       'TMPro.TMP_InputField', 'TMPro.TMP_Text',
-                       'TMPro.TextMeshPro', 'TMPro.TextMeshProUGUI'})
+_UI_TYPES = {'UnityEngine.UI': frozenset({'UnityEngine.UI.Text', 'UnityEngine.UI.InputField'}),
+             'Unity.TextMeshPro': frozenset({'TMPro.TMP_InputField', 'TMPro.TMP_Text',
+                                             'TMPro.TextMeshPro', 'TMPro.TextMeshProUGUI'})}
 _UI_REFERENCE_FIELDS = frozenset({'m_Font', 'm_FontAsset', 'm_Material',
     'm_fontAsset', 'm_sharedMaterial', 'm_TextComponent', 'm_Placeholder',
     'm_textComponent', 'm_placeholder'})
@@ -255,6 +255,7 @@ def _primary_stripped(obj, types, descriptor=None):
         return dict(m_FileID=fid, m_PathID=pid)
 
     def read(desc, path, packed=False, depth=0):
+        nonlocal p
         if depth > 64:
             raise FormatError('MANAGED_DESCRIPTOR_UNSUPPORTED')
         kind = desc.get('kind')
@@ -272,6 +273,11 @@ def _primary_stripped(obj, types, descriptor=None):
                 raise FormatError('MANAGED_ARRAY_BOUNDS_INVALID')
             values = [read(desc['element'], path + [i], True, depth + 1) for i in range(count)]
             align(); return values
+        if raw_reader.empty_cull_event(desc):
+            start = p
+            if num('i') == 0:
+                return {}
+            p = start
         if kind == 'pptr' or (kind == 'named' and raw_reader.is_object_type(types, desc)):
             return reference(path, desc.get('name'))
         if kind == 'named':
@@ -290,6 +296,7 @@ def _primary_stripped(obj, types, descriptor=None):
         raise FormatError('MANAGED_DESCRIPTOR_UNSUPPORTED')
 
     cid = obj['class_id']
+    pending_field = None
     if cid == 114:
         values = {'m_GameObject': reference(['m_GameObject'], 'UnityEngine.GameObject')}
         num('B'); align()
@@ -297,8 +304,9 @@ def _primary_stripped(obj, types, descriptor=None):
         values['m_Name'] = string(['m_Name'])
         if descriptor is None:
             return dict(value=values, strings=strings, references=references)
-        for field in raw_reader.managed_fields(types, descriptor):
-            values[field['name']] = read(field['type'], [field['name']])
+        managed, pending_field = raw_reader._complete_managed_fields(
+            raw_reader.managed_fields(types, descriptor), read, strings, references, allow_prefix=True)
+        values.update(managed)
     elif cid == 49:
         values = {'m_Name': string(['m_Name']), 'm_Script': string(['m_Script'])}
     elif cid == 115:
@@ -308,9 +316,9 @@ def _primary_stripped(obj, types, descriptor=None):
             values[field] = string([field])
     else:
         raise FormatError('NATIVE_LAYOUT_UNSUPPORTED')
-    if p != len(payload):
+    if pending_field is None and p != len(payload):
         raise FormatError('OBJECT_END_MISMATCH')
-    return dict(value=values, strings=strings, references=references)
+    return dict(value=values, strings=strings, references=references, pending_field=pending_field)
 
 
 def _descriptor(script):
@@ -326,7 +334,7 @@ def _ui_type(types, descriptor, seen=()):
     if not descriptor:
         return False
     name = descriptor.get('name')
-    if name in _UI_TYPES:
+    if name in _UI_TYPES.get(descriptor.get('assembly'), ()):
         return True
     key = (descriptor.get('assembly'), name)
     if key in seen or name in raw_reader.NATIVE_BASES:
@@ -354,6 +362,18 @@ def _field_binding(types, descriptor, path):
                 return None
             bound, desc = found[0], found[0]['type']
     return bound
+
+def _display_field_reason(class_id, path, binding, ui_type):
+    if len(path) == 1 and path[0] in _NATIVE_TEXT.get(class_id, ()):
+        return 'NATIVE_SERIALIZED_DISPLAY_SLOT'
+    if ui_type and tuple(path) in (('m_Text',), ('m_text',)):
+        return 'UI_SERIALIZED_TEXT_SLOT'
+    if binding and binding.get('display_consumers'):
+        return 'MANAGED_FIELD_DISPLAY_FLOW'
+    if binding and binding.get('native_display'):
+        return 'NATIVE_SERIALIZED_DISPLAY_SLOT'
+    return None
+
 
 
 def _json_strings(text):
@@ -640,10 +660,10 @@ def scan_serialized(path: Path, relative_path: str, *, method='primary', managed
                                  file_sha256=_digest(raw), parser='UnityPy-1.25.4' if method == 'primary'
                                  else 'first_party_v22_unityfs', runtime_observed=False))
 
-    def pending(reason, obj=None, entry=None, affects_display=True):
+    def pending(reason, obj=None, entry=None, affects_display=True, *, field_path=()):
         row = dict(reason=reason, file=relative, affects_display=affects_display, proof_ref=proof_id)
         if obj is not None:
-            row['location'] = _location(obj, [], entry)
+            row['location'] = _location(obj, field_path, entry)
         result['pending'].append(row)
 
     try:
@@ -680,6 +700,7 @@ def scan_serialized(path: Path, relative_path: str, *, method='primary', managed
                 # Texture/mesh/etc. opaque native bytes are not display blockers.
                 if obj['class_id'] in (49, 114, 115) or obj['class_id'] in _NATIVE_TEXT:
                     pending('DISPLAY_OBJECT_LAYOUT_UNRESOLVED', obj, entry)
+    expected_display_fields = {}
     for entry, payload, doc in documents:
         for obj in doc['objects']:
             data = decoded.get((entry, obj['path_id']))
@@ -706,17 +727,30 @@ def scan_serialized(path: Path, relative_path: str, *, method='primary', managed
                         if method == 'primary':
                             data = _primary_stripped(obj, types, descriptor)
                         else:
-                            custom = raw_reader.managed_object(payload, obj, types, descriptor, data['fields_offset'])
+                            custom = raw_reader.managed_object(
+                                payload, obj, types, descriptor, data['fields_offset'], allow_prefix=True)
                             data = dict(value={**data['value'], **custom['value']},
                                         strings=data['strings'] + custom['strings'],
-                                        references=data['references'] + custom['references'])
+                                        references=data['references'] + custom['references'],
+                                        pending_field=custom['pending_field'])
                     except (ValueError, KeyError, TypeError, struct.error):
                         pending('MANAGED_DISPLAY_LAYOUT_UNRESOLVED', obj, entry)
+                    else:
+                        if data['pending_field'] is not None:
+                            pending('MANAGED_DISPLAY_LAYOUT_UNRESOLVED', obj, entry,
+                                    field_path=[data['pending_field']])
             try:
                 ui_type = _ui_type(types, descriptor)
             except FormatError:
                 ui_type = False
                 pending('MANAGED_BASE_TYPE_MISSING', obj, entry)
+            # Check format-owned visible slots against emitted rows without
+            # using the per-occurrence display classifier.
+            display_fields = ('m_Text', 'm_text') if ui_type else _NATIVE_TEXT.get(obj['class_id'], ())
+            for field in display_fields:
+                value = data['value'].get(field)
+                if isinstance(value, str) and value:
+                    expected_display_fields[entry, obj['path_id'], (field,)] = obj
             for field_index, string in enumerate(data['strings']):
                 field_path = string['field_path']
                 if not field_path:
@@ -728,14 +762,9 @@ def scan_serialized(path: Path, relative_path: str, *, method='primary', managed
                         binding = _field_binding(types, descriptor, field_path)
                     except FormatError:
                         pass
-                if (len(field_path) == 1 and field_path[0] in _NATIVE_TEXT.get(obj['class_id'], set())):
-                    classification, reason = 'display', 'NATIVE_SERIALIZED_DISPLAY_SLOT'
-                elif ui_type and field_path in (['m_Text'], ['m_text']):
-                    classification, reason = 'display', 'UI_SERIALIZED_TEXT_SLOT'
-                elif binding and binding.get('display_consumers'):
-                    classification, reason = 'display', 'MANAGED_FIELD_DISPLAY_FLOW'
-                elif binding and binding.get('native_display'):
-                    classification, reason = 'display', 'NATIVE_SERIALIZED_DISPLAY_SLOT'
+                display_reason = _display_field_reason(obj['class_id'], field_path, binding, ui_type)
+                if display_reason:
+                    classification, reason = 'display', display_reason
                 elif binding and binding.get('native_identity'):
                     classification, reason = 'non_display', 'NATIVE_UI_IDENTITY_FIELD'
                 elif field_path == ['m_Name'] or obj['class_id'] == 115:
@@ -750,6 +779,9 @@ def scan_serialized(path: Path, relative_path: str, *, method='primary', managed
                     proof['field_token'] = binding.get('proof', {}).get('field_token')
                 row = dict(kind=kind, file=relative, location=location, source=string['source'],
                            classification=classification, reason=reason, proof=proof)
+                if obj['class_id'] == 129 and field_path == ['productName'] and string['source']:
+                    row['display_projection_required'] = True
+                    pending('UNITY_STARTUP_IDENTITY_REQUIRES_DISPLAY_PROJECTION', obj, entry, field_path=field_path)
                 result['occurrences'].append(row)
                 if kind == 'textasset':
                     table_reader = _primary_table_strings if method == 'primary' else _table_strings
@@ -787,12 +819,12 @@ def scan_serialized(path: Path, relative_path: str, *, method='primary', managed
                                 proof_ref=proof_id)
                     result['dependencies'].append(edge)
                     if display_dependency and pid and not target:
-                        pending('DISPLAY_REFERENCE_TARGET_MISSING', obj, entry)
+                        pending('DISPLAY_REFERENCE_TARGET_MISSING', obj, entry, field_path=ref['field_path'])
                     elif display_dependency and target and target['class_id'] in (28, 213):
                         # This is a structural media dependency, never permission to read pixels.
                         pending('DISPLAY_MEDIA_CONTENT_UNVERIFIED', obj, entry, affects_display=False)
                 except (FormatError, KeyError, TypeError):
-                    pending('PPTR_BINDING_UNRESOLVED', obj, entry)
+                    pending('PPTR_BINDING_UNRESOLVED', obj, entry, field_path=ref['field_path'])
     # A source-bound field-to-display flow can bind a referenced TextAsset's
     # payload. Mere resource proximity and unclassified PPtrs never do so.
     displayed_assets = set()
@@ -822,6 +854,13 @@ def scan_serialized(path: Path, relative_path: str, *, method='primary', managed
         else:
             row['classification'] = 'display'
             row['reason'] = 'TEXTASSET_DISPLAY_REFERENCE'
+    for row in result['occurrences']:
+        if row['classification'] == 'display':
+            loc = row['location']
+            key = (loc.get('container_entry'), loc['object_id'], tuple(loc['field_path']))
+            expected_display_fields.pop(key, None)
+    for (entry, _, path), obj in expected_display_fields.items():
+        pending('PROVEN_DISPLAY_CONSUMER_WITHOUT_TARGET', obj, entry, field_path=path)
     return result
 
 
@@ -917,7 +956,13 @@ def patch_serialized(raw: bytes, replacements: list[dict], *, managed_types=None
                     descriptor = descriptor or _bound_script(types, relative, entry, obj, target_entry, script_ref['path_id'])
                     if not descriptor:
                         raise FormatError('MONOSCRIPT_DEPENDENCY_MISSING')
-                    custom = raw_reader.managed_object(payload, obj, types, descriptor, data['fields_offset'])
+                    custom = raw_reader.managed_object(
+                        payload, obj, types, descriptor, data['fields_offset'], allow_prefix=True)
+                    if custom['pending_field'] is not None:
+                        ui_type = _ui_type(types, descriptor)
+                        if any(not _display_field_reason(obj['class_id'], path,
+                                   _field_binding(types, descriptor, path), ui_type) for path in fields):
+                            raise FormatError('MANAGED_PREFIX_DISPLAY_FIELD_UNPROVEN')
                     data['strings'].extend(custom['strings'])
             spans = []
             for path, rows in fields.items():
@@ -934,6 +979,8 @@ def patch_serialized(raw: bytes, replacements: list[dict], *, managed_types=None
                     if len(rows) != 1 or rows[0]['source'] != string['source']:
                         raise FormatError('SOURCE_STRING_BINDING_MISMATCH')
                     target_text = rows[0]['target']
+                if obj['class_id'] == 129 and path == ('productName',) and target_text != string['source']:
+                    raise FormatError('SDK_STARTUP_IDENTITY_WRITE_FORBIDDEN')
                 encoded = target_text.encode('utf-8')
                 if len(encoded) > 0x7fffffff:
                     raise FormatError('STRING_SIZE_UNSUPPORTED')

@@ -7,6 +7,7 @@ import os
 import re
 from collections import defaultdict
 from pathlib import Path
+from time import perf_counter_ns
 from typing import Any
 
 from unity_inventory_cache import ScanCache, encoded, file_digest, fingerprint, relative_file
@@ -107,17 +108,28 @@ def _merge(results: list[dict[str, Any]]) -> dict[str, Any]:
     return output
 
 
-def _pe_is_managed(path: Path) -> bool:
-    from unity_pe import directory_info
-    raw = path.read_bytes()
-    return bool(directory_info(raw, 14)[0])
+def _pe_is_managed(raw: bytes) -> bool:
+    from unity_pe import PE
+    image = PE(raw)
+    return image.directory_count > 14 and bool(image.directory(14)[0])
+
+
+def _managed_inputs(root: Path, digests: dict[str, str]) -> dict[str, tuple[Path, str]]:
+    inputs = {}
+    for file, digest in digests.items():
+        path = root / file
+        if path.suffix.lower() in {".dll", ".exe"}:
+            if path.is_symlink() or not _inside(path, root):
+                raise ValueError("SDK_MANAGED_PEER_PATH_INVALID")
+            inputs[file] = path, digest
+    return inputs
 
 
 
 
 def scan_snapshot(snapshot: Path, manifest: dict[str, Any], cache_path: Path, output: Path, *, method: str) -> dict[str, Any]:
     """Private worker API: never reads the counterpart's inventories or analyses."""
-    from unity_managed import scan_assembly
+    from unity_managed import ManagedPeers, scan_assembly
     from unity_native import scan_native
     from unity_objects import bind_script_references, scan_serialized
     from unity_native_calls import scan_native_dependencies
@@ -135,6 +147,12 @@ def scan_snapshot(snapshot: Path, manifest: dict[str, Any], cache_path: Path, ou
         if not _inside(path, snapshot) or path.is_symlink() or not path.is_file() or path.stat().st_size != record["size"] or file_digest(path) != record["sha256"]:
             raise ValueError("SDK_SNAPSHOT_BINDING_MISMATCH")
     implementation = scanner_fingerprint(method)
+    managed_started = perf_counter_ns()
+    peer_inputs = _managed_inputs(snapshot, {file: record["sha256"] for file, record in zip(names, files)})
+    peers = ManagedPeers(peer_inputs)
+    # A newly added or changed PE can introduce either a wrapper or an
+    # ambiguous assembly binding. Non-managed results do not depend on it.
+    managed_implementation = fingerprint([implementation, sorted((file, digest) for file, (_, digest) in peer_inputs.items())])
     managed_types: dict[str, Any] = {}
     serialized = []
     reused = scanned = 0
@@ -143,28 +161,33 @@ def scan_snapshot(snapshot: Path, manifest: dict[str, Any], cache_path: Path, ou
         for record in files:
             file, digest = record["file"], record["sha256"]
             path = snapshot / file
-            if path.name != "app.info" and path.suffix.lower() not in {".dll", ".exe"}:
+            if path.name != "app.info" and file not in peer_inputs:
                 serialized.append(record)
                 continue
-            if cache.reusable(method, file, digest, implementation):
+            cached_managed = file in peer_inputs and cache.reusable(method, file, digest, managed_implementation)
+            if cached_managed or cache.reusable(method, file, digest, implementation):
                 result = cache.metadata(method, file)
                 reused += 1
             else:
+                cache_key = implementation
                 if path.name == "app.info":
                     result = scan_native(path, file, method=method)
                 else:
                     resources = scan_native(path, file, method=method)
-                    native = scan_native_dependencies(path.read_bytes(), file, method=method)
+                    raw = path.read_bytes()
+                    native = scan_native_dependencies(raw, file, method=method)
                     results = [resources, reconcile_resource_dependencies(resources, native)]
-                    if _pe_is_managed(path):
-                        results.append(scan_assembly(path, file, method=method))
+                    if _pe_is_managed(raw):
+                        results.append(scan_assembly(path, file, method=method, peers=peers))
+                        cache_key = managed_implementation
                     result = _merge(results)
-                cache.store(method, file, digest, implementation, result)
+                cache.store(method, file, digest, cache_key, result)
                 scanned += 1
             for name, layout in result.get("types", {}).items():
                 if name in managed_types and managed_types[name] != layout:
                     raise ValueError("SDK_MANAGED_TYPE_AMBIGUOUS")
                 managed_types[name] = layout
+        serialized_started = perf_counter_ns()
         type_digest = fingerprint(managed_types)
         object_implementation = fingerprint([implementation, type_digest])
         # The first pass records physical MonoScript/PPtr bindings. The second
@@ -196,7 +219,11 @@ def scan_snapshot(snapshot: Path, manifest: dict[str, Any], cache_path: Path, ou
             result["base_scanner_digest"] = object_implementation
             cache.store(method, file, digest, bound_implementation, result)
             scanned += 1
-        summary = cache.inventory(method, output, implementation)
+        summary = cache.inventory(method, output, implementation, telemetry={
+            "scanned_files": scanned, "reused_files": reused,
+            "managed_ms": (serialized_started - managed_started) // 1_000_000,
+            "serialized_ms": (perf_counter_ns() - serialized_started) // 1_000_000,
+        })
     return {"status": "static_inventory_ready" if summary["static_complete"] else "inventory_pending", "method": method, "scanned_files": scanned, "reused_files": reused, **summary}
 
 
@@ -220,7 +247,7 @@ def extract_inventory(game_root: Path, output_root: Path) -> dict[str, Any]:
 
 def build_payload(request_path: Path, output_root: Path) -> dict[str, Any]:
     from game_l10n.formats import read_segments
-    from unity_managed import patch_assembly
+    from unity_managed import ManagedPeers, patch_assembly
     from unity_native import patch_native
     from unity_native_calls import patch_native_literals
     from unity_objects import patch_serialized
@@ -252,30 +279,37 @@ def build_payload(request_path: Path, output_root: Path) -> dict[str, Any]:
         if file not in expected:
             raise ValueError("SDK_PACK_SOURCE_NOT_BOUND")
         if translations[segment["id"]] != segment["source"]:
+            if metadata['unity_kind'] == 'app_info':
+                # The product-name line is both a possible label and part of
+                # Unity's startup identity. There is no independent display slot.
+                raise ValueError('SDK_STARTUP_IDENTITY_WRITE_FORBIDDEN')
             groups[file].append({"kind": metadata["unity_kind"], "file": file, "location": metadata["location"], "source": segment["source"], "target": translations[segment["id"]]})
     output_root.mkdir(parents=True)
     files = []
+    managed_peers = None
     for file, replacements in sorted(groups.items()):
         source = (game_root / file).resolve()
-        if not _inside(source, game_root) or source.is_symlink() or file_digest(source) != expected[file]:
+        if not _inside(source, game_root) or source.is_symlink():
             raise ValueError("SDK_PACK_SOURCE_CHANGED")
         original = source.read_bytes()
+        if hashlib.sha256(original).hexdigest() != expected[file]:
+            raise ValueError("SDK_PACK_SOURCE_CHANGED")
         rebuilt = original
         by_kind = defaultdict(list)
         for row in replacements:
             by_kind[row["kind"]].append(row)
-        managed = by_kind.pop("managed_literal", []) + by_kind.pop("managed_resource", [])
+        literals = by_kind.pop("managed_literal", [])
+        managed = literals + by_kind.pop("managed_resource", [])
         if managed:
-            rebuilt = patch_assembly(rebuilt, managed)
+            if literals and managed_peers is None:
+                managed_peers = ManagedPeers(_managed_inputs(game_root, expected))
+            rebuilt = patch_assembly(rebuilt, managed, peers=managed_peers)
         native = by_kind.pop("native_literal", [])
         if native:
             rebuilt = patch_native_literals(rebuilt, native)
         native_resources = by_kind.pop("native_resource", [])
         if native_resources:
             rebuilt = patch_native(rebuilt, native_resources)
-        app_info = by_kind.pop("app_info", [])
-        if app_info:
-            rebuilt = patch_native(rebuilt, app_info, app_info=True)
         objects = by_kind.pop("serialized_string", []) + by_kind.pop("textasset", [])
         if objects:
             rebuilt = patch_serialized(rebuilt, objects, managed_types=request.get("managed_types"))

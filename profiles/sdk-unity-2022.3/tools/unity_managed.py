@@ -1,8 +1,8 @@
 """Managed Unity inventory and selected-occurrence rewriting (stdlib only).
 
 Public API:
-    scan_assembly(path: Path, relative_path: str, *, method='primary') -> dict
-    patch_assembly(raw: bytes, replacements: list[dict]) -> bytes
+    scan_assembly(path: Path, relative_path: str, *, method='primary', peers=None) -> dict
+    patch_assembly(raw: bytes, replacements: list[dict], *, peers=None) -> bytes
 Replacements have source, target and location={method_token,il_offset,string_token?}
 or location={resource_token,entry_index,resource_name?} for embedded .resources.
 string_token is checked when supplied, but is not occurrence identity.
@@ -18,11 +18,12 @@ exception flow, virtual dispatch and external transformations on display paths
 remain pending; raw strings alone are not completeness blockers.
 """
 from collections import defaultdict, deque
+from itertools import pairwise
 from pathlib import Path, PurePosixPath
 import hashlib
 import struct
 
-from unity_clr import Image, ManagedFormatError, align, compress, require, take, unpack
+from unity_clr import Image, ManagedFormatError, align, compress, compressed, require, take, unpack
 import unity_dotnet_resources as resource_format
 import unity_pe
 
@@ -45,6 +46,150 @@ SINKS = {
     ('UnityEngine.IMGUIModule', 'UnityEngine.GUILayout', 'Box'): 'string_arguments',
     ('UnityEngine.IMGUIModule', 'UnityEngine.GUILayout', 'Button'): 'string_arguments',
 }
+
+CROSS_CALLER_OPS = (
+    set(range(0x02, 0x0f))
+    | {0x00, 0x11, 0x13, 0x14, 0x25, 0x26, 0x28, 0x2a, 0x6f, 0x72, 0x73, 0x7b, 0x7e, 0xfe09, 0xfe0c, 0xfe0e}
+)
+
+
+def _arg_slot(op, operand):
+    return op - 2 if 0x02 <= op <= 0x05 else operand if op in (0x0e, 0xfe09) else None
+
+
+def _assembly_type(image, coded, kind):
+    table, rid = image.coded(kind, coded)
+    return image.bound_type_ref(rid) if table == 1 and rid else None
+
+
+def _wrapper_signature(image, data):
+    if data == b'\x00\x01\x01\x0e':
+        return (0, None)
+    if data[:4] == b'\x00\x02\x01\x12':
+        coded, end = compressed(data, 4)
+        if data[end:] == b'\x0e':
+            receiver = _assembly_type(image, coded, 'TypeDefOrRef')
+            if receiver:
+                return (1, receiver)
+
+
+def _wrapper_reference(image, token):
+    if token >> 24 != 10:
+        return None
+    parent, name, blob = image.row(10, token & 0xffffff)
+    signature = _wrapper_signature(image, image.blob(blob))
+    declaration = _assembly_type(image, parent, 'MemberRefParent') if signature else None
+    if declaration:
+        return declaration, image.string(name), signature
+
+
+def _display_wrapper(image, declaration, name, signature):
+    # Prove the exact argument goes only to one setter. A returned value,
+    # alternate path, extra call, or transformed argument needs a real graph.
+    _, namespace, type_name = declaration
+    owners = [rid for rid, row in enumerate(image.rows.get(2, ()), 1)
+              if rid not in image.nested and image.string(row[2]) == namespace and image.string(row[1]) == type_name]
+    if len(owners) != 1 or '`' in type_name or name.startswith('.'):
+        return None
+    owner = owners[0]
+    declaration_row = image.row(2, owner)
+    if declaration_row[0] & 7 != 1:
+        return None
+    definitions = image.rows.get(6, ())
+    start = declaration_row[5] - 1
+    end = image.rows[2][owner][5] - 1 if owner < len(image.rows[2]) else len(definitions)
+    matches = [(idx + 1, definitions[idx]) for idx in range(start, end)
+               if image.string(definitions[idx][3]) == name
+               and _wrapper_signature(image, image.blob(definitions[idx][4])) == signature]
+    if len(matches) != 1:
+        return None
+    rid, (rva, impl, flags, _, _, _) = matches[0]
+    if not rva or impl or flags & 0x17 != 0x16 or flags & (0x40 | 0x400 | 0x2000):
+        return None
+    if any(image.coded('TypeOrMethodDef', row[2]) in ((2, owner), (6, rid)) for row in image.rows.get(42, ())):
+        return None
+    body = image.body(rid)
+    instructions = [i for i in body['instructions'] if i['opcode'] != 0x00]
+    if body['handlers'] or len(instructions) != 4:
+        return None
+    receiver, value, setter, ret = instructions
+    if (ret['opcode'] != 0x2a or setter['opcode'] not in (0x28, 0x6f) or
+            _arg_slot(value['opcode'], int.from_bytes(value['operand'], 'little')) != signature[0]):
+        return None
+    token = int.from_bytes(setter['operand'], 'little')
+    table, member = token >> 24, token & 0xffffff
+    if table != 10:
+        return None
+    parent, _, blob = image.row(10, member)
+    sink_type = _assembly_type(image, parent, 'MemberRefParent')
+    if not sink_type or image.blob(blob) != b'\x20\x01\x01\x0e':
+        return None
+    sink_owner, sink_name = image.member(0x0a000000 | member)
+    if SINKS.get((sink_owner['assembly'], sink_owner['name'], sink_name)) != 'setter':
+        return None
+    receiver_token = int.from_bytes(receiver['operand'], 'little')
+    if signature[0] == 1:
+        if _arg_slot(receiver['opcode'], receiver_token) != 0 or signature[1] != sink_type:
+            return None
+    else:
+        if receiver['opcode'] != 0x7e or receiver_token >> 24 != 4:
+            return None
+        field = receiver_token & 0xffffff
+        flags, _, blob = image.row(4, field)
+        data = image.blob(blob)
+        if flags & 0x50 != 0x10 or image.field_owner.get(field) != owner or data[:2] != b'\x06\x12':
+            return None
+        coded, end = compressed(data, 2)
+        if end != len(data) or _assembly_type(image, coded, 'TypeDefOrRef') != sink_type:
+            return None
+    return signature[0], {'method_token': 0x06000000 | rid, 'il_offset': setter['offset'],
+                          'sink': {'assembly': sink_owner['assembly'], 'type': sink_owner['name'], 'member': sink_name}}
+
+
+class ManagedPeers:
+    """Read-only wrapper resolver for one source snapshot and one scan method."""
+
+    def __init__(self, files):
+        self.files = files  # relative path -> (validated path, expected SHA-256)
+        self.index = None
+        self.wrappers = {}
+
+    def _image(self, file):
+        path, digest = self.files[file]
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise RuntimeError('MANAGED_PEER_SOURCE_CHANGED')
+        pe = unity_pe.PE(raw)
+        return Image(raw) if pe.directory_count > 14 and pe.directory(14)[0] else None
+
+    def resolve(self, image, key):
+        binding = key[0][0]
+        own = image.assembly_binding()
+        if own and own[0] == binding[0]:
+            return None
+        if key not in self.wrappers:
+            if self.index is None:
+                self.index = defaultdict(list)
+                for file in self.files:
+                    peer = self._image(file)
+                    identity = peer.assembly_binding() if peer else None
+                    if identity:
+                        self.index[identity[0]].append((file, identity[1]))
+            candidates = self.index.get(binding[0], ())
+            wrapper = None
+            if len(candidates) == 1:
+                file, full_key = candidates[0]
+                if not binding[1] or binding[1] == full_key:
+                    peer = self._image(file)
+                    try:
+                        wrapper = _display_wrapper(peer, *key)
+                    except (ValueError, KeyError):
+                        pass  # Unreadable declaration or body is not a wrapper proof.
+                    if wrapper:
+                        slot, proof = wrapper
+                        wrapper = slot, {'file': file, **proof}
+            self.wrappers[key] = wrapper
+        return self.wrappers[key]
 
 
 def _node(kind, *parts):
@@ -165,6 +310,10 @@ def _local_method(image, token):
     if owner.get('assembly') != image.assembly:
         cache[token] = None
         return None
+    parent, owner_rid = image.coded('MemberRefParent', image.row(10, rid)[0])
+    if parent != 2 and (parent != 1 or image.type_ref_scope(owner_rid) != (0, 1)):
+        cache[token] = None
+        return None
     signature = image.method_signature(token)
     matches = [candidate for candidate in _member_candidates(image, 6, owner, name)
                if image.method_signature(candidate) == signature]
@@ -194,13 +343,15 @@ def _field_token(image, token):
     return cache[token]
 
 
-def _flow(image, bodies, occurrences, fields, resources, resource_occurrences):
+def _flow(image, bodies, occurrences, fields, resources, resource_occurrences, peers=None, rewrite_guard=None):
     reverse = defaultdict(set)
     edges, edge_keys = [], set()
     sinks, unknown = {}, {}
     method_issues = defaultdict(set)
     method_links = defaultdict(set)
     method_fields = defaultdict(set)
+    cross_calls, non_display_uses, external_uses, bad_returns, bad_receivers = {}, set(), set(), set(), set()
+    peer_targets = {}
     def edge(src, dst, kind, method, il):
         key = (src, dst, kind, method, il)
         if key not in edge_keys:
@@ -269,8 +420,7 @@ def _flow(image, bodies, occurrences, fields, resources, resource_occurrences):
             terminal = False
             if op == 0x72:
                 stack.append({literal_nodes[(method, offset)]})
-            elif 0x02 <= op <= 0x05 or op in (0x0e, 0xfe09):
-                arg = op - 2 if op <= 5 else operand
+            elif (arg := _arg_slot(op, operand)) is not None:
                 stack.append({_node('argument', method, arg)})
             elif op in (0x0f, 0xfe0a):
                 stack.append(fresh('argument_address'))
@@ -292,6 +442,7 @@ def _flow(image, bodies, occurrences, fields, resources, resource_occurrences):
             elif op == 0x26:
                 pop()
             elif op in (0x28, 0x6f, 0x73):
+                args = receiver = ()
                 try:
                     signature = image.method_signature(operand)
                     owner, name = image.member(operand)
@@ -306,6 +457,26 @@ def _flow(image, bodies, occurrences, fields, resources, resource_occurrences):
                         if not signature['instance'] or not slots or slots[0] != 0 or signature['return']['kind'] != 'void':
                             sink_mode = None
                         slots = [0]
+                    possible_wrapper, wrapper = False, None
+                    if op == 0x28 and not sink_mode and not target:
+                        if operand not in peer_targets:
+                            reference = _wrapper_reference(image, operand)
+                            peer_targets[operand] = (reference is not None,
+                                                     peers.resolve(image, reference) if reference and peers is not None else None)
+                        possible_wrapper, wrapper = peer_targets[operand]
+                    if peers is not None:
+                        non_display_uses.update(receiver)
+                        for slot, value in enumerate(args):
+                            if not ((wrapper and slot == wrapper[0]) or
+                                    (sink_mode == 'setter' and op != 0x73 and not target and slot == 0)):
+                                non_display_uses.update(value)
+                    if wrapper:
+                        slot, peer_proof = wrapper
+                        proof = {'method_token': method, 'il_offset': offset, 'sink': peer_proof['sink'],
+                                 'cross_assembly': peer_proof}
+                        cross_calls.setdefault((method, offset), (proof, set()))[1].update(args[slot])
+                        if slot and (not args[0] or any(node in unknown or node in literal_records for node in args[0])):
+                            bad_receivers.add((method, offset))
                     if sink_mode:
                         sink = _node('sink', method, offset)
                         sinks[sink] = {'method_token': method, 'il_offset': offset, 'sink': {'assembly': owner['assembly'], 'type': owner['name'], 'member': name}}
@@ -330,15 +501,17 @@ def _flow(image, bodies, occurrences, fields, resources, resource_occurrences):
                             method_issues[method].add('virtual_dispatch_unresolved')
                     else:
                         call = _node('unknown', method, offset, 'external_call')
-                        if not sink_mode and not manager_ctor and not resource_lookup:
+                        if not sink_mode and not wrapper and not manager_ctor and not resource_lookup:
                             unknown[call] = 'external_call_unresolved'
                             method_issues[method].add('external_call_unresolved')
+                            if possible_wrapper:
+                                external_uses.update(inputs)
                         if manager_ctor:
                             managers[call] = args[0]
                         elif resource_lookup:
                             lookups[call] = (receiver, args[0], method, offset)
                             unknown[call] = 'managed_resource_lookup_unresolved'
-                        else:
+                        elif not wrapper:
                             for src in inputs:
                                 edge(src, call, 'external_argument', method, offset)
                         returned = {call}
@@ -352,6 +525,9 @@ def _flow(image, bodies, occurrences, fields, resources, resource_occurrences):
                         edge_keys.add(key)
                         edges.append(edges_key)
                 except (ValueError, KeyError):
+                    non_display_uses.update(receiver)
+                    for value in (*stack, *args):
+                        non_display_uses.update(value)
                     method_issues[method].add('call_signature_unresolved')
                     stack = [fresh('call_signature_unresolved')]
             elif op in (0x7b, 0x7c, 0x7e, 0x7f, 0x7d, 0x80):
@@ -366,7 +542,7 @@ def _flow(image, bodies, occurrences, fields, resources, resource_occurrences):
                         edge(src, field, 'field_store', method, offset)
                 else:
                     if op in (0x7b, 0x7c):
-                        pop()
+                        non_display_uses.update(pop())
                     stack.append({field} if op in (0x7b, 0x7e) else fresh('field_address'))
                 key = ('field', method, offset)
                 if key not in edge_keys:
@@ -376,6 +552,9 @@ def _flow(image, bodies, occurrences, fields, resources, resource_occurrences):
                 if method_sig['return']['kind'] != 'void':
                     for src in pop():
                         edge(src, _node('return', method), 'method_return', method, offset)
+                    bad_returns.add(method)
+                elif stack or i['end'] != len(body['code']):
+                    bad_returns.add(method)
                 terminal = True
             elif op in (0x2b, 0x38, 0xdd, 0xde):
                 if op in (0xdd, 0xde):
@@ -478,7 +657,9 @@ def _flow(image, bodies, occurrences, fields, resources, resource_occurrences):
             index = int(slot) - int(signature['instance'])
             if 0 <= index < len(signature['arguments']) and signature['arguments'][index]['kind'] == 'string':
                 unknown[node] = 'managed_display_argument_input_unbound'
-    connected_methods = {p['method_token'] for p in sinks.values()}
+    # A proved caller is not a closed census of an externally callable
+    # wrapper's inputs. Keep its callee-side pending evidence separate.
+    connected_methods = {p['method_token'] for p in sinks.values()} | {method for method, _ in cross_calls}
     changed = True
     while changed:
         changed = False
@@ -491,6 +672,44 @@ def _flow(image, bodies, occurrences, fields, resources, resource_occurrences):
     for method in sorted(connected_methods):
         for reason in sorted(method_issues[method]):
             pending.append({'reason': reason, 'method_token': method, 'scope': 'display_dependency'})
+    external_literals = ancestors(external_uses) & literal_records.keys()
+    unsafe_cross = set()
+    cross_proofs = defaultdict(list)
+    if cross_calls:
+        other_literals = ancestors(non_display_uses) & literal_records.keys()
+        eligible_methods = {}
+        for (method, offset), (proof, sources) in cross_calls.items():
+            if method not in eligible_methods:
+                body = bodies[method]
+                eligible_methods[method] = (
+                    not body['handlers'] and method not in bad_returns
+                    and not (method_issues[method] - {'external_call_unresolved'})
+                    and all(i['opcode'] in CROSS_CALLER_OPS for i in body['instructions'])
+                )
+            sink = _node('sink', method, offset)
+            sinks[sink] = proof
+            concrete = sources & literal_records.keys()
+            if (not eligible_methods[method] or (method, offset) in bad_receivers
+                    or len(sources) != 1 or concrete != sources
+                    or any(literal_records[node]['location']['method_token'] != method for node in concrete)):
+                # The backward graph may expose physical origins, but cannot
+                # prove these caller paths are exclusively display uses.
+                unsafe_cross.update(ancestors(sources) & literal_records.keys())
+                reason = 'managed_cross_assembly_display_input_unresolved'
+            elif concrete & (other_literals | identifier_nodes):
+                unsafe_cross.update(concrete)
+                reason = 'managed_cross_assembly_display_use_shared'
+            else:
+                node = next(iter(concrete))
+                cross_proofs[node].append((sink, proof))
+                continue
+            pending.append({'reason': reason, 'scope': 'display_dependency', 'dependency': sink,
+                            'method_token': method, 'il_offset': offset, 'consumers': [proof]})
+        for node, proofs in cross_proofs.items():
+            if node not in unsafe_cross and node not in external_literals:
+                for sink, proof in proofs:
+                    edge(node, sink, 'cross_assembly_display_argument', proof['method_token'], proof['il_offset'])
+    unsafe_literals = identifier_nodes | external_literals | unsafe_cross
     for token, field in fields.items():
         node = _node('field', token)
         if node in reached:
@@ -510,11 +729,15 @@ def _flow(image, bodies, occurrences, fields, resources, resource_occurrences):
         if node in reached:
             occurrence['classification'] = 'display'
             occurrence['reason'] = 'structural_display_argument_flow'
-            if node in identifier_nodes:
+            if node in unsafe_literals:
                 occurrence['display_projection_required'] = True
-                pending.append({'reason': 'managed_shared_identifier_write_unsafe',
+                pending.append({'reason': 'managed_shared_identifier_write_unsafe' if node in identifier_nodes
+                                else 'managed_shared_control_write_unsafe',
                                 'scope': 'display_dependency', 'dependency': node,
                                 'location': dict(loc), 'consumers': consumers[node]})
+        elif node in cross_proofs and node not in unsafe_literals:
+            occurrence['classification'] = 'display'
+            occurrence['reason'] = 'structural_cross_assembly_display_argument_flow'
         elif node in identifier_nodes:
             occurrence['classification'] = 'non_display'
             occurrence['reason'] = 'structural_resource_identifier'
@@ -522,10 +745,45 @@ def _flow(image, bodies, occurrences, fields, resources, resource_occurrences):
             occurrence['classification'] = 'uncertain'
             occurrence['reason'] = 'no_proven_display_consumer'
         occurrence['proof'] = {'method_ref': _node('method', loc['method_token']), 'flow_node': node}
+        if node in cross_proofs and node not in unsafe_literals:
+            occurrence['proof']['cross_assembly_consumers'] = [proof for _, proof in cross_proofs[node]]
+        if rewrite_guard is not None and node in unsafe_literals:
+            rewrite_guard[(loc['method_token'], loc['il_offset'])] = (
+                'MANAGED_SHARED_IDENTIFIER_WRITE_UNSAFE' if node in identifier_nodes
+                else 'MANAGED_SHARED_CONTROL_WRITE_UNSAFE'
+            )
     return edges, pending, sinks
 
 
-def scan_assembly(path: Path, relative_path: str, *, method: str = 'primary') -> dict:
+def _check_display_consumers(image, bodies, occurrences):
+    """Audit exact direct UI setter operands without using the flow graph."""
+    covered = {(row['location']['method_token'], row['location']['il_offset'])
+               for row in occurrences if row['classification'] == 'display'}
+    known = {}
+    for method, body in bodies.items():
+        for value, call in pairwise(body['instructions']):
+            if value['opcode'] != 0x72 or call['opcode'] not in (0x28, 0x6f):
+                continue
+            if (method, value['offset']) in covered:
+                continue
+            operand = int.from_bytes(call['operand'], 'little')
+            if operand not in known:
+                try:
+                    owner, name = image.member(operand)
+                    sig = image.method_signature(operand)
+                    known[operand] = (SINKS.get((owner.get('assembly'), owner.get('name'), name)) == 'setter'
+                                      and sig['instance'] and not sig['vararg']
+                                      and [a['kind'] for a in sig['arguments']] == ['string']
+                                      and sig['return']['kind'] == 'void')
+                except (ValueError, KeyError, UnicodeError):
+                    known[operand] = False
+            if known[operand]:
+                yield {'reason': 'PROVEN_DISPLAY_CONSUMER_WITHOUT_TARGET', 'scope': 'display_dependency',
+                       'method_token': method, 'il_offset': value['offset'],
+                       'location': {'method_token': method, 'il_offset': call['offset']}}
+
+
+def scan_assembly(path: Path, relative_path: str, *, method: str = 'primary', peers=None) -> dict:
     require(method in ('primary', 'independent'), 'MANAGED_SCAN_METHOD')
     relative = PurePosixPath(relative_path.replace('\\', '/'))
     require(not relative.is_absolute() and '..' not in relative.parts, 'MANAGED_RELATIVE_PATH')
@@ -543,8 +801,9 @@ def scan_assembly(path: Path, relative_path: str, *, method: str = 'primary') ->
                     'location': {'method_token': mid, 'il_offset': off, 'string_token': token}, 'source': text}
                    for mid, off, token, text in iterator(image, bodies)]
     occurrences.sort(key=lambda o: (o['location']['method_token'], o['location']['il_offset']))
-    dependencies, flow_pending, sinks = _flow(image, bodies, occurrences, fields, resources, resource_occurrences)
+    dependencies, flow_pending, sinks = _flow(image, bodies, occurrences, fields, resources, resource_occurrences, peers)
     pending.extend(flow_pending)
+    pending.extend(_check_display_consumers(image, bodies, occurrences))
     for occurrence in resource_occurrences:
         occurrence['file'] = str(relative)
     occurrences.extend(resource_occurrences)
@@ -569,9 +828,41 @@ def _us_entry(text):
     return compress(len(data) + 1) + data + bytes([int(special)])
 
 
+def _startup_methods(image, bodies):
+    """Bind exact managed entry points and directly reachable local methods."""
+    entry = unpack('<I', image.raw, image.cli + 20)[0]
+    require(not entry or entry >> 24 == 6 and entry in bodies, 'MANAGED_STARTUP_ENTRY_UNRESOLVED')
+    roots = {entry} if entry else set()
+    for rid, row in enumerate(image.rows.get(6, ()), 1):
+        # A type initializer may be invoked by the loader before first use.
+        if row[2] & 0x1810 == 0x1810 and image.string(row[3]) == '.cctor':
+            roots.add(0x06000000 | rid)
+    for parent, ctor, _ in image.rows.get(12, ()):
+        table, rid = image.coded('HasCustomAttribute', parent)
+        if table != 6:
+            continue
+        ctor_table, ctor_rid = image.coded('CustomAttributeType', ctor)
+        owner, name = image.member(ctor_table << 24 | ctor_rid)
+        if name == '.ctor' and (owner['assembly'], owner['name']) in {
+                ('UnityEngine.CoreModule', 'UnityEngine.RuntimeInitializeOnLoadMethodAttribute'),
+                ('UnityEngine', 'UnityEngine.RuntimeInitializeOnLoadMethodAttribute'),
+                ('System.Runtime', 'System.Runtime.CompilerServices.ModuleInitializerAttribute')}:
+            roots.add(0x06000000 | rid)
+    pending = list(roots)
+    while pending:
+        for ins in bodies.get(pending.pop(), {}).get('instructions', ()):
+            if ins['opcode'] not in (0x28, 0x6f, 0x73, 0xfe06, 0xfe07):
+                continue
+            target = _local_method(image, int.from_bytes(ins['operand'], 'little'))
+            if target in bodies and target not in roots:
+                roots.add(target)
+                pending.append(target)
+    return roots
 
 
-def patch_assembly(raw: bytes, replacements: list[dict]) -> bytes:
+
+
+def patch_assembly(raw: bytes, replacements: list[dict], *, peers=None) -> bytes:
     """Append selected #US or embedded .resources values without hooks.
 
     Unsigned IL-only PE32/PE32+ images with ordinary alignment are supported,
@@ -623,13 +914,12 @@ def patch_assembly(raw: bytes, replacements: list[dict]) -> bytes:
     bodies = {0x06000000 | rid: image.body(rid) for rid, row in enumerate(image.rows.get(6, []), 1) if row[0]}
     spans = sorted((body['start'], body['start'] + len(body['code'])) for body in bodies.values())
     require(all(left[1] <= right[0] for left, right in zip(spans, spans[1:])), 'MANAGED_PATCH_ALIASED_BODY')
-    unsafe_identifiers = set()
+    unsafe_writes = {}
+    startup = _startup_methods(image, bodies)
     if any('resource_token' not in row['location'] for row in replacements):
         literals = [{'location': {'method_token': mid, 'il_offset': off}, 'source': text}
                     for mid, off, _, text in _enumerate_primary(image, bodies)]
-        _flow(image, bodies, literals, {}, resources, resource_occurrences)
-        unsafe_identifiers = {(row['location']['method_token'], row['location']['il_offset'])
-                              for row in literals if row.get('display_projection_required')}
+        _flow(image, bodies, literals, {}, resources, resource_occurrences, peers, rewrite_guard=unsafe_writes)
     for replacement in replacements:
         require(isinstance(replacement, dict), 'MANAGED_REPLACEMENT_SHAPE')
         loc = replacement.get('location')
@@ -642,6 +932,8 @@ def patch_assembly(raw: bytes, replacements: list[dict]) -> bytes:
         selected.add((method, il))
         if method not in bodies:
             bodies[method] = image.body(method & 0xffffff)
+        require(method not in startup or replacement['target'] == replacement['source'],
+                'MANAGED_STARTUP_LITERAL_WRITE_FORBIDDEN')
         body = bodies[method]
         require(body is not None, 'MANAGED_REPLACEMENT_NO_BODY')
         candidates = [i for i in body['instructions'] if i['offset'] == il]
@@ -653,8 +945,9 @@ def patch_assembly(raw: bytes, replacements: list[dict]) -> bytes:
         require(isinstance(replacement.get('source'), str) and strings[old & 0xffffff] == replacement['source'], 'MANAGED_REPLACEMENT_SOURCE_MISMATCH')
         target = replacement.get('target')
         require(isinstance(target, str), 'MANAGED_TARGET_TYPE')
-        require(target == replacement['source'] or (method, il) not in unsafe_identifiers,
-                'MANAGED_SHARED_IDENTIFIER_WRITE_UNSAFE')
+        unsafe_reason = unsafe_writes.get((method, il))
+        if unsafe_reason and target != replacement['source']:
+            raise ManagedFormatError(unsafe_reason)
         if target not in new_tokens:
             require(len(heap) <= 0xffffff, 'MANAGED_PATCH_US_TOKEN_LIMIT')
             new_tokens[target] = 0x70000000 | len(heap)

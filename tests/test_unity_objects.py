@@ -98,7 +98,26 @@ class ObjectInventoryTests(unittest.TestCase):
         result = scan(raw)
         self.assertEqual([r['classification'] for r in result['occurrences']],
                          ['display', 'uncertain', 'display'])
-        self.assertEqual(result['pending'], [])
+        self.assertTrue(result['occurrences'][2]['display_projection_required'])
+        self.assertEqual([r['reason'] for r in result['pending']],
+                         ['UNITY_STARTUP_IDENTITY_REQUIRES_DISPLAY_PROJECTION'])
+        with self.assertRaisesRegex(ValueError, 'SDK_STARTUP_IDENTITY_WRITE_FORBIDDEN'):
+            objects.patch_serialized(raw, [replacement(3, ['productName'], 'TITLE', 'NEW TITLE')])
+
+    def test_common_native_ui_omission_holds_both_inventory_methods(self):
+        tree = text_tree()
+        raw = serialized([(102, tree), (900, text_tree(900))], [(1, 0, string('VISIBLE')), (2, 1, string('RAW'))])
+        fake = {i: types.SimpleNamespace(path_id=i, type=types.SimpleNamespace(value=cid),
+                                        serialized_type=types.SimpleNamespace(node=primary_nodes(tree)),
+                                        read_typetree=lambda text=text: {'m_Text': text})
+                for i, cid, text in ((1, 102, 'VISIBLE'), (2, 900, 'RAW'))}
+        env = types.SimpleNamespace(file=types.SimpleNamespace(objects=fake, externals=[]))
+        with patch.object(objects, '_load_primary', return_value=env), patch.object(objects, '_display_field_reason', return_value=None):
+            for method in ('primary', 'independent'):
+                result = scan(raw, method=method)
+                [gap] = result['pending']
+                self.assertEqual(gap['reason'], 'PROVEN_DISPLAY_CONSUMER_WITHOUT_TARGET')
+                self.assertEqual((gap['location']['object_id'], gap['location']['field_path']), (1, ['m_Text']))
 
     def test_injected_primary_agrees_on_real_byte_physical_locators(self):
         payload = string('SAME') + struct.pack('<i', 2) + string('') + string('SAME') + struct.pack('<iq', 0, 8)
@@ -215,6 +234,79 @@ class ObjectInventoryTests(unittest.TestCase):
             kind='unsupported', reason='serialize_reference')
         result = scan(raw, managed_types=types_)
         self.assertIn('MANAGED_DISPLAY_LAYOUT_UNRESOLVED', [r['reason'] for r in result['pending']])
+
+    def test_stripped_tmp_prefix_extracts_and_rewrites_only_proven_display_field(self):
+        script = (string('SCRIPT') + bytes(20) + string('TextMeshProUGUI') +
+                  string('TMPro') + string('Unity.TextMeshPro.dll'))
+        prefix = struct.pack('<iqB', 0, 0, 1) + bytes(3) + struct.pack('<iq', 0, 2) + string('UI')
+        control = string('Unchanged selector')
+        opaque = string('Not a visible label') + b'\x81\x9f\x17\xff'
+        fields = [(name, dict(kind='string')) for name in ('m_text', 'selector')]
+        event = dict(kind='named', assembly='UnityEngine.UI',
+                     name='UnityEngine.UI.MaskableGraphic/CullStateChangedEvent')
+        fields = [('m_OnCullStateChanged', event), *fields, ('unknown', dict(kind='unsupported'))]
+        desc = {'Unity.TextMeshPro::TMPro.TextMeshProUGUI': {'fields': [
+            dict(name=name, type=kind, serialized=True) for name, kind in fields]}}
+        def fixture(event_count, text):
+            wire = prefix + struct.pack('<i', event_count) + text + control + opaque
+            return serialized([(114, []), (115, [])], [(1, 0, wire), (2, 1, script)], trees=False)
+        raw = fixture(0, string('Visible caption'))
+        fake = {}
+        for obj in reader.serialized(raw)['objects']:
+            payload = raw[obj['offset']:obj['offset'] + obj['size']]
+            fake[obj['path_id']] = types.SimpleNamespace(path_id=obj['path_id'],
+                type=types.SimpleNamespace(value=obj['class_id']),
+                serialized_type=types.SimpleNamespace(node=None), get_raw_data=lambda data=payload: data)
+        env = types.SimpleNamespace(file=types.SimpleNamespace(objects=fake, externals=[]))
+        with patch.object(objects, '_load_primary', return_value=env):
+            for method in ('primary', 'independent'):
+                result = scan(raw, method=method, managed_types=desc)
+                self.assertEqual([(row['location']['field_path'], row['source']) for row in result['occurrences']
+                                  if row['classification'] == 'display'], [(['m_text'], 'Visible caption')])
+                self.assertEqual([(row['reason'], row['location']['field_path']) for row in result['pending']],
+                                 [('MANAGED_DISPLAY_LAYOUT_UNRESOLVED', ['unknown'])])
+        value = 'Visible caption expanded'
+        output = objects.patch_serialized(raw, [replacement(1, ['m_text'], 'Visible caption', value)],
+                                          managed_types=desc)
+        obj = reader.serialized(output)['objects'][0]
+        self.assertEqual(output[obj['offset']:obj['offset'] + obj['size']],
+                         prefix + bytes(4) + string(value) + control + opaque)
+        with self.assertRaisesRegex(ValueError, 'MANAGED_PREFIX_DISPLAY_FIELD_UNPROVEN'):
+            objects.patch_serialized(raw, [replacement(1, ['selector'], 'Unchanged selector', 'BAD')],
+                                     managed_types=desc)
+        for bad in (fixture(1, string('Do not seek past a callback')), fixture(0, b'\xff\xff\xff\x7f')):
+            result = scan(bad, managed_types=desc)
+            self.assertFalse(any(row['classification'] == 'display' for row in result['occurrences']))
+            self.assertTrue(result['pending'])
+
+    def test_snapshot_records_method_neutral_dependencies_and_warm_cache_reuse(self):
+        from unity_inventory import scan_snapshot
+
+        raw = serialized([(102, text_tree()), (114, [])], [
+            (1, 0, string('Visible caption')), (2, 1, struct.pack('<iqB', 0, 0, 1) +
+                bytes(3) + struct.pack('<iq', 0, 99) + string('Different UI'))])
+        manifest = {'schema': 'parr0t.unity-source-snapshot.v1', 'unity_version': '2022.3.0',
+                    'files': [{'file': 'synthetic.assets', 'sha256': hashlib.sha256(raw).hexdigest(),
+                               'size': len(raw)}]}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'synthetic.assets').write_bytes(raw)
+            cache = root / 'evidence.sqlite3'
+            output = root / 'inventory.json'
+            scan_snapshot(root, manifest, cache, output, method='independent')
+            cold = json.loads(output.read_bytes())
+            scan_snapshot(root, manifest, cache, output, method='independent')
+            warm = json.loads(output.read_bytes())
+        first = cold['coverage']['extraction_evidence']
+        second = warm['coverage']['extraction_evidence']
+        self.assertEqual((first['telemetry']['scanned_files'], first['telemetry']['reused_files']), (1, 0))
+        self.assertEqual((second['telemetry']['scanned_files'], second['telemetry']['reused_files']), (0, 1))
+        self.assertEqual(first['pending_display_keys'], second['pending_display_keys'])
+        self.assertEqual(len(first['pending_display_keys']), 1)
+        self.assertFalse(warm['coverage']['declared_complete'])
+        self.assertEqual([row['source'] for row in warm['segments']
+                          if row['metadata']['display_scope_evidence']['kind'] == 'positive_display_binding'],
+                         ['Visible caption'])
 
     def test_public_native_layouts_do_not_use_clr_pointer_field_storage(self):
         types_ = {'Synthetic::Values': dict(name='Values', assembly='Synthetic', base=None, enum=False,

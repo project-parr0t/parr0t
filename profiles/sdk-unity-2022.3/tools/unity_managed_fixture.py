@@ -18,7 +18,9 @@ def token(op, value):
 
 
 def fixture(*, codes=None, strong=False, pe64=False, unsupported_field=False, resources=None, resource_flow=False, linked_resource=False,
-            string_argument=False, external_helper_assembly=None, shared_resource_key=False, assembly_name='Synthetic'):
+            string_argument=False, external_helper_assembly=None, shared_resource_key=False, assembly_name='Synthetic',
+            assembly_version=(1, 0, 0, 0), display_receiver=False, method_names=None, method_signatures=None,
+            external_helper_signature=b'\x00\x01\x01\x0e'):
     strings = bytearray(b'\0')
     blobs = bytearray(b'\0')
     def s(value):
@@ -57,16 +59,25 @@ def fixture(*, codes=None, strong=False, pe64=False, unsupported_field=False, re
         6: [(0x2000 + off - 0x200, 0, 0x16, s('Method' + str(i)), b(b'\x00\x01\x01\x02' if i == 2 else b'\x00\x00\x01'), 1) for i, off in enumerate(body_offsets)],
         10: [(9, s('set_text'), b(b'\x20\x01\x01\x0e')), (25, s('.ctor'), b(b'\x20\x00\x01'))],
         12: [(65, 19, b(b'\x01\x00\x00\x00'))],
-        32: [(0x8004, 1, 0, 0, 0, int(strong), b(b'KEY') if strong else 0, s(assembly_name), 0)],
+        32: [(0x8004, *assembly_version, int(strong), b(b'KEY') if strong else 0, s(assembly_name), 0)],
         35: [(1, 0, 0, 0, 0, 0, s('UnityEngine.UI'), 0, 0), (1, 0, 0, 0, 0, 0, s('UnityEngine.CoreModule'), 0, 0)],
     }
     if string_argument:
         row = rows[6][0]
         rows[6][0] = (*row[:4], b(b'\x00\x01\x01\x0e'), row[5])
+    if display_receiver:
+        flags, name, _ = rows[4][3]
+        rows[4][3] = (flags, name, b(b'\x06\x12\x05'))  # static UnityEngine.UI.Text
+    for index, signature in (method_signatures or {}).items():
+        row = rows[6][index]
+        rows[6][index] = (*row[:4], b(signature), row[5])
+    for index, name in (method_names or {}).items():
+        row = rows[6][index]
+        rows[6][index] = (*row[:3], s(name), *row[4:])
     if external_helper_assembly:
         rows[35].append((1, 0, 0, 0, 0, 0, s(external_helper_assembly), 0, 0))
         rows[1].append((14, s('Panel'), s('Synthetic')))
-        rows[10].append((33, s('Method0'), b(b'\x00\x01\x01\x0e')))
+        rows[10].append((33, s('Method0'), b(external_helper_signature)))
     if resource_flow:
         rows[35].append((1, 0, 0, 0, 0, 0, s('mscorlib'), 0, 0))
         rows[1].extend([(14, s('ResourceManager'), s('System.Resources')), (14, s('Assembly'), s('System.Reflection'))])
@@ -130,6 +141,28 @@ def fixture(*, codes=None, strong=False, pe64=False, unsupported_field=False, re
         struct.pack_into('<I', raw, resource_offset, len(resources))
         raw[resource_offset + 4:resource_offset + 4 + len(resources)] = resources
     return bytes(raw)
+
+
+def cross_assembly_pair(*, helper_version=(1, 0, 0, 0), helper_uses_control=False,
+                        duplicate_method=False, helper_signature=None, caller_code=None, typed_receiver=False):
+    field_load = token(0x7e, 0x04000004)
+    signature = b'\x00\x02\x01\x12\x05\x0e' if typed_receiver else b'\x00\x01\x01\x0e'
+    if caller_code is None:
+        caller_code = ((field_load if typed_receiver else b'') + token(0x72, 0x70000001)
+                       + token(0x28, 0x0a000003) + b'\x2a')
+    caller = fixture(codes=[caller_code], external_helper_assembly='Synthetic.Helper',
+                     display_receiver=typed_receiver, external_helper_signature=signature)
+    receiver_and_text = b'\x02\x03' if typed_receiver else field_load + b'\x02'
+    wrapper = receiver_and_text + token(0x6f, 0x0a000001) + b'\x2a'
+    if helper_uses_control:
+        control_arg = b'\x03' if typed_receiver else b'\x02'
+        wrapper = control_arg + bytes((0x2c, len(wrapper) - 1)) + wrapper
+    codes = [wrapper, wrapper] if duplicate_method else [wrapper]
+    signatures = dict.fromkeys(range(len(codes)), helper_signature or signature)
+    helper = fixture(codes=codes, assembly_name='Synthetic.Helper', assembly_version=helper_version,
+                     display_receiver=True, method_signatures=signatures,
+                     method_names={1: 'Method0'} if duplicate_method else None)
+    return caller, helper
 
 
 def resource_fixture(version=2):

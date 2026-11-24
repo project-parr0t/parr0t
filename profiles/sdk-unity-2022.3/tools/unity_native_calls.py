@@ -175,6 +175,50 @@ def _references(code, begin):
     return refs, calls, direct
 
 
+def _startup_functions(pe, functions, imports):
+    entry = unpack('<I', pe.raw, pe.opt + 16)[0]
+    # No TLS callback scope is claimed when a TLS directory is present.
+    if pe.directory_count > 9 and any(pe.directory(9)):
+        return None
+    if not entry:
+        return set()
+    ordered = sorted(functions)
+    from bisect import bisect_right
+    def function_at(rva):
+        pos = bisect_right(ordered, rva) - 1
+        if pos >= 0 and rva < functions[ordered[pos]]['end']:
+            return ordered[pos]
+
+    root = function_at(entry)
+    if root is None:
+        return None
+    seen, todo = {root}, [root]
+    while todo:
+        begin = todo.pop()
+        function = functions[begin]
+        if not function['complete']:
+            return None
+        for ins in function['decoded']:
+            if (ins['opcode'] == 0xff and (ins['modrm'] >> 3) & 7 in (2, 4)
+                    and (ins['modrm'] not in (0x15, 0x25) or ins['address_override']
+                         or begin + ins['end'] + ins['displacement'] not in imports)):
+                return None
+            if ins['opcode'] not in (0xe8, 0xe9, 0xeb):
+                continue
+            end = ins['end']
+            size = 1 if ins['opcode'] == 0xeb else 4
+            start = pe.at(begin + end - size, size)
+            destination = begin + end + int.from_bytes(pe.raw[start:start + size], 'little', signed=True)
+            target = function_at(destination)
+            if target is None:
+                # Unknown thunk/leaf code is not proof of startup separation.
+                return None
+            if target not in seen:
+                seen.add(target)
+                todo.append(target)
+    return seen
+
+
 def scan_native_dependencies(raw: bytes, relative_path: str, *, method='primary') -> dict:
     require(method in ('primary', 'independent'), 'NATIVE_SCAN_METHOD')
     relative = PurePosixPath(relative_path.replace('\\', '/'))
@@ -348,6 +392,8 @@ def scan_native_dependencies(raw: bytes, relative_path: str, *, method='primary'
             result['pending'].append({'reason': 'native_display_projection_required', 'scope': 'display_dependency', 'location': occurrence['location']})
     result['occurrences'] = sorted(nominations, key=lambda row: (row['location']['rva'], row['location']['encoding'], row['location']['use_rva']))
     result['proofs']['functions'] = {str(begin): {'end_rva': fn['end'], 'decoded': fn['complete']} for begin, fn in functions.items() if begin in connected}
+    startup = _startup_functions(pe, functions, imports)
+    result['proofs']['startup_functions'] = sorted(startup) if startup is not None else None
     return result
 
 
@@ -361,6 +407,8 @@ def patch_native_literals(raw, replacements):
     if not replacements:
         return raw
     inventory = scan_native_dependencies(raw, 'synthetic-binding.dll')
+    startup_functions = inventory['proofs'].get('startup_functions')
+    startup = set(startup_functions) if startup_functions is not None else None
     rows = {(o['location']['rva'], o['location']['encoding'], o['location']['use_rva']): o for o in inventory['occurrences']}
     payload, writes, seen = bytearray(), [], set()
     for replacement in replacements:
@@ -371,6 +419,8 @@ def patch_native_literals(raw, replacements):
         seen.add(key)
         row = rows[key]
         require(not row['projection_required'], 'NATIVE_PROJECTION_REQUIRED')
+        require(startup is not None and row['proof']['function_rva'] not in startup,
+                'NATIVE_STARTUP_LITERAL_WRITE_FORBIDDEN')
         require(isinstance(replacement.get('source'), str) and row['source'] == replacement['source'], 'NATIVE_REPLACEMENT_SOURCE_MISMATCH')
         target = replacement.get('target')
         require(isinstance(target, str) and '\0' not in target, 'NATIVE_TARGET_TYPE')

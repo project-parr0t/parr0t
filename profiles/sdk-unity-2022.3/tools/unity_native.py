@@ -293,6 +293,11 @@ def scan_native(path: Path, relative_path: str, *, method: str = "primary") -> d
         occurrences = []
         if len(lines) >= 2:
             occurrences.append({"kind": "app_info", "file": relative_path, "location": {"line_index": 1}, "source": lines[1], "classification": "display" if lines[1] else "non_display", "reason": "UNITY_PRODUCT_WINDOW_TITLE", "proof": {"format": "unity-app-info", "role": "product_name"}})
+            if lines[1]:
+                occurrences[-1]["display_projection_required"] = True
+                return {"occurrences": occurrences, "types": {}, "dependencies": [], "proofs": {},
+                        "pending": [{"reason": "UNITY_STARTUP_IDENTITY_REQUIRES_DISPLAY_PROJECTION",
+                                     "scope": "display_dependency", "location": {"line_index": 1}}]}
         return {"occurrences": occurrences, "types": {}, "dependencies": [], "pending": [], "proofs": {}}
     from unity_native_resources import scan_resource_consumers
     _, leaves = _leaves(raw)

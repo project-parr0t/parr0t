@@ -5,6 +5,7 @@ import hashlib
 import json
 import sqlite3
 from pathlib import Path, PurePosixPath
+from time import perf_counter_ns
 from typing import Any, Iterator
 
 
@@ -106,6 +107,18 @@ def is_candidate(row: dict[str, Any]) -> bool:
         row["classification"] == "uncertain" and row.get("display_dependency") is True
     )
 
+def _pending_display_key(file, source_digest, row):
+    # A file-level observation stays file-level; a location is never
+    # inferred from display text, traversal order, or another method's proof.
+    coordinates = ("dependency", "method_token", "type_token", "field_token", "il_offset",
+                   "resource_token", "entry_index", "line_index", "resource_path", "rva", "use_rva",
+                   "function_rva", "call_rva", "load_rva", "register", "object_id",
+                   "container_entry", "field_path", "parser", "parser_path")
+    location = row.get("location") or {}
+    return fingerprint([file, source_digest, row.get("reason"), row.get("scope"),
+                        {key: row[key] for key in coordinates if key in row},
+                        {key: location[key] for key in coordinates if key in location}])
+
 
 class ScanCache:
     """Each result is bound to method, source bytes and implemented scanner bytes."""
@@ -202,7 +215,7 @@ class ScanCache:
         for key, payload in self.connection.execute(query, (method,)):
             yield {"id": key, **json.loads(payload)}
 
-    def summary(self, method: str) -> dict[str, Any]:
+    def summary(self, method: str, *, include_pending_keys: bool = False) -> dict[str, Any]:
         counts = {"raw_occurrence_count": 0, "display_candidate_count": 0, "control_only_count": 0, "unclassified_count": 0}
         for classification, candidate, count in self.connection.execute("SELECT classification,candidate,count(*) FROM occurrences WHERE method=? GROUP BY classification,candidate", (method,)):
             counts["raw_occurrence_count"] += count
@@ -210,16 +223,24 @@ class ScanCache:
             counts["control_only_count"] += count if classification == "non_display" else 0
             counts["unclassified_count"] += count if classification == "uncertain" and not candidate else 0
         pending = []
+        pending_keys = set()
         bindings = []
         for file, source_digest, scanner_digest, metadata in self.connection.execute("SELECT file,source_digest,scanner_digest,metadata FROM scans WHERE method=? ORDER BY file", (method,)):
             value = json.loads(metadata)
-            pending.extend(item for item in value.get("pending", []) if not isinstance(item, dict) or item.get("affects_display", True))
+            visible = [item for item in value.get("pending", []) if not isinstance(item, dict) or item.get("affects_display", True)]
+            pending.extend(visible)
+            if include_pending_keys:
+                pending_keys.update(_pending_display_key(file, source_digest, item)
+                                    for item in visible if isinstance(item, dict))
             bindings.append([file, source_digest, scanner_digest, value.get("proof_ids")])
-        return {**counts, "pending": pending, "evidence_fingerprint": fingerprint(bindings)}
+        return {**counts, "pending": pending, "evidence_fingerprint": fingerprint(bindings),
+                **({"pending_display_keys": sorted(pending_keys)} if include_pending_keys else {})}
 
-    def inventory(self, method: str, output: Path, implementation: str) -> dict[str, Any]:
+    def inventory(self, method: str, output: Path, implementation: str, *, telemetry=None) -> dict[str, Any]:
         """Stream JSON to disk; neither model output nor tool RPC carries the table."""
-        summary = self.summary(method)
+        started = perf_counter_ns()
+        summary = self.summary(method, include_pending_keys=telemetry is not None)
+        pending_keys = summary.pop("pending_display_keys", None)
         coverage = {
             "declared_complete": not summary["pending"],
             "exclusions": [],
@@ -229,7 +250,7 @@ class ScanCache:
             coverage["exclusions"].append({"reason_code": "STRUCTURALLY_NON_DISPLAY", "affects_user_visible_text": False, "target_count": summary["control_only_count"], "evidence_fingerprint": summary["evidence_fingerprint"]})
         if summary["pending"]:
             coverage["exclusions"].append({"reason_code": "UNRESOLVED_DISPLAY_DEPENDENCY", "affects_user_visible_text": True, "target_count": len(summary["pending"]), "evidence_fingerprint": fingerprint(summary["pending"])})
-        header = {"schema": "parr0t.source-inventory.v1", "method": "unity-2022.3-" + method, "implementation_fingerprint": implementation, "coverage": coverage}
+        header = {"schema": "parr0t.source-inventory.v1", "method": "unity-2022.3-" + method, "implementation_fingerprint": implementation}
         output.parent.mkdir(parents=True, exist_ok=True)
         temporary = output.with_suffix(output.suffix + ".tmp")
         try:
@@ -249,7 +270,12 @@ class ScanCache:
                         if key in row:
                             metadata[key] = row[key]
                     stream.write(encoded({"id": row["id"], "order": order, "source": row["source"], "metadata": metadata}))
-                stream.write("]}\n")
+                if telemetry is not None:
+                    coverage["extraction_evidence"] = {
+                        "pending_display_keys": pending_keys,
+                        "telemetry": {**telemetry, "inventory_ms": (perf_counter_ns() - started) // 1_000_000},
+                    }
+                stream.write('],"coverage":' + encoded(coverage) + '}')
             temporary.replace(output)
         finally:
             temporary.unlink(missing_ok=True)

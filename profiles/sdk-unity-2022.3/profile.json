@@ -11,8 +11,8 @@
     },
     {
       "path": "unity_clr.py",
-      "bytes": 19956,
-      "sha256": "fb27c776278902a560aea4b98f9f2aabd2838b8884ca16a9c19d08a492b69274"
+      "bytes": 21949,
+      "sha256": "f3eac1ebd70ba9badb15120312d94669e915bcf4d7306ea64ca55535901d5d53"
     },
     {
       "path": "unity_dotnet_resources.py",
@@ -21,43 +21,43 @@
     },
     {
       "path": "unity_inventory.py",
-      "bytes": 14641,
-      "sha256": "7560346028ab28cf1e0d17b3c665517a4a9a4056cbd7bc546e0dc354f55d10ca"
+      "bytes": 16758,
+      "sha256": "c7258f62e3c48047602176552bb35d761bc475a80e22e35f68a892043d6cec43"
     },
     {
       "path": "unity_inventory_cache.py",
-      "bytes": 14818,
-      "sha256": "0445937e3ad259dd60f8c31197b79a854eff81b8144c0d009dd118f4691f6702"
+      "bytes": 16569,
+      "sha256": "b3a476f7cccfbbb03f96f2ecd561888c5248211503593e840222d483971ce9d4"
     },
     {
       "path": "unity_managed.py",
-      "bytes": 38386,
-      "sha256": "93015f2ee1cb2efa6409b0be71083ea433c884a264a741ae3a22d18300ef70a1"
+      "bytes": 53716,
+      "sha256": "af60549ac5092f7910d1f72d52747e2c3c05b94f96e24cf4fe7378c676583b35"
     },
     {
       "path": "unity_managed_fixture.py",
-      "bytes": 11888,
-      "sha256": "d8690878c0bb9084cfdead7c22998e00be2ecff0b488f9e27c58dd118bef02cc"
+      "bytes": 13922,
+      "sha256": "923d507459235a39a4e0b86133e81515bc985a84d406086f59f2fb1b61dc48a1"
     },
     {
       "path": "unity_native.py",
-      "bytes": 16509,
-      "sha256": "c96030ffa4f0ddd50019674b956e2abfeb7b7f1477bd6cce26e5c0e986ed69ac"
+      "bytes": 18857,
+      "sha256": "c1c30f05bbbe42745eece6a1f2e9640f9020d5a8ccecd1336bae47adfc1ed492"
     },
     {
       "path": "unity_native_calls.py",
-      "bytes": 22113,
-      "sha256": "4f5acbc816cbc10c8e1fd327102d1308877556058bc2d99c63cfc94d54d71e15"
+      "bytes": 24258,
+      "sha256": "958ba16cb69213bb76cbf48f4b038e2f46ae28c68809615053b2017b0e5046ce"
     },
     {
       "path": "unity_native_fixture.py",
-      "bytes": 1621,
-      "sha256": "7e3723a812ef86a6d0137dd521b2adefee671513c038495d0114c85a0e58395e"
+      "bytes": 6518,
+      "sha256": "00c617ab69f8d4dd77312d60805f8697d31e34e1d027c77d3a12f754b6f01ed5"
     },
     {
       "path": "unity_objects.py",
-      "bytes": 47194,
-      "sha256": "5e339c3166ac5bd85f017a9e1b9ada85858f9e388f97369b0f1a035e5e56bb73"
+      "bytes": 49930,
+      "sha256": "8e9b34a36a83d29ce6b8053493cada039f9a338b34f7c9dc4ee0cc1b2eae0e77"
     },
     {
       "path": "unity_objects_fixture.py",
@@ -71,8 +71,8 @@
     },
     {
       "path": "unity_raw.py",
-      "bytes": 27556,
-      "sha256": "2b85c451a8f00c3156be745b43a5e9699a6f56f034b6df5334b49a9f0ba9d38b"
+      "bytes": 28975,
+      "sha256": "f8d204fd2e3e7feb578e19c263916f2a457372120649a4a5d98a0438423fb35b"
     },
     {
       "path": "pack.py",
@@ -108,6 +108,16 @@
       "path": "unpack.py",
       "bytes": 908,
       "sha256": "84d3f2aa3efb7400c10996a00b9f199e66cbfe2492534dbb84b6108547970534"
+    },
+    {
+      "path": "unity_tmp.py",
+      "bytes": 28437,
+      "sha256": "5d460978b3b92aa62b347bb049d6c82d078ebab9a64c1f2bc8c6d36cf447c1b4"
+    },
+    {
+      "path": "unity_tmp_wire.py",
+      "bytes": 15170,
+      "sha256": "0d79e9da24881c259eb48153dc6d44a52830046989dbbb464c9f054be1f80197"
     }
   ]
 }

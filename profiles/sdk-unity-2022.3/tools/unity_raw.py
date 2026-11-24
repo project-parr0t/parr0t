@@ -363,7 +363,36 @@ def is_object_type(types, descriptor, seen=()):
     return bool(typ.get('base') and is_object_type(types, typ['base'], seen + (key,)))
 
 
-def managed_object(raw, obj, types, descriptor, fields_offset):
+_UNKNOWN_MANAGED_LAYOUT = frozenset({
+    'MANAGED_DESCRIPTOR_UNSUPPORTED', 'MANAGED_TYPE_MISSING', 'NATIVE_MANAGED_LAYOUT_UNSUPPORTED',
+})
+
+
+def empty_cull_event(desc):
+    # UnityEventBase serializes the persistent-call list first; the exact
+    # built-in event can be traversed only when that list is empty.
+    return (desc.get('kind'), desc.get('assembly'), desc.get('name')) == (
+        'named', 'UnityEngine.UI', 'UnityEngine.UI.MaskableGraphic/CullStateChangedEvent')
+
+
+def _complete_managed_fields(fields, read, strings, refs, *, allow_prefix):
+    values = {}
+    for field in fields:
+        count_strings, count_refs = len(strings), len(refs)
+        name = field['name']
+        try:
+            values[name] = read(field['type'], [name])
+        except FormatError as exc:
+            if not allow_prefix or str(exc) not in _UNKNOWN_MANAGED_LAYOUT:
+                raise
+            # Reject all partial values from the field that failed, including
+            # earlier elements in an incompletely decoded list or value type.
+            del strings[count_strings:]
+            del refs[count_refs:]
+            return values, name
+    return values, None
+
+def managed_object(raw, obj, types, descriptor, fields_offset, *, allow_prefix=False):
     c = Cursor(raw, fields_offset, obj['offset'] + obj['size'])
     strings, refs = [], []
 
@@ -389,6 +418,10 @@ def managed_object(raw, obj, types, descriptor, fields_offset):
             result = [read(desc['element'], path + [i], True, depth + 1) for i in range(count)]
             c.align()
             return result
+        if empty_cull_event(desc):
+            if c.num('<i') == 0:
+                return {}
+            c.pos = start
         if kind == 'pptr' or (kind == 'named' and is_object_type(types, desc)):
             fid, pid = c.num('<i'), c.num('<q')
             refs.append(dict(field_path=path, file_id=fid, path_id=pid,
@@ -409,10 +442,11 @@ def managed_object(raw, obj, types, descriptor, fields_offset):
             return value
         raise FormatError('MANAGED_DESCRIPTOR_UNSUPPORTED')
 
-    result = {f['name']: read(f['type'], [f['name']]) for f in managed_fields(types, descriptor)}
-    if c.pos != c.end:
+    result, pending_field = _complete_managed_fields(
+        managed_fields(types, descriptor), read, strings, refs, allow_prefix=allow_prefix)
+    if pending_field is None and c.pos != c.end:
         raise FormatError('MANAGED_OBJECT_END_MISMATCH')
-    return dict(value=result, strings=strings, references=refs)
+    return dict(value=result, strings=strings, references=refs, pending_field=pending_field)
 
 
 def rebuild(raw, document, changed):

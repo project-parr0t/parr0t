@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 TOOLS = Path(__file__).resolve().parents[1] / "profiles/sdk-unity-2022.3/tools"
 sys.path.insert(0, str(TOOLS))
@@ -200,6 +201,38 @@ class NativeTextTests(unittest.TestCase):
         self.assertEqual(rebuilt, b"\xef\xbb\xbfSYNTHETIC COMPANY\r\n" + "\ud569\uc131 \uc81c\ubaa9".encode() + b"\r\nUNOWNED\r\n")
         with self.assertRaisesRegex(ValueError, "INVALID"):
             patch_native(raw, [{"location": {"line_index": 1}, "source": "SYNTHETIC PRODUCT", "target": "TARGET\nINJECTED"}], app_info=True)
+
+    def test_pack_refuses_to_replace_bound_unity_startup_identity(self):
+        import unity_inventory
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work, game = root / 'work', root / 'synthetic'
+            work.mkdir()
+            info = game / 'Synthetic_Data/app.info'
+            info.parent.mkdir(parents=True)
+            body = b'Synthetic Company\nSynthetic Product\n'
+            info.write_bytes(body)
+            name = info.relative_to(game).as_posix()
+            scan = scan_native(info, name)
+            self.assertTrue(scan['occurrences'][0]['display_projection_required'])
+            documents = {
+                'segments.json': [{'id': 'synthetic', 'source': 'Synthetic Product',
+                                   'metadata': {'file': name, 'unity_kind': 'app_info',
+                                                'location': {'line_index': 1}}}],
+                'reviewed.json': [{'segment_id': 'synthetic', 'source': 'Synthetic Product',
+                                   'text': 'Changed Product', 'status': 'reviewed'}],
+                'sources.json': {'files': [{'file': name, 'sha256': file_digest(info)}]},
+                'request.json': {'game_root': str(game), 'segments_path': 'segments.json',
+                                 'reviewed_path': 'reviewed.json', 'source_manifest_path': 'sources.json'},
+            }
+            for filename, data in documents.items():
+                (work / filename).write_text(json.dumps(data), encoding='utf-8')
+            output = work / 'built'
+            with patch.dict('os.environ', GAME_L10N_STAGE='pack'), patch.object(unity_inventory, 'require_prepared', return_value=(work, {})):
+                with self.assertRaisesRegex(ValueError, 'SDK_STARTUP_IDENTITY_WRITE_FORBIDDEN'):
+                    unity_inventory.build_payload(work / 'request.json', output)
+            self.assertFalse(output.exists())
+            self.assertEqual(info.read_bytes(), body)
 
 
 if __name__ == "__main__":

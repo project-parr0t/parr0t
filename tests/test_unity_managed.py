@@ -1,12 +1,16 @@
 """Synthetic actual PE/CLI fixtures; no assemblies, packages or runtime needed."""
+import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import struct
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 TOOLS = Path(__file__).resolve().parents[1] / 'profiles/sdk-unity-2022.3/tools'
+sys.path.insert(0, str(TOOLS))
 for name in ('unity_clr', 'unity_dotnet_resources', 'unity_pe', 'unity_managed', 'unity_managed_fixture', 'unity_native_calls'):
     spec = importlib.util.spec_from_file_location(name, TOOLS / (name + '.py'))
     module = importlib.util.module_from_spec(spec)
@@ -16,6 +20,7 @@ m = sys.modules['unity_managed']
 c = sys.modules['unity_clr']
 fixture = sys.modules['unity_managed_fixture'].fixture
 token = sys.modules['unity_managed_fixture'].token
+cross_assembly_pair = sys.modules['unity_managed_fixture'].cross_assembly_pair
 
 
 
@@ -52,6 +57,41 @@ class ManagedTests(unittest.TestCase):
         self.assertEqual(fields[0]['display_consumers'][0]['method_token'], 0x06000002)
         self.assertNotIn('classification', fields[1])
         self.assertTrue(self.scan(fixture(unsupported_field=True))['pending'])
+
+    def test_both_inventories_hold_a_known_setter_omission(self):
+        raw = fixture(codes=[b'\x14' + token(0x72, 0x70000001) + token(0x6f, 0x0a000001) + b'\x2a'])
+        def omit_target(_image, _bodies, occurrences, *_args):
+            occurrences.clear()
+            return [], [], {}
+        with patch.object(m, '_flow', side_effect=omit_target), tempfile.TemporaryDirectory() as directory:
+            from unity_inventory_cache import ScanCache
+            path = Path(directory) / 'Synthetic.dll'
+            path.write_bytes(raw)
+            with ScanCache(Path(directory) / 'evidence.sqlite3') as cache:
+                for method in ('primary', 'independent'):
+                    result = m.scan_assembly(path, path.name, method=method)
+                    [gap] = result['pending']
+                    self.assertEqual(gap['reason'], 'PROVEN_DISPLAY_CONSUMER_WITHOUT_TARGET')
+                    self.assertEqual((gap['method_token'], gap['location']['il_offset']), (0x06000001, 6))
+                    cache.store(method, path.name, hashlib.sha256(raw).hexdigest(), 'fixture', result)
+                    output = Path(directory) / (method + '.json')
+                    cache.inventory(method, output, 'fixture')
+                    self.assertFalse(json.loads(output.read_bytes())['coverage']['declared_complete'])
+
+    def test_clr_entry_path_blocks_only_the_startup_literal(self):
+        caption = b'\x14' + token(0x72, 0x70000001) + token(0x6f, 0x0a000001) + b'\x2a'
+        raw = bytearray(fixture(codes=[token(0x28, 0x06000002) + b'\x2a', caption, caption]))
+        cli = c.Image(bytes(raw)).cli
+        struct.pack_into('<I', raw, cli + 20, 0x06000001)
+        original = bytes(raw)
+        startup, ordinary = self.scan(original)['occurrences']
+        def edit(row):
+            return {key: row[key] for key in ('location', 'source')} | {'target': 'SYNTHETIC TARGET'}
+        with self.assertRaisesRegex(ValueError, 'MANAGED_STARTUP_LITERAL_WRITE_FORBIDDEN'):
+            m.patch_assembly(original, [edit(startup)])
+        changed = m.patch_assembly(original, [edit(ordinary)])
+        self.assertEqual([row['source'] for row in self.scan(changed)['occurrences']],
+                         [startup['source'], 'SYNTHETIC TARGET'])
 
     def test_selected_use_rewrite_preserves_shared_original_token(self):
         raw = fixture()
@@ -161,6 +201,129 @@ class ManagedTests(unittest.TestCase):
                 self.assertEqual(unbound[0]['dependency'], 'argument:100663297:0')
                 self.assertEqual(unbound[0]['consumers'][0]['sink']['member'], 'set_text')
 
+    def _peer_inputs(self, root, *images):
+        inputs = {}
+        for file, raw in zip(('Player.dll', 'DisplayPlugin.dll', 'SecondPlugin.dll'), images):
+            path = root / file
+            path.write_bytes(raw)
+            inputs[file] = path, hashlib.sha256(raw).hexdigest()
+        return inputs
+
+    def test_cross_assembly_static_wrapper_binds_exact_call_without_closing_helper(self):
+        for typed_receiver in (False, True):
+            with self.subTest(typed_receiver=typed_receiver), tempfile.TemporaryDirectory() as directory:
+                caller, helper = cross_assembly_pair(typed_receiver=typed_receiver)
+                inputs = self._peer_inputs(Path(directory), caller, helper)
+                caller_path, _ = inputs['Player.dll']
+                helper_path, _ = inputs['DisplayPlugin.dll']
+                found = []
+                for method in ('primary', 'independent'):
+                    peers = m.ManagedPeers(inputs)
+                    result = m.scan_assembly(caller_path, caller_path.name, method=method, peers=peers)
+                    occurrence, = result['occurrences']
+                    self.assertEqual(occurrence['classification'], 'display')
+                    self.assertEqual(occurrence['reason'], 'structural_cross_assembly_display_argument_flow')
+                    self.assertEqual(occurrence['location']['il_offset'], 5 if typed_receiver else 0)
+                    proof, = occurrence['proof']['cross_assembly_consumers']
+                    self.assertEqual(proof['cross_assembly']['file'], helper_path.name)
+                    self.assertEqual(proof['cross_assembly']['method_token'], 0x06000001)
+                    self.assertEqual(proof['cross_assembly']['il_offset'], 2 if typed_receiver else 6)
+                    self.assertEqual(proof['sink']['member'], 'set_text')
+                    self.assertTrue(any(edge['kind'] == 'cross_assembly_display_argument' for edge in result['dependencies']))
+                    helper_result = m.scan_assembly(helper_path, helper_path.name, method=method, peers=peers)
+                    self.assertIn('managed_display_argument_input_unbound', [row['reason'] for row in helper_result['pending']])
+                    found.append(occurrence)
+                self.assertEqual(*found)
+                edit = {'location': found[0]['location'], 'source': found[0]['source'], 'target': 'SYNTHETIC TRANSLATED'}
+                with self.assertRaisesRegex(ValueError, 'MANAGED_SHARED_CONTROL_WRITE_UNSAFE'):
+                    m.patch_assembly(caller, [edit])
+                rewritten = m.patch_assembly(caller, [edit], peers=m.ManagedPeers(inputs))
+                self.assertEqual(self.scan(rewritten)['occurrences'][0]['source'], edit['target'])
+                helper_path.write_bytes(cross_assembly_pair(helper_uses_control=True, typed_receiver=typed_receiver)[1])
+                with self.assertRaisesRegex(RuntimeError, 'MANAGED_PEER_SOURCE_CHANGED'):
+                    m.patch_assembly(caller, [edit], peers=m.ManagedPeers(inputs))
+
+    def test_cross_assembly_rejects_ambiguous_mismatched_or_control_wrappers(self):
+        cases = (
+            ({'helper_version': (1, 0, 0, 1)}, False),
+            ({'helper_signature': b'\x00\x02\x01\x0e\x02'}, False),
+            ({'duplicate_method': True}, False),
+            ({'helper_uses_control': True}, False),
+            ({}, True),
+        )
+        for options, duplicate_assembly in cases:
+            with self.subTest(options=options, duplicate_assembly=duplicate_assembly), tempfile.TemporaryDirectory() as directory:
+                caller, helper = cross_assembly_pair(**options)
+                images = (caller, helper, helper) if duplicate_assembly else (caller, helper)
+                inputs = self._peer_inputs(Path(directory), *images)
+                path, _ = inputs['Player.dll']
+                for method in ('primary', 'independent'):
+                    result = m.scan_assembly(path, path.name, method=method, peers=m.ManagedPeers(inputs))
+                    self.assertEqual([row['classification'] for row in result['occurrences']], ['uncertain'])
+                    self.assertFalse(any(edge['kind'] == 'cross_assembly_display_argument' for edge in result['dependencies']))
+
+    def test_cross_assembly_literal_with_caller_control_use_is_not_writable(self):
+        literal = token(0x72, 0x70000001)
+        wrapper = token(0x28, 0x0a000003)
+        setter = token(0x6f, 0x0a000001)
+        cases = (
+            (literal + b'\x25' + wrapper + b'\x2c\x01\x00\x2a', False, 'uncertain'),
+            (b'\x14' + literal + b'\x25' + wrapper + setter + b'\x2a', True, 'display'),
+        )
+        for code, helper_uses_control, classification in cases:
+            with self.subTest(classification=classification), tempfile.TemporaryDirectory() as directory:
+                caller, helper = cross_assembly_pair(caller_code=code, helper_uses_control=helper_uses_control)
+                inputs = self._peer_inputs(Path(directory), caller, helper)
+                path, _ = inputs['Player.dll']
+                for method in ('primary', 'independent'):
+                    peers = m.ManagedPeers(inputs)
+                    result = m.scan_assembly(path, path.name, method=method, peers=peers)
+                    row, = result['occurrences']
+                    self.assertEqual(row['classification'], classification)
+                    self.assertFalse(any(edge['kind'] == 'cross_assembly_display_argument' for edge in result['dependencies']))
+                    self.assertTrue(result['pending'])
+                    if classification == 'display':
+                        self.assertTrue(row['display_projection_required'])
+                    edit = {'location': row['location'], 'source': row['source'], 'target': 'SYNTHETIC TRANSLATED'}
+                    with self.assertRaisesRegex(ValueError, 'MANAGED_SHARED_CONTROL_WRITE_UNSAFE'):
+                        m.patch_assembly(caller, [edit], peers=peers)
+
+    def test_cross_assembly_snapshot_cache_reuses_per_method_and_invalidates_on_peer_change(self):
+        from unity_inventory import scan_snapshot
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / 'snapshot'
+            snapshot.mkdir()
+            caller, helper = cross_assembly_pair()
+            inputs = self._peer_inputs(snapshot, caller, helper)
+            manifest = {'schema': 'parr0t.unity-source-snapshot.v1', 'unity_version': '2022.3.0f1',
+                        'files': [{'file': file, 'size': path.stat().st_size, 'sha256': digest}
+                                  for file, (path, digest) in sorted(inputs.items())]}
+            cache = root / 'evidence.sqlite3'
+            ids = []
+            for method in ('primary', 'independent'):
+                output = root / (method + '.json')
+                cold = scan_snapshot(snapshot, manifest, cache, output, method=method)
+                self.assertEqual((cold['scanned_files'], cold['reused_files']), (2, 0))
+                self.assertGreater(cold['pending_count'], 0)
+                segment, = json.loads(output.read_text(encoding='utf-8'))['segments']
+                ids.append(segment['id'])
+                warm = scan_snapshot(snapshot, manifest, cache, output, method=method)
+                self.assertEqual((warm['scanned_files'], warm['reused_files']), (0, 2))
+                self.assertEqual(json.loads(output.read_text(encoding='utf-8'))['segments'], [segment])
+            self.assertEqual(*ids)
+            changed = cross_assembly_pair(helper_uses_control=True)[1]
+            peer = next(record for record in manifest['files'] if record['file'] == 'DisplayPlugin.dll')
+            (snapshot / peer['file']).write_bytes(changed)
+            peer.update(size=len(changed), sha256=hashlib.sha256(changed).hexdigest())
+            for method in ('primary', 'independent'):
+                output = root / (method + '.json')
+                refreshed = scan_snapshot(snapshot, manifest, cache, output, method=method)
+                self.assertEqual((refreshed['scanned_files'], refreshed['reused_files']), (2, 0))
+                self.assertGreater(refreshed['pending_count'], 0)
+                self.assertEqual(json.loads(output.read_text(encoding='utf-8'))['segments'], [])
+
     def test_local_sink_argument_with_bound_literal_is_not_unbound(self):
         raw = fixture(codes=[b'\x14\x02' + token(0x6f, 0x0a000001) + b'\x2a',
                              token(0x72, 0x70000001) + token(0x28, 0x06000001) + b'\x2a'],
@@ -256,6 +419,16 @@ class ManagedTests(unittest.TestCase):
         self.assertEqual(by_use[0x2087]['source'], 'SYNTHETIC CAPTION')
         self.assertEqual(native._cstring(sys.modules['unity_pe'].PE(changed), 0x4000, 'utf-16-le'), row['source'])
         self.assertFalse(after['proofs']['static_complete'])
+
+    def test_pe_entry_point_blocks_native_retargeting_in_startup_function(self):
+        native = sys.modules['unity_native_calls']
+        raw = bytearray(sys.modules['unity_managed_fixture'].build_native_fixture())
+        pe = sys.modules['unity_pe'].PE(raw)
+        struct.pack_into('<I', raw, pe.opt + 16, 0x2080)
+        raw = bytes(raw)
+        row = native.scan_native_dependencies(raw, 'SyntheticNative.dll')['occurrences'][0]
+        with self.assertRaisesRegex(ValueError, 'NATIVE_STARTUP_LITERAL_WRITE_FORBIDDEN'):
+            native.patch_native_literals(raw, [{'location': row['location'], 'source': row['source'], 'target': 'TARGET'}])
 
 
     def test_native_projection_and_managed_code_guard(self):
