@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+import struct
 import unittest
+import zlib
 from pathlib import Path
 
 from game_l10n.errors import ConfigurationError
@@ -23,11 +25,23 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def rgba_png(changed: tuple[int, int] | None = None) -> bytes:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(data, zlib.crc32(kind)))
+
+    scanlines = bytearray(32 * (64 * 4 + 1))
+    if changed is not None:
+        x, y = changed
+        scanlines[y * 257 + x * 4 + 4] = 255
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 64, 32, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(scanlines)) + chunk(b"IEND", b""))
+
+
 class ImageLocalizationTests(unittest.TestCase):
     def test_font_glyph_coverage_reads_unicode_cmap_from_sfnt_and_woff(self):
         import struct
         import zlib
-        from game_l10n.font_coverage import _font_glyph_coverage
+        from game_l10n.font_coverage import _font_glyph_coverage, _font_probe_counts, _text_codepoints
 
         groups = struct.pack(">IIIIII", 0x30, 0x39, 3, 0xAC00, 0xAC01, 0)
         table = struct.pack(">HHIII", 12, 0, 16 + len(groups), 0, 2) + groups
@@ -44,6 +58,9 @@ class ImageLocalizationTests(unittest.TestCase):
                 result = _font_glyph_coverage(path)
                 self.assertEqual(result["hangul_syllables"], {"supported": 1, "total": 11172})
                 self.assertEqual(result["digits"], {"supported": 10, "total": 10})
+                codepoints = _text_codepoints(["\uac00\uac01 0", "\uac00\n"])
+                self.assertEqual(_font_probe_counts(path, codepoints)["final_text_glyphs"],
+                                 {"unique_codepoints": 3, "supported": 2, "missing": 1})
 
     def test_media_object_reference_is_bound_to_its_exact_archive(self):
         from game_l10n.image_localization import _verify_engine_media_binding_probe
@@ -80,7 +97,7 @@ class ImageLocalizationTests(unittest.TestCase):
         source = game / "fixture-ui" / "title.png"
         source.parent.mkdir(parents=True)
         work.mkdir()
-        source.write_bytes(b"synthetic-source-image")
+        source.write_bytes(rgba_png())
         manifest = work / "inputs" / "image-ui-inventory.json"
         manifest.parent.mkdir()
         manifest.write_text(
@@ -155,7 +172,7 @@ class ImageLocalizationTests(unittest.TestCase):
 
             output = work / "synthetic-output" / "title.png"
             output.parent.mkdir(parents=True)
-            output.write_bytes(b"synthetic-localized-image")
+            output.write_bytes(rgba_png((2, 3)))
             results = work / "translations" / "image-ui-results.json"
             results.parent.mkdir()
             results.write_text(
@@ -166,7 +183,7 @@ class ImageLocalizationTests(unittest.TestCase):
                         "assets": [
                             {
                                 "id": "synthetic-ui-title",
-                                "source_sha256": digest(b"synthetic-source-image"),
+                                "source_sha256": digest(rgba_png()),
                                 "output_path": "synthetic-output/title.png",
                                 "output_sha256": digest(output.read_bytes()),
                                 "width": 64,
@@ -198,6 +215,16 @@ class ImageLocalizationTests(unittest.TestCase):
             self.assertEqual(public_image_localization_state(work)["status"], "complete")
 
             result_payload = json.loads(results.read_text(encoding="utf-8"))
+            with self.subTest("a fresh digest cannot hide a changed alpha sample outside the rectangle"):
+                original_output = output.read_bytes()
+                output.write_bytes(rgba_png((1, 3)))
+                result_payload["assets"][0]["output_sha256"] = digest(output.read_bytes())
+                results.write_text(json.dumps(result_payload), encoding="utf-8")
+                with self.assertRaisesRegex(ConfigurationError, "OUTSIDE_TEXT_REGION_CHANGED"):
+                    verify_image_localization_results(work, manifest, results, game_roots=[game])
+                output.write_bytes(original_output)
+                result_payload["assets"][0]["output_sha256"] = digest(original_output)
+
             result_payload["assets"][0]["review_status"] = "user_accepted_unreviewed"
             result_payload["assets"][0]["user_acceptance_evidence_sha256"] = "d" * 64
             results.write_text(json.dumps(result_payload), encoding="utf-8")
