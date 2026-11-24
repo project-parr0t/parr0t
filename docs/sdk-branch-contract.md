@@ -61,12 +61,12 @@ After its deterministic pack and round-trip verification succeeds, an engine bra
 
 ## Display eligibility before semantic work
 
-After activation, each SDK first makes a bounded locale applicability check.
-A proven reader and reversible target-locale apply path take precedence over
+After activation, use the bounded locale applicability check. A verified source
+loader, source catalog, and reversible value apply path take precedence over
 source extraction. On this route enumerate only localizable locale values;
-preserve keys, non-values and structure, and skip screen review and all
-fallback string extraction. Do not silently fill a locale gap by scanning
-source. An inconclusive applicability check is not evidence that locale is unavailable.
+preserve keys, non-values, and structure, and skip screen review and fallback
+string extraction. Unresolved source checks are not evidence of unavailability.
+Target activation is not a prerequisite to inventory.
 
 On the display-extraction route, prove each target with a supported display
 field or exact consumer argument. Follow nested serialized values, arrays

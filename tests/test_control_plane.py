@@ -99,7 +99,7 @@ class ControlPlaneContractTests(unittest.TestCase):
                 self.assertEqual((work / "game-l10n.json").read_bytes(), original_config)
                 self.assertFalse((work / ".game-l10n/data-plane/source_probe/receipt.json").exists())
 
-    def test_inconclusive_locale_probe_routes_repair_instead_of_inventory(self) -> None:
+    def test_locale_inventory_requires_source_proof_but_not_target_activation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sdk, game, work = root / "sdk", root / "game", root / "work"
@@ -115,6 +115,7 @@ class ControlPlaneContractTests(unittest.TestCase):
                 patch("game_l10n.cli.require_sdk_activation", return_value=activation),
                 patch("game_l10n.workspace.require_sdk_activation", return_value=activation),
                 patch("game_l10n.cli.preparation_state", return_value={"status": "not_required"}),
+                patch("game_l10n.data_plane_task.require_extractor_preparation"),
             ):
                 from game_l10n.locale_probe import CHECKS, SCHEMA
 
@@ -164,6 +165,37 @@ class ControlPlaneContractTests(unittest.TestCase):
                 self.assertFalse(recovered["dispatch_allowed"])
                 self.assertEqual(recovered["issue_codes"], ["locale_applicability_unavailable"])
                 self.assertEqual(status()["next_actions"], ["unpack_and_extract_ordered_script"])
+
+                checks = dict.fromkeys(CHECKS, "verified")
+                checks["target_route"] = "unresolved"
+                seal("inconclusive", checks)
+                state = status()
+                self.assertEqual(state["next_actions"], ["unpack_and_extract_ordered_script"])
+                self.assertEqual(state["locale_applicability"]["status"], "inconclusive")
+                self.assertEqual(state["locale_applicability"]["inventory_status"], "applicable")
+
+                # A prepared adapter may predate the current sealed probe.
+                config["extractor_requirements"] = {"source_metadata": {
+                    "locale_catalog_adapter": {"evidence_fingerprint": "2" * 64},
+                }}
+                for method in ("primary", "independent"):
+                    with self.subTest(method=method):
+                        role = f"{method}_inventory"
+                        runner = work / "tools" / f"locale_inventory_{method}.py"
+                        runner.write_text("raise SystemExit('synthetic runner must not execute')\n",
+                                          encoding="utf-8")
+                        prepared = prepare_data_plane_task(
+                            work, stage_dir.parent / role, worker_role=role, config=config,
+                            sdk_activation=activation,
+                        )
+                        relay = json.loads((work / prepared["relay_path"]).read_bytes())
+                        task = json.loads((work / relay["task_path"]).read_bytes())
+                        self.assertEqual(task["locale_probe_binding"], {
+                            "route": "locale_data", "locale_probe": "applicable",
+                            "evidence_fingerprint": "1" * 64,
+                        })
+                        self.assertEqual(task["locale_inventory_runner"]["path"],
+                                         runner.relative_to(work).as_posix())
 
     def test_failed_discovery_receipt_blocks_sdk_activation_until_recovered(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

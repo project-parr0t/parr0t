@@ -54,7 +54,7 @@ These are per-cohort dependencies, not mandatory whole-job barriers. Core advanc
 ## Operating rules
 
 - Select and activate before data-plane work. Bind exact matches to a Git checkout/worktree or authenticated portable snapshot. Portable activation records the full commit ID and verifies normalized content. Other identities are read-only `derive-new` references, never promotion targets. Pass-through tools are placeholders.
-- Probe locale applicability before text enumeration. A working locale loader and reversible apply path select locale-only inventory; do not also scan code/strings or review screens. An inconclusive probe holds the affected scope. See `docs/engine-static-scope.md`.
+- Before text enumeration, verify the active source loader, source catalog, and reversible value application. These checks select locale-only inventory; do not also scan code/strings or review screens. Unresolved source checks hold the affected scope. Target activation is diagnostic and does not gate inventory. See `docs/engine-static-scope.md`.
 - Independent ordered inventories prove static—not runtime—coverage. `require_independent_inventory: false` selects primary-only assurance. Admit only positive display bindings or verified locale values; keep unresolved display dependencies outside semantic work and report them as pending.
 - Cache scans and repair bound gaps proportionally; no arbitrary record-count threshold changes permission or coverage.
 - Keep relevant narrative/voice, functional/UI, knowledge, adjacency, glossary, and immutable evidence target-scoped.

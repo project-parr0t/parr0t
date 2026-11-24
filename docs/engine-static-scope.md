@@ -3,11 +3,11 @@
 Separating raw occurrences from eligible display targets is mandatory for every SDK, as specified in `docs/sdk-branch-contract.md`. An SDK may additionally build a smaller translation inventory when its public format exposes stable runtime roots, display bindings and control-flow references. This additional reachability pruning is optional, not a generic text heuristic. Raw literal discovery is not proof of display use. Retain actual uncertain display dependencies, but do not promote every unclassified raw string into that category.
 
 After SDK activation and before either inventory, use a bounded locale probe.
-Verify the selected engine's active loader, source format, and reversible
-target-locale apply path. An applicable locale route enumerates only locale
-values; there is no screen review or fallback source extraction. Only a
-verified unavailable route permits display extraction. An inconclusive probe
-stays pending, even when additional screen review has been waived.
+Verify the selected engine's active source loader, source catalog, and
+reversible value apply path. An applicable route enumerates only locale
+values; there is no screen review or fallback source extraction. A disproved
+source-side check permits display extraction; unresolved source-side checks
+remain pending. Target activation is diagnostic, not an inventory gate.
 
 ## Claims
 

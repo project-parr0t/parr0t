@@ -61,6 +61,8 @@ only positively established display values; analysis that finds an unresolved
 actual display dependency records it as pending, not as a segment. Unclassified
 raw strings remain private accounting data, not pending display dependencies
 without evidence. Both inventory methods must agree on the route.
+`locale_probe` records the inventory decision; the probe's diagnostic
+`target_route` result does not change it or attest runtime activation.
 
 Each row binds `metadata.display_binding_id`, its exact UTF-8 `source_sha256`,
 and a lowercase SHA-256 `evidence_fingerprint`. Its `metadata.storage_role` and

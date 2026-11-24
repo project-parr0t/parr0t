@@ -3540,7 +3540,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         extractor_preparation = preparation_state(work_dir, config, active)
         if extractor_preparation["status"] == "pending":
             action = EXTRACTOR_PREPARATION_ACTION
-        elif locale_probe is not None and locale_probe["status"] not in {"applicable", "unavailable"}:
+        elif locale_probe is not None and locale_probe["inventory_status"] not in {"applicable", "unavailable"}:
             action = "verify_locale_applicability"
     action = action or "run_primary_translation_review_pipeline"
     failure_resume = None
@@ -3642,6 +3642,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "extractor_preparation": extractor_preparation,
                 **({"locale_applicability": {
                     "status": locale_probe["status"], "issue_code": locale_probe["issue_code"],
+                    "inventory_status": locale_probe["inventory_status"],
                     **({"checks": locale_probe["checks"]} if "checks" in locale_probe else {}),
                 }} if locale_probe is not None else {}),
                 "execution": config.get("execution", {}),

@@ -1972,7 +1972,9 @@ def current_locale_probe(
     receipt_path = data_plane_receipt_path(work_dir, "source_probe", purpose=LOCALE_PROBE_PURPOSE)
     if not os.path.lexists(receipt_path.parent):
         return None
-    pending = {"status": "pending", "issue_code": "locale_applicability_pending"}
+    pending = {
+        "status": "pending", "inventory_status": "pending", "issue_code": "locale_applicability_pending",
+    }
     try:
         relay_path = _active_data_plane_dir(receipt_path.parent) / "relay.json"
         _, task = _load_bound_data_plane_relay(work_dir, relay_path)
@@ -2005,10 +2007,19 @@ def current_locale_probe(
         })
         if public["issue_codes"] != [code] or (public.get("execution") or {}).get("complete") is not True:
             return pending
+        checks = payload["checks"]
+        inventory_states = {checks[key] for key in LOCALE_PROBE_CHECKS if key != "target_route"}
+        if "disproved" in inventory_states:
+            inventory_status = "unavailable"
+        elif "unresolved" in inventory_states:
+            inventory_status = "inconclusive"
+        else:
+            inventory_status = "applicable"
         return {
             "status": payload["outcome"], "issue_code": code,
+            "inventory_status": inventory_status,
             "evidence_fingerprint": payload["evidence_sha256"],
-            "checks": payload["checks"],
+            "checks": checks,
         }
     except (ConfigurationError, OSError, ValueError, KeyError, TypeError):
         return pending
@@ -2388,7 +2399,7 @@ def prepare_data_plane_task(
         if purpose != EXTRACTOR_PREPARATION_PURPOSE:
             raise ConfigurationError("E_LOCALE_ADAPTER_PREPARATION_PURPOSE")
         probe = current_locale_probe(work_dir, config, sdk_activation or {})
-        if probe is None or probe["status"] != "applicable":
+        if probe is None or probe["inventory_status"] != "applicable":
             raise ConfigurationError("E_LOCALE_ADAPTER_APPLICABILITY_REQUIRED")
         previous = config.get("extractor_requirements") or {}
         requirements = {
@@ -2409,7 +2420,7 @@ def prepare_data_plane_task(
     locale_probe = None
     if worker_role in {"primary_inventory", "independent_inventory"}:
         locale_probe = current_locale_probe(work_dir, config, sdk_activation or {})
-        if locale_probe is not None and locale_probe["status"] not in {"applicable", "unavailable"}:
+        if locale_probe is not None and locale_probe["inventory_status"] not in {"applicable", "unavailable"}:
             return {
                 "status": "pending", "worker_role": worker_role, "dispatch_allowed": False,
                 "next_action": "verify_locale_applicability", "issue_codes": [locale_probe["issue_code"]],
@@ -3014,14 +3025,17 @@ def prepare_data_plane_task(
         private_payload["inventory_scope_contract"] = TEXT_ELIGIBILITY_CONTRACT
         private_payload["screen_review_skip_allowed"] = screen_review_skip_allowed(work_dir)
         if locale_probe is not None:
+            inventory_status = locale_probe["inventory_status"]
             private_payload["locale_probe_binding"] = {
-                "locale_probe": locale_probe["status"],
-                "route": "locale_data" if locale_probe["status"] == "applicable" else "display_extraction",
+                "locale_probe": inventory_status,
+                "route": "locale_data" if inventory_status == "applicable" else "display_extraction",
                 "evidence_fingerprint": locale_probe["evidence_fingerprint"],
             }
             adapter = (config.get("extractor_requirements") or {}).get("source_metadata", {}).get("locale_catalog_adapter")
             if adapter is not None:
-                if locale_probe["status"] != "applicable" or adapter["evidence_fingerprint"] != locale_probe["evidence_fingerprint"]:
+                # Preparation binds the adapter and its original evidence. Each
+                # inventory independently binds the current sealed probe.
+                if inventory_status != "applicable":
                     raise ConfigurationError("E_LOCALE_ADAPTER_APPLICABILITY_CHANGED")
                 role = "primary" if worker_role == "primary_inventory" else "independent"
                 runner = work_dir / "tools" / f"locale_inventory_{role}.py"
@@ -3554,17 +3568,15 @@ def prepare_data_plane_task(
     elif purpose == LOCALE_PROBE_PURPOSE:
         private_payload["requirements"].extend([
             "run_only_bounded_read_only_locale_applicability_probe_using_activated_sdk_and_locked_languages",
-            "bind_active_loader_source_catalog_schema_and_exact_target_locale_load_and_apply_path",
+            "bind_active_loader_source_catalog_schema_and_reversible_value_apply_path",
             "prove_value_only_apply_and_reverse_on_synthetic_or_bounded_local_fixture_without_install",
             "verify_locale_applicability_not_existing_target_locale_presence_or_translation_quality",
-            "if_only_target_route_is_unresolved_reuse_the_other_verified_checks_and_trace_the_active_selection_dispatch_to_the_exact_catalog_slot",
-            "verify_target_activation_with_a_synthetic_placeholder_catalog_or_a_contentless_registration_probe_not_an_existing_target_language_catalog",
-            "a_reversible_install_overlay_may_reuse_the_active_source_catalog_slot_for_the_target_language_only_when_selection_lookup_and_original_restore_are_proven_without_changing_game_logic",
-            "do_not_assume_the_language_must_have_a_native_target_locale_key_or_claim_an_unproved_active_slot",
+            "target_route_is_diagnostic_only_and_does_not_gate_inventory",
+            "if_target_activation_evidence_already_exists_record_it_without_inspecting_existing_target_language_content",
+            "reuse_prior_verified_inventory_checks_and_test_only_unresolved_inventory_checks_with_new_evidence",
             "do_not_scan_source_literals_or_inspect_screen_images_or_existing_target_language_content",
             "do_not_change_sdk_selection_config_inventories_game_files_or_start_other_stages",
             "write_only_bound_categorical_artifact_and_envelope_no_text_assets_logs_or_details_in_artifact",
-            "for_an_inconclusive_retry_use_the_prior_categorical_checks_to_test_only_unresolved_prerequisites_with_new_evidence",
             "do_not_confuse_a_missing_test_with_disproof_verify_the_active_SDK_format_contract_and_exact_loader_or_apply_behavior",
             "a_format_or_apply_path_excluded_by_exercised_SDK_behavior_can_disprove_that_exact_route_not_other_unexamined_routes",
             "return_inconclusive_for_missing_evidence_and_unavailable_only_for_a_disproved_route",
