@@ -58,11 +58,13 @@ from .data_plane_task import (
     DATA_PLANE_RELAY_SCHEMA,
     DATA_PLANE_RECEIPT_SCHEMA,
     ENGINE_MEDIA_BINDINGS_PURPOSE,
+    LOCALE_LOCAL_PACKAGE_PURPOSE,
     _load_bound_data_plane_relay,
     claim_context_chunk,
     commit_context_fragment,
     current_data_plane_operational_failure,
     current_data_plane_receipt,
+    current_locale_probe,
     current_inventory_constraint,
     data_plane_receipt_path,
     finalize_context_fragments,
@@ -122,7 +124,7 @@ from .native_broker import probe_native_host, run_native_broker
 from .native_review import (collect_native_review, collect_native_rewrite,
                             collect_reviewed_candidates, process_native_review_followup)
 from .instance_release import validate_instance_release
-from .native_resume import native_resume_status
+from .native_resume import native_resume_status, native_translation_failure_counts
 from .native_pass import (
     DEFAULT_MAX_MATERIAL_TOKENS,
     DEFAULT_MAX_RECORDS,
@@ -171,6 +173,7 @@ from .extractor_preparation import (
     preparation_state,
     require_extractor_preparation,
 )
+from .locale_probe import PURPOSE as LOCALE_PROBE_PURPOSE
 from .workspace import (
     initialize_workspace,
     refresh_sdk_inventory,
@@ -223,6 +226,9 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
         "docs/sdk-branch-contract.md",
     ),
     "prepare_and_validate_extractors": ("docs/sdk-selection.md",),
+    "verify_locale_applicability": (
+        "docs/sdk-selection.md", "docs/engine-static-scope.md", "docs/control-plane-contract.md",
+    ),
     "unpack_and_extract_ordered_script": ("docs/coverage-gates.md",),
     "extract_independent_source_inventory": ("docs/coverage-gates.md",),
     "verify_independent_source_inventory": ("docs/coverage-gates.md",),
@@ -334,6 +340,7 @@ STATUS_ACTION_CONTRACTS: dict[str, tuple[str, ...]] = {
 STATUS_DATA_PLANE_ROLES = {
     "record_target_identity_evaluate_and_select_sdk": "source_probe",
     "prepare_and_validate_extractors": "source_probe",
+    "verify_locale_applicability": "source_probe",
     "unpack_and_extract_ordered_script": "primary_inventory",
     "extract_independent_source_inventory": "independent_inventory",
     "reconcile_inventory_identity_namespace": "inventory_reconciler",
@@ -348,8 +355,10 @@ def _status_data_plane_task(work_dir: Path, action: str) -> dict[str, Any] | Non
     role = STATUS_DATA_PLANE_ROLES.get(action)
     if role is None:
         return None
-    preparation = action == EXTRACTOR_PREPARATION_ACTION
-    purpose = EXTRACTOR_PREPARATION_PURPOSE if preparation else ""
+    purpose = {
+        EXTRACTOR_PREPARATION_ACTION: EXTRACTOR_PREPARATION_PURPOSE,
+        "verify_locale_applicability": LOCALE_PROBE_PURPOSE,
+    }.get(action, "")
     receipt = current_data_plane_receipt(work_dir, role, purpose=purpose)
     task: dict[str, Any] = {
         "worker_role": role,
@@ -359,7 +368,7 @@ def _status_data_plane_task(work_dir: Path, action: str) -> dict[str, Any] | Non
         "prepare_command": (
             "game-l10n prepare-data-plane-task --workspace <workspace> "
             f"--worker-role {role}"
-            + (f" --purpose {EXTRACTOR_PREPARATION_PURPOSE}" if preparation else "")
+            + (f" --purpose {purpose}" if purpose else "")
         ),
         "seal_command": (
             "game-l10n seal-data-plane-task --workspace <workspace> "
@@ -378,8 +387,8 @@ def _status_data_plane_task(work_dir: Path, action: str) -> dict[str, Any] | Non
         "runtime_setup_command": "game-l10n native-runtime --workspace <workspace> --host <codex|omp>",
         "launch_record_command": "game-l10n record-native-launch --workspace <workspace> --relay <relay-path>",
     }
-    if preparation:
-        task["purpose"] = EXTRACTOR_PREPARATION_PURPOSE
+    if purpose:
+        task["purpose"] = purpose
         task["stage"] = "discovery"
     if role == "context_analyzer":
         task["parallelism"] = "core_bound_disjoint_chunks_up_to_configured_ceiling"
@@ -486,6 +495,8 @@ def _public_inventory_gate(state: dict[str, Any] | None) -> dict[str, Any]:
         "primary_segments": state.get("primary_segments", 0),
         "independent_segments": state.get("independent_segments", 0),
         "agreed_target_count": state.get("agreed_target_count", 0),
+        **({"extraction_summary": state["extraction_summary"]}
+           if "extraction_summary" in state else {}),
         "gap_score": state.get("gap_score", 0),
         "issue_codes": list(state.get("issue_codes", [])),
         "identity_gate": dict(state.get("identity_gate", {})),
@@ -1109,6 +1120,16 @@ def cmd_image_localization_policy(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_screen_review_policy(args: argparse.Namespace) -> int:
+    from .screen_review_policy import record_screen_review_policy
+
+    state = record_screen_review_policy(
+        Path(args.workspace).resolve(), mode=args.mode, user_requested=args.user_requested,
+    )
+    print(json.dumps(state))
+    return 0
+
+
 def cmd_target_language_policy(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     state = record_target_language_policy(
@@ -1575,6 +1596,11 @@ def cmd_native_resume_status(args: argparse.Namespace) -> int:
         _path_in_workspace(work_dir, args.manifest, must_exist=True)
         if args.manifest else None
     )
+    if args.failure_counts:
+        if manifest is None:
+            raise ValueError("E_NATIVE_RESUME_TRANSLATION_CHECKPOINT_REQUIRED")
+        print(json.dumps(native_translation_failure_counts(work_dir, manifest)))
+        return 0
     result = native_resume_status(work_dir, manifest_path=manifest)
     result["core_runtime"] = _core_runtime()
     print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -1657,6 +1683,8 @@ def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
             if args.offline_processing else None
         ),
         discard_unverified_receipt=args.discard_unverified_receipt,
+        deterministic_inventory_worker=getattr(args, "deterministic_inventory_worker", False),
+        prepare_locale_adapter=getattr(args, "prepare_locale_adapter", False),
     )
     if (
         args.worker_role == "image_ui_inventory"
@@ -1988,6 +2016,7 @@ def cmd_framework_mode(args: argparse.Namespace) -> int:
         Path(args.workspace).resolve(), args.mode,
         user_requested=args.user_requested,
         logs=[Path(value) for value in args.log],
+        omp_subagents=args.omp_subagent,
         approval=approval,
     )
     result["core_runtime"] = _core_runtime()
@@ -2033,6 +2062,13 @@ def _prepare_native_pass(args: argparse.Namespace) -> dict[str, Any]:
     declared_native_roles = native_role_models(config)
     ordered_native_review = bool(declared_native_roles) and pass_kind in {"review", "rewrite"}
     segments = read_segments(source)
+    review_selection = None
+    if pass_kind in {"review", "rewrite"}:
+        from .native_review import _review_admission
+
+        stage = ("review-rewrite" if pass_kind == "rewrite"
+                 else "review-triage" if args.review_tier == "triage" else "review")
+        review_selection = _review_admission(work_dir, segments, config.get("routing", {}), stage=stage)
     if extra_fallback and (
         pass_kind != "review" or args.review_tier != "strong" or not ordered_native_review
         or args.native_provider is not None or args.route_attempt is not None
@@ -2094,16 +2130,28 @@ def _prepare_native_pass(args: argparse.Namespace) -> dict[str, Any]:
                     raise ConfigurationError("E_NATIVE_REVIEW_TIER_INVALID")
                 role, stage, tier_limit = "rewriters", "review-rewrite", None
             groups = partition_native_review_routes(
-                segments, routing.get(role, []), stage=stage, route_models=runtime_models,
+                segments, routing.get(role, []), stage=stage, route_models={
+                    **{item["name"]: item["model"] for item in config.get("providers", [])
+                       if isinstance(item.get("model"), str) and item["model"]},
+                    **runtime_models,
+                },
                 attempt_limits=routing.get("review_attempt_limits", {}), tier_limit=tier_limit,
+                candidate_model_routes=routing.get("review_candidate_model_routes"),
             )
             if extra_fallback:
                 from .review_policy import _record_additional_fallback_review
+                from .native_review import _review_candidate_locked, _review_failed_route, _review_queue_superseded
 
                 fallback = NATIVE_ROLE_ROUTES["review-fallback"]
                 if (list(groups) != [""] or not segments
                         or fallback not in routing.get("reviewers", [])[1:]
-                        or fallback not in runtime_models):
+                        or fallback not in runtime_models
+                        or any(not _review_failed_route(item, fallback, runtime_models[fallback])
+                               for item in segments)
+                        or (routing.get("review_triagers")
+                            and any(_review_candidate_locked(work_dir, item)
+                                    or _review_queue_superseded(work_dir, item)
+                                    for item in segments))):
                     raise ConfigurationError("E_ADDITIONAL_FALLBACK_SCOPE_INVALID: require exhausted targets and a bound fallback")
                 output = _record_additional_fallback_review(work_dir, segments, fallback, runtime_models[fallback])
                 groups = {fallback: segments}
@@ -2157,7 +2205,8 @@ def _prepare_native_pass(args: argparse.Namespace) -> dict[str, Any]:
                         )
                     partitions.append(metadata)
                 return {"status": "partitioned" if partitions else "complete",
-                        "pass_kind": pass_kind, "partitions": partitions}
+                        "pass_kind": pass_kind, "partitions": partitions,
+                        "review_selection": review_selection}
             provider = next(iter(groups))
             attempt = 1
         if provider not in runtime_models:
@@ -2237,6 +2286,8 @@ def _prepare_native_pass(args: argparse.Namespace) -> dict[str, Any]:
             max_records,
         )
     )
+    if retry_state is not None and repair_cap is not None:
+        min_records = min(min_records, max_records)
     max_workers = (
         args.max_workers
         if args.max_workers is not None
@@ -2640,6 +2691,23 @@ def cmd_resume_native_review_queues(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_collect_native_translation_candidates(args: argparse.Namespace) -> int:
+    from .native_followup import collect_native_translation_candidates
+
+    work_dir = Path(args.workspace).resolve()
+    require_sdk_activation(work_dir, load_config(work_dir))
+    result = collect_native_translation_candidates(
+        work_dir, _path_in_workspace(work_dir, args.input, must_exist=True),
+        _path_in_workspace(work_dir, args.manifest, must_exist=True) if args.manifest else None,
+        _path_in_workspace(work_dir, args.output),
+        retry_cohort=_path_in_workspace(work_dir, args.retry_cohort, must_exist=True)
+        if args.retry_cohort else None,
+        previous=(_path_in_workspace(work_dir, path, must_exist=True) for path in args.previous),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def cmd_collect_native_review(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     config = load_config(work_dir)
@@ -2702,6 +2770,9 @@ def cmd_collect_native_rewrite(args: argparse.Namespace) -> int:
         _path_in_workspace(work_dir, args.manifest, must_exist=True),
         _path_in_workspace(work_dir, args.output),
         review_max_rounds=int(config.get("routing", {}).get("review_max_rounds", 2)),
+        target_language=config["project"]["target_language"],
+        awaiting_input=_path_in_workspace(work_dir, args.awaiting_input, must_exist=True)
+        if args.awaiting_input is not None else None,
         **_native_review_integrity_options(work_dir, config),
     )
     print(json.dumps(result, ensure_ascii=False))
@@ -2721,24 +2792,33 @@ def cmd_process_native_review_followup(args: argparse.Namespace) -> int:
     config = load_config(work_dir)
     require_sdk_activation(work_dir, config)
     role = "judge_fallback" if args.operation == "judge" else "selective_rewrite"
-    from .native_review import partition_native_review_routes
+    from .native_review import _review_admission, partition_native_review_routes
     routing = config.get("routing", {})
     route_key = "reviewers" if args.operation == "judge" else "rewriters"
     stage = "review" if args.operation == "judge" else "review-rewrite"
     source = _path_in_workspace(work_dir, args.input, must_exist=True)
     output = _path_in_workspace(work_dir, args.output)
-    total_records = len(read_segments(source))
+    segments = read_segments(source)
+    total_records = len(segments)
+    review_selection = _review_admission(work_dir, segments, routing, stage=stage)
+    route_models = {
+        item["name"]: item["model"] for item in config.get("providers", [])
+        if isinstance(item.get("model"), str) and item["model"]
+    }
+    route_models.update((native_runtime(work_dir) or {}).get("models", {}))
     groups = partition_native_review_routes(
-        read_segments(source), routing.get(route_key, []), stage=stage,
-        route_models=(native_runtime(work_dir) or {}).get("models", {}),
+        segments, routing.get(route_key, []), stage=stage,
+        route_models=route_models,
         attempt_limits=routing.get("review_attempt_limits", {}),
         tier_limit=routing.get("strong_max_calls") if args.operation == "judge" else None,
+        candidate_model_routes=routing.get("review_candidate_model_routes"),
     )
     if any(provider.startswith("native-") for provider in groups):
         print(json.dumps({
             "status": "route_partition_required", "action": "prepare_native_pass",
             "issue_code": "E_NATIVE_REVIEW_NATIVE_FALLBACK_REQUIRED",
             "routes": [{"provider": provider, "count": len(items)} for provider, items in groups.items()],
+            "review_selection": review_selection,
             "command_argv": [
                 "game-l10n", "prepare-native-pass", "--workspace", str(work_dir),
                 "--input", args.input, "--output", args.output,
@@ -3173,6 +3253,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         image_localization["extractor_preparation"] = image_preparation
         if image_preparation["status"] == "pending":
             image_action = EXTRACTOR_PREPARATION_ACTION
+    locale_probe = None
+    if sdk_activation["status"] == "active":
+        locale_probe = current_locale_probe(work_dir, config, active)
     if action is None:
         # Existing inventory pairs and downstream checkpoints remain untouched.
         # Every new inventory dispatch independently enforces current readiness.
@@ -3441,6 +3524,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         extractor_preparation = preparation_state(work_dir, config, active)
         if extractor_preparation["status"] == "pending":
             action = EXTRACTOR_PREPARATION_ACTION
+        elif locale_probe is not None and locale_probe["status"] not in {"applicable", "unavailable"}:
+            action = "verify_locale_applicability"
     action = action or "run_primary_translation_review_pipeline"
     failure_resume = None
     if inventory_verified and queue_pending:
@@ -3539,6 +3624,10 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "sdk_selection": sdk_selection,
                 "sdk_activation": sdk_activation,
                 "extractor_preparation": extractor_preparation,
+                **({"locale_applicability": {
+                    "status": locale_probe["status"], "issue_code": locale_probe["issue_code"],
+                    **({"checks": locale_probe["checks"]} if "checks" in locale_probe else {}),
+                }} if locale_probe is not None else {}),
                 "execution": config.get("execution", {}),
                 "runtime": config.get("runtime", {"default_policy": "deny"}),
                 "target_language_policy": target_language_policy,
@@ -4079,13 +4168,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     policy.add_argument("--publish-approved", choices=["yes", "no"])
     policy.set_defaults(func=cmd_policy)
+    from .review_policy import REVIEW_SETTING_FIELDS
     review_policy = sub.add_parser("review-policy", help="Inspect or record the user's exact fallback-review model and call limit")
     review_policy.add_argument("--workspace", required=True)
     review_policy.add_argument("--fallback-model")
     review_policy.add_argument("--fallback-provider")
     review_policy.add_argument("--max-calls", type=int)
     review_policy.add_argument("--user-requested", action="store_true")
-    for key in ("triage_max_calls", "strong_max_calls", "review_max_workers", "triage_max_workers", "strong_max_workers"):
+    for key in REVIEW_SETTING_FIELDS:
         review_policy.add_argument("--" + key.replace("_", "-"), type=int)
     review_policy.set_defaults(func=cmd_review_policy)
 
@@ -4473,6 +4563,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     native_resume.add_argument("--workspace", required=True)
     native_resume.add_argument("--manifest", help="Select one existing bound checkpoint by manifest path")
+    native_resume.add_argument(
+        "--failure-counts", action="store_true",
+        help="With --manifest, report only categorical counts from imported translation waves",
+    )
     native_resume.set_defaults(func=cmd_native_resume_status)
 
     native_host = sub.add_parser("native-runtime", help="Bind or inspect the native host and exact worker models")
@@ -4602,6 +4696,17 @@ def build_parser() -> argparse.ArgumentParser:
     exchange_collect.add_argument("--unresolved-output", required=True)
     exchange_collect.set_defaults(func=cmd_collect_translation_exchange_candidates)
 
+    translation_collect = sub.add_parser("collect-native-translation-candidates")
+    translation_collect.add_argument("--workspace", required=True)
+    translation_collect.add_argument("--input", required=True)
+    translation_binding = translation_collect.add_mutually_exclusive_group(required=True)
+    translation_binding.add_argument("--manifest")
+    translation_binding.add_argument("--retry-cohort", help="Immutable exported successful retry lineage")
+    translation_collect.add_argument("--output", required=True, help="New ordered review input")
+    translation_collect.add_argument("--previous", action="append", default=[],
+                                     help="Earlier review input from the same manifest; repeat to skip its targets")
+    translation_collect.set_defaults(func=cmd_collect_native_translation_candidates)
+
     native_review = sub.add_parser("collect-native-review")
     native_review.add_argument("--workspace", required=True)
     native_review.add_argument("--input", required=True)
@@ -4614,6 +4719,10 @@ def build_parser() -> argparse.ArgumentParser:
     native_rewrite.add_argument("--workspace", required=True)
     native_rewrite.add_argument("--input", required=True)
     native_rewrite.add_argument("--manifest", required=True)
+    native_rewrite.add_argument(
+        "--awaiting-input",
+        help="Collect only the ordered targets still awaiting results in an earlier collection",
+    )
     native_rewrite.add_argument("--output", required=True)
     native_rewrite.set_defaults(func=cmd_collect_native_rewrite)
 
@@ -4836,6 +4945,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     exchange_process.set_defaults(func=cmd_process_translation_exchange)
 
+    screen_review = sub.add_parser(
+        "screen-review-policy",
+        help="Record explicit permission for additional text screen review; does not change extraction eligibility",
+    )
+    screen_review.add_argument("--workspace", required=True)
+    screen_review.add_argument("--mode", choices=["required", "skip"], required=True)
+    screen_review.add_argument("--user-requested", action="store_true")
+    screen_review.set_defaults(func=cmd_screen_review_policy)
+
     data_plane_prepare = sub.add_parser(
         "prepare-data-plane-task",
         help="Create one core-bound isolated discovery, inventory, or context relay task",
@@ -4845,8 +4963,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--worker-role", choices=sorted(DATA_PLANE_PROFILES), required=True
     )
     data_plane_prepare.add_argument(
-        "--purpose", choices=[EXTRACTOR_PREPARATION_PURPOSE, ENGINE_MEDIA_BINDINGS_PURPOSE], default="",
-        help="Bind an extractor-preparation probe or an exact-seed engine media probe",
+        "--purpose", choices=[EXTRACTOR_PREPARATION_PURPOSE, ENGINE_MEDIA_BINDINGS_PURPOSE,
+                              LOCALE_PROBE_PURPOSE, LOCALE_LOCAL_PACKAGE_PURPOSE], default="",
+        help="Bind an exact media, locale, extractor-preparation or local package task",
     )
     data_plane_prepare.add_argument(
         "--output",
@@ -4855,6 +4974,14 @@ def build_parser() -> argparse.ArgumentParser:
     data_plane_prepare.add_argument(
         "--discard-unverified-receipt", metavar="TASK_ID",
         help="Retire the exact incomplete reconciler receipt after Core verifies the stale relay was never admitted",
+    )
+    data_plane_prepare.add_argument(
+        "--deterministic-inventory-worker", action="store_true",
+        help="Bind the activated workspace inventory runner as the only prompt OMP worker command",
+    )
+    data_plane_prepare.add_argument(
+        "--prepare-locale-adapter", action="store_true",
+        help="Bind missing locale inventory and reversible apply tooling to a sealed applicable probe",
     )
     data_plane_prepare.add_argument(
         "--content-source-grant",
@@ -5061,6 +5188,8 @@ def build_parser() -> argparse.ArgumentParser:
     framework_mode.add_argument("--user-requested", action="store_true")
     framework_mode.add_argument("--approval-stdin", action="store_true", help="Private host approval proof on stdin")
     framework_mode.add_argument("--log", action="append", default=[], help="Exact user-approved log file")
+    framework_mode.add_argument("--omp-subagent", action="append", default=[],
+                                help="Exact OMP child ID in the host-bound analysis approval")
     framework_mode.set_defaults(func=cmd_framework_mode)
 
     diagnostic_log = sub.add_parser(

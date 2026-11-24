@@ -21,6 +21,7 @@ from game_l10n.native_pass import (
     seal_native_wave_relay,
 )
 from game_l10n.native_followup import CANDIDATE_METADATA_KEY
+from game_l10n.native_resume import native_translation_failure_counts
 from game_l10n.store import stable_hash
 from tests.test_validators import optional_slot_fixture
 from tests import _result_manifest, write_semantic_result_rows as _write_semantic_result_rows
@@ -1207,20 +1208,39 @@ class NativePassTests(unittest.TestCase):
 
     def test_review_tier_is_explicit_even_when_route_has_a_legacy_alias(self) -> None:
         from game_l10n.native_pass import _native_review_call_budget
+        from game_l10n.native_review import collect_native_review
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source.jsonl"
-            source.write_text("fixture", encoding="utf-8")
+            segments = [review_segment("line")]
+            source.write_text(json.dumps(asdict(segments[0])) + "\n", encoding="utf-8")
             (root / "game-l10n.json").write_text(json.dumps({"routing": {
                 "review_triagers": ["native-luna"], "reviewers": ["native-luna"],
                 "triage_max_workers": 17, "strong_max_workers": 3,
                 "triage_max_calls": 1, "strong_max_calls": 5,
                 "review_attempt_limits": {"native-luna": 4},
             }}))
+            binding = {"provider": "native-luna", "model": "configured-model", "attempt": 1}
+            with self.assertRaisesRegex(ValueError, "E_NATIVE_REVIEW_EVIDENCE_REQUIRED"):
+                prepare_native_tasks(root, source, segments, root / "untriaged", pass_kind="review",
+                                     review_tier="strong", route_binding=binding)
+            triage_tasks = root / "triage-tasks"
+            prepare_native_tasks(root, source, segments, triage_tasks, pass_kind="review",
+                                 review_tier="triage", route_binding=binding)
+            results = root / "triage-tasks-results"
+            results.mkdir()
+            write_semantic_result_rows(results / "task-0001.jsonl", [
+                {"target_id": "line", "status": "success", "text": "REWRITE voice"},
+            ])
+            triage_manifest = triage_tasks / "manifest.json"
+            import_native_wave(root, triage_manifest, results, 1)
+            collect_native_review(root, source, triage_manifest, root / "triage", tier="triage")
+            source = root / "triage/strong-input.jsonl"
+            segments = read_segments(source)
             prepared = prepare_native_tasks(
-                root, source, [review_segment("line")], root / "tasks",
+                root, source, segments, root / "tasks",
                 pass_kind="review", review_tier="strong", max_workers=128,
-                route_binding={"provider": "native-luna", "model": "configured-model", "attempt": 1},
+                route_binding=binding,
             )
             manifest = json.loads((root / "tasks/manifest.json").read_text())
             self.assertEqual(prepared["max_workers"], 3)
@@ -1229,9 +1249,9 @@ class NativePassTests(unittest.TestCase):
             original = (root / "tasks/manifest.json").read_bytes()
             with self.assertRaisesRegex(ValueError, "E_NATIVE_TASK_MANIFEST_IMMUTABLE"):
                 prepare_native_tasks(
-                    root, source, [review_segment("line")], root / "tasks",
+                    root, source, segments, root / "tasks",
                     pass_kind="review", review_tier="strong", max_workers=128,
-                    route_binding={"provider": "native-luna", "model": "configured-model", "attempt": 1},
+                    route_binding=binding,
                     review_split_max_depth=24,
                 )
             self.assertEqual((root / "tasks/manifest.json").read_bytes(), original)
@@ -1939,10 +1959,11 @@ class NativePassTests(unittest.TestCase):
             prepare_native_tasks(
                 root,
                 source,
-                [Segment("fixture-1", "SOURCE_1"), Segment("fixture-2", "SOURCE_2")],
+                [Segment("fixture-1", "SOURCE_1"), Segment("fixture-2", "SOURCE_2"),
+                 Segment("fixture-3", "SOURCE_3"), Segment("fixture-4", "SOURCE_4")],
                 tasks,
                 max_records=1,
-                max_workers=2,
+                max_workers=4,
             )
             step = native_control_step(root, tasks / "manifest.json", results)
             dispatch = root / step["relay"]["dispatch"]
@@ -1959,6 +1980,13 @@ class NativePassTests(unittest.TestCase):
                     }
                 ],
             )
+            self._write_rows(results / "task-0003.jsonl", [{
+                "target_id": "fixture-3", "status": "refused", "text": "",
+            }])
+            (results / "task-0004.jsonl").write_text(
+                '[{"target_id":"fixture-4","status":"success","text":"SYNTHETIC"}]\n',
+                encoding="utf-8",
+            )
 
             sealed = seal_native_wave_relay(root, dispatch, relay_ended=True)
             resumed = native_control_step(
@@ -1967,13 +1995,19 @@ class NativePassTests(unittest.TestCase):
                 results,
                 require_relay_receipt=True,
             )
+            self.assertEqual(native_translation_failure_counts(root, (tasks / "manifest.json").resolve()), {
+                "waves": 1, "records": 4,
+                "counts": {"success": 1, "worker_ended_without_result": 1,
+                           "fallback_required": 1, "worker_result_schema_invalid": 1},
+                "latest_wave_rejected_task_shapes": {"json_array": 1},
+            })
 
-        self.assertEqual(sealed["counts"]["ready_tasks"], 2)
+        self.assertEqual(sealed["counts"]["ready_tasks"], 4)
         self.assertEqual(sealed["counts"]["pending_tasks"], 0)
-        self.assertEqual(sealed["ended_tasks_recorded"], 1)
+        self.assertEqual(sealed["ended_tasks_recorded"], 2)
         self.assertEqual(resumed["action"], "aggregate_completed_pass")
         self.assertEqual(resumed["imported_wave"]["success"], 1)
-        self.assertEqual(resumed["imported_wave"]["failed"], 1)
+        self.assertEqual(resumed["imported_wave"]["failed"], 3)
 
     def test_native_wave_relay_seals_waves_wider_than_default_workers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

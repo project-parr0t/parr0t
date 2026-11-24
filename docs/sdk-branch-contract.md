@@ -61,11 +61,30 @@ After its deterministic pack and round-trip verification succeeds, an engine bra
 
 ## Display eligibility before semantic work
 
-Every SDK separates its private raw-occurrence census from its active translation inventory. A string, a source-language match, an engine/resource container, two equal inventories, or an evidence digest alone is not a display-use proof. This separation is mandatory; the additional reachability pruning in `docs/engine-static-scope.md` is optional.
+After activation, each SDK first makes a bounded locale applicability check.
+A proven reader and reversible target-locale apply path take precedence over
+source extraction. On this route enumerate only localizable locale values;
+preserve keys, non-values and structure, and skip screen review and all
+fallback string extraction. Do not silently fill a locale gap by scanning
+source. An inconclusive applicability check is not evidence that locale is unavailable.
 
-The SDK must derive each active target from a supported display-bearing format role or a source-bound consumer/dependency trace. Account separately for display targets, actual unresolved display dependencies, proven non-display occurrences, and raw unclassified occurrences. Resolve unsupported roles from cached structural evidence through the isolated SDK preparation/reconciliation workflow, not a human per-string whitelist or a semantic context pass over every raw literal. An unresolved actual display consumer keeps affected scope pending; it must not disappear behind a complete claim.
+On the display-extraction route, prove each target with a supported display
+field or exact consumer argument. Follow nested serialized values, arrays
+and references only as far as the evidence binds the specific displayed value.
+The SDK must keep actual unresolved display dependencies pending outside the
+translation inventory; raw literals or candidate sink names are not evidence.
 
-Control keys, indices, script operands and shared control storage are not active replacement targets. Preserve their bytes and use distinct display-only projections when the same value also reaches a display. `display_projection_required=true` is a repair requirement, not permission to translate control storage. New inventories emit the existing `coverage.display_scope` and source-bound per-target evidence; no parallel eligibility schema is needed.
+Control keys, indices, script operands, and shared control storage are not
+replacement targets, even if read by a renderer. Translate only a separate
+display value, or an evidenced exact display-literal span. Preserve code,
+identifiers, protected tokens and all bytes outside selected script spans.
+`display_projection_required=true` is a repair requirement, not permission.
+
+An SDK may implement reusable engine/version format and renderer rules only.
+Per-game roots, loader overrides, custom calls, file paths, offsets, hashes and
+proof instances stay in the external workspace. A single title succeeding does
+not establish a reusable SDK rule. See `docs/coverage-gates.md` for the bound
+eligibility contract and scoped screen-review approval.
 
 Context is evidence for already eligible targets, not an inventory filter. Attach only the relevant speaker, branch, state, composition and explicitly bound semantic facts. Keep full command trees, editor records, unrelated notes, diagnostics and parse/provenance caches outside model inputs. Useful annotations may be retained when bound to the target; do not indiscriminately remove all notes or classify their wording in the text-free parent.
 

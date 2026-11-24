@@ -3,16 +3,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import file_digest, sha256
 import json
+from math import isfinite
 import re
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
 from .errors import ConfigurationError
-from .inventory_scope import _BasisSnapshot, _validate_active_display_scope, inventory_scope
+from .inventory_scope import (
+    _BasisSnapshot, _inventory_source_fingerprint, _validate_active_display_scope,
+    _validate_text_source, inventory_scope,
+)
 from .localization_authority import localization_authority_contract
 from .models import FailureCode, Segment, TranslationResult
 from .review_selection import target_language_review_reasons
+from .screen_review_policy import screen_review_skip_allowed
 from .store import stable_hash
 
 
@@ -35,7 +40,13 @@ UI_SLOT_ROLES = {"standalone", "label", "value", "state_value", "template_fragme
 INVENTORY_COMPARISON_KEY = "inventory_comparison_key"
 PRIMARY_IDENTITY_SCHEMA = "parr0t.primary-inventory-identity.v1"
 # Bump when a stricter active display rule requires revalidating saved attestations.
-_DISPLAY_SCOPE_VALIDATION_VERSION = 1
+_DISPLAY_SCOPE_VALIDATION_VERSION = 2
+
+
+@dataclass(frozen=True, slots=True)
+class _ExtractionEvidence:
+    pending_keys: set[str]
+    telemetry: dict[str, int | float]
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,18 +55,89 @@ class _InventoryDocument:
     active_rows: list[dict[str, Any]]
     scope_correction: dict[str, Any] | None
     sha256: str
+    extraction_evidence: _ExtractionEvidence | None
 
 
 def validate_inventory_display_scope(
-    payload: dict[str, Any], *, required: bool = False
+    payload: dict[str, Any], *, required: bool = False,
+    required_text_source: bool = False, screen_review_skip: bool | None = None,
 ) -> None:
-    """Validate evidence-backed translation scope for new inventory tasks."""
+    """Validate eligibility; None means no task or workspace skip proof is available."""
+    coverage = payload.get("coverage")
+    if isinstance(coverage, dict):
+        _extraction_evidence(coverage)
     active_rows, _ = inventory_scope(payload)
-    _validate_active_display_scope(payload, active_rows, required=required)
+    _validate_active_display_scope(
+        payload, active_rows, required=required, required_text_source=required_text_source,
+        screen_review_skip=screen_review_skip,
+    )
 
 
 PRIMARY_IDENTITY_PATH = Path(".game-l10n/inventory-primary-identity.json")
 _SURROGATE = re.compile(r"[\ud800-\udfff]")
+_EXTRACTION_KEY = re.compile(r"[0-9a-f]{64}")
+_EXTRACTION_FILE_COUNTS = ("scanned_files", "reused_files")
+_EXTRACTION_TIMINGS = ("managed_ms", "serialized_ms", "inventory_ms")
+
+
+def _extraction_evidence(coverage: dict[str, Any]) -> _ExtractionEvidence | None:
+    if "extraction_evidence" not in coverage:
+        return None
+    evidence = coverage["extraction_evidence"]
+    error = "Inventory coverage.extraction_evidence has an invalid shape"
+    if not isinstance(evidence, dict) or evidence.keys() != {"pending_display_keys", "telemetry"}:
+        raise ConfigurationError(error)
+    keys = evidence["pending_display_keys"]
+    if not isinstance(keys, list) or any(
+        not isinstance(key, str) or _EXTRACTION_KEY.fullmatch(key) is None for key in keys
+    ):
+        raise ConfigurationError(error)
+    telemetry = evidence["telemetry"]
+    if not isinstance(telemetry, dict) or telemetry.keys() != {
+        *_EXTRACTION_FILE_COUNTS, *_EXTRACTION_TIMINGS,
+    }:
+        raise ConfigurationError(error)
+    for name in _EXTRACTION_FILE_COUNTS:
+        if type(telemetry[name]) is not int or telemetry[name] < 0:
+            raise ConfigurationError(error)
+    for name in _EXTRACTION_TIMINGS:
+        value = telemetry[name]
+        if type(value) not in (int, float) or value < 0 or (
+            type(value) is float and not isfinite(value)
+        ):
+            raise ConfigurationError(error)
+    return _ExtractionEvidence(set(keys), telemetry)
+
+
+def _extraction_summary(
+    primary: _InventoryDocument, independent: _InventoryDocument | None = None,
+    *, agreed_target_count: int = 0,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for role, document in (("primary", primary), ("independent", independent)):
+        if document is None:
+            continue
+        method: dict[str, Any] = {}
+        evidence = document.extraction_evidence
+        if evidence is not None:
+            method["unresolved_dependency_count"] = len(evidence.pending_keys)
+            method["telemetry"] = evidence.telemetry
+        if independent is not None and document.payload["coverage"].get("display_scope") is not None:
+            # "Uncovered" here means not independently agreed, not lacking
+            # review approval or pack integration.
+            method["uncovered_active_display_candidate_count"] = (
+                len(document.active_rows) - agreed_target_count
+            )
+        if method:
+            summary[role] = method
+    primary_evidence = primary.extraction_evidence
+    independent_evidence = independent.extraction_evidence if independent is not None else None
+    if primary_evidence is not None and independent_evidence is not None:
+        common = len(primary_evidence.pending_keys & independent_evidence.pending_keys)
+        summary["common_unresolved_dependency_count"] = common
+        summary["primary_only_unresolved_dependency_count"] = len(primary_evidence.pending_keys) - common
+        summary["independent_only_unresolved_dependency_count"] = len(independent_evidence.pending_keys) - common
+    return {"extraction_summary": summary} if summary else {}
 
 
 def _static_scope_tracking(coverage: dict[str, Any]) -> dict[str, Any] | None:
@@ -179,6 +261,7 @@ def _validate_inventory_unicode(value: Any) -> None:
 def _inventory_document(
     path: Path, *, defer_projection_constraints: bool = False,
     required_display_scope: bool = False,
+    screen_review_skip: bool | None = None,
     _basis_cache: dict[Path, _BasisSnapshot] | None = None,
 ) -> _InventoryDocument:
     try:
@@ -220,6 +303,7 @@ def _inventory_document(
                 "Every inventory exclusion must declare affects_user_visible_text"
             )
     tracking = _static_scope_tracking(coverage)
+    extraction_evidence = _extraction_evidence(coverage)
     if not isinstance(segments, list) or not segments:
         raise ConfigurationError("Inventory must contain at least one segment")
     active_rows, correction = inventory_scope(
@@ -228,8 +312,10 @@ def _inventory_document(
     )
     if tracking is not None and tracking["included_count"] != len(active_rows):
         raise ConfigurationError("Inventory static scope included count does not match eligible segments")
-    _validate_active_display_scope(payload, active_rows, required=required_display_scope)
-    return _InventoryDocument(payload, active_rows, correction, digest)
+    _validate_active_display_scope(
+        payload, active_rows, required=required_display_scope, screen_review_skip=screen_review_skip,
+    )
+    return _InventoryDocument(payload, active_rows, correction, digest, extraction_evidence)
 
 
 def _segment_map(
@@ -373,15 +459,7 @@ def _localization_authority_map(
 
 def inventory_fingerprint(payload: dict[str, Any]) -> str:
     try:
-        return stable_hash(
-            {
-                "schema": payload["schema"],
-                "method": payload["method"],
-                "implementation_fingerprint": payload["implementation_fingerprint"],
-                "coverage": payload["coverage"],
-                "segments": payload["segments"],
-            }
-        )
+        return _inventory_source_fingerprint(payload)
     except UnicodeEncodeError as exc:
         raise ConfigurationError(
             "E_INVENTORY_INVALID_UNICODE: inventory strings must contain Unicode scalar values"
@@ -545,6 +623,13 @@ def _write_primary_identity_binding(
     }
 
 
+def _text_source_identity(payload: dict[str, Any]) -> tuple[str, str] | None:
+    declaration = payload["coverage"].get("text_source")
+    if declaration is None:
+        return None
+    return declaration["route"], declaration["locale_probe"]
+
+
 def verify_inventory_pair(
     primary_path: Path, independent_path: Path, *, required_display_scope: bool = False,
 ) -> dict[str, Any]:
@@ -571,6 +656,9 @@ def _verify_inventory_payloads(
         raise ConfigurationError("Inventory methods must be independently named")
     if primary["implementation_fingerprint"] == independent["implementation_fingerprint"]:
         raise ConfigurationError("Inventory methods must use different implementation fingerprints")
+    primary_text_source = _text_source_identity(primary)
+    independent_text_source = _text_source_identity(independent)
+    text_source_route_mismatch = primary_text_source != independent_text_source
     primary_active, primary_correction = primary_document.active_rows, primary_document.scope_correction
     independent_active, independent_correction = independent_document.active_rows, independent_document.scope_correction
     primary_targets = {**primary, "segments": primary_active}
@@ -688,11 +776,14 @@ def _verify_inventory_payloads(
         or scope_tracking_mismatch
         or not declared_complete
         or correction_mismatch
+        or text_source_route_mismatch
         or projection_constraints
     )
     issue_codes: list[str] = []
     if correction_mismatch:
         issue_codes.append("INVENTORY_SCOPE_CORRECTION_MISMATCH")
+    if text_source_route_mismatch:
+        issue_codes.append("INVENTORY_TEXT_SOURCE_ROUTE_MISMATCH")
     if projection_constraints:
         issue_codes.append("INVENTORY_SCOPE_PROJECTION_REQUIRED")
     if namespace_mismatch:
@@ -730,6 +821,7 @@ def _verify_inventory_payloads(
         + int(scope_tracking_mismatch)
         + int(not declared_complete)
         + int(correction_mismatch)
+        + int(text_source_route_mismatch)
         + projection_constraints
     )
     return {
@@ -750,6 +842,9 @@ def _verify_inventory_payloads(
         "primary_segments": len(primary_rows),
         "independent_segments": len(independent_rows),
         "agreed_target_count": agreed_target_count,
+        **_extraction_summary(
+            primary_document, independent_document, agreed_target_count=agreed_target_count,
+        ),
         "primary_occurrences": len(primary["segments"]),
         "independent_occurrences": len(independent["segments"]),
         "scope_correction": scope_correction,
@@ -765,6 +860,8 @@ def _verify_inventory_payloads(
         "user_visible_exclusion_count": len(visible_exclusions),
         "static_scope": primary_scope,
         "static_scope_tracking_mismatch": scope_tracking_mismatch,
+        **({"text_source_route_mismatch": text_source_route_mismatch}
+           if primary_text_source is not None or independent_text_source is not None else {}),
         "static_complete": complete,
         "issue_codes": issue_codes,
         "gap_score": gap_score,
@@ -818,8 +915,15 @@ def save_inventory_attestation(
 
     # Validate both inventory documents before advancing canonical ID lineage.
     basis_cache: dict[Path, _BasisSnapshot] = {}
-    primary_document = _inventory_document(primary_path, defer_projection_constraints=True, _basis_cache=basis_cache)
-    independent_document = _inventory_document(independent_path, defer_projection_constraints=True, _basis_cache=basis_cache)
+    screen_review_skip = screen_review_skip_allowed(work_dir)
+    primary_document = _inventory_document(
+        primary_path, defer_projection_constraints=True, _basis_cache=basis_cache,
+        screen_review_skip=screen_review_skip,
+    )
+    independent_document = _inventory_document(
+        independent_path, defer_projection_constraints=True, _basis_cache=basis_cache,
+        screen_review_skip=screen_review_skip,
+    )
     primary_payload = primary_document.payload
     attestation = _verify_inventory_payloads(
         primary_path, independent_path, primary_document, independent_document
@@ -876,6 +980,8 @@ def save_inventory_attestation(
         "declared_complete": "INVENTORY_NOT_DECLARED_COMPLETE"
         not in attestation["issue_codes"],
     }
+    if "text_source_route_mismatch" in attestation:
+        current_vector["text_source_route_mismatch"] = attestation["text_source_route_mismatch"]
     previous_vector = (
         previous_reconciliation.get("gap_vector")
         if isinstance(previous_reconciliation, dict)
@@ -958,6 +1064,13 @@ def require_inventory_attestation(
         previous_path = work_dir / ".game-l10n" / "inventory-attestation.json"
         previous = json.loads(previous_path.read_text(encoding="utf-8")) if previous_path.is_file() else None
         fingerprint = inventory_fingerprint(primary)
+        if not (isinstance(previous, dict) and previous.get("assurance_mode") == "primary_only"
+                and previous.get("assurance_complete") is True
+                and previous.get("primary_path") == str(primary_path.resolve())
+                and previous.get("primary_fingerprint") == fingerprint):
+            _validate_text_source(
+                primary["coverage"], required=False, screen_review_skip=screen_review_skip_allowed(work_dir),
+            )
         identity = _write_primary_identity_binding(
             work_dir, primary_path, primary, previous,
             primary_fingerprint=fingerprint, scope_correction=document.scope_correction,
@@ -972,6 +1085,7 @@ def require_inventory_attestation(
             "primary_path": str(primary_path.resolve()),
             "primary_fingerprint": fingerprint,
             "primary_segments": len(document.active_rows),
+            **_extraction_summary(document),
             "declared_complete": primary["coverage"]["declared_complete"],
             "scope_correction": document.scope_correction,
             "primary_identity_binding": identity,
@@ -1025,12 +1139,16 @@ def require_inventory_attestation(
     # Revalidate legacy checkpoints in place, without advancing the reconciliation
     # generation or replacing the attested scope and identity history.
     basis_cache: dict[Path, _BasisSnapshot] = {}
+    text_sources: list[tuple[str, str] | None] = []
     for role, path in (("primary", primary_path), ("independent", independent_path)):
         if current_validation and saved_bindings.get(role) == bindings[role]:
             continue
         document = _inventory_document(path, _basis_cache=basis_cache)
         if state.get(f"{role}_fingerprint") != inventory_fingerprint(document.payload):
             raise ConfigurationError(f"{role.capitalize()} inventory changed after independent verification")
+        text_sources.append(_text_source_identity(document.payload))
+    if len(text_sources) == 2 and text_sources[0] != text_sources[1]:
+        raise ConfigurationError("INVENTORY_TEXT_SOURCE_ROUTE_MISMATCH")
     state["display_scope_validation_version"] = _DISPLAY_SCOPE_VALIDATION_VERSION
     state["file_bindings"] = bindings
     _atomic_json(state_path, state)

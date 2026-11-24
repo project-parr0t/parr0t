@@ -450,6 +450,9 @@ def _relay_command_argv(work_dir: Path, relay_path: Path, relay: dict) -> dict[s
     return commands
 
 
+_WAVE_WORKER_DISPATCH_REVISION = 2
+
+
 def _relay_worker_dispatches(work_dir: Path, relay_path: Path, relay: dict, contract: dict) -> dict:
     """Compile metadata-only, complete native task prompts; never forward task contents."""
     root = work_dir.resolve()
@@ -473,7 +476,16 @@ def _relay_worker_dispatches(work_dir: Path, relay_path: Path, relay: dict, cont
             "Do not search for another workspace or task."
         )
         if native:
-            prompt += f"\nManifest: {(root / relay['manifest']).resolve()}\nResult: {(root / binding['result']).resolve()}"
+            manifest = (root / relay["manifest"]).resolve()
+            result = (root / binding["result"]).resolve()
+            if contract.get("worker_dispatch_revision") == _WAVE_WORKER_DISPATCH_REVISION:
+                instruction = relay["relay_contract"]["worker_message_template"].format(
+                    workspace=root, pass_kind=relay["pass_kind"], task=task,
+                    manifest=manifest, result=result,
+                )
+                prompt += f"\n\n{instruction}"
+            else:
+                prompt += f"\nManifest: {manifest}\nResult: {result}"
         dispatches[key] = {
             "model": contract["model"], "task_path": str(task), "task_sha256": digest,
             "slot": slot, "worker_prompt": prompt,
@@ -666,6 +678,9 @@ def _contract_for_relay(work_dir: Path, relay: dict, relay_path: Path) -> dict |
         contract.update(relay_prompt_line=marker, worker_prompt_line=marker)
         previous = relay.get("launch_contract")
         if "worker_prompt" in contract and (previous is None or "worker_dispatches" in previous):
+            if (relay.get("schema") == "parr0t.native-wave-relay.v1" and previous
+                    and previous.get("worker_dispatch_revision") == _WAVE_WORKER_DISPATCH_REVISION):
+                contract["worker_dispatch_revision"] = _WAVE_WORKER_DISPATCH_REVISION
             contract["worker_dispatches"] = _relay_worker_dispatches(work_dir, relay_path, relay, contract)
     if legacy_results and contract is not None:
         contract["legacy_results"] = legacy_results
@@ -732,6 +747,9 @@ def _load(work_dir: Path, relay_path: Path) -> tuple[dict, dict, dict]:
     if isinstance(expected, dict):
         # Unrelated routes do not change this launch's locked execution identity.
         expected["runtime_fingerprint"] = contract.get("runtime_fingerprint")
+        if relay.get("schema") == "parr0t.native-wave-relay.v1" and "host_policy_fingerprint" in contract:
+            # Policy fingerprints record retry provenance; the host authorizes each actual dispatch.
+            expected["host_policy_fingerprint"] = contract["host_policy_fingerprint"]
     if contract != expected:
         raise ValueError("E_NATIVE_LAUNCH_INVALID: runtime binding changed")
     if "command_argv" in relay and relay["command_argv"] != _relay_command_argv(work_dir, relay_path, relay):

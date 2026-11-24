@@ -86,6 +86,40 @@ async function deniedWithoutDelivery(session, tool, input) {
   return denial;
 }
 
+test("a deterministic inventory worker cannot use inline Python or substitute its envelope", async () => {
+  const f = fixture();
+  const root = realpathSync(f.workspace);
+  const script = path.join(root, "tools", "reconcile_inventory_worker.py");
+  mkdirSync(path.dirname(script));
+  const scriptBytes = "print('synthetic reconciliation')\n";
+  writeFileSync(script, scriptBytes);
+  const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+  const cli = [process.execPath, "-I", "-B", path.join(root, "synthetic-core.py")];
+  const argv = [...cli.slice(0, -1), script, "--workspace", root, "--core-entry", cli.at(-1),
+    "--relay", "<relay>", "--task-sha256", "<task-sha256>"];
+  const taskFile = path.join(path.dirname(f.relay), "task.json");
+  writeJson(taskFile, { worker_execution: {
+    tool: "parr0t_process", core_runtime: { cli_argv: cli },
+    deterministic_worker: { argv, script_sha256: digest(scriptBytes) },
+  } });
+  const taskDigest = digest(readFileSync(taskFile));
+  const relay = f.marker.split("=")[1];
+  writeJson(f.relay, { schema: "parr0t.data-plane-relay.v4", task_id: "synthetic-task",
+    worker_role: "inventory_reconciler", task_path: path.posix.join(path.posix.dirname(relay), "task.json"),
+    task_sha256: taskDigest });
+  const session = host(f.workspace);
+  const expected = argv.map(arg => arg === "<relay>" ? relay : arg === "<task-sha256>" ? taskDigest : arg);
+  const startup = await session.emit("before_agent_start", { prompt: f.marker, systemPrompt: [] });
+  expect(startup.systemPrompt.join("\n")).toContain(JSON.stringify({ argv: expected }));
+  await deniedWithoutDelivery(session, "parr0t_process", { argv: [cli[0], "-c", "print('alternate')"] });
+  await deniedWithoutDelivery(session, "write", { path: "control-envelope.json", content: "{}" });
+  const execute = input => session.tools.get("parr0t_process").execute("synthetic", input, undefined, undefined, session.ctx);
+  await expect(execute({ argv: expected.slice(0, -1) })).rejects.toThrow("exact deterministic inventory argv");
+  await execute({ argv: expected });
+  await expect(execute({ argv: expected })).rejects.toThrow("already invoked");
+  expect(session.executions.map(({ command, args }) => [command, ...args])).toEqual([expected]);
+});
+
 function controlLaunch(workspace) {
   const directory = path.join(workspace, ".game-l10n", "omp-control", "a".repeat(32));
   mkdirSync(directory, { recursive: true });

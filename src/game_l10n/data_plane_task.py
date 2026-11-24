@@ -44,6 +44,7 @@ from .extractor_preparation import (
     ACTION as EXTRACTOR_PREPARATION_ACTION,
     ATTESTATION_PATH as EXTRACTOR_ATTESTATION_PATH,
     PURPOSE as EXTRACTOR_PREPARATION_PURPOSE,
+    apply_extractor_requirements,
     require_extractor_preparation,
     preparation_required,
 )
@@ -55,6 +56,10 @@ from .image_localization import (
     verify_image_localization_results,
     verify_image_ui_inventory,
 )
+from .inventory_scope import DISPLAY_SCOPE_SCHEMA, TEXT_ELIGIBILITY_CONTRACT
+from .locale_probe import CHECKS as LOCALE_PROBE_CHECKS, PURPOSE as LOCALE_PROBE_PURPOSE
+from .locale_probe import SCHEMA as LOCALE_PROBE_SCHEMA, validate_locale_probe
+from .screen_review_policy import screen_review_skip_allowed
 from .inventory_constraints import (
     CONSTRAINT_ACTION,
     CONSTRAINT_CODE,
@@ -981,9 +986,12 @@ def _operational_failure_path(relay_path: Path, task_id: str) -> Path:
 
 
 ENGINE_MEDIA_BINDINGS_PURPOSE = "engine_media_bindings"
+LOCALE_LOCAL_PACKAGE_PURPOSE = "locale_local_package"
 _PURPOSE_ROLES = {
     EXTRACTOR_PREPARATION_PURPOSE: "source_probe",
     ENGINE_MEDIA_BINDINGS_PURPOSE: "image_ui_inventory",
+    LOCALE_PROBE_PURPOSE: "source_probe",
+    LOCALE_LOCAL_PACKAGE_PURPOSE: "source_probe",
 }
 
 
@@ -1957,6 +1965,117 @@ def current_data_plane_receipt(
     }
 
 
+def current_locale_probe(
+    work_dir: Path, config: dict[str, Any], sdk_activation: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Read the canonical probe binding without exposing the probe artifact."""
+    receipt_path = data_plane_receipt_path(work_dir, "source_probe", purpose=LOCALE_PROBE_PURPOSE)
+    if not os.path.lexists(receipt_path.parent):
+        return None
+    pending = {"status": "pending", "issue_code": "locale_applicability_pending"}
+    try:
+        relay_path = _active_data_plane_dir(receipt_path.parent) / "relay.json"
+        _, task = _load_bound_data_plane_relay(work_dir, relay_path)
+        if (
+            task.get("purpose") != LOCALE_PROBE_PURPOSE
+            or task.get("sdk_activation") != sdk_activation
+            or task.get("language_binding") != language_binding(work_dir, config)
+            or task.get("source_roots") != [str(Path(root).resolve()) for root in config.get("game_roots", [])]
+        ):
+            return pending
+        public = current_data_plane_receipt(work_dir, "source_probe", purpose=LOCALE_PROBE_PURPOSE)
+        if public is None:
+            return pending
+        receipt = json.loads(receipt_path.read_bytes())
+        artifact = task["output_artifact"]
+        if receipt.get("task_id") != task["task_id"] or receipt.get("artifact_paths") != [artifact]:
+            return pending
+        path = (work_dir / artifact).resolve()
+        if not is_within(path, work_dir):
+            return pending
+        body = path.read_bytes()
+        digest_path = path.with_suffix(".sha256.txt")
+        if digest_path.is_file() and digest_path.read_text(encoding="ascii") != hashlib.sha256(body).hexdigest():
+            return pending
+        payload = json.loads(body)
+        from .locale_probe import validate_locale_probe
+
+        code = validate_locale_probe(payload, task["task_id"], {
+            **receipt, "issue_codes": [], "target_ids": [], "route_evidence_path": "",
+        })
+        if public["issue_codes"] != [code] or (public.get("execution") or {}).get("complete") is not True:
+            return pending
+        return {
+            "status": payload["outcome"], "issue_code": code,
+            "evidence_fingerprint": payload["evidence_sha256"],
+            "checks": payload["checks"],
+        }
+    except (ConfigurationError, OSError, ValueError, KeyError, TypeError):
+        return pending
+
+
+def _recover_locale_envelope(
+    work_dir: Path, relay_path: Path, receipt_path: Path, receipt_bytes: bytes,
+    task: dict[str, Any], sdk_activation: dict[str, Any], config: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Recover a malformed wrapper, never an invalid substantive result."""
+    if (task.get("sdk_activation") != sdk_activation
+            or task.get("language_binding") != language_binding(work_dir, config)
+            or task.get("source_roots") != [str(Path(root).resolve()) for root in config.get("game_roots", [])]):
+        return None
+    from .locale_probe import validate_locale_probe
+
+    for key in ("output_artifact", "output_envelope"):
+        path = work_dir / task[key]
+        if path.resolve() != path or not is_within(path, work_dir):
+            return None
+    artifact_path = work_dir / task["output_artifact"]
+    envelope_path = work_dir / task["output_envelope"]
+    try:
+        body = artifact_path.read_bytes()
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            return None
+        partial = payload.get("outcome") == "inconclusive"
+        envelope = {
+            "schema": "parr0t.control-envelope.v2", "worker_role": "source_probe", "stage": "discovery",
+            "status": "partial" if partial else "success", "target_ids": [],
+            "counts": {"total": 1, "success": int(not partial), "error": 0, "pending": int(partial)},
+            "issue_codes": [], "artifact_paths": [task["output_artifact"]],
+            "queue_transitions": [], "route_evidence_path": "",
+        }
+        validate_locale_probe(payload, task["task_id"], envelope)
+        old_envelope = envelope_path.read_bytes()
+    except (ConfigurationError, OSError, ValueError):
+        return None
+    sealed = _seal_recovered_envelope(
+        work_dir, relay_path, receipt_path, receipt_bytes, artifact_path, body,
+        envelope_path, old_envelope, envelope, issue_code="E_LOCALE_PROBE_REPAIR_CHANGED",
+    )
+    return {
+        "status": "locale_probe_recovered", "worker_role": "source_probe", "dispatch_allowed": False,
+        "receipt_path": sealed["receipt_path"], "issue_codes": sealed["issue_codes"],
+    }
+
+
+def _seal_recovered_envelope(
+    work_dir: Path, relay_path: Path, receipt_path: Path, receipt_bytes: bytes,
+    artifact_path: Path, body: bytes, envelope_path: Path, old_envelope: bytes,
+    envelope: dict[str, Any], *, issue_code: str,
+) -> dict[str, Any]:
+    with exclusive_file_lock(work_dir / ".game-l10n/native/launch.lock", issue_code="E_NATIVE_LAUNCH_BUSY", blocking=True):
+        _require_current_data_plane_relay(relay_path)
+        require_native_workers_ended(work_dir, relay_path)
+        if (receipt_path.read_bytes() != receipt_bytes or artifact_path.read_bytes() != body
+                or envelope_path.read_bytes() != old_envelope):
+            raise ConfigurationError(issue_code)
+        for source, prior in ((envelope_path, old_envelope), (receipt_path, receipt_bytes)):
+            archive = source.with_name(f"{source.stem}.before-repair-{hashlib.sha256(prior).hexdigest()}.json")
+            _atomic_bytes(archive, prior)
+        _atomic_json(envelope_path, envelope)
+    return seal_data_plane_task(work_dir, relay_path, worker_ended=True)
+
+
 def _inventory_constraint_state(
     work_dir: Path,
     task_dir: Path,
@@ -2174,10 +2293,12 @@ def _context_worker_execution(
     }
 
 
-def _inventory_worker_execution(work_dir: Path, runtime: dict[str, Any] | None) -> dict[str, Any]:
+def _inventory_worker_execution(
+    work_dir: Path, runtime: dict[str, Any] | None, deterministic_worker: dict | None
+) -> dict[str, Any]:
     transport, prefix = _worker_python_transport(runtime)
     workspace = str(work_dir.resolve())
-    return {
+    execution = {
         "schema": INVENTORY_WORKER_EXECUTION_SCHEMA,
         **transport,
         "workspace_root": workspace,
@@ -2195,6 +2316,17 @@ def _inventory_worker_execution(work_dir: Path, runtime: dict[str, Any] | None) 
         },
         "allowed_issue_codes": sorted(ISSUE_CODES_BY_STAGE["inventory"]),
     }
+    if deterministic_worker is not None:
+        cli = execution["core_runtime"]["cli_argv"]
+        execution["deterministic_worker"] = {
+            "script_sha256": deterministic_worker["sha256"],
+            "argv": [
+                *cli[:-1], str(work_dir / "tools" / deterministic_worker["path"]),
+                "--workspace", workspace, "--core-entry", cli[-1],
+                "--relay", "<relay>", "--task-sha256", "<task-sha256>",
+            ],
+        }
+    return execution
 
 
 def prepare_data_plane_task(
@@ -2210,6 +2342,8 @@ def prepare_data_plane_task(
     offline_processing: list[dict[str, Any]] | None = None,
     inspection_assets: list[Path] | None = None,
     discard_unverified_receipt: str | None = None,
+    deterministic_inventory_worker: bool = False,
+    prepare_locale_adapter: bool = False,
 ) -> dict[str, Any]:
     """Prepare one exact, private discovery, inventory, or context worker task.
 
@@ -2227,6 +2361,14 @@ def prepare_data_plane_task(
     profile = DATA_PLANE_PROFILES.get(worker_role)
     if profile is None:
         raise ConfigurationError("E_DATA_PLANE_TASK_ROLE: unsupported data-plane role")
+    runner = None
+    if deterministic_inventory_worker:
+        if worker_role != "inventory_reconciler" or not runtime or runtime["host"] != "omp" or runtime.get("omp_isolation") != "prompt":
+            raise ConfigurationError("E_DATA_PLANE_TASK_ROLE: deterministic inventory worker requires prompt OMP reconciliation")
+        manifest = ((sdk_activation or {}).get("workspace_tools") or {}).get("manifest", [])
+        runner = next((entry for entry in manifest if entry["path"] == "reconcile_inventory_worker.py"), None)
+        if runner is None:
+            raise ConfigurationError("E_DATA_PLANE_TASK_SDK_ACTIVATION: deterministic inventory worker is not activated")
     data_plane_receipt_path(work_dir, worker_role, purpose=purpose)
     if purpose == ENGINE_MEDIA_BINDINGS_PURPOSE and not inspection_assets:
         raise ConfigurationError("E_IMAGE_INSPECTION_ASSET_REQUIRED")
@@ -2242,6 +2384,36 @@ def prepare_data_plane_task(
             raise ConfigurationError("E_DATA_PLANE_TASK_SDK_ACTIVATION: current activation is required")
         if not purpose:
             require_extractor_preparation(work_dir, config, current_activation)
+    if prepare_locale_adapter:
+        if purpose != EXTRACTOR_PREPARATION_PURPOSE:
+            raise ConfigurationError("E_LOCALE_ADAPTER_PREPARATION_PURPOSE")
+        probe = current_locale_probe(work_dir, config, sdk_activation or {})
+        if probe is None or probe["status"] != "applicable":
+            raise ConfigurationError("E_LOCALE_ADAPTER_APPLICABILITY_REQUIRED")
+        previous = config.get("extractor_requirements") or {}
+        requirements = {
+            **previous,
+            "required_capabilities": sorted(set(previous.get("required_capabilities", ()))
+                                            | {"locale-ordered-inventory", "locale-value-roundtrip"}),
+            "required_formats": sorted(set(previous.get("required_formats", ())) | {"active-locale-catalog"}),
+            "source_metadata": {
+                **previous.get("source_metadata", {}),
+                "locale_catalog_adapter": {"evidence_fingerprint": probe["evidence_fingerprint"]},
+            },
+        }
+        path = work_dir / ".game-l10n" / "data-plane" / (
+            "locale-adapter-requirements-" + stable_hash(requirements) + ".json"
+        )
+        _atomic_json(path, requirements)
+        config = {**config, "extractor_requirements": apply_extractor_requirements(work_dir, path, _digest(path))}
+    locale_probe = None
+    if worker_role in {"primary_inventory", "independent_inventory"}:
+        locale_probe = current_locale_probe(work_dir, config, sdk_activation or {})
+        if locale_probe is not None and locale_probe["status"] not in {"applicable", "unavailable"}:
+            return {
+                "status": "pending", "worker_role": worker_role, "dispatch_allowed": False,
+                "next_action": "verify_locale_applicability", "issue_codes": [locale_probe["issue_code"]],
+            }
     output_dir = output_dir.resolve()
     if not is_within(output_dir, work_dir):
         raise ConfigurationError("E_DATA_PLANE_TASK_PATH: output must stay inside the workspace")
@@ -2412,7 +2584,17 @@ def prepare_data_plane_task(
                 prior_relay_path = output_dir / "relay.json"
                 if prior_relay_path.is_file():
                     require_native_workers_ended(work_dir, prior_relay_path)
-                    prior_relay, _ = _load_bound_data_plane_relay(work_dir, prior_relay_path)
+                    prior_relay, prior_bound_task = _load_bound_data_plane_relay(work_dir, prior_relay_path)
+                    if (purpose == LOCALE_PROBE_PURPOSE and previous_receipt_bytes is not None
+                            and previous_issue_codes == ["malformed_response"]
+                            and previous_receipt.get("status") == "error"
+                            and previous_receipt.get("execution", {}).get("complete") is True):
+                        repaired = _recover_locale_envelope(
+                            work_dir, prior_relay_path, previous_receipt_path, previous_receipt_bytes,
+                            prior_bound_task, sdk_activation or {}, config,
+                        )
+                        if repaired is not None:
+                            return repaired
                 if previous_receipt.get("execution", {}).get("complete", True) is not True:
                     return {
                         "status": "pending", "worker_role": worker_role,
@@ -2545,6 +2727,10 @@ def prepare_data_plane_task(
                         work_dir, previous_relay_path
                     )
                     if bound_task.get("task_id") == previous_task.get("task_id"):
+                        if worker_role == "inventory_reconciler" and bool(
+                            bound_task.get("worker_execution", {}).get("deterministic_worker")
+                        ) != deterministic_inventory_worker:
+                            raise ConfigurationError("E_DATA_PLANE_TASK_ACTIVE: cannot change the bound worker execution")
                         if content_source_grant is not None or content_source_scope:
                             policy = bound_task["content_source_policy"]
                             proposed = content_source_policy(
@@ -2667,7 +2853,11 @@ def prepare_data_plane_task(
     envelope = (
         output_dir / f"control-envelope.g{control_generation}.attempt-{attempt}{revision_suffix}.json"
     ).resolve()
-    if purpose == ENGINE_MEDIA_BINDINGS_PURPOSE:
+    if purpose == LOCALE_PROBE_PURPOSE:
+        artifact = envelope.with_name(envelope.name.replace("control-envelope.", "locale-applicability.", 1))
+    elif purpose == LOCALE_LOCAL_PACKAGE_PURPOSE:
+        artifact = envelope.with_name(envelope.name.replace("control-envelope.", "local-text-patch.", 1)).with_suffix(".zip")
+    elif purpose == ENGINE_MEDIA_BINDINGS_PURPOSE:
         artifact = envelope.with_name(envelope.name.replace("control-envelope.", "engine-media-bindings.", 1))
     relay_max_workers = 1
     worker_delegation_allowed = False
@@ -2716,8 +2906,51 @@ def prepare_data_plane_task(
             "kinds": ["binding_metadata", "ui_image", "font"],
             "evidence_sha256": "sha256 of a supplied bound seed proving the exact reference",
             "unresolved_bindings": "nonnegative integer, without source strings or snippets",
+            "container_binding_fields": ["root_index", "relative_path", "archive_sha256", "entry", "object_id", "kind"],
+            "container_binding_kinds": ["font", "ui_image"],
         }
-    elif purpose == EXTRACTOR_PREPARATION_PURPOSE:
+    if purpose == LOCALE_LOCAL_PACKAGE_PURPOSE:
+        from .tooling import _require_pack_input_binding
+
+        require_extractor_preparation(work_dir, config, sdk_activation or {})
+        if not config.get("extractor_requirements", {}).get("source_metadata", {}).get("locale_catalog_adapter"):
+            raise ConfigurationError("E_LOCALE_PACKAGE_ADAPTER_REQUIRED")
+        completion = work_dir / ".game-l10n" / "completion-attestation.json"
+        result_path = Path(json.loads(completion.read_bytes())["result_artifact"]["path"])
+        runner = work_dir / "pack_local_locale.py"
+        if runner.resolve(strict=True) != runner:
+            raise ConfigurationError("E_LOCALE_PACKAGE_RUNNER_PATH")
+        transport, prefix = _worker_python_transport(runtime)
+        private_payload["locale_package"] = {
+            **transport,
+            "argv": [*prefix[:-1], str(runner), str(output_dir / "task.json"), str(Path(__file__).resolve().parents[1])],
+            "runner_sha256": _digest(runner),
+            "completion_sha256": _digest(completion),
+            "result_path": _relative(work_dir, result_path),
+            "result_sha256": _require_pack_input_binding(work_dir, result_path),
+        }
+    if purpose == LOCALE_PROBE_PURPOSE:
+        prior_probe = current_locale_probe(work_dir, config, sdk_activation or {})
+        if prior_probe is not None and prior_probe["status"] == "inconclusive":
+            private_payload["previous_locale_checks"] = prior_probe["checks"]
+        elif (previous_receipt_closes and previous_task.get("sdk_activation") == sdk_activation
+                and previous_task.get("language_binding") == private_payload["language_binding"]
+                and previous_task.get("source_roots") == roots
+                and isinstance(previous_task.get("previous_locale_checks"), dict)):
+            private_payload["previous_locale_checks"] = previous_task["previous_locale_checks"]
+        private_payload["locale_probe_contract"] = {
+            "schema": LOCALE_PROBE_SCHEMA,
+            "checks": list(LOCALE_PROBE_CHECKS),
+            "outcomes": ["applicable", "unavailable", "inconclusive"],
+            "result_fields": ["schema", "task_id", "outcome", "checks", "evidence_sha256"],
+            "check_values": ["verified", "disproved", "unresolved"],
+            "envelope_disposition": "success_for_verified_or_disproved_route_partial_for_inconclusive_no_issue_codes",
+            "envelope_counts": {
+                "success": {"total": 1, "success": 1, "error": 0, "pending": 0},
+                "partial": {"total": 1, "success": 0, "error": 0, "pending": 1},
+            },
+        }
+    if purpose == EXTRACTOR_PREPARATION_PURPOSE:
         if ((config.get("extractor_requirements") or {}).get("source_metadata") or {}).get("image_candidate_discovery"):
             private_payload["requirements"].extend([
                 "obey_the_exact_image_candidate_discovery_output_contract_in_extractor_requirements",
@@ -2725,6 +2958,15 @@ def prepare_data_plane_task(
                 "decode_only_image_font_candidates_into_inputs_image_assets_preserve_original_source_bytes",
                 "do_not_acquire_dependencies_execute_the_game_or_infer_new_processing_authority",
                 "functional_checks_must_publish_the_exact_candidate_manifest_and_resolve_every_bound_source",
+            ])
+        if "locale_catalog_adapter" in (config.get("extractor_requirements") or {}).get("source_metadata", {}):
+            private_payload["requirements"].extend([
+                "use_the_verified_active_source_catalog_and_reversible_target_slot_only_never_search_for_existing_target_language",
+                "build_workspace_owned_locale_inventory_primary_py_and_locale_inventory_independent_py_with_independent_value_discovery",
+                "bind_stable_physical_value_IDs_and_preserve_order_duplicates_and_all_keys_outside_value_slots",
+                "build_workspace_owned_locale_apply_py_for_value_only_reversible_application_to_workspace_copies",
+                "prove_discovery_order_duplicate_retention_key_preservation_value_only_roundtrip_and_original_restoration_with_fixed_synthetic_fixtures",
+                "run_the_bound_extractor_preparation_check_and_write_only_the_control_envelope",
             ])
         private_payload["extractor_requirements"] = config.get("extractor_requirements")
         private_payload["preparation_contract"] = {
@@ -2769,7 +3011,26 @@ def prepare_data_plane_task(
             worker_route=worker_route,
         )
     if worker_role in {"primary_inventory", "independent_inventory"}:
-        private_payload["inventory_scope_contract"] = "parr0t.display-scope.v1"
+        private_payload["inventory_scope_contract"] = TEXT_ELIGIBILITY_CONTRACT
+        private_payload["screen_review_skip_allowed"] = screen_review_skip_allowed(work_dir)
+        if locale_probe is not None:
+            private_payload["locale_probe_binding"] = {
+                "locale_probe": locale_probe["status"],
+                "route": "locale_data" if locale_probe["status"] == "applicable" else "display_extraction",
+                "evidence_fingerprint": locale_probe["evidence_fingerprint"],
+            }
+            adapter = (config.get("extractor_requirements") or {}).get("source_metadata", {}).get("locale_catalog_adapter")
+            if adapter is not None:
+                if locale_probe["status"] != "applicable" or adapter["evidence_fingerprint"] != locale_probe["evidence_fingerprint"]:
+                    raise ConfigurationError("E_LOCALE_ADAPTER_APPLICABILITY_CHANGED")
+                role = "primary" if worker_role == "primary_inventory" else "independent"
+                runner = work_dir / "tools" / f"locale_inventory_{role}.py"
+                if not runner.is_file() or runner.resolve() != runner:
+                    raise ConfigurationError("E_LOCALE_ADAPTER_TOOL_MISSING")
+                private_payload["locale_inventory_runner"] = {"path": _relative(work_dir, runner), "sha256": _digest(runner)}
+                private_payload["requirements"].append(
+                    "use_the_exact_bound_locale_inventory_runner_from_preparation_and_do_not_repeat_the_completed_locale_probe"
+                )
     if worker_role == "inventory_reconciler":
         attestation_path = work_dir / ".game-l10n" / "inventory-attestation.json"
         if not attestation_path.is_file():
@@ -3129,11 +3390,12 @@ def prepare_data_plane_task(
             [
                 "raw_literal_presence_alone_is_not_display_or_completeness_evidence",
                 "derive_display_targets_from_format_roles_bindings_and_runtime_reference_evidence",
-                "resolve_supported_format_roles_and_display_consumer_dependencies_before_materializing_targets",
+                "register_only_positive_supported_display_bindings_never_raw_or_possible_only_targets",
+                "follow_nested_values_only_with_a_source_bound_path_to_an_exact_display_slot",
                 "keep_unclassified_raw_occurrences_out_of_context_translation_and_review",
                 "do_not_infer_display_use_from_language_container_membership_or_evidence_hash_alone",
-                "include_player_visible_system_messages_and_dynamic_display_dependencies",
-                "retain_unresolved_player_visible_candidates",
+                "include_evidenced_player_visible_system_messages",
+                "record_unresolved_actual_display_dependencies_as_pending_not_active_targets",
                 "account_raw_occurrences_by_provenance_and_category_separately_from_display_target_counts",
                 "keep_private_occurrence_evidence_for_display_bound_uncertain_and_proven_non_display_classifications",
                 "store_reusable_method_file_and_type_proofs_once_and_reference_them_by_fingerprint",
@@ -3151,6 +3413,12 @@ def prepare_data_plane_task(
         private_payload["requirements"].extend(
             [
                 "scan_source_once_using_selected_sdk_role_method",
+                "probe_the_active_sdk_locale_loader_and_reversible_target_apply_path_before_enumerating_text",
+                "when_locale_is_applicable_inventory_only_its_display_values_without_screen_review_or_source_extraction",
+                "only_extract_display_text_after_the_sdk_proves_no_applicable_locale_path",
+                "do_not_treat_an_inconclusive_locale_probe_as_permission_for_extraction",
+                "emit_coverage_text_source_and_per_target_role_for_the_exact_bound_route",
+                "skip_only_additional_screen_review_if_the_task_binds_user_approval_never_skip_eligibility",
                 "cache_role_local_structural_parse_provenance_and_display_dependency_evidence",
                 "construct_inventory_from_cached_single_pass_evidence_without_repeated_source_reads",
                 "do_not_read_or_derive_from_counterpart_inventory",
@@ -3185,6 +3453,7 @@ def prepare_data_plane_task(
                 "reuse_existing_inventory_scans_and_cached_evidence",
                 "do_not_repeat_full_source_scans",
                 "resolve_only_reported_gap_categories",
+                "resolve_any_text_source_route_disagreement_from_cached_loader_evidence_never_merge_routes",
                 "for_large_gaps_group_cached_occurrences_by_evidenced_sdk_display_consumer_and_storage_role",
                 "apply_each_supported_structural_rule_to_all_matching_pending_occurrences_in_one_local_sdk_pass",
                 "preserve_independent_method_proof_for_each_occurrence_and_leave_ambiguous_cases_pending",
@@ -3251,6 +3520,7 @@ def prepare_data_plane_task(
         private_payload["requirements"].extend([
             "derive_exact_UI_image_atlas_and_font_references_from_bound_local_seed_metadata_only",
             "report_exact_active_runtime_metadata_references_needed_next_as_binding_metadata",
+            "for_exact_bound_archive_objects_report_optional_container_bindings_without_decoding_pixels_or_fonts",
             "use_known_engine_layout_only_when_supported_by_the_active_SDK_and_seed_metadata",
             "no_listing_tree_scan_OCR_opening_or_testing_unbound_files_or_target_locale_assets",
             "do_not_translate_or_assert_visual_scope_complete_from_this_binding_probe",
@@ -3281,6 +3551,30 @@ def prepare_data_plane_task(
                 "do_not_apply_pack_install_launch_publish_or_delegate",
             ]
         )
+    elif purpose == LOCALE_PROBE_PURPOSE:
+        private_payload["requirements"].extend([
+            "run_only_bounded_read_only_locale_applicability_probe_using_activated_sdk_and_locked_languages",
+            "bind_active_loader_source_catalog_schema_and_exact_target_locale_load_and_apply_path",
+            "prove_value_only_apply_and_reverse_on_synthetic_or_bounded_local_fixture_without_install",
+            "verify_locale_applicability_not_existing_target_locale_presence_or_translation_quality",
+            "if_only_target_route_is_unresolved_reuse_the_other_verified_checks_and_trace_the_active_selection_dispatch_to_the_exact_catalog_slot",
+            "verify_target_activation_with_a_synthetic_placeholder_catalog_or_a_contentless_registration_probe_not_an_existing_target_language_catalog",
+            "a_reversible_install_overlay_may_reuse_the_active_source_catalog_slot_for_the_target_language_only_when_selection_lookup_and_original_restore_are_proven_without_changing_game_logic",
+            "do_not_assume_the_language_must_have_a_native_target_locale_key_or_claim_an_unproved_active_slot",
+            "do_not_scan_source_literals_or_inspect_screen_images_or_existing_target_language_content",
+            "do_not_change_sdk_selection_config_inventories_game_files_or_start_other_stages",
+            "write_only_bound_categorical_artifact_and_envelope_no_text_assets_logs_or_details_in_artifact",
+            "for_an_inconclusive_retry_use_the_prior_categorical_checks_to_test_only_unresolved_prerequisites_with_new_evidence",
+            "do_not_confuse_a_missing_test_with_disproof_verify_the_active_SDK_format_contract_and_exact_loader_or_apply_behavior",
+            "a_format_or_apply_path_excluded_by_exercised_SDK_behavior_can_disprove_that_exact_route_not_other_unexamined_routes",
+            "return_inconclusive_for_missing_evidence_and_unavailable_only_for_a_disproved_route",
+        ])
+    elif purpose == LOCALE_LOCAL_PACKAGE_PURPOSE:
+        private_payload["requirements"].extend([
+            "run_only_the_exact_locale_package_argv_in_the_bound_workspace_using_parr0t_process",
+            "this_is_a_deterministic_local_text_package_not_full_image_font_or_runtime_completion",
+            "do_not_install_launch_or_forward_source_or_translation_content",
+        ])
     elif purpose:
         private_payload["requirements"].extend(
             [
@@ -3310,7 +3604,7 @@ def prepare_data_plane_task(
             work_dir, output_dir / "task.json", runtime
         )
     elif worker_role == "inventory_reconciler":
-        private_payload["worker_execution"] = _inventory_worker_execution(work_dir, runtime)
+        private_payload["worker_execution"] = _inventory_worker_execution(work_dir, runtime, runner)
 
     semantic_kind = {
         "context_analyzer": "localization_context",
@@ -4171,22 +4465,52 @@ def _seal_bound_data_plane_task(
             raise ConfigurationError(
                 "E_DATA_PLANE_RESULT_INVALID: successful inventory is not declared complete"
             )
-        if result["status"] == "success":
+        eligibility = task.get("inventory_scope_contract") == TEXT_ELIGIBILITY_CONTRACT
+        if result["status"] == "success" or (eligibility and result["status"] == "partial"):
             try:
                 validate_inventory_display_scope(
                     inventory,
-                    required=task.get("inventory_scope_contract")
-                    == "parr0t.display-scope.v1",
+                    required=eligibility or task.get("inventory_scope_contract") == DISPLAY_SCOPE_SCHEMA,
+                    required_text_source=eligibility,
+                    screen_review_skip=(task.get("screen_review_skip_allowed") is True) if eligibility else None,
                 )
+                binding = task.get("locale_probe_binding")
+                if binding is not None:
+                    text_source = inventory["coverage"]["text_source"]
+                    if any(text_source.get(key) != value for key, value in binding.items()):
+                        raise ConfigurationError("E_INVENTORY_LOCALE_PROBE_MISMATCH")
             except ConfigurationError as exc:
                 raise ConfigurationError(
                     "E_INVENTORY_DISPLAY_SCOPE_REQUIRED"
                 ) from exc
+    elif task.get("purpose") == LOCALE_PROBE_PURPOSE:
+        if result["artifact_paths"] != [expected_artifact]:
+            raise ConfigurationError("E_LOCALE_PROBE_RESULT_INVALID")
+        from .workspace import load_config, require_sdk_activation
+        if require_sdk_activation(work_dir, load_config(work_dir)) != task.get("sdk_activation"):
+            raise ConfigurationError("E_LOCALE_PROBE_RESULT_INVALID")
+        outcome = validate_locale_probe(
+            json.loads(artifact_path.read_text(encoding="utf-8")), str(task["task_id"]), result,
+        )
+        result["issue_codes"] = [outcome]
+        _atomic_bytes(artifact_path.with_suffix(".sha256.txt"), _digest(artifact_path).encode("ascii"))
     elif task.get("purpose") == EXTRACTOR_PREPARATION_PURPOSE:
         if result["status"] == "success":
             from .workspace import load_config, require_sdk_activation
             config = load_config(work_dir)
             require_extractor_preparation(work_dir, config, require_sdk_activation(work_dir, config))
+    elif task.get("purpose") == LOCALE_LOCAL_PACKAGE_PURPOSE:
+        from .filesystem_package import validate_filesystem_package
+        from .tooling import _require_pack_input_binding
+
+        binding = task["locale_package"]
+        if (artifact_path != work_dir / expected_artifact
+                or result["status"] != "success" or result["artifact_paths"] != [expected_artifact]
+                or result["counts"] != {"error": 0, "pending": 0, "success": 1, "total": 1}
+                or _digest(work_dir / ".game-l10n" / "completion-attestation.json") != binding["completion_sha256"]
+                or _require_pack_input_binding(work_dir, work_dir / binding["result_path"]) != binding["result_sha256"]
+                or validate_filesystem_package(artifact_path)["checkpoint_schema"] != "parr0t.local-release-integrity/v1"):
+            raise ConfigurationError("E_LOCALE_PACKAGE_BINDING")
     elif result["worker_role"] == "source_probe" and result["status"] == "success":
         config = json.loads(artifact_path.read_text(encoding="utf-8"))
         selection = config.get("sdk_selection", {})

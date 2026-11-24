@@ -28,7 +28,7 @@ For a new job:
 
 For an existing job, start with status and reuse valid checkpoints. Never repeat locked successes; only core-owned unfinished-target retry or changed-binding repair may reissue work.
 
-Continuation/diagnosis: `control-plane-contract.md`. The ordinary OMP bootstrap supplies root `parr0t_session` and `parr0t_framework_mode` as well as native process execution. Entry/lifecycle requires the user's requested action (`user_requested: true`), not a compulsory interactive dialog. Ordinary roots supply an absolute `workspace`; dedicated helpers retain their exact bound workspace. `parr0t_session` preserves the actual current root model/thinking unless an explicit exact model is selected. Clean pause/analysis/shutdown can resume with `mode: "localization"`; actual semantic/history exposure requires canonical fresh recovery. Children cannot authorize entry or mode changes. Do not confuse a missing caller tool with the registered child controller's tool state.
+Continuation/diagnosis: `control-plane-contract.md`. The ordinary OMP bootstrap supplies root `parr0t_session` and `parr0t_framework_mode` as well as native process execution. Entry/lifecycle requires the user's requested action (`user_requested: true`), not a compulsory interactive dialog. An explicit absolute `workspace` selects the launch target for `parr0t_session`, including from a bound root; omitting it uses the caller's binding. `parr0t_framework_mode` remains restricted to the bound workspace in dedicated sessions. The launcher preserves the current root model/thinking unless an explicit exact model is selected. Clean pause/analysis/shutdown can resume with `mode: "localization"`; actual semantic/history exposure requires canonical fresh recovery. Children cannot authorize entry or mode changes. Do not confuse a missing caller tool with the registered child controller's tool state.
 
 ## State machine
 
@@ -36,7 +36,8 @@ Continuation/diagnosis: `control-plane-contract.md`. The ordinary OMP bootstrap 
 workspace and authorization
   -> SDK identity and selection
   -> exact SDK implementation activation
-  -> ordered inventories at the selected assurance level
+  -> bounded locale-path probe in the active SDK
+  -> ordered locale values, or ordered positive display targets if locale is unavailable
   -> required reconciliation
   -> typed context analysis
   -> configured translation routes for unfinished targets
@@ -48,12 +49,13 @@ workspace and authorization
   -> local_patch_ready
 ```
 
-These are per-cohort dependencies, not mandatory whole-job barriers. Core advances independent completed cohorts and groups heterogeneous pending routes. Recoverable failures continue within the initial request; honor explicit user pause/stop and changed-scope consent. Failures cannot exclude content or shrink the manifest. Blocking unresolved targets hold normal delivery unless the user requests a separate honestly incomplete artifact; invalid-integrity candidates remain forbidden.
+These are per-cohort dependencies, not mandatory whole-job barriers. Core advances independent completed cohorts and groups heterogeneous pending routes. Continue until `local_patch_ready`, an explicit user pause/stop, or a concrete error or authorization gate with no remaining authorized repair or independent work. Build missing in-scope capability rather than stopping at an inconclusive check. Do not repeat unchanged failed work or bypass coverage or consent. Blocking unresolved targets hold normal delivery unless the user requests a separate honestly incomplete artifact; invalid-integrity candidates remain forbidden.
 
 ## Operating rules
 
 - Select and activate before data-plane work. Bind exact matches to a Git checkout/worktree or authenticated portable snapshot. Portable activation records the full commit ID and verifies normalized content. Other identities are read-only `derive-new` references, never promotion targets. Pass-through tools are placeholders.
-- Independent ordered inventories prove static—not runtime—coverage. `require_independent_inventory: false` selects primary-only assurance, never independent/full-static proof. Raw presence or `declared_complete` alone never establishes display scope.
+- Probe locale applicability before text enumeration. A working locale loader and reversible apply path select locale-only inventory; do not also scan code/strings or review screens. An inconclusive probe holds the affected scope. See `docs/engine-static-scope.md`.
+- Independent ordered inventories prove static—not runtime—coverage. `require_independent_inventory: false` selects primary-only assurance. Admit only positive display bindings or verified locale values; keep unresolved display dependencies outside semantic work and report them as pending.
 - Cache scans and repair bound gaps proportionally; no arbitrary record-count threshold changes permission or coverage.
 - Keep relevant narrative/voice, functional/UI, knowledge, adjacency, glossary, and immutable evidence target-scoped.
 - The text-free parent handles only metadata and dispatches core relays; it never inspects game-root or semantic contents. A missing SDK changes nothing.
@@ -62,7 +64,7 @@ These are per-cohort dependencies, not mandatory whole-job barriers. Core advanc
 - Review limits are user-selected, not Sol-name caps. Missing fallback count defaults to 3 total calls; a missing exact authorized route remains pending. `review-pipeline.md`.
 - Translation is faithful transformation, not content generation. Independent review checks meaning, omission, voice, tone, function, conditions, units, terminology, allusions, placeholders, markup, control codes, ordering, and material layout risk.
 - Build only in the workspace; synthetic checks never install or launch games.
-- Apply proportional verification and stop after the changed layer passes. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.
+- Apply proportional verification: stop repeating a check after the changed layer passes, then advance the next eligible action. Keep small or tightly coupled work in the current agent; parallelize only independent bulk shards or genuinely independent research.
 - Native uses `native-pass-step` and terminal core seals. Only explicit user time/token/cost limits constrain the whole job; per-request capacity is separate and routes to safe sharding/compaction or actionable repair.
 - Observe finitely and interruptibly. Operational/admission errors are not semantic refusal/exhaustion: the owner ends started children and seals, then core creates a fresh manifest for only unfinished targets on the next approved configured route. Preserve successes/evidence; no successor means actionable repair, not source preservation or unchanged retry loops.
 - Prompt OMP needs its loaded helper and `parr0t_process`; guarded mode additionally needs guard evidence and `parr0t_exec`. Actual readiness checks both the mode-specific native tool and root `parr0t_framework_mode`. Top-level catalog absence alone is not missing registration: check the `xd://` device when deferred. Registered lifecycle devices enforce the same actual root authority as direct calls; they are not writable lifecycle metadata. Unknown harmless local tools are not blanket forbidden; messaging, private history, content/network scope and exact bound assets remain protected.
