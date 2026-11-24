@@ -12,11 +12,14 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 SCHEMA = "parr0t.steam-workshop-metadata.v1"
 SUBMIT_ITEM_UPDATE_CALLBACK = 3404
 RESULT_OK = 1
+VERIFICATION_LOCALES = ("english", "koreana")
+REQUEST_GAP_SECONDS = 1.0
+CALL_TIMEOUT_SECONDS = 30.0
 INVALID_UPDATE_HANDLE = (1 << 64) - 1
 INVALID_QUERY_HANDLE = (1 << 64) - 1
 UGC_DETAILS_TAG_BYTES = 1025
@@ -254,6 +257,7 @@ class SteamMetadataClient:
         if actual_owner != owner_id:
             self.close()
             raise MetadataError(f"Steam client account {actual_owner} does not match manifest owner")
+        self._next_request_at = 0.0
 
     def _resolve_interface(self, prefix: str, versions: Iterable[int]) -> int:
         for version in versions:
@@ -362,6 +366,14 @@ class SteamMetadataClient:
     def _utf8(value: str) -> bytes:
         return value.encode("utf-8")
 
+    def _send(self, function: Callable[..., int], *args: Any) -> int:
+        delay = self._next_request_at - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        if not self._dll.SteamAPI_ISteamUser_BLoggedOn(self._user):
+            raise MetadataError("Steam client is offline or unauthenticated")
+        return function(self._ugc, *args)
+
     def update(self, plan: MetadataPlan, locale: str) -> None:
         handle = self._dll.SteamAPI_ISteamUGC_StartItemUpdate(self._ugc, plan.app_id, plan.item_id)
         if handle == INVALID_UPDATE_HANDLE:
@@ -374,8 +386,10 @@ class SteamMetadataClient:
         for field, setter, value in setters:
             if not setter(self._ugc, handle, self._utf8(value)):
                 raise MetadataError(f"Steam rejected {field} for {locale}")
-        call = self._dll.SteamAPI_ISteamUGC_SubmitItemUpdate(
-            self._ugc, handle, self._utf8("Synchronize localized Workshop metadata")
+        call = self._send(
+            self._dll.SteamAPI_ISteamUGC_SubmitItemUpdate,
+            handle,
+            self._utf8("Synchronize localized Workshop metadata"),
         )
         if not call:
             raise MetadataError(f"Steam rejected metadata submission for {locale}")
@@ -386,7 +400,6 @@ class SteamMetadataClient:
             raise MetadataError(f"Steam returned an unexpected Workshop item for {locale}")
         if result.needs_legal_agreement:
             raise MetadataError("Steam requires acceptance of the Workshop legal agreement")
-        self._verify(plan, locale)
 
     def update_tags(self, plan: MetadataPlan) -> bool:
         current = self._query_tags(plan)
@@ -406,8 +419,8 @@ class SteamMetadataClient:
             self._ugc, handle, ctypes.byref(values)
         ):
             raise MetadataError("Steam rejected Workshop tags")
-        call = self._dll.SteamAPI_ISteamUGC_SubmitItemUpdate(
-            self._ugc, handle, self._utf8("Add required Workshop tags")
+        call = self._send(
+            self._dll.SteamAPI_ISteamUGC_SubmitItemUpdate, handle, self._utf8("Add required Workshop tags")
         )
         if not call:
             raise MetadataError("Steam rejected tag submission")
@@ -434,7 +447,7 @@ class SteamMetadataClient:
         if query == INVALID_QUERY_HANDLE:
             raise MetadataError("Steam rejected the tag verification query")
         try:
-            call = self._dll.SteamAPI_ISteamUGC_SendQueryUGCRequest(self._ugc, query)
+            call = self._send(self._dll.SteamAPI_ISteamUGC_SendQueryUGCRequest, query)
             if not call:
                 raise MetadataError("Steam rejected the tag verification request")
             self._wait_for_completion(call)
@@ -468,7 +481,7 @@ class SteamMetadataClient:
             raise MetadataError("Steam did not return a valid metadata update result")
         return result
 
-    def _verify(self, plan: MetadataPlan, locale: str) -> None:
+    def verify(self, plan: MetadataPlan, locale: str) -> None:
         item_id = ctypes.c_uint64(plan.item_id)
         query = self._dll.SteamAPI_ISteamUGC_CreateQueryUGCDetailsRequest(
             self._ugc, ctypes.byref(item_id), 1
@@ -484,7 +497,7 @@ class SteamMetadataClient:
                 self._ugc, query, True
             ):
                 raise MetadataError(f"Steam rejected long-description verification for {locale}")
-            call = self._dll.SteamAPI_ISteamUGC_SendQueryUGCRequest(self._ugc, query)
+            call = self._send(self._dll.SteamAPI_ISteamUGC_SendQueryUGCRequest, query)
             if not call:
                 raise MetadataError(f"Steam rejected metadata verification query for {locale}")
             self._wait_for_completion(call)
@@ -503,14 +516,17 @@ class SteamMetadataClient:
                 UGC_DETAILS_DESCRIPTION_OFFSET : UGC_DETAILS_DESCRIPTION_OFFSET
                 + UGC_DETAILS_DESCRIPTION_BYTES
             ].split(b"\0", 1)[0].decode("utf-8", errors="strict")
-            if result != RESULT_OK or returned_item != plan.item_id:
-                raise MetadataError(f"Steam returned an invalid Workshop item for {locale}")
+            if returned_item != plan.item_id:
+                raise MetadataError("Steam returned an unexpected Workshop item for metadata verification")
+            if result != RESULT_OK:
+                raise MetadataError(f"Steam metadata verification failed for {locale} with EResult {result}")
             if title != plan.title or description != plan.description:
                 raise MetadataError(f"Steam metadata verification mismatch for {locale}")
         finally:
             self._dll.SteamAPI_ISteamUGC_ReleaseQueryUGCRequest(self._ugc, query)
 
     def _wait_for_completion(self, call: int) -> None:
+        deadline = time.monotonic() + CALL_TIMEOUT_SECONDS
         while True:
             self._dll.SteamAPI_RunCallbacks()
             failed = ctypes.c_bool(False)
@@ -519,7 +535,10 @@ class SteamMetadataClient:
             ):
                 if failed.value:
                     raise MetadataError("Steam API call failed before returning a result")
+                self._next_request_at = time.monotonic() + REQUEST_GAP_SECONDS
                 return
+            if time.monotonic() >= deadline:
+                raise MetadataError(f"Steam API call timed out after {CALL_TIMEOUT_SECONDS:g} seconds")
             time.sleep(0.05)
 
 
@@ -556,7 +575,11 @@ def synchronize(
             return
         for index, locale in enumerate(selected, start=1):
             client.update(plan, locale)
-            print(f"[{index}/{len(selected)}] {locale}: updated and verified", flush=True)
+            print(f"[{index}/{len(selected)}] {locale}: submitted", flush=True)
+        for locale in VERIFICATION_LOCALES:
+            if locale in selected:
+                client.verify(plan, locale)
+                print(f"{locale}: verified through the Steam client API", flush=True)
 
 
 def require_item_approval(plan: MetadataPlan, approved_item: int | None) -> None:
