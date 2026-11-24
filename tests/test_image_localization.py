@@ -100,7 +100,7 @@ class ImageLocalizationTests(unittest.TestCase):
         return work, game, manifest
 
     def test_image_route_is_disabled_until_explicit_user_request(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+        with tempfile.TemporaryDirectory() as directory:
             work, game, manifest = self._fixture(Path(directory))
             self.assertEqual(public_image_localization_state(work)["status"], "disabled")
             with self.assertRaisesRegex(ConfigurationError, "USER_REQUEST_REQUIRED"):
@@ -111,7 +111,7 @@ class ImageLocalizationTests(unittest.TestCase):
                 )
 
     def test_verified_scope_and_result_are_content_bound(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+        with tempfile.TemporaryDirectory() as directory:
             work, game, manifest = self._fixture(Path(directory))
             record_image_localization_policy(
                 work, requested=True, user_requested=True
@@ -196,7 +196,7 @@ class ImageLocalizationTests(unittest.TestCase):
             self.assertEqual(public_image_localization_state(work)["status"], "invalid")
 
     def test_uncertain_or_unconfirmed_asset_cannot_enter_scope(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+        with tempfile.TemporaryDirectory() as directory:
             work, game, manifest = self._fixture(Path(directory))
             record_image_localization_policy(
                 work, requested=True, user_requested=True
