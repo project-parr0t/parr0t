@@ -75,7 +75,8 @@ task-bound categorical result and envelope at the assigned locations; only
 the sealed receipt is parent-visible. Status keeps the probe outcome separate
 from its `inventory_status`. The latter is `applicable` when those three
 checks pass, `unavailable` when one is disproved, and `inconclusive` otherwise.
-`target_route` remains a diagnostic and cannot change the inventory decision.
+New probes can omit `target_route`; when supplied it is diagnostic only.
+Older sealed outcomes remain readable without changing their receipts.
 Core requests repair only for pending or inconclusive inventory evidence.
 Both fresh inventory methods bind the resulting inventory route and current
 sealed evidence fingerprint.

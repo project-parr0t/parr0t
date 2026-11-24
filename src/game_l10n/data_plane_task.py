@@ -57,8 +57,9 @@ from .image_localization import (
     verify_image_ui_inventory,
 )
 from .inventory_scope import DISPLAY_SCOPE_SCHEMA, TEXT_ELIGIBILITY_CONTRACT
-from .locale_probe import CHECKS as LOCALE_PROBE_CHECKS, PURPOSE as LOCALE_PROBE_PURPOSE
+from .locale_probe import INVENTORY_CHECKS as LOCALE_INVENTORY_CHECKS, PURPOSE as LOCALE_PROBE_PURPOSE
 from .locale_probe import SCHEMA as LOCALE_PROBE_SCHEMA, validate_locale_probe
+from .locale_probe import locale_inventory_status
 from .screen_review_policy import screen_review_skip_allowed
 from .inventory_constraints import (
     CONSTRAINT_ACTION,
@@ -2000,24 +2001,15 @@ def current_locale_probe(
         if digest_path.is_file() and digest_path.read_text(encoding="ascii") != hashlib.sha256(body).hexdigest():
             return pending
         payload = json.loads(body)
-        from .locale_probe import validate_locale_probe
-
         code = validate_locale_probe(payload, task["task_id"], {
             **receipt, "issue_codes": [], "target_ids": [], "route_evidence_path": "",
         })
         if public["issue_codes"] != [code] or (public.get("execution") or {}).get("complete") is not True:
             return pending
         checks = payload["checks"]
-        inventory_states = {checks[key] for key in LOCALE_PROBE_CHECKS if key != "target_route"}
-        if "disproved" in inventory_states:
-            inventory_status = "unavailable"
-        elif "unresolved" in inventory_states:
-            inventory_status = "inconclusive"
-        else:
-            inventory_status = "applicable"
         return {
             "status": payload["outcome"], "issue_code": code,
-            "inventory_status": inventory_status,
+            "inventory_status": locale_inventory_status(checks),
             "evidence_fingerprint": payload["evidence_sha256"],
             "checks": checks,
         }
@@ -2942,7 +2934,7 @@ def prepare_data_plane_task(
         }
     if purpose == LOCALE_PROBE_PURPOSE:
         prior_probe = current_locale_probe(work_dir, config, sdk_activation or {})
-        if prior_probe is not None and prior_probe["status"] == "inconclusive":
+        if prior_probe is not None and prior_probe["inventory_status"] == "inconclusive":
             private_payload["previous_locale_checks"] = prior_probe["checks"]
         elif (previous_receipt_closes and previous_task.get("sdk_activation") == sdk_activation
                 and previous_task.get("language_binding") == private_payload["language_binding"]
@@ -2951,7 +2943,8 @@ def prepare_data_plane_task(
             private_payload["previous_locale_checks"] = previous_task["previous_locale_checks"]
         private_payload["locale_probe_contract"] = {
             "schema": LOCALE_PROBE_SCHEMA,
-            "checks": list(LOCALE_PROBE_CHECKS),
+            "checks": list(LOCALE_INVENTORY_CHECKS),
+            "optional_checks": ["target_route"],
             "outcomes": ["applicable", "unavailable", "inconclusive"],
             "result_fields": ["schema", "task_id", "outcome", "checks", "evidence_sha256"],
             "check_values": ["verified", "disproved", "unresolved"],
@@ -3571,15 +3564,15 @@ def prepare_data_plane_task(
             "bind_active_loader_source_catalog_schema_and_reversible_value_apply_path",
             "prove_value_only_apply_and_reverse_on_synthetic_or_bounded_local_fixture_without_install",
             "verify_locale_applicability_not_existing_target_locale_presence_or_translation_quality",
-            "target_route_is_diagnostic_only_and_does_not_gate_inventory",
-            "if_target_activation_evidence_already_exists_record_it_without_inspecting_existing_target_language_content",
+            "compute_outcome_and_envelope_status_from_the_required_checks_only",
+            "omit_target_route_unless_recording_optional_existing_activation_evidence",
             "reuse_prior_verified_inventory_checks_and_test_only_unresolved_inventory_checks_with_new_evidence",
             "do_not_scan_source_literals_or_inspect_screen_images_or_existing_target_language_content",
             "do_not_change_sdk_selection_config_inventories_game_files_or_start_other_stages",
             "write_only_bound_categorical_artifact_and_envelope_no_text_assets_logs_or_details_in_artifact",
             "do_not_confuse_a_missing_test_with_disproof_verify_the_active_SDK_format_contract_and_exact_loader_or_apply_behavior",
             "a_format_or_apply_path_excluded_by_exercised_SDK_behavior_can_disprove_that_exact_route_not_other_unexamined_routes",
-            "return_inconclusive_for_missing_evidence_and_unavailable_only_for_a_disproved_route",
+            "if_any_required_check_is_disproved_use_unavailable_else_if_unresolved_use_inconclusive_else_use_applicable",
         ])
     elif purpose == LOCALE_LOCAL_PACKAGE_PURPOSE:
         private_payload["requirements"].extend([

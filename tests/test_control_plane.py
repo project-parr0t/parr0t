@@ -70,7 +70,7 @@ class ControlPlaneContractTests(unittest.TestCase):
                 config["sdk_selection"]["inventory_fingerprint"] = "synthetic-selection"
                 original_config = (work / "game-l10n.json").read_bytes()
                 output = work / ".game-l10n/data-plane/locale_applicability"
-                from game_l10n.locale_probe import CHECKS, SCHEMA
+                from game_l10n.locale_probe import INVENTORY_CHECKS, SCHEMA
 
                 with patch("game_l10n.workspace.require_sdk_activation", return_value={"status": "active"}):
                     prepared = prepare_data_plane_task(
@@ -83,7 +83,7 @@ class ControlPlaneContractTests(unittest.TestCase):
                     artifact = task["output_artifact"]
                     (work / artifact).write_text(json.dumps({
                         "schema": SCHEMA, "task_id": task["task_id"] if valid else "unbound",
-                        "outcome": "applicable", "checks": dict.fromkeys(CHECKS, "verified"),
+                        "outcome": "applicable", "checks": dict.fromkeys(INVENTORY_CHECKS, "verified"),
                         "evidence_sha256": "1" * 64,
                     }), encoding="utf-8")
                     (work / relay["expected_envelope"]).write_text(json.dumps({

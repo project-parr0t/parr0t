@@ -9,7 +9,17 @@ from .errors import ConfigurationError
 
 PURPOSE = "locale_applicability"
 SCHEMA = "parr0t.locale-applicability.v1"
-CHECKS = ("loader_binding", "source_catalog", "target_route", "reversible_value_apply")
+INVENTORY_CHECKS = ("loader_binding", "source_catalog", "reversible_value_apply")
+CHECKS = (*INVENTORY_CHECKS, "target_route")
+
+
+def locale_inventory_status(checks: dict[str, str]) -> str:
+    states = {checks[key] for key in INVENTORY_CHECKS}
+    if "disproved" in states:
+        return "unavailable"
+    if "unresolved" in states:
+        return "inconclusive"
+    return "applicable"
 
 
 def validate_locale_probe(payload: Any, task_id: str, result: dict[str, Any]) -> str:
@@ -21,11 +31,11 @@ def validate_locale_probe(payload: Any, task_id: str, result: dict[str, Any]) ->
     digest = payload["evidence_sha256"]
     if (payload["schema"] != SCHEMA or payload["task_id"] != task_id
             or not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest)
-            or not isinstance(checks, dict) or set(checks) != set(CHECKS)
+            or not isinstance(checks, dict) or set(checks) not in (set(INVENTORY_CHECKS), set(CHECKS))
             or any(value not in ("verified", "disproved", "unresolved") for value in checks.values())):
         raise ConfigurationError("E_LOCALE_PROBE_RESULT_INVALID")
     states = set(checks.values())
-    if outcome == "applicable" and states == {"verified"}:
+    if outcome == "applicable" and locale_inventory_status(checks) == "applicable":
         status, counts = "success", {"total": 1, "success": 1, "error": 0, "pending": 0}
     elif outcome == "unavailable" and "disproved" in states:
         status, counts = "success", {"total": 1, "success": 1, "error": 0, "pending": 0}
