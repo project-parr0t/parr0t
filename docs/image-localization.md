@@ -21,6 +21,8 @@ When the approved scope forbids recursive image enumeration, start an `image_ui_
 
 Add `--verify-fonts` to that status command for deterministic Unicode cmap coverage of the sealed local font references. It reports counts only and does not install, copy, or replace fonts; a character map is not evidence of in-engine layout.
 
+An activated SDK may report embedded image and font object bindings against the exact supplied archive path and digest. The sealed status exposes object counts only; those counts do not verify glyph coverage, decode original pixels, or establish image-translation eligibility.
+
 An unchanged opaque-source retry does not launch another image inventory worker. Core applies the hash-bound additive extractor requirements without dropping existing formats, capabilities, metadata, or unrelated policy, then uses the existing isolated extractor-preparation flow. Pending image repair does not stop independent text work. Only an exact readiness-attested candidate manifest with complete original-source accounting and unchanged hashes admits the narrow `inputs/image-assets` cache as a read-only image source; the workspace as a whole never becomes a game root.
 
 ## Scope discovery and translation
