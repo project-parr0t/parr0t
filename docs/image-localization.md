@@ -17,6 +17,10 @@ Use the validated game inventory to bind exact local assets and unchanged SHA-25
 
 For automatic loose-asset inventory, Core discovers and hash-binds image/font candidates within the authorized scope and supplies a private candidate manifest; callers need not manually enumerate them. Unexamined packaged, linked, unreadable, or unsupported sources remain explicit deterministic SDK/extractor repair work, never proof of `no_targets`. Native sealing verifies the report against that exact discovery. Direct revalidation uses `verify-image-ui-inventory --candidate-discovery <core-generated-workspace-json>` and must not erase bound discovery evidence or turn incomplete scope into completion by omitting it.
 
+When the approved scope forbids recursive image enumeration, start an `image_ui_inventory` relay with `--purpose engine_media_bindings` and exact, known metadata seeds passed as `--inspection-asset`. `engine-media-bindings-status --relay <relay>` exposes only sealed references and unresolved counts. Bind only the resulting in-scope assets in follow-up relays. The metadata probe does not establish visual completeness or `no_targets`.
+
+Add `--verify-fonts` to that status command for deterministic Unicode cmap coverage of the sealed local font references. It reports counts only and does not install, copy, or replace fonts; a character map is not evidence of in-engine layout.
+
 An unchanged opaque-source retry does not launch another image inventory worker. Core applies the hash-bound additive extractor requirements without dropping existing formats, capabilities, metadata, or unrelated policy, then uses the existing isolated extractor-preparation flow. Pending image repair does not stop independent text work. Only an exact readiness-attested candidate manifest with complete original-source accounting and unchanged hashes admits the narrow `inputs/image-assets` cache as a read-only image source; the workspace as a whole never becomes a game root.
 
 ## Scope discovery and translation

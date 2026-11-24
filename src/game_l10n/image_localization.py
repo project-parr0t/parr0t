@@ -235,6 +235,49 @@ def bound_inspection_assets(
     return [entries[path] for path in sorted(entries)]
 
 
+def _verify_engine_media_binding_probe(work_dir: Path, path: Path, task: dict[str, Any]) -> dict[str, Any]:
+    _, payload = _load_workspace_json(work_dir, path, label="ENGINE_MEDIA_BINDINGS")
+    references = payload.get("references")
+    unresolved = payload.get("unresolved_bindings")
+    if (set(payload) != {"schema", "task_id", "references", "unresolved_bindings"}
+            or payload["schema"] != "parr0t.engine-media-bindings.v1"
+            or payload["task_id"] != task["task_id"]
+            or not isinstance(references, list) or len(references) > 256
+            or type(unresolved) is not int or unresolved < 0):
+        raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID")
+    roots = [Path(root).resolve() for root in task["source_roots"]]
+    seeds = set()
+    for entry in task["bound_local_assets"]:
+        source = Path(entry["path"])
+        if not source.is_file() or _sha256(source) != entry["sha256"]:
+            raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID: bound seed changed")
+        seeds.add(entry["sha256"])
+    if not seeds:
+        raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID: bound seed required")
+    kinds = {
+        "binding_metadata": {".js", ".json", ".html", ".css", ".xml", ".atlas", ".fnt"},
+        "ui_image": {".png", ".webp", ".jpg", ".jpeg", ".bmp", ".gif"},
+        "font": {".ttf", ".otf", ".ttc", ".woff", ".woff2", ".fnt"},
+    }
+    bindings = []
+    seen = set()
+    for item in references:
+        if not isinstance(item, dict) or set(item) != {"root_index", "relative_path", "kind", "evidence_sha256"}:
+            raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID")
+        index, kind = item["root_index"], item["kind"]
+        relative = _safe_relative(item["relative_path"])
+        if (type(index) is not int or not 0 <= index < len(roots)
+                or not isinstance(kind, str) or Path(relative).suffix.lower() not in kinds.get(kind, ())
+                or not _is_sha256(item["evidence_sha256"]) or item["evidence_sha256"] not in seeds):
+            raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID")
+        resolved = (roots[index] / relative).resolve()
+        if not is_within(resolved, roots[index]) or resolved in seen:
+            raise ConfigurationError("E_ENGINE_MEDIA_BINDINGS_INVALID")
+        seen.add(resolved)
+        bindings.append({"path": str(resolved), "kind": kind, "exists": resolved.is_file()})
+    return {"references": bindings, "unresolved_bindings": unresolved}
+
+
 def _load_workspace_json(work_dir: Path, path: Path, *, label: str) -> tuple[Path, dict[str, Any]]:
     resolved = path.resolve()
     if not is_within(resolved, work_dir.resolve()) or not resolved.is_file():

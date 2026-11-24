@@ -1,12 +1,12 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import createLifecycle, { publishHostModels } from "../src/game_l10n/templates/native-relay-lifecycle.mjs";
 
-async function fixture(run) {
+async function fixture(run, { wave = false } = {}) {
   const workspace = mkdtempSync(path.join(os.tmpdir(), "parr0t-lifecycle-state-"));
   try {
     const taskPath = path.join(workspace, "synthetic-task.json");
@@ -14,14 +14,15 @@ async function fixture(run) {
     writeFileSync(taskPath, taskBytes);
     const taskSha = createHash("sha256").update(taskBytes).digest("hex");
     const relayPath = path.join(workspace, "relay.json");
-    const keys = ["worker-0", "worker-1", "finalizer"];
+    const keys = wave ? ["tasks/task-0001.jsonl", "tasks/task-0002.jsonl"] : ["worker-0", "worker-1", "finalizer"];
     const dispatches = Object.fromEntries(keys.map((key, slot) => [key, {
-      model: "synthetic/model:high", task_path: taskPath, task_sha256: taskSha, slot,
+      model: "synthetic/model:high", task_path: taskPath, task_sha256: taskSha, slot: wave ? key : slot,
       worker_prompt: `PARR0T_OMP_TASK=${key}\nSynthetic task ${taskPath} ${taskSha}`,
     }]));
     const relay = {
+      ...(wave ? { schema: "parr0t.native-wave-relay.v1" } : {}),
       launch_contract: { model: "synthetic/model:high", worker_dispatches: dispatches },
-      execution_plan: { tracking_required: true },
+      execution_plan: { tracking_required: !wave },
       command_argv: {
         "capability-available": ["preflight"],
         "worker-started": Object.fromEntries(keys.map(key => [key, ["start", key, "<worker-id>"]])),
@@ -32,7 +33,9 @@ async function fixture(run) {
         },
       },
     };
-    writeFileSync(relayPath, JSON.stringify(relay));
+    const relayBytes = JSON.stringify(relay);
+    const relaySha = createHash("sha256").update(relayBytes).digest("hex");
+    writeFileSync(relayPath, relayBytes);
     const started = new Set();
     const events = [];
     let failPreflight = false;
@@ -59,10 +62,49 @@ async function fixture(run) {
       await worker.before_agent_start({ prompt: dispatches[key].worker_prompt }, ctx);
       return { end: event => worker.agent_end(event, ctx) };
     }
-    await run({ dispatch, enter, lifecycle, parent, events, started, taskPath, taskBytes,
+    const timingDir = path.join(workspace, "logs", "native-wave-timing");
+    await run({ dispatch, enter, lifecycle, make, parent, events, started, taskPath, taskBytes, keys, relaySha, timingDir,
       failPreflight: value => { failPreflight = value; } });
   } finally { rmSync(workspace, { recursive: true, force: true }); }
 }
+
+test("wave timing uses only settled lifecycle events and deduplicates the exact binding", async () => {
+  await fixture(async ({ dispatch, enter, lifecycle, make, parent, keys, relaySha, timingDir }) => {
+    assert.equal((await dispatch(keys, "dispatch")).block, undefined);
+    const early = make();
+    await early.before_agent_start({ prompt: "Synthetic relay" }, parent);
+    await early.agent_end({}, parent);
+    assert.equal(existsSync(timingDir), false);
+    const terminal = {
+      get provider_generation_ms() { throw new Error("must not infer generation time"); },
+      get messages() { throw new Error("must not inspect history"); },
+    };
+    for (const [index, key] of keys.entries()) {
+      const worker = await enter(key, `SyntheticWorker${index}`);
+      await worker.end({ willContinue: true });
+      await worker.end(terminal);
+    }
+    const relayEvent = path.join(timingDir, `${relaySha}.json`);
+    await lifecycle.agent_end({ awaitingAsyncWork: true }, parent);
+    assert.equal(existsSync(relayEvent), false);
+    await lifecycle.agent_end(terminal, parent);
+    const first = readFileSync(relayEvent, "utf8");
+    const replay = make();
+    await replay.before_agent_start({ prompt: "Synthetic replay" }, parent);
+    await replay.agent_end(terminal, parent);
+    assert.equal(readFileSync(relayEvent, "utf8"), first);
+    const records = readdirSync(timingDir).map(name => JSON.parse(readFileSync(path.join(timingDir, name), "utf8")));
+    assert.deepEqual(records.map(record => record.event).sort(), ["relay_ended", "worker_ended", "worker_ended"]);
+    assert.deepEqual(records.filter(record => record.task_sha256).map(record => record.task_sha256).sort(),
+      keys.map(key => createHash("sha256").update(key).digest("hex")).sort());
+    for (const record of records) {
+      assert.equal(record.schema, "parr0t.native-wave-timing.v1");
+      assert.equal(record.relay_sha256, relaySha);
+      assert.ok(Number.isInteger(record.elapsed_ms) && record.elapsed_ms >= 0);
+      assert.equal(record.provider_generation_ms, null);
+    }
+  }, { wave: true });
+});
 
 test("context workers end independently and finalizer waits for every terminal event", async () => {
   await fixture(async ({ dispatch, enter, lifecycle, parent, events }) => {
