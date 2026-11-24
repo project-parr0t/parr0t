@@ -1,10 +1,10 @@
 # Steam Workshop metadata contract
 
-Use this contract only after the user explicitly authorizes the exact Workshop metadata mutation. Content publication, default metadata, localized metadata, Git publication, and game execution are separate actions.
+This contract governs Steam Workshop publication and verification. Use it only for the exact action the user authorizes. Content publication, default metadata, localized metadata, Git publication, and game execution are separate actions.
 
 ## Determine item state from authoritative fields
 
-Query `ISteamRemoteStorage/GetPublishedFileDetails` before mutation and bind the returned item ID, creator, creator app, consumer app, visibility, `banned`, and result code. A localized community page, generic warning banner, missing localized title, or anonymous rendering anomaly is not proof that an item was deleted or moderated. Report deletion or moderation only when an authoritative status field establishes it.
+Use Valve's native, authenticated Steam client API (`ISteamUGC`) for Workshop preflight and readback. Bind the exact item ID, creator, creator app, consumer app, visibility, ban flag, and result code. A Community-page warning or a failed web request is not evidence of deletion or moderation. Report either only when the authoritative client API fields establish it.
 
 ## Preserve complete locale records
 
@@ -28,12 +28,12 @@ Localized title and description synchronization may use `scripts/sync_steam_work
 
 Do not acquire or execute a third-party Workshop publisher as a fallback. Do not extract browser or Steam client credentials, cookies, session tokens, or API keys. If the native API rejects an update, keep the update held. An authenticated community-page edit is a separate browser mutation and requires the user's explicit authorization and their own interactive login.
 
-## Verify the public result
+## Verify through the Steam client API only
 
-Command success is not publication proof. After mutation:
+SteamCMD is for authorized uploads, not verification. Its success acknowledgement is not proof that the release is available. After SteamCMD exits, verify through the Valve client API only, using the reviewed Valve library and an online client signed into the expected account. SteamCMD login can disconnect the desktop client; if it is offline or unauthenticated, hold verification and ask the user to reconnect. Do not run SteamCMD again to verify, or fall back to the Steam Web API, `steamcommunity.com`, browser automation, scraping, or any other HTTP probe.
 
-1. Query authoritative public item details again and require a successful result, the expected public item binding, and no ban.
-2. Read every managed locale publicly and require the expected nonempty title and canonical description.
-3. Read the item's tags through the native UGC query and require every manifest `required_tags` entry while permitting preserved pre-existing tags.
-4. Record mismatched locales or tags and retry only those records through the same authorized path.
-5. If public verification is blocked or inconsistent, hold completion and report the exact evidence; never reinterpret it as deletion, moderation, or success.
+1. Query the exact Workshop item through `ISteamUGC` and require the expected identity, visibility, and ban state. Reuse that record for other checks it supports, including required tags.
+2. For content, confirm the client has the current Workshop install with no update pending, and compare the files at the path returned by the client API with the staged package. A stale local copy or the upload acknowledgement alone does not pass. If a field such as changenote text cannot be read through the client API, report it as independently unverified rather than fetching a web page.
+3. For a localized release, read back only English (`english`) and Korean (`koreana`) once each. If both match the expected title and description and all requested submissions succeeded, this passes the locale verification gate for the release; it does not mean other locales were read back. For a partial metadata update, read back only the selected languages among those two. Content-only uploads do not trigger locale readback.
+4. Keep at most one network-bearing UGC request in flight per workflow. Wait for it to complete, then wait at least one second before submitting another; apply any stricter Steam limit. This is a local ceiling, not a Valve quota. Pumping callbacks for a pending request does not issue a new request.
+5. On a rate-limit response, such as `k_EResultRateLimitExceeded` or HTTP `429` reported by existing logs, stop the batch immediately. On an access-denied response, offline session, or timeout, stop and report the exact failure. Do not retry automatically, fan out by locale, or switch clients, accounts, IPs, or HTTP paths. Respect any reported cooldown; a later, explicitly authorized attempt may query only outstanding records. Leave verification pending until the required checks pass.
