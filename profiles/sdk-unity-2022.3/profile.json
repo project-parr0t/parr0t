@@ -40,6 +40,11 @@
       "sha256": "923d507459235a39a4e0b86133e81515bc985a84d406086f59f2fb1b61dc48a1"
     },
     {
+      "path": "unity_media.py",
+      "bytes": 8068,
+      "sha256": "d31f37ca3c6366668cbe0646b23e20b2a2124af5de2e01350c8b2b7bcc5bb51b"
+    },
+    {
       "path": "unity_native.py",
       "bytes": 18857,
       "sha256": "c1c30f05bbbe42745eece6a1f2e9640f9020d5a8ccecd1336bae47adfc1ed492"

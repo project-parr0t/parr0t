@@ -73,6 +73,15 @@ For TextMeshPro, `unity_tmp.validate_tmp_renderer` checks a bound renderer's ser
 
 Keep target maps, selectors, paths, source/target text and all build orchestration in the private workspace. Callers write returned bytes only to new workspace artifacts and integrate the framework's completion and verified-pack gates themselves. The helpers do not install or launch anything.
 
+### Bound Player media references
+
+Import `unity_media` from the profile's `tools` directory. This is a read-only SDK library, not a Core command. Supply the exact, stable Windows Player `_Data` directory and a `FileBinding(relative_path, sha256)` for the top-level source file. Use its canonical Player-relative filename and lowercase, full SHA-256; the helper checks the digest before parsing. It rejects linked or nonregular source files and supports only Unity 2022.3 Windows standalone v22 little-endian serialized files. Archive, metadata and selected-object limits are 256 MiB, 8 MiB and 1 MiB respectively, with at most 1,024 supplied object IDs per call.
+
+- `scene_metadata_references(player_data, scene, monoscript_ids=())` accepts an already bound `levelN` scene. It reports top-level `.assets` files and the two known `Resources/` files only when named by the scene's external table. If the caller has resolved exact same-scene `MonoScript` PathIDs, pass them to add `Managed/<name>.dll` entries from those scripts' serialized assembly names. Unsupported reference paths are omitted; supplied IDs for missing or wrong-class objects are rejected. Results are unique in first-evidence order, and each `FileReference` carries the source filename and digest as evidence.
+- `texture_stream_references(player_data, archive, object_ids)` accepts exact `Texture2D` PathIDs and preserves their order and repetitions. It reads the embedded type tree's `m_StreamData` and reports a `TextureStream` with its object ID, byte offset, size and `FileReference` only for a bare path exactly equal to the archive filename plus `.resS`. A zeroed stream field returns `None`; stripped, malformed and unsupported layouts or paths raise `FormatError`. UnityFS members, archive URIs and guessed texture layouts are not supported.
+
+The helper does not discover scenes, enumerate directories, check whether a referenced file exists, open a dependency or companion, decode pixels, or infer visible UI scope. The reported digest belongs to the **source** of the reference, not its target. Before reading any target, independently authorize and bind its bytes; for a companion, also validate the reported range against those bytes.
+
 ## Pure UI screening library
 
 `unity_layout` has no UnityPy, font-file or other external dependency. Supply public-shaped values from a private inventory; the helper does not inspect assets. `Rect(parent, anchor_min, anchor_max, size_delta)` represents a node; a node with `parent=None` represents the canvas reference rectangle. `resolve_rect_size(rectangles, node_id, canvas_size)` resolves child anchor spans plus size deltas through the full parent chain. Missing parents, cycles, nonfinite values and non-positive dimensions are rejected. Rotation, scaling, pivots, driven layout groups and runtime transforms are outside this calculation.
@@ -90,4 +99,4 @@ result = screen_text("SOURCE", size, metrics, TextLayout(16))
 
 The estimate uses codepoint advances and conservative character wrapping. It does not model Unity word wrapping, shaping, kerning, full rich-text semantics, runtime font fallbacks, dynamic text or nonreference screen sizes. Missing glyphs and overflow are screening findings, not authorization to change authored typography. Actual rendering and runtime coverage require separately authorized user-run observations under `docs/engine-faq.md`.
 
-Run the public profile's `tools/selftest.py` for dependency-free interface checks. The focused synthetic suite is `python -m unittest tests.test_unity_serialized tests.test_unity_layout tests.test_unity_2022_3_profile -v` from the SDK checkout.
+Run the public profile's `tools/selftest.py` for dependency-free interface checks. The focused synthetic suite is `python -m unittest tests.test_unity_serialized tests.test_unity_media tests.test_unity_layout tests.test_unity_2022_3_profile -v` from the SDK checkout.
