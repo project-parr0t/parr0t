@@ -416,6 +416,60 @@ class NativeReviewTests(unittest.TestCase):
                     collect_reviewed_candidates(root, source,
                         [root / "collected/results.json"], root / "invalid.json")
 
+    def test_retranslation_keeps_sealed_review_history_and_requires_confirmation(self):
+        from dataclasses import replace
+        from game_l10n.models import AttemptRecord
+        from game_l10n.native_review import (
+            _bound_result, _issue_review_queue, _pending_segment, _review_queue_parents, collect_native_rewrite,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            provider, model = "native-sol", "fixture/sol"
+            bases = [replace(review_segment(key), previous="previous", next="next")
+                     for key in ("repaired", "unsafe")]
+            parents = {}
+            for index, route in enumerate(("escalation", "rewrite", "rewrite_retry")):
+                pending = []
+                for base in bases:
+                    state = _bound_result(base)
+                    state.attempts = [
+                        AttemptRecord("review", "native-luna", "rewrite", candidate_generation=1),
+                        AttemptRecord("review-rewrite", "native-rewrite", "error", candidate_generation=1,
+                                      issues=["target_script_absent"]),
+                    ]
+                    state.metadata["rewrite_issues"] = ["meaning"]
+                    state.metadata["target_language_risk"] = ["target_script_absent"]
+                    pending.append(_pending_segment(base, state))
+                _issue_review_queue(root, pending, route, str(index), parents)
+                parents = _review_queue_parents(pending)
+            source, tasks, results = root / "pending.jsonl", root / "tasks", root / "results"
+            source.write_text("".join(json.dumps(asdict(row)) + "\n" for row in pending), encoding="utf-8")
+            prepare_native_tasks(root, source, read_segments(source), tasks, pass_kind="translation",
+                                 route_binding={"provider": provider, "model": model, "attempt": 1})
+            results.mkdir()
+            write_semantic_result_rows(results / "task-0001.jsonl", [
+                {"target_id": "repaired", "status": "success", "text": "\ubc88\uc5ed", "issues": []},
+                {"target_id": "unsafe", "status": "success", "text": "untranslated", "issues": []},
+            ])
+            manifest = tasks / "manifest.json"
+            import_native_wave(root, manifest, results, 1)
+            (root / "game-l10n.json").write_text(json.dumps({"routing": {
+                "review_triagers": ["native-luna"], "translators": [provider],
+            }}), encoding="utf-8")
+            destination = root / "collected"
+            with self.assertRaisesRegex(ValueError, "REWRITE_PASS_REQUIRED"):
+                collect_native_rewrite(root, source, manifest, destination, target_language="ko")
+            summary = collect_native_rewrite(root, source, manifest, destination, target_language="ko",
+                                             language_integrity_recovery=True)
+            self.assertEqual((summary["accepted"], summary["confirmation_pending"], summary["unresolved"]), (0, 1, 1))
+            recovered = _bound_result(read_segments(destination / "confirmation-input.jsonl")[0])
+            self.assertEqual((recovered.segment_id, recovered.text, recovered.candidate_generation), ("repaired", "\ubc88\uc5ed", 2))
+            self.assertEqual([(a.provider, a.status) for a in recovered.attempts],
+                             [("native-luna", "rewrite"), ("native-rewrite", "error"), (provider, "success")])
+            self.assertEqual(_bound_result(read_segments(destination / "unresolved-input.jsonl")[0]).attempts[-1].issues,
+                             ["target_script_absent"])
+
     def test_native_rewrite_rejects_unflagged_inputs(self):
         from game_l10n.native_review import collect_native_rewrite
         with tempfile.TemporaryDirectory() as directory:

@@ -1122,12 +1122,13 @@ def collect_native_rewrite(
     glossary: list[Any] | None = None, extra_patterns: list[str] | None = None,
     max_length_ratio: float = 4.0, review_max_rounds: int = 2,
     awaiting_input: Path | None = None,
+    language_integrity_recovery: bool = False,
     target_language: str = "",
 ) -> dict[str, Any]:
     """Bind native corrections to their history, requiring a separate judge next.
 
     This collector starts no provider and grants no provider-role exception.
-    It consumes the existing rewrite pass and Segment formats only.
+    An explicitly authorized retranslation may repair a sealed language-integrity failure.
     """
     require_control_plane_ready(work_dir)
     work_dir = work_dir.resolve()
@@ -1145,12 +1146,20 @@ def collect_native_rewrite(
             raise ValueError("E_NATIVE_REVIEW_OUTPUT_INVALID")
     _require_candidate_bindings(segments, "rewrite")
     manifest = _load_task_manifest(work_dir, manifest_path)
-    if manifest.get("pass_kind") != "rewrite":
+    expected_pass = "translation" if language_integrity_recovery else "rewrite"
+    if manifest.get("pass_kind") != expected_pass:
         raise ValueError("E_NATIVE_REWRITE_PASS_REQUIRED")
     config_path = work_dir / "game-l10n.json"
     config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
     routing = config.get("routing", {})
-    _review_admission(work_dir, ordered_source, routing, stage="review-rewrite")
+    admission = _review_admission(work_dir, ordered_source, routing, stage="review-rewrite")
+    if language_integrity_recovery and (
+        not ordered_source
+        or not target_language
+        or admission["routes"] != {"rewrite_retry": len(ordered_source)}
+        or (manifest.get("route_binding") or {}).get("provider") not in routing.get("translators", [])
+    ):
+        raise ValueError("E_NATIVE_TRANSLATION_RECOVERY_SCOPE_INVALID")
     if output.resolve() in {source.resolve().parent, manifest_path.resolve().parent}:
         raise ValueError("E_NATIVE_REVIEW_OUTPUT_INVALID")
     initial = []
@@ -1162,6 +1171,17 @@ def collect_native_rewrite(
                   and a.candidate_generation == result.candidate_generation]
         if not native or not result.metadata.get("rewrite_issues"):
             raise ValueError("E_NATIVE_REVIEW_REWRITE_NOT_FLAGGED")
+        if language_integrity_recovery and (
+            not result.metadata.get("target_language_risk")
+            or not any(
+                attempt.stage == "review-rewrite" and attempt.status == "error"
+                and attempt.operational is not True
+                and attempt.candidate_generation == result.candidate_generation
+                for attempt in result.attempts
+            )
+            or _review_candidate_locked(work_dir, segment)
+        ):
+            raise ValueError("E_NATIVE_TRANSLATION_RECOVERY_SCOPE_INVALID")
         if sum(a.stage.startswith("review-rewrite") and a.status == "success"
                for a in result.attempts) >= max(0, review_max_rounds - 1):
             raise ValueError("E_NATIVE_REWRITE_LIMIT_REACHED")
@@ -1184,8 +1204,9 @@ def collect_native_rewrite(
                      extra_patterns=extra_patterns, max_length_ratio=max_length_ratio)
                      if row["status"] == "success" else [])
         language = (target_language_review_reasons(row["text"], target_language, segment.metadata)
-                    if row["status"] == "success" and result.metadata.get("target_language_risk")
-                    else [])
+                    if row["status"] == "success" and (
+                        language_integrity_recovery or result.metadata.get("target_language_risk")
+                    ) else [])
         valid = row["status"] == "success" and not integrity and not language
         interrupted = row["provider"] == "native-control" and row.get("issues") in (
             ["worker_not_started"], ["worker_interrupted"],

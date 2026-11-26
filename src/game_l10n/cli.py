@@ -2802,6 +2802,7 @@ def cmd_collect_native_rewrite(args: argparse.Namespace) -> int:
         target_language=config["project"]["target_language"],
         awaiting_input=_path_in_workspace(work_dir, args.awaiting_input, must_exist=True)
         if args.awaiting_input is not None else None,
+        language_integrity_recovery=args.user_requested_language_integrity_recovery,
         **_native_review_integrity_options(work_dir, config),
     )
     print(json.dumps(result, ensure_ascii=False))
@@ -4762,6 +4763,10 @@ def build_parser() -> argparse.ArgumentParser:
     native_rewrite.add_argument(
         "--awaiting-input",
         help="Collect only the ordered targets still awaiting results in an earlier collection",
+    )
+    native_rewrite.add_argument(
+        "--user-requested-language-integrity-recovery", action="store_true",
+        help="Collect a bound native retranslation of sealed language-integrity rejections, retaining review history",
     )
     native_rewrite.add_argument("--output", required=True)
     native_rewrite.set_defaults(func=cmd_collect_native_rewrite)
