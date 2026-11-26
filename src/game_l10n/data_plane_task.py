@@ -2380,7 +2380,7 @@ def prepare_data_plane_task(
         raise ConfigurationError("E_IMAGE_INSPECTION_ASSET_REQUIRED")
     if (image_preview_index is not None or image_preview_sheets or image_preview_ordinals is not None) and (
         worker_role != "image_ui_inventory" or purpose or inspection_assets is not None
-        or image_preview_index is None or not image_preview_sheets or offline_processing
+        or image_preview_index is None or not image_preview_sheets
     ):
         raise ConfigurationError("E_WINDOWS_IMAGE_PREVIEW_BINDING_INVALID")
     if purpose == EXTRACTOR_PREPARATION_PURPOSE:
@@ -3638,6 +3638,12 @@ def prepare_data_plane_task(
 
         private_payload["offline_processing"] = validated_offline_processing(work_dir, offline_processing)
         preview_script = str(Path(__file__).with_name("windows_image_preview.py").resolve())
+        originals = bool(image_preview_index is not None)
+        if originals and (not scoped_image or image_preview_ordinals is None
+                          or len(image_preview_ordinals) > 32 or len(offline_processing) != 1
+                          or private_payload["offline_processing"][0]["argv"][0] != preview_script
+                          or private_payload["offline_processing"][0]["argv"].count("--original-scale") != 1):
+            raise ConfigurationError("E_WINDOWS_IMAGE_PREVIEW_BINDING_INVALID")
         if worker_role == "image_ui_inventory" and any(
             binding["argv"][0] == preview_script for binding in private_payload["offline_processing"]
         ):
@@ -3647,6 +3653,15 @@ def prepare_data_plane_task(
                 "after_preview_command_use_read_to_view_the_returned_private_png_sheets_and_the_ordinal_index",
                 "save_observed_classifications_and_remain_partial_if_a_preview_or_its_original_text_region_was_not_visible",
             ])
+            if originals:
+                private_payload["requirements"][-2] = (
+                    "read_actual_original_scale_pngs_from_the_returned_private_ordinal_index_only_not_just_contact_sheets"
+                )
+                private_payload["requirements"].extend([
+                    "visually_inspect_every_available_original_scale_png_at_its_exact_bound_ordinal",
+                    "keep_failed_decode_animated_and_visually_unavailable_originals_unexamined",
+                    "no_text_is_a_visual_decision_and_does_not_require_visibility_proof_when_exact_image_contains_no_text",
+                ])
         encoder = str(Path(__file__).with_name("bound_webp_encode.py").resolve())
         encoder_args = [binding["argv"] for binding in private_payload["offline_processing"] if binding["argv"][0] == encoder]
         if worker_role == "image_localizer" and encoder_args:

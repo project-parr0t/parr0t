@@ -78,3 +78,16 @@ class WindowsImagePreviewTests(unittest.TestCase):
             sheet = (root / result['sheets'][0]).read_bytes()
             self.assertEqual(sheet[:8], b'\x89PNG\r\n\x1a\n')
             self.assertEqual(struct.unpack_from('>II', sheet, 16), (1170, 840))
+
+    def test_original_scale_preview_keeps_native_dimensions_and_rejects_changed_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "fixture.png"
+            body = rgba_png((8, 4))
+            path.write_bytes(body)
+            assets = [{"path": str(path), "ordinal": 7, "sha256": hashlib.sha256(body).hexdigest()},
+                      {"path": str(path), "ordinal": 8, "sha256": "0" * 64}]
+            rows = _render(root, assets, original_scale=True)["assets"]
+            self.assertEqual([row["status"] for row in rows], ["original_scale", "changed"])
+            self.assertEqual(struct.unpack_from(">II", (root / rows[0]["file"]).read_bytes(), 16), (64, 32))
+            self.assertNotIn("file", rows[1])

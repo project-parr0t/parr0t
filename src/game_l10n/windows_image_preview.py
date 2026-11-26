@@ -79,14 +79,60 @@ ConvertTo-Json -InputObject @{assets=@($rows.ToArray()); sheets=@($sheets.ToArra
 """
 
 
-def _render(output: Path, assets: list[dict]) -> dict:
+_ORIGINALS = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+Add-Type -AssemblyName PresentationCore, WindowsBase
+$inputData = ConvertFrom-Json ([Console]::In.ReadToEnd())
+$rows = [Collections.Generic.List[object]]::new()
+$hash = [Security.Cryptography.SHA256]::Create()
+try {
+  foreach ($asset in $inputData.assets) {
+    $row = [ordered]@{ordinal=$asset.ordinal; status='decode_failed'}
+    $rows.Add($row)
+    $stream = $null
+    try {
+      $source = [IO.FileInfo]::new($asset.path)
+      if ($source.Length -gt 67108864) { $row.status = 'too_large'; continue }
+      $bytes = [IO.File]::ReadAllBytes($asset.path)
+      if (([BitConverter]::ToString($hash.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() -ne $asset.sha256) {
+        $row.status = 'changed'; continue
+      }
+      $stream = [IO.MemoryStream]::new($bytes, $false)
+      $decoder = [Windows.Media.Imaging.BitmapDecoder]::Create($stream, 'PreservePixelFormat', 'OnLoad')
+      if ($decoder.Frames.Count -ne 1 -or ($bytes.Length -ge 21 -and
+          [Text.Encoding]::ASCII.GetString($bytes, 8, 8) -eq 'WEBPVP8X' -and ($bytes[20] -band 2))) {
+        $row.status = 'animated'; continue
+      }
+      $frame = $decoder.Frames[0]
+      if ([long]$frame.PixelWidth * $frame.PixelHeight -gt 16777216) { $row.status = 'too_large'; continue }
+      $name = ('ordinal-{0:d4}.png' -f [int]$asset.ordinal)
+      $encoder = [Windows.Media.Imaging.PngBitmapEncoder]::new()
+      $encoder.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($frame, $null, $null, $null))
+      $file = [IO.File]::Open([IO.Path]::Combine($inputData.output, $name), 'CreateNew')
+      try { $encoder.Save($file) } finally { $file.Dispose() }
+      $row.status = 'original_scale'; $row.file = $name
+      $row.width = $frame.PixelWidth; $row.height = $frame.PixelHeight
+    } catch [IO.IOException] {
+    } catch [NotSupportedException] {
+    } catch [FormatException] {
+    } finally {
+      if ($null -ne $stream) { $stream.Dispose() }
+    }
+  }
+} finally { $hash.Dispose() }
+ConvertTo-Json -InputObject @{assets=@($rows.ToArray())} -Compress -Depth 4
+"""
+
+
+def _render(output: Path, assets: list[dict], *, original_scale: bool = False) -> dict:
     # The child runs only the fixed script and receives only its exact bound inputs.
     env = {key: os.environ[key] for key in ('SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'USERPROFILE', 'PATH')
            if key in os.environ}
     powershell = Path(env['SYSTEMROOT']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
     result = subprocess.run(
         [str(powershell), '-NoProfile', '-NonInteractive', '-STA', '-EncodedCommand',
-         base64.b64encode(_RENDER.encode('utf-16le')).decode('ascii')],
+         base64.b64encode((_ORIGINALS if original_scale else _RENDER).encode('utf-16le')).decode('ascii')],
         input=json.dumps({'output': str(output), 'assets': assets}).encode('ascii'),
         capture_output=True, env=env, cwd=output, check=False,
     )
@@ -174,6 +220,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--workspace', type=Path, required=True)
     parser.add_argument('--relay', type=Path, required=True)
+    parser.add_argument('--original-scale', action='store_true')
     args = parser.parse_args()
     work = args.workspace.resolve()
     relay, task = _load_bound_data_plane_relay(work, work / args.relay)
@@ -183,6 +230,27 @@ def main() -> None:
             or not any(all(entry.get(key) == value for key, value in binding.items())
                        for entry in task.get('offline_processing', []))):
         raise ValueError('E_WINDOWS_IMAGE_PREVIEW_NOT_BOUND')
+    if args.original_scale:
+        selected = task.get('image_preview')
+        if not task.get('image_cohort_observations') or not selected:
+            raise ValueError('E_WINDOWS_IMAGE_PREVIEW_NOT_BOUND')
+        ordinals = [n for sheet in selected['sheets'] for n in sheet['asset_ordinals']]
+        if not 1 <= len(ordinals) <= 32 or len(ordinals) != len(set(ordinals)):
+            raise ValueError('E_WINDOWS_IMAGE_PREVIEW_NOT_BOUND')
+        assets = [{**task['bound_local_assets'][n - 1], 'ordinal': n} for n in ordinals]
+        output = work / '.game-l10n/data-plane/windows-image-detail' / task['task_id']
+        if output.resolve() != output or output.exists():
+            raise ValueError('E_WINDOWS_IMAGE_PREVIEW_OUTPUT_NOT_NEW')
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=output.parent) as directory:
+            stage = Path(directory) / 'originals'
+            stage.mkdir()
+            index = _render(stage, assets, original_scale=True)
+            (stage / 'index.json').write_text(json.dumps(index, sort_keys=True), encoding='utf-8')
+            stage.rename(output)
+        print(json.dumps({'original_scale_dir': output.relative_to(work).as_posix(),
+                          'image_rows': len(index['assets'])}))
+        return
     output = work / '.game-l10n/data-plane/windows-image-preview' / task['task_id']
     if output.resolve() != output or output.exists():
         raise ValueError('E_WINDOWS_IMAGE_PREVIEW_OUTPUT_NOT_NEW')
