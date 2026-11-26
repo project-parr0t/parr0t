@@ -987,10 +987,12 @@ def _operational_failure_path(relay_path: Path, task_id: str) -> Path:
 
 
 ENGINE_MEDIA_BINDINGS_PURPOSE = "engine_media_bindings"
+IMAGE_COHORT_REVIEW_PURPOSE = "image_cohort_visual_review"
 LOCALE_LOCAL_PACKAGE_PURPOSE = "locale_local_package"
 _PURPOSE_ROLES = {
     EXTRACTOR_PREPARATION_PURPOSE: "source_probe",
     ENGINE_MEDIA_BINDINGS_PURPOSE: "image_ui_inventory",
+    IMAGE_COHORT_REVIEW_PURPOSE: "image_localizer",
     LOCALE_PROBE_PURPOSE: "source_probe",
     LOCALE_LOCAL_PACKAGE_PURPOSE: "source_probe",
 }
@@ -2350,6 +2352,7 @@ def prepare_data_plane_task(
     image_preview_index: Path | None = None,
     image_preview_sheets: list[int] | None = None,
     image_preview_ordinals: list[int] | None = None,
+    image_review_from: Path | None = None,
 ) -> dict[str, Any]:
     """Prepare one exact, private discovery, inventory, or context worker task.
 
@@ -2461,7 +2464,22 @@ def prepare_data_plane_task(
         raise ConfigurationError(
             "E_DATA_PLANE_TASK_SDK_ACTIVATION: data-plane tasks require an active SDK"
         )
-    if worker_role in {"image_ui_inventory", "image_localizer"}:
+    if (image_review_from is not None) != (purpose == IMAGE_COHORT_REVIEW_PURPOSE):
+        raise ConfigurationError("E_WEBP_VISUAL_REVIEW_BINDING_INVALID")
+    webp_review = None
+    if image_review_from is not None:
+        from .windows_webp_review import ERROR, _binding
+
+        require_image_localization_requested(work_dir)
+        script = str(Path(__file__).with_name("windows_webp_review.py").resolve())
+        if (not offline_processing or len(offline_processing) != 1
+                or not isinstance(offline_processing[0], dict)
+                or not isinstance(offline_processing[0].get("argv"), list)
+                or offline_processing[0]["argv"][:1] != [script]):
+            raise ConfigurationError(ERROR)
+        webp_review = _binding(work_dir, image_review_from)
+    image_draft_scope = None
+    if worker_role in {"image_ui_inventory", "image_localizer"} and webp_review is None:
         if worker_role == "image_localizer":
             require_image_localization_requested(work_dir)
         else:
@@ -2870,6 +2888,8 @@ def prepare_data_plane_task(
         artifact = envelope.with_name(envelope.name.replace("control-envelope.", "local-text-patch.", 1)).with_suffix(".zip")
     elif purpose == ENGINE_MEDIA_BINDINGS_PURPOSE:
         artifact = envelope.with_name(envelope.name.replace("control-envelope.", "engine-media-bindings.", 1))
+    elif webp_review:
+        artifact = envelope.with_name(envelope.name.replace("control-envelope.", "image-review.", 1))
     relay_max_workers = 1
     worker_delegation_allowed = False
     private_payload: dict[str, Any] = {
@@ -3376,7 +3396,16 @@ def prepare_data_plane_task(
                 },
             }
         )
-    if worker_role == "image_localizer":
+    if webp_review:
+        private_payload["webp_visual_review"] = webp_review
+        private_payload["webp_visual_review_png_root"] = _relative(work_dir, artifact.with_name(artifact.stem + "-pairs"))
+        private_payload["bound_local_assets"] = [
+            {"path": path, "sha256": digest}
+            for row in webp_review["assets"]
+            for path, digest in ((row["original"], row["original_sha256"]),
+                                 (str(work_dir / row["edited"]), row["edited_sha256"]))
+        ]
+    elif worker_role == "image_localizer":
         scope_path = work_dir / IMAGE_SCOPE_PATH
         if not scope_path.is_file():
             raise ConfigurationError(
@@ -3554,6 +3583,22 @@ def prepare_data_plane_task(
                 "do_not_translate_edit_apply_pack_install_launch_or_delegate",
             ]
         )
+    elif webp_review:
+        private_payload["webp_visual_review_contract"] = {
+            "schema": "parr0t.webp-visual-review.v1",
+            "fields": ["schema", "task_id", "draft_task_id", "records"],
+            "record_fields": ["ordinal", "status"],
+            "statuses": ["approved", "revise", "unresolved"],
+        }
+        private_payload["requirements"].extend([
+            "run_exact_bound_offline_processing_argv_using_parr0t_process_with_python_-I_-B_once_before_review",
+            "use_read_to_view_both_full_resolution_private_pngs_for_each_asset_in_webp_visual_review_png_root",
+            "compare_source_meaning_korean_accuracy_style_and_fit_for_every_exact_region",
+            "mark_approved_only_when_every_region_is_visually_verified_no_clipping_ghosting_or_unreadable_text",
+            "mark_revise_for_an_observed_defect_and_unresolved_if_either_png_or_a_region_cannot_be_verified",
+            "write_one_record_per_asset_in_bound_order_even_if_unresolved_and_include_report_in_artifact_paths",
+            "review_only_never_retranslate_edit_the_draft_approve_an_install_or_claim_full_image_scope",
+        ])
     elif worker_role == "image_localizer":
         private_payload["requirements"].extend(
             [
@@ -4823,6 +4868,12 @@ def _seal_bound_data_plane_task(
                 "E_DATA_PLANE_RESULT_INVALID: context state path left the workspace"
             )
         _atomic_json(state_path, context_state)
+    elif task.get("webp_visual_review") and result["status"] in {"success", "partial"}:
+        from .windows_webp_review import _review_counts
+
+        result["counts"] = _review_counts(work_dir, task, artifact_path)
+        result["status"] = "success" if result["counts"]["success"] == result["counts"]["total"] else "partial"
+        _atomic_bytes(artifact_path.with_suffix(".sha256.txt"), _digest(artifact_path).encode("ascii"))
     elif task.get("purpose") == ENGINE_MEDIA_BINDINGS_PURPOSE:
         if result["status"] in {"success", "partial"}:
             from .image_localization import _verify_engine_media_binding_probe

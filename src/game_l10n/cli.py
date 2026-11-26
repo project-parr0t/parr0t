@@ -58,6 +58,7 @@ from .data_plane_task import (
     DATA_PLANE_RELAY_SCHEMA,
     DATA_PLANE_RECEIPT_SCHEMA,
     ENGINE_MEDIA_BINDINGS_PURPOSE,
+    IMAGE_COHORT_REVIEW_PURPOSE,
     LOCALE_LOCAL_PACKAGE_PURPOSE,
     _load_bound_data_plane_relay,
     claim_context_chunk,
@@ -1163,6 +1164,15 @@ def cmd_verify_image_ui_inventory(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_seal_image_review_evidence(args: argparse.Namespace) -> int:
+    from .windows_webp_review import _seal_review_evidence
+
+    work_dir = Path(args.workspace).resolve()
+    relay = _path_in_workspace(work_dir, args.relay, must_exist=True)
+    print(json.dumps(_seal_review_evidence(work_dir, relay), ensure_ascii=True))
+    return 0
+
+
 def cmd_accept_unreviewed_images(args: argparse.Namespace) -> int:
     work_dir = Path(args.workspace).resolve()
     result = record_image_unreviewed_acceptance(
@@ -1654,6 +1664,8 @@ def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
     config = load_config(work_dir)
     runtime_isolation(work_dir, native_runtime(work_dir, required=True))
     purpose = getattr(args, "purpose", "")
+    if not purpose and getattr(args, "image_review_from", None):
+        purpose = IMAGE_COHORT_REVIEW_PURPOSE
     activation = None
     if args.worker_role != "source_probe" or purpose:
         activation = require_sdk_activation(work_dir, config)
@@ -1691,6 +1703,8 @@ def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
         if getattr(args, "image_preview_index", None) else None,
         image_preview_sheets=getattr(args, "image_preview_sheet", None),
         image_preview_ordinals=getattr(args, "image_preview_ordinal", None),
+        image_review_from=_path_in_workspace(work_dir, args.image_review_from, must_exist=True)
+        if getattr(args, "image_review_from", None) else None,
     )
     if (
         args.worker_role == "image_ui_inventory"
@@ -4261,6 +4275,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     image_inventory.set_defaults(func=cmd_verify_image_ui_inventory)
 
+    image_review_evidence = sub.add_parser("seal-image-review-evidence", help="Revalidate a closed visual review report")
+    image_review_evidence.add_argument("--workspace", required=True)
+    image_review_evidence.add_argument("--relay", required=True)
+    image_review_evidence.set_defaults(func=cmd_seal_image_review_evidence)
+
     image_acceptance = sub.add_parser(
         "accept-unreviewed-images",
         help="Record explicit user acceptance for exact unreviewed UI-image assets",
@@ -5045,6 +5064,7 @@ def build_parser() -> argparse.ArgumentParser:
                                     help="Inspect one 1-based sheet without closing the full image scope")
     data_plane_prepare.add_argument("--image-preview-ordinal", type=int, action="append",
                                    help="Restrict selected sheets to these exact 1-based candidate ordinals")
+    data_plane_prepare.add_argument("--image-review-from", help="Independently inspect an exact closed, pixel-checked WebP draft")
     data_plane_prepare.set_defaults(func=cmd_prepare_data_plane_task)
     data_plane_prepare.add_argument("--inspection-asset", action="append", help="Exact approved local image/font inspection asset")
     data_plane_prepare.add_argument("--offline-processing", help="Workspace JSON manifest of approved exact offline argv bindings")
