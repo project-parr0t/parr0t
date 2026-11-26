@@ -2347,6 +2347,8 @@ def prepare_data_plane_task(
     discard_unverified_receipt: str | None = None,
     deterministic_inventory_worker: bool = False,
     prepare_locale_adapter: bool = False,
+    image_preview_index: Path | None = None,
+    image_preview_sheets: list[int] | None = None,
 ) -> dict[str, Any]:
     """Prepare one exact, private discovery, inventory, or context worker task.
 
@@ -2375,6 +2377,11 @@ def prepare_data_plane_task(
     data_plane_receipt_path(work_dir, worker_role, purpose=purpose)
     if purpose == ENGINE_MEDIA_BINDINGS_PURPOSE and not inspection_assets:
         raise ConfigurationError("E_IMAGE_INSPECTION_ASSET_REQUIRED")
+    if (image_preview_index is not None or image_preview_sheets) and (
+        worker_role != "image_ui_inventory" or purpose or inspection_assets is not None
+        or image_preview_index is None or not image_preview_sheets or offline_processing
+    ):
+        raise ConfigurationError("E_WINDOWS_IMAGE_PREVIEW_BINDING_INVALID")
     if purpose == EXTRACTOR_PREPARATION_PURPOSE:
         profile = {**profile, "artifact": EXTRACTOR_ATTESTATION_PATH}
     if purpose or (
@@ -3681,6 +3688,17 @@ def prepare_data_plane_task(
             "retain_unexamined_sources_in_scope_coverage_until_sdk_evidence_resolves_them",
             "full_requested_scope_is_not_limited_to_previously_confirmed_ui_images",
         ])
+        if image_preview_index is not None:
+            from .windows_image_preview import _bind_preview_sheets
+
+            preview = _bind_preview_sheets(work_dir, image_preview_index, image_preview_sheets, discovery["bound_local_assets"])
+            private_payload["image_preview"] = preview
+            private_payload["requirements"].extend([
+                "read_each_exact_png_listed_in_image_preview_sheets_with_the_host_image_attachment_tool",
+                "examine_only_those_sheet_ordinals_and_use_their_corresponding_originals_for_full_resolution",
+                "retain_all_other_image_candidates_as_unexamined_in_the_full_scope_accounting",
+                "write_partial_inventory_evidence_and_return_only_the_bound_envelope",
+            ])
     from .native_runtime import active_execution_environment_policy
 
     private_payload["execution_environment_policy"] = active_execution_environment_policy(work_dir)
@@ -4771,6 +4789,15 @@ def _seal_bound_data_plane_task(
 
             _verify_engine_media_binding_probe(work_dir, artifact_path, task)
             _atomic_bytes(artifact_path.with_suffix(".sha256.txt"), _digest(artifact_path).encode("ascii"))
+    elif result["worker_role"] == "image_ui_inventory" and task.get("image_preview"):
+        if result["status"] in {"success", "partial"}:
+            # A scoped preview cannot attest full player-visible scope on its own.
+            inspected = min(result["counts"]["success"], task["image_preview"]["asset_count"])
+            total = len(task["bound_local_assets"])
+            errors = min(result["counts"]["error"], task["image_preview"]["asset_count"] - inspected)
+            result["status"] = "partial"
+            result["issue_codes"] = sorted(set(result["issue_codes"]) | {"image_scope_unexamined"})
+            result["counts"] = {"total": total, "success": inspected, "error": errors, "pending": total - inspected - errors}
     elif result["worker_role"] == "image_ui_inventory" and result["status"] == "success":
         discovery = None
         if task.get("input_image_candidates"):

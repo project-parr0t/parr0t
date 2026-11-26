@@ -1,13 +1,41 @@
 import base64
 import hashlib
+import json
 import os
 from pathlib import Path
 import struct
 import tempfile
 import unittest
 
-from game_l10n.windows_image_preview import _render
+from game_l10n.store import stable_hash
+from game_l10n.windows_image_preview import _bind_preview_sheets, _render
 from tests.test_image_localization import rgba_png
+
+
+class PreviewBindingTests(unittest.TestCase):
+    def test_only_selected_sheet_ordinals_are_bound_to_the_exact_candidate_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            task_id = "a" * 64
+            folder = root / ".game-l10n/data-plane/windows-image-preview" / task_id
+            folder.mkdir(parents=True)
+            assets = [{"path": "one", "sha256": "b" * 64}, {"path": "two", "sha256": "c" * 64}]
+            names = ["sheet-0001.png", "sheet-0002.png"]
+            image = rgba_png()
+            (folder / names[1]).write_bytes(image)
+            index = folder / "index.json"
+            index.write_text(json.dumps({
+                "schema": "parr0t.windows-image-inspection-preview.v1", "task_id": task_id,
+                "asset_binding": stable_hash(assets), "sheets": names,
+                "assets": [{"ordinal": i, "sheet": name, "status": "previewed"} for i, name in enumerate(names, 1)],
+            }), encoding="utf-8")
+            binding = _bind_preview_sheets(root, index, [2], assets)
+            self.assertEqual(binding["sheets"], [{
+                "path": (folder / names[1]).relative_to(root).as_posix(),
+                "sha256": hashlib.sha256(image).hexdigest(), "asset_ordinals": [2],
+            }])
+            with self.assertRaisesRegex(ValueError, "BINDING_INVALID"):
+                _bind_preview_sheets(root, index, [2], list(reversed(assets)))
 
 
 @unittest.skipUnless(os.name == 'nt', 'uses Windows WIC')

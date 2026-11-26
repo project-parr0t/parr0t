@@ -1687,6 +1687,9 @@ def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
         discard_unverified_receipt=args.discard_unverified_receipt,
         deterministic_inventory_worker=getattr(args, "deterministic_inventory_worker", False),
         prepare_locale_adapter=getattr(args, "prepare_locale_adapter", False),
+        image_preview_index=_path_in_workspace(work_dir, args.image_preview_index, must_exist=True)
+        if getattr(args, "image_preview_index", None) else None,
+        image_preview_sheets=getattr(args, "image_preview_sheet", None),
     )
     if (
         args.worker_role == "image_ui_inventory"
@@ -5036,6 +5039,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--content-source-scope",
         help="Exact scope ID bound by --content-source-grant",
     )
+    data_plane_prepare.add_argument("--image-preview-index", help="Exact existing Windows contact-sheet index")
+    data_plane_prepare.add_argument("--image-preview-sheet", type=int, action="append",
+                                    help="Inspect one 1-based sheet without closing the full image scope")
     data_plane_prepare.set_defaults(func=cmd_prepare_data_plane_task)
     data_plane_prepare.add_argument("--inspection-asset", action="append", help="Exact approved local image/font inspection asset")
     data_plane_prepare.add_argument("--offline-processing", help="Workspace JSON manifest of approved exact offline argv bindings")

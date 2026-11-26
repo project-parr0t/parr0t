@@ -95,6 +95,56 @@ def _render(output: Path, assets: list[dict]) -> dict:
     return json.loads(result.stdout)
 
 
+def _bind_preview_sheets(
+    work_dir: Path, index: Path, sheets: list[int], bound_assets: list[dict],
+) -> dict:
+    from .store import stable_hash
+
+    error = "E_WINDOWS_IMAGE_PREVIEW_BINDING_INVALID"
+    base = work_dir / ".game-l10n/data-plane/windows-image-preview"
+    if (
+        index.resolve() != index or index.parent.parent != base or index.name != "index.json"
+        or not sheets or any(type(n) is not int or n < 1 for n in sheets)
+        or len(set(sheets)) != len(sheets)
+    ):
+        raise ValueError(error)
+    body = index.read_bytes()
+    report = json.loads(body)
+    if (
+        not isinstance(report, dict) or report.get("schema") != "parr0t.windows-image-inspection-preview.v1"
+        or report.get("task_id") != index.parent.name or len(index.parent.name) != 64
+        or report.get("asset_binding") != stable_hash(bound_assets)
+        or not isinstance(report.get("sheets"), list) or not isinstance(report.get("assets"), list)
+    ):
+        raise ValueError(error)
+    selected = {}
+    for number in sheets:
+        name = f"sheet-{number:04d}.png"
+        path = index.with_name(name)
+        if name not in report["sheets"] or path.resolve() != path:
+            raise ValueError(error)
+        image = path.read_bytes()
+        if not image.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError(error)
+        selected[name] = {"path": path.relative_to(work_dir).as_posix(),
+                          "sha256": sha256(image).hexdigest(), "asset_ordinals": []}
+    seen = set()
+    for row in report["assets"]:
+        if not isinstance(row, dict):
+            raise ValueError(error)
+        if row.get("sheet") not in selected or row.get("status") != "previewed":
+            continue
+        ordinal = row.get("ordinal")
+        if type(ordinal) is not int or not 1 <= ordinal <= len(bound_assets) or ordinal in seen:
+            raise ValueError(error)
+        seen.add(ordinal)
+        selected[row["sheet"]]["asset_ordinals"].append(ordinal)
+    if not seen:
+        raise ValueError(error)
+    return {"index": index.relative_to(work_dir).as_posix(), "index_sha256": sha256(body).hexdigest(),
+            "sheets": list(selected.values()), "asset_count": len(seen)}
+
+
 def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from game_l10n.data_plane_task import _load_bound_data_plane_relay
