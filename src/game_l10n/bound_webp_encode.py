@@ -66,6 +66,10 @@ def _check_pixels(before: bytearray, after: bytearray, width: int, regions: list
         raise ValueError("E_BOUND_WEBP_ALPHA_CHANGED")
     if before == after:
         raise ValueError("E_BOUND_WEBP_UNCHANGED")
+    _check_outside(before, after, width, regions)
+
+
+def _check_outside(before: bytearray, after: bytearray, width: int, regions: list[list[int]]) -> None:
     original, edited = memoryview(before), memoryview(after)
     stride = width * 4
     for row in range(len(before) // stride):
@@ -104,12 +108,21 @@ def _dimensions(body: bytes) -> tuple[int, int]:
 
 
 def _canonical_png(body: bytes, dimensions: tuple[int, int], original: bytearray,
-                   regions: list[list[int]]) -> bytes:
+                   regions: list[list[int]], *, preserve_alpha: bool = False) -> bytes:
     from game_l10n.image_region_pixels import _decode_png
 
     scanlines = _decode_png(body, dimensions)
     width, height = dimensions
-    _check_pixels(original, _pixels(scanlines, width, height), width, regions)
+    edited = _pixels(scanlines, width, height)
+    if preserve_alpha and edited[3::4] != original[3::4]:
+        # Alpha is never editable. Do not hide an out-of-region violation by correcting it.
+        _check_outside(original, edited, width, regions)
+        stride = width * 4
+        for row in range(height):
+            start = row * (stride + 1)
+            scanlines[start + 4:start + stride + 1:4] = original[row * stride + 3:(row + 1) * stride:4]
+        edited[3::4] = original[3::4]
+    _check_pixels(original, edited, width, regions)
     scanlines[::width * 4 + 1] = bytes(height)
     return _png(scanlines, dimensions)
 
@@ -177,7 +190,10 @@ def main() -> None:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--prepare-only", action="store_true")
     mode.add_argument("--retry-task-id")
+    parser.add_argument("--reuse-checked-task-id")
     args = parser.parse_args()
+    if args.reuse_checked_task_id and not args.retry_task_id:
+        parser.error("--reuse-checked-task-id requires --retry-task-id")
     work = args.workspace.resolve()
     relay_path = (work / args.relay).resolve()
     relay, task = _load_bound_data_plane_relay(work, relay_path)
@@ -210,22 +226,43 @@ def main() -> None:
     try:
         result = _process(work, relay_path, task, args, output, inventory_path, executable, approval, identity)
     except (ConfigurationError, ValueError, OSError, KeyError) as exc:
-        code = str(exc).split(":", 1)[0]
-        if not re.fullmatch(r"E_(?:BOUND_WEBP|PNG|THIRD_PARTY_APPROVAL)_[A-Z_]+", code):
-            code = "E_BOUND_WEBP_PROCESSING_FAILED"
+        code = _issue_code(exc)
         _atomic_json(status, {"task_id": task["task_id"], "status": "error", "issue_code": code})
         raise SystemExit(code) from None
     _atomic_json(status, {"task_id": task["task_id"], **result})
     print(json.dumps(result))
+    if result.get("asset_issue_counts"):
+        raise SystemExit("E_BOUND_WEBP_PARTIAL")
+
+
+def _issue_code(error: Exception) -> str:
+    code = str(error).split(":", 1)[0]
+    return (code if re.fullmatch(r"E_(?:BOUND_WEBP|PNG|THIRD_PARTY_APPROVAL)_[A-Z_]+", code)
+            else "E_BOUND_WEBP_PROCESSING_FAILED")
 
 
 def _process(work: Path, relay_path: Path, task: dict, args: argparse.Namespace, output: Path,
              inventory_path: Path, executable: Path, approval: Path, identity: dict) -> dict:
+    from game_l10n.data_plane_task import _atomic_bytes
+    from game_l10n.errors import ConfigurationError
     from game_l10n.image_localization import _validate_inventory
     from game_l10n.image_region_pixels import _MAX_FILE
     from game_l10n.third_party_approval import require_third_party_approval
 
     retry = _retry_inputs(work, relay_path.parent, task, args.retry_task_id) if args.retry_task_id else {}
+    retained = (_retry_inputs(work, relay_path.parent, task, args.reuse_checked_task_id)
+                if args.reuse_checked_task_id else {})
+    reused = 0
+    issues: dict[str, int] = {}
+
+    def authorize() -> None:
+        with executable.open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != args.sha256:
+                raise ValueError("E_BOUND_WEBP_EXECUTABLE_CHANGED")
+        require_third_party_approval(work, approval, action="execute", **identity,
+                                    digest="sha256:" + args.sha256, purpose=PURPOSE,
+                                    data_scope=DATA_SCOPE, consume=True)
+
     env = {key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP") if key in os.environ}
     encoded = 0
     _, inventory, _, sources = _validate_inventory(work, inventory_path, [Path(item) for item in task["source_roots"]])
@@ -264,34 +301,57 @@ def _process(work: Path, relay_path: Path, task: dict, args: argparse.Namespace,
                 stream.write(_png(scanlines, dimensions))
             encoded += 1
             continue
-        with source.open("rb") as stream:
-            png = stream.read(_MAX_FILE + 1)
-        if len(png) > _MAX_FILE:
-            raise ValueError("E_BOUND_WEBP_PNG_TOO_LARGE")
         regions = [region["bbox"] for region in asset["text_regions"]]
-        png = _canonical_png(png, dimensions, before, regions)
+        try:
+            checked = retained.get(asset["id"])
+            if checked and checked[0] == asset:
+                candidate = checked[1].with_suffix(".webp")
+                if candidate.is_file() and candidate.resolve() == candidate:
+                    result = _verified_webp(candidate, dimensions, before, regions, env, output)
+                    _atomic_bytes(destination, result)
+                    reused += 1
+                    continue
+            with source.open("rb") as stream:
+                png = stream.read(_MAX_FILE + 1)
+            if len(png) > _MAX_FILE:
+                raise ValueError("E_BOUND_WEBP_PNG_TOO_LARGE")
+            png = _canonical_png(png, dimensions, before, regions, preserve_alpha=bool(args.retry_task_id))
+        except (ConfigurationError, ValueError) as exc:
+            code = _issue_code(exc)
+            issues[code] = issues.get(code, 0) + 1
+            continue
         with TemporaryDirectory(dir=output) as temporary:
             stage = Path(temporary)
             validated, packed = stage / "input.png", stage / "encoded.webp"
             validated.write_bytes(png)
-            with executable.open("rb") as stream:
-                if hashlib.file_digest(stream, "sha256").hexdigest() != args.sha256:
-                    raise ValueError("E_BOUND_WEBP_EXECUTABLE_CHANGED")
-            require_third_party_approval(work, approval, action="execute", **identity,
-                                        digest="sha256:" + args.sha256, purpose=PURPOSE,
-                                        data_scope=DATA_SCOPE, consume=True)
-            _encode(executable, validated, packed, env)
-            with packed.open("rb") as stream:
-                result = stream.read(_MAX_FILE + 1)
-            if len(result) > _MAX_FILE or _dimensions(result) != dimensions:
-                raise ValueError("E_BOUND_WEBP_DIMENSIONS_CHANGED")
-            _check_pixels(before, _read_webp(result, dimensions, env, stage), dimensions[0], regions)
+            authorize()
+            try:
+                _encode(executable, validated, packed, env)
+                _verified_webp(packed, dimensions, before, regions, env, stage)
+            except ValueError as exc:
+                code = _issue_code(exc)
+                issues[code] = issues.get(code, 0) + 1
+                continue
             packed.rename(destination)
         encoded += 1
-    if not encoded:
+    if not (encoded or reused or issues):
         raise ValueError("E_BOUND_WEBP_NO_STAGED_PNG")
-    return ({"prepared_source_pngs": encoded, "status": "prepared"} if args.prepare_only else
-            {"encoded_webp": encoded, "status": "pixel_checked_not_visually_reviewed"})
+    if args.prepare_only:
+        return {"prepared_source_pngs": encoded, "status": "prepared"}
+    return {"encoded_webp": encoded, "reused_webp": reused, "asset_issue_counts": issues,
+            "status": "pixel_check_incomplete" if issues else "pixel_checked_not_visually_reviewed"}
+
+
+def _verified_webp(path: Path, dimensions: tuple[int, int], before: bytearray,
+                   regions: list[list[int]], env: dict[str, str], output: Path) -> bytes:
+    from game_l10n.image_region_pixels import _MAX_FILE
+
+    with path.open("rb") as stream:
+        result = stream.read(_MAX_FILE + 1)
+    if len(result) > _MAX_FILE or _dimensions(result) != dimensions:
+        raise ValueError("E_BOUND_WEBP_DIMENSIONS_CHANGED")
+    _check_pixels(before, _read_webp(result, dimensions, env, output), dimensions[0], regions)
+    return result
 
 
 if __name__ == "__main__":

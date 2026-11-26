@@ -40,6 +40,23 @@ class WebpEncoderIntegrityTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigurationError, 'PNG_INVALID'):
             _canonical_png(body, (1, 2), original, [[1, 1, 1, 1]])
 
+    def test_retry_preserves_exact_alpha_but_rejects_outside_region_edits(self):
+        dimensions = (2, 2)
+        scanlines = bytearray([0, 10, 20, 30, 70, 11, 21, 31, 80,
+                              0, 12, 22, 32, 90, 13, 23, 33, 100])
+        original = bytearray(scanlines[1:9] + scanlines[10:])
+        staged = bytearray(scanlines)
+        staged[14], staged[17] = 190, 255
+        regions = [[1, 1, 1, 1]]
+        with self.assertRaisesRegex(ValueError, "ALPHA_CHANGED"):
+            _canonical_png(_png(staged, dimensions), dimensions, original, regions)
+        encoded = _canonical_png(_png(staged, dimensions), dimensions, original, regions, preserve_alpha=True)
+        scanlines[14] = 190
+        self.assertEqual(_decode_png(encoded, dimensions), scanlines)
+        staged[4] = 71
+        with self.assertRaisesRegex(ValueError, "OUTSIDE_TEXT_CHANGED"):
+            _canonical_png(_png(staged, dimensions), dimensions, original, regions, preserve_alpha=True)
+
     def test_retry_requires_unchanged_archived_inventory_and_same_model(self):
         with tempfile.TemporaryDirectory() as root:
             work = Path(root).resolve()
