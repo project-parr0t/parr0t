@@ -3629,6 +3629,16 @@ def prepare_data_plane_task(
         from .third_party_approval import validated_offline_processing
 
         private_payload["offline_processing"] = validated_offline_processing(work_dir, offline_processing)
+        preview_script = str(Path(__file__).with_name("windows_image_preview.py").resolve())
+        if worker_role == "image_ui_inventory" and any(
+            binding["argv"][0] == preview_script for binding in private_payload["offline_processing"]
+        ):
+            private_payload["requirements"].extend([
+                "before_examining_candidates_run_bound_windows_image_preview_argv_once_using_parr0t_process",
+                "run_exact_python_executable_then_-I_-B_then_the_complete_offline_processing_argv",
+                "after_preview_command_use_read_to_view_the_returned_private_png_sheets_and_the_ordinal_index",
+                "save_observed_classifications_and_remain_partial_if_a_preview_or_its_original_text_region_was_not_visible",
+            ])
     if source_policy["semantic_content_generation"]:
         private_payload["runtime_model"] = (
             str(runtime["models"].get(worker_route, worker_route))
