@@ -214,6 +214,29 @@ class ReleaseCheckpointTests(unittest.TestCase):
             with self.assertRaisesRegex(ReleaseCheckpointError, "evidence binding"):
                 validate_release_checkpoint(checkpoint)
 
+    def test_verified_partial_checkpoint_omits_unapplied_targets_and_retains_review(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory, row, arguments = self._generation_fixture(root)
+            document = json.loads(inventory.read_bytes())
+            document["segments"].insert(0, {"id": "unapplied", "source": "Unapplied"})
+            inventory.write_text(json.dumps(document), encoding="utf-8")
+            row.status = "reviewed"
+            row.acceptance_authority = "reviewer"
+            row.attempts = [AttemptRecord(stage="review", provider="fixture", status="approved", candidate_generation=1)]
+            arguments.update(release_id="partial-r1", review_required=True)
+            checkpoint, proof = generate_local_release_integrity(
+                root, inventory, [row], verified_subset=True, **arguments,
+            )
+            self.assertEqual([item["id"] for item in checkpoint["entries"]], [row.segment_id])
+            self.assertEqual(list(proof), [row.segment_id])
+            self.assertEqual(checkpoint["entries"][0]["status"], "reviewed")
+            with self.assertRaises(ReleaseCheckpointError):
+                generate_local_release_integrity(root, inventory, [row], **arguments)
+            arguments["release_id"] = "r1"
+            with self.assertRaises(ReleaseCheckpointError):
+                generate_local_release_integrity(root, inventory, [row], verified_subset=True, **arguments)
+
     def test_generator_rejects_source_placeholder_status_order_language_and_consent_drift(self) -> None:
         for mutation in ("source", "placeholder", "review", "accepted", "order", "language", "license", "integrity"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:

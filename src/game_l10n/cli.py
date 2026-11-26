@@ -54,12 +54,13 @@ from .context_analysis import CONTEXT_STATE_SCHEMA, ContextAnalyzer, analyze_wit
 from .corrections import apply_user_corrections
 from .correction_ui import CorrectionWorkspace, serve_correction_ui
 from .data_plane_task import (
+    _PURPOSE_ROLES,
     DATA_PLANE_PROFILES,
     DATA_PLANE_RELAY_SCHEMA,
     DATA_PLANE_RECEIPT_SCHEMA,
     ENGINE_MEDIA_BINDINGS_PURPOSE,
     IMAGE_COHORT_REVIEW_PURPOSE,
-    LOCALE_LOCAL_PACKAGE_PURPOSE,
+    IMAGE_COHORT_REVISION_PURPOSE,
     _load_bound_data_plane_relay,
     claim_context_chunk,
     commit_context_fragment,
@@ -1699,6 +1700,8 @@ def cmd_prepare_data_plane_task(args: argparse.Namespace) -> int:
         discard_unverified_receipt=args.discard_unverified_receipt,
         deterministic_inventory_worker=getattr(args, "deterministic_inventory_worker", False),
         prepare_locale_adapter=getattr(args, "prepare_locale_adapter", False),
+        prepare_display_application=getattr(args, "prepare_display_application", False),
+        user_requested_partial_package=args.user_requested_partial_package,
         image_preview_index=_path_in_workspace(work_dir, args.image_preview_index, must_exist=True)
         if getattr(args, "image_preview_index", None) else None,
         image_preview_sheets=getattr(args, "image_preview_sheet", None),
@@ -5031,9 +5034,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--worker-role", choices=sorted(DATA_PLANE_PROFILES), required=True
     )
     data_plane_prepare.add_argument(
-        "--purpose", choices=[EXTRACTOR_PREPARATION_PURPOSE, ENGINE_MEDIA_BINDINGS_PURPOSE,
-                              LOCALE_PROBE_PURPOSE, LOCALE_LOCAL_PACKAGE_PURPOSE], default="",
+        "--purpose", choices=sorted(_PURPOSE_ROLES.keys() - {"image_cohort_visual_review", "image_cohort_revision"}),
+        default="",
         help="Bind an exact media, locale, extractor-preparation or local package task",
+    )
+    data_plane_prepare.add_argument(
+        "--user-requested-partial-package", action="store_true",
+        help="Record explicit approval to omit unverified targets from a separately labeled local package",
     )
     data_plane_prepare.add_argument(
         "--output",

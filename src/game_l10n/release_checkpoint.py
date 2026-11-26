@@ -356,6 +356,7 @@ def generate_local_release_integrity(
     patch_id: str, release_id: str, owner: str, license_name: str,
     source_language: str, target_language: str,
     review_required: bool = True, allow_incomplete_artifact: bool = False,
+    verified_subset: bool = False,
     glossary: Iterable[Any] = (), extra_patterns: list[str] | None = None,
     max_length_ratio: float = 4.0,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -387,6 +388,12 @@ def generate_local_release_integrity(
         for row in document.active_rows
     ]
     rows = list(results)
+    if verified_subset:
+        selected = {row.segment_id for row in rows if isinstance(row, TranslationResult)}
+        if (not release_id.startswith("partial-") or not selected or len(selected) != len(rows)
+                or any(row.status not in {"reviewed", "accepted_unreviewed"} for row in rows)):
+            raise ReleaseCheckpointError("verified subset requires an explicit partial release and accepted targets")
+        segments = [segment for segment in segments if segment.id in selected]
     if (
         not rows or any(not isinstance(row, TranslationResult) for row in rows)
         or [row.segment_id for row in rows] != [segment.id for segment in segments]

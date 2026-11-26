@@ -989,12 +989,14 @@ def _operational_failure_path(relay_path: Path, task_id: str) -> Path:
 ENGINE_MEDIA_BINDINGS_PURPOSE = "engine_media_bindings"
 IMAGE_COHORT_REVIEW_PURPOSE = "image_cohort_visual_review"
 LOCALE_LOCAL_PACKAGE_PURPOSE = "locale_local_package"
+VERIFIED_PARTIAL_PACKAGE_PURPOSE = "verified_partial_local_package"
 _PURPOSE_ROLES = {
     EXTRACTOR_PREPARATION_PURPOSE: "source_probe",
     ENGINE_MEDIA_BINDINGS_PURPOSE: "image_ui_inventory",
     IMAGE_COHORT_REVIEW_PURPOSE: "image_localizer",
     LOCALE_PROBE_PURPOSE: "source_probe",
     LOCALE_LOCAL_PACKAGE_PURPOSE: "source_probe",
+    VERIFIED_PARTIAL_PACKAGE_PURPOSE: "source_probe",
 }
 
 
@@ -2349,6 +2351,8 @@ def prepare_data_plane_task(
     discard_unverified_receipt: str | None = None,
     deterministic_inventory_worker: bool = False,
     prepare_locale_adapter: bool = False,
+    prepare_display_application: bool = False,
+    user_requested_partial_package: bool = False,
     image_preview_index: Path | None = None,
     image_preview_sheets: list[int] | None = None,
     image_preview_ordinals: list[int] | None = None,
@@ -2363,6 +2367,8 @@ def prepare_data_plane_task(
     work_dir = work_dir.resolve()
     require_control_plane_ready(work_dir)
     require_control_plane_entry(work_dir)
+    if user_requested_partial_package != (purpose == VERIFIED_PARTIAL_PACKAGE_PURPOSE):
+        raise ConfigurationError("E_PARTIAL_PACKAGE_USER_AUTHORIZATION_REQUIRED")
     runtime = native_runtime(work_dir)
     isolation = runtime_isolation(work_dir, runtime) if runtime else None
     isolation_fingerprint = stable_hash(isolation) if isolation is not None else None
@@ -2886,6 +2892,8 @@ def prepare_data_plane_task(
         artifact = envelope.with_name(envelope.name.replace("control-envelope.", "locale-applicability.", 1))
     elif purpose == LOCALE_LOCAL_PACKAGE_PURPOSE:
         artifact = envelope.with_name(envelope.name.replace("control-envelope.", "local-text-patch.", 1)).with_suffix(".zip")
+    elif purpose == VERIFIED_PARTIAL_PACKAGE_PURPOSE:
+        artifact = envelope.with_name(envelope.name.replace("control-envelope.", "local-partial-patch.", 1)).with_suffix(".zip")
     elif purpose == ENGINE_MEDIA_BINDINGS_PURPOSE:
         artifact = envelope.with_name(envelope.name.replace("control-envelope.", "engine-media-bindings.", 1))
     elif webp_review:
@@ -2959,6 +2967,41 @@ def prepare_data_plane_task(
             "completion_sha256": _digest(completion),
             "result_path": _relative(work_dir, result_path),
             "result_sha256": _require_pack_input_binding(work_dir, result_path),
+        }
+    if purpose == VERIFIED_PARTIAL_PACKAGE_PURPOSE:
+        from .image_localization import _current_scope
+        from .tooling import _require_pack_input_binding
+
+        if config.get("release_checkpoint", {}).get("required_for_distribution", False):
+            raise ConfigurationError("E_PARTIAL_PACKAGE_LOCAL_ONLY")
+        completion = work_dir / ".game-l10n" / "completion-attestation.json"
+        completed = json.loads(completion.read_bytes())
+        result = Path(completed["result_artifact"]["path"])
+        inventory = Path(json.loads((work_dir / ".game-l10n/inventory-attestation.json").read_bytes())["primary_path"])
+        if any(path.resolve() != path or not is_within(path, work_dir) for path in (inventory, result)):
+            raise ConfigurationError("E_PARTIAL_PACKAGE_INPUT")
+        from .coverage import require_inventory_attestation as require_partial_inventory
+
+        attestation = require_partial_inventory(work_dir, inventory, config=config)
+        if attestation["primary_fingerprint"] != completed["source_inventory"]["fingerprint"]:
+            raise ConfigurationError("E_PARTIAL_PACKAGE_INPUT")
+        image_scope = _current_scope(work_dir)
+        runner_name = "pack_verified_partial.py"
+        manifest = ((sdk_activation or {}).get("workspace_tools") or {}).get("manifest", [])
+        runner_binding = next((item for item in manifest if item["path"] == runner_name), None)
+        runner = work_dir / "tools" / runner_name
+        if runner_binding is None or runner.resolve() != runner or _digest(runner) != runner_binding["sha256"]:
+            raise ConfigurationError("E_PARTIAL_PACKAGE_RUNNER_REQUIRED")
+        transport, argv = _worker_python_transport(runtime)
+        private_payload["verified_partial_package"] = {
+            "user_authorized_skip_unverified": True,
+            "inventory": _relative(work_dir, inventory), "inventory_sha256": _digest(inventory),
+            "result": _relative(work_dir, result), "result_sha256": _require_pack_input_binding(work_dir, result),
+            "completion_sha256": _digest(completion), "image_scope": image_scope,
+            "inventory_fingerprint": attestation["primary_fingerprint"],
+            "build": {**transport, "argv": [*argv[:-1], str(runner), str(work_dir),
+                      str(output_dir / "relay.json"), str(Path(__file__).resolve().parents[1])],
+                      "runner_sha256": runner_binding["sha256"]},
         }
     if purpose == LOCALE_PROBE_PURPOSE:
         prior_probe = current_locale_probe(work_dir, config, sdk_activation or {})
@@ -3632,6 +3675,13 @@ def prepare_data_plane_task(
             "run_only_the_exact_locale_package_argv_in_the_bound_workspace_using_parr0t_process",
             "this_is_a_deterministic_local_text_package_not_full_image_font_or_runtime_completion",
             "do_not_install_launch_or_forward_source_or_translation_content",
+        ])
+    elif purpose == VERIFIED_PARTIAL_PACKAGE_PURPOSE:
+        private_payload["requirements"].extend([
+            "run_only_the_exact_verified_partial_package_build_argv_using_parr0t_process",
+            "the_activated_adapter_selects_verified_text_images_and_font_preserves_held_targets_and_runs_local_roundtrip",
+            "do_not_edit_the_adapter_rebuild_or_self_approve_a_failed_build",
+            "write_the_standard_envelope_with_only_the_verified_zip_as_artifact_no_other_payload_or_publication",
         ])
     elif purpose:
         private_payload["requirements"].extend(
@@ -4629,6 +4679,36 @@ def _seal_bound_data_plane_task(
                 or _require_pack_input_binding(work_dir, work_dir / binding["result_path"]) != binding["result_sha256"]
                 or validate_filesystem_package(artifact_path)["checkpoint_schema"] != "parr0t.local-release-integrity/v1"):
             raise ConfigurationError("E_LOCALE_PACKAGE_BINDING")
+    elif task.get("purpose") == VERIFIED_PARTIAL_PACKAGE_PURPOSE:
+        from .filesystem_package import validate_filesystem_package
+        from .tooling import _require_pack_input_binding
+
+        binding = task["verified_partial_package"]
+        if (result["status"] != "success" or result["artifact_paths"] != [expected_artifact]
+                or result["counts"] != {"error": 0, "pending": 0, "success": 1, "total": 1}
+                or _digest(work_dir / binding["inventory"]) != binding["inventory_sha256"]
+                or _digest(work_dir / ".game-l10n/completion-attestation.json") != binding["completion_sha256"]
+                or _require_pack_input_binding(work_dir, work_dir / binding["result"]) != binding["result_sha256"]):
+            raise ConfigurationError("E_PARTIAL_PACKAGE_BINDING")
+        from .release_checkpoint import CHECKPOINT_NAME, LOCAL_INTEGRITY_SCHEMA
+        from .formats import read_translation_results
+        from zipfile import ZipFile
+
+        package = validate_filesystem_package(artifact_path)
+        with ZipFile(artifact_path) as archive:
+            checkpoint = json.loads(archive.read(CHECKPOINT_NAME))
+        rows = {row.segment_id: row for row in read_translation_results(work_dir / binding["result"])}
+        entries = checkpoint["entries"]
+        ids = {item["id"] for item in entries}
+        if (package["checkpoint_schema"] != LOCAL_INTEGRITY_SCHEMA
+                or not checkpoint["release_id"].startswith("partial-")
+                or checkpoint["source_inventory"]["fingerprint"] != binding["inventory_fingerprint"]
+                or [item["id"] for item in entries] != [target for target in rows if target in ids]
+                or any(item["status"] not in {"reviewed", "accepted_unreviewed"}
+                       or item["status"] != rows[item["id"]].status or item["target"] != rows[item["id"]].text
+                       or item["source_sha256"] != hashlib.sha256(rows[item["id"]].source.encode("utf-8")).hexdigest()
+                       for item in entries)):
+            raise ConfigurationError("E_PARTIAL_PACKAGE_BINDING")
     elif result["worker_role"] == "source_probe" and result["status"] == "success":
         config = json.loads(artifact_path.read_text(encoding="utf-8"))
         selection = config.get("sdk_selection", {})

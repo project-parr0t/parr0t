@@ -51,6 +51,7 @@ data-plane purpose binds the reviewed pack input and a workspace-owned
 not a claim of image, font, or runtime completion.
 
 `verified_partial_local_package` is a separate, explicitly authorized local build from sealed, verified-only text and image payloads. Its README and release ID identify the incomplete scope; the local checkpoint covers only included text. It does not change the canonical inventory or attest complete localization.
+Prepare it with `--worker-role source_probe --purpose verified_partial_local_package --user-requested-partial-package`. Core seals it separately from full delivery and verifies that every checkpoint entry exactly matches the ordered accepted results. Use a `partial-` release ID and identify omissions in the package display name printed in its README.
 
 The generated ZIP layout is fixed:
 
