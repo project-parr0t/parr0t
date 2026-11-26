@@ -3646,6 +3646,17 @@ def prepare_data_plane_task(
                 "after_preview_command_use_read_to_view_the_returned_private_png_sheets_and_the_ordinal_index",
                 "save_observed_classifications_and_remain_partial_if_a_preview_or_its_original_text_region_was_not_visible",
             ])
+        encoder = str(Path(__file__).with_name("bound_webp_encode.py").resolve())
+        if worker_role == "image_localizer" and any(
+            binding["argv"][0] == encoder for binding in private_payload["offline_processing"]
+        ):
+            private_payload["requirements"].extend([
+                "stage_edited_8_bit_noninterlaced_rgba_png_in_output_image_root_as_asset_NNNN_png",
+                "use_1_based_asset_order_in_input_image_inventory_for_NNNN_and_preserve_original_dimensions",
+                "run_bound_webp_encoder_using_exact_python_executable_then_-I_-B_then_complete_offline_processing_argv",
+                "use_corresponding_asset_NNNN_webp_as_output_and_verify_decoded_pixels_alpha_and_engine_structure",
+                "encoder_success_does_not_prove_pixel_preservation_or_independent_visual_review",
+            ])
     if source_policy["semantic_content_generation"]:
         private_payload["runtime_model"] = (
             str(runtime["models"].get(worker_route, worker_route))
