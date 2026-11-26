@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 from game_l10n.store import stable_hash
-from game_l10n.windows_image_preview import _bind_preview_sheets, _render
+from game_l10n.windows_image_preview import _bind_preview_sheets, _render, _select_preview_ordinals
 from tests.test_image_localization import rgba_png
 
 
@@ -36,6 +36,27 @@ class PreviewBindingTests(unittest.TestCase):
             }])
             with self.assertRaisesRegex(ValueError, "BINDING_INVALID"):
                 _bind_preview_sheets(root, index, [2], list(reversed(assets)))
+            with self.assertRaisesRegex(ValueError, "BINDING_INVALID"):
+                _select_preview_ordinals(binding, [1])
+
+    def test_continuation_binds_only_the_requested_ordinal_from_a_shared_sheet(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            task_id = "a" * 64
+            folder = root / ".game-l10n/data-plane/windows-image-preview" / task_id
+            folder.mkdir(parents=True)
+            assets = [{"path": str(n), "sha256": "b" * 64} for n in (1, 2)]
+            name = "sheet-0001.png"
+            (folder / name).write_bytes(rgba_png())
+            index = folder / "index.json"
+            index.write_text(json.dumps({
+                "schema": "parr0t.windows-image-inspection-preview.v1", "task_id": task_id,
+                "asset_binding": stable_hash(assets), "sheets": [name],
+                "assets": [{"ordinal": i, "sheet": name, "status": "previewed"} for i in (1, 2)],
+            }), encoding="utf-8")
+            binding = _select_preview_ordinals(_bind_preview_sheets(root, index, [1], assets), [2])
+            self.assertEqual(binding["sheets"][0]["asset_ordinals"], [2])
+            self.assertEqual(binding["asset_count"], 1)
 
 
 @unittest.skipUnless(os.name == 'nt', 'uses Windows WIC')

@@ -145,6 +145,26 @@ def _bind_preview_sheets(
             "sheets": list(selected.values()), "asset_count": len(seen)}
 
 
+def _select_preview_ordinals(binding: dict, ordinals: list[int] | None) -> dict:
+    if ordinals is None:
+        return binding
+    error = "E_WINDOWS_IMAGE_PREVIEW_BINDING_INVALID"
+    if not ordinals or any(type(n) is not int or n < 1 for n in ordinals):
+        raise ValueError(error)
+    pending = set(ordinals)
+    if len(pending) != len(ordinals):
+        raise ValueError(error)
+    sheets = []
+    for item in binding["sheets"]:
+        selected = [n for n in item["asset_ordinals"] if n in pending]
+        if selected:
+            pending.difference_update(selected)
+            sheets.append({**item, "asset_ordinals": selected})
+    if pending:
+        raise ValueError(error)
+    return {**binding, "sheets": sheets, "asset_count": len(ordinals)}
+
+
 def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from game_l10n.data_plane_task import _load_bound_data_plane_relay

@@ -2349,6 +2349,7 @@ def prepare_data_plane_task(
     prepare_locale_adapter: bool = False,
     image_preview_index: Path | None = None,
     image_preview_sheets: list[int] | None = None,
+    image_preview_ordinals: list[int] | None = None,
 ) -> dict[str, Any]:
     """Prepare one exact, private discovery, inventory, or context worker task.
 
@@ -2377,7 +2378,7 @@ def prepare_data_plane_task(
     data_plane_receipt_path(work_dir, worker_role, purpose=purpose)
     if purpose == ENGINE_MEDIA_BINDINGS_PURPOSE and not inspection_assets:
         raise ConfigurationError("E_IMAGE_INSPECTION_ASSET_REQUIRED")
-    if (image_preview_index is not None or image_preview_sheets) and (
+    if (image_preview_index is not None or image_preview_sheets or image_preview_ordinals is not None) and (
         worker_role != "image_ui_inventory" or purpose or inspection_assets is not None
         or image_preview_index is None or not image_preview_sheets or offline_processing
     ):
@@ -3710,9 +3711,12 @@ def prepare_data_plane_task(
             "full_requested_scope_is_not_limited_to_previously_confirmed_ui_images",
         ])
         if image_preview_index is not None:
-            from .windows_image_preview import _bind_preview_sheets
+            from .windows_image_preview import _bind_preview_sheets, _select_preview_ordinals
 
-            preview = _bind_preview_sheets(work_dir, image_preview_index, image_preview_sheets, discovery["bound_local_assets"])
+            preview = _select_preview_ordinals(
+                _bind_preview_sheets(work_dir, image_preview_index, image_preview_sheets, discovery["bound_local_assets"]),
+                image_preview_ordinals,
+            )
             private_payload["image_preview"] = preview
             private_payload["requirements"].extend([
                 "read_each_exact_png_listed_in_image_preview_sheets_with_the_host_image_attachment_tool",
