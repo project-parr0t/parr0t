@@ -1,5 +1,7 @@
 # Codex App + DeepSeek API workflow
 
+New workspaces default to `codex-app-native`: native Luna translation and triage, native Sol pre-fallback, strong review and selective rewrite, and no configured external adapters. Explicit model selections may bind additional native fallbacks. The `codex-app-deepseek` preset below is opt-in; existing workspaces keep their recorded providers, permissions, routes, and checkpoints.
+
 This mode is the recommended hybrid setup: by default the signed-in Codex desktop app supplies native GPT-6 Luna primary translation, native GPT-6.1 Sol pre-fallback translation, complete Luna triage workers, and selective Sol strong judges, while the remaining translation failures, selective correction, and judge fallback may be sent to the DeepSeek API. These model names describe preset defaults, not immutable model choices. Explicit initial user/template exact role selections take precedence through recorded native-role overrides; all unspecified roles and routes retain their existing settings. The workflow's Luna/Sol/DeepSeek labels below describe the default routes, not permission to overwrite an explicit model selection.
 
 It is different from the `openai-deepseek` CLI preset:

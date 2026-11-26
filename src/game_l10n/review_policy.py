@@ -184,6 +184,7 @@ def configure_review_policy(
     settings: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     from .native_runtime import configure_native_runtime, native_runtime
+    from .provider_policy import CODEX_APP_PRESETS, validate_provider_policy
     from .workspace import _write_config, load_config
 
     if not user_requested:
@@ -218,7 +219,7 @@ def configure_review_policy(
         elif (
             provider in {None, NATIVE_ROLE_ROUTES["review-fallback"]}
             and exact_native_model(model)
-            and (config.get("provider_preset") == "codex-app-deepseek"
+            and (config.get("provider_preset") in CODEX_APP_PRESETS
                  or (config.get("provider_preset") == "custom" and runtime is not None))
         ):
             config = apply_native_role_models(config, {"review-fallback": model})
@@ -232,7 +233,6 @@ def configure_review_policy(
         routing.setdefault("review_attempt_limits", {})[route] = max_calls
         selected = {"provider": route, "model": model}
     routing.update(settings)
-    from .provider_policy import validate_provider_policy
     validate_provider_policy(config)
     _write_config(work_dir, config)
     binding_issue = ""

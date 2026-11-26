@@ -29,8 +29,11 @@ from .provider_policy import (
     CODEX_APP_EXTERNAL_ROLES,
     CODEX_APP_EXECUTION_MODE,
     CODEX_APP_PRESET,
+    CODEX_APP_PRESETS,
     CONTROL_OBSERVATION_POLICY,
+    DEFAULT_PROVIDER_PRESET,
     MODE_LOCK_PATH,
+    PROVIDER_PRESETS,
     provider_mode_lock,
     validate_provider_policy,
 )
@@ -1200,7 +1203,7 @@ def _apply_review_routing_defaults(config: dict[str, Any]) -> None:
     validate_review_limits(limits)
     validate_review_settings(routing)
     preset = str(config.get("provider_preset", ""))
-    if preset == CODEX_APP_PRESET:
+    if preset in CODEX_APP_PRESETS:
         routing.setdefault("review_triagers", ["native-luna"])
     elif preset == "openai-deepseek":
         routing.setdefault("review_triagers", ["openai-luna"])
@@ -1263,7 +1266,7 @@ def initialize_workspace(
     *,
     git_choice: str = "disabled",
     game_roots: list[Path] | None = None,
-    provider_preset: str = CODEX_APP_PRESET,
+    provider_preset: str = DEFAULT_PROVIDER_PRESET,
     target_language: str = "ko",
 ) -> None:
     work_dir = work_dir.resolve()
@@ -1273,39 +1276,39 @@ def initialize_workspace(
     config = json.loads(json.dumps(CONFIG_TEMPLATE))
     target_language = normalize_language_tag(target_language, field="target_language")
     config["project"]["target_language"] = target_language
-    if provider_preset not in {"openai-deepseek", CODEX_APP_PRESET, "custom"}:
-        raise ConfigurationError(
-            "provider_preset must be openai-deepseek, codex-app-deepseek, or custom"
-        )
+    if provider_preset not in PROVIDER_PRESETS:
+        raise ConfigurationError("provider_preset must be one of: " + ", ".join(PROVIDER_PRESETS))
     config["provider_preset"] = provider_preset
     config["provider_policy"] = {
         "selected_preset": provider_preset,
         "key_presence_selects_mode": False,
     }
-    if provider_preset == CODEX_APP_PRESET:
+    if provider_preset in CODEX_APP_PRESETS:
         config["execution_mode"] = CODEX_APP_EXECUTION_MODE
-        deepseek = next(
-            item for item in config["providers"] if item["name"] == "deepseek"
-        )
-        deepseek["allowed_roles"] = sorted(CODEX_APP_EXTERNAL_ROLES)
-        config["providers"] = [deepseek]
+        external = provider_preset == CODEX_APP_PRESET
+        fallback = ["deepseek"] if external else []
+        external_roles = sorted(CODEX_APP_EXTERNAL_ROLES) if external else []
+        config["providers"] = [
+            {**adapter, "allowed_roles": external_roles}
+            for adapter in config["providers"] if external and adapter["name"] == "deepseek"
+        ]
         config["native_workflow"] = {
             "required": True,
             "launcher": "collaboration",
             "child_model_cli_allowed": False,
             "external_provider_primary_allowed": False,
-            "external_provider_roles": sorted(CODEX_APP_EXTERNAL_ROLES),
+            "external_provider_roles": external_roles,
         }
         config["routing"] = {
             "context_analyzers": ["native-sol", "native-luna"],
-            "translators": ["native-luna", "native-sol", "deepseek"],
+            "translators": ["native-luna", "native-sol", *fallback],
             "translator_retries": {
                 "native-luna": 0,
                 "native-sol": 0,
             },
             "review_triagers": ["native-luna"],
-            "reviewers": ["native-sol", "deepseek"],
-            "rewriters": ["deepseek"],
+            "reviewers": ["native-sol", *fallback],
+            "rewriters": fallback or ["native-sol"],
             "strong_review_sample_percent": 5.0,
             "strong_review_high_risk_categories": [
                 "allusion",
@@ -1317,7 +1320,7 @@ def initialize_workspace(
             ],
             "require_review": True,
             "review_max_rounds": 2,
-            "review_attempt_limits": {"native-sol": 2, "deepseek": 3},
+            "review_attempt_limits": {"native-sol": 2, **dict.fromkeys(fallback, 3)},
             "max_workers": 8,
             "context_max_workers": 6,
             "retry_refusals_once": False,
@@ -1460,7 +1463,7 @@ def load_config(work_dir: Path) -> dict[str, Any]:
     validate_provider_policy(
         config,
         mode_lock=mode_lock,
-        require_mode_lock=config.get("provider_preset") == CODEX_APP_PRESET,
+        require_mode_lock=config.get("provider_preset") in CODEX_APP_PRESETS,
     )
     return config
 

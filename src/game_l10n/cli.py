@@ -148,6 +148,8 @@ from .progress_ui import live_processing_ui
 from .providers import ProviderRegistry
 from .provider_policy import (
     CODEX_APP_EXECUTION_MODE,
+    DEFAULT_PROVIDER_PRESET,
+    PROVIDER_PRESETS,
     effective_execution_mode,
     require_direct_provider_pipeline,
     validate_provider_policy,
@@ -4177,11 +4179,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.add_argument(
         "--provider-preset",
-        choices=["openai-deepseek", "codex-app-deepseek", "custom"],
-        default="codex-app-deepseek",
+        choices=PROVIDER_PRESETS,
+        default=DEFAULT_PROVIDER_PRESET,
         help=(
-            "OpenAI/DeepSeek APIs, native workers with configurable authorized fallback roles, "
-            "or a manually configured provider chain"
+            "Native workers without an implicit external fallback (default), explicit "
+            "DeepSeek presets, or a manually configured provider chain"
         ),
     )
     init.set_defaults(func=cmd_init)

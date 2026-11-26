@@ -33,17 +33,19 @@
           <label>기초 사용 모델<input name="baseModel" type="text" placeholder="번역 모델 ID · 기존 설정 유지" autocomplete="off" spellcheck="false"></label>
           <label>약검수 모델<input name="triageModel" type="text" placeholder="정확한 모델 ID · 기존 설정 유지" autocomplete="off" spellcheck="false"></label>
           <label>강검수 모델<input name="strongModel" type="text" placeholder="정확한 모델 ID · 기존 설정 유지" autocomplete="off" spellcheck="false"></label>
-          <label>수정 모델<input name="rewriteModel" type="text" placeholder="정확한 모델 ID · 기존 설정 유지" autocomplete="off" spellcheck="false"></label>
+          <label>수정 모델<input name="rewriteModel" type="text" placeholder="미지정 시 공통 폴백 사용" autocomplete="off" spellcheck="false"></label>
           <label class="toggle"><input type="checkbox" name="analyzeContext" checked>문맥 파악</label>
           <label id="context-model-field" class="wide">문맥 파악 모델<input name="contextModel" type="text" placeholder="정확한 모델 ID · 기존 설정 유지" autocomplete="off" spellcheck="false"></label>
         </div>
       </details>
       <fieldset>
-        <legend>검수 <span class="optional">명시한 상한 우선 · 최초 호출 포함</span></legend>
+        <legend>폴백·검수 <span class="optional">검수 상한은 최초 호출 포함</span></legend>
         <div class="fields">
-          <label>폴백 모델<select id="fallback-preset" aria-label="폴백 모델 목록"></select></label>
-          <label>폴백 최대 횟수<input name="fallbackAttempts" type="number" min="1" step="1" placeholder="기존 상한 유지 · 없으면 3회"></label>
-          <label class="wide" id="fallback-model-field" hidden>직접 입력한 폴백 모델 ID<input name="fallbackModel" type="text" placeholder="정확한 모델 ID" autocomplete="off" spellcheck="false"></label>
+          <label>공통 폴백 모델<select id="fallback-preset"></select></label>
+          <label>폴백 검수 최대 횟수<input name="fallbackAttempts" type="number" min="1" step="1" placeholder="기존 상한 유지 · 없으면 3회"></label>
+          <label class="wide" id="fallback-model-field" hidden>직접 입력한 공통 폴백 모델 ID<input name="fallbackModel" type="text" placeholder="정확한 모델 ID" autocomplete="off" spellcheck="false"></label>
+          <label class="wide">별도 폴백 검수 모델<input name="reviewFallbackModel" type="text" placeholder="미지정 시 공통 폴백 사용" autocomplete="off" spellcheck="false"></label>
+          <p class="optional wide">공통 모델은 번역 폴백에 쓰이며, 별도 지정이 없는 폴백 검수와 수정에도 쓰입니다.</p>
         </div>
         <div class="catalog-control"><label class="toggle"><input type="checkbox" id="use-proxy" aria-describedby="local-access-help">localhost 연결 요청</label><span id="catalog-status" role="status" aria-live="polite"></span></div>
         <p class="optional" id="local-access-help">켜면 OpenCodex 모델 목록을 읽기 위해 http://localhost:10100에 연결합니다. 필요한 경우 브라우저의 로컬 네트워크 접근 권한을 허용하세요. 이미 차단했다면 사이트 설정에서 변경하세요. 이 권한은 CORS를 해제하지 않으며, 서버가 현재 사이트의 origin을 허용하지 않으면 모델 목록을 읽을 수 없습니다.</p>

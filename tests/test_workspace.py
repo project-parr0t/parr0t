@@ -211,6 +211,11 @@ class WorkspaceTests(unittest.TestCase):
             config = load_config(work)
             self.assertEqual(config["repository"]["initial_choice"], "disabled")
             self.assertEqual(config["project"]["target_language"], "fr")
+            self.assertEqual(config["providers"], [])
+            self.assertEqual(config["native_workflow"]["external_provider_roles"], [])
+            self.assertEqual(config["routing"]["rewriters"], ["native-sol"])
+            self.assertEqual(config["routing"]["reviewers"], ["native-sol"])
+            self.assertEqual(config["routing"]["translators"], ["native-luna", "native-sol"])
             from game_l10n.language_policy import target_language_policy
             policy = target_language_policy(work)
             self.assertEqual(policy["target_language"], "fr")
@@ -754,6 +759,7 @@ class WorkspaceTests(unittest.TestCase):
                 "api_key_env": "FIXTURE_API_KEY",
                 "allowed_roles": ["translation_fallback", "judge_fallback", "selective_rewrite"],
             }]
+            config["native_workflow"]["external_provider_roles"] = config["providers"][0]["allowed_roles"]
             selected = {
                 "context_analyzers": ["native-selected-context"],
                 "translators": ["native-selected-translation", "chosen-fallback"],

@@ -89,6 +89,8 @@ class PromptModelPolicyTests(unittest.TestCase):
         expected_retries = dict(before["routing"]["translator_retries"])
         expected_retries["native-translation"] = expected_retries.pop("native-luna")
         self.assertEqual(after["routing"]["translator_retries"], expected_retries)
+        self.assertEqual(after["routing"]["translators"],
+                         ["native-translation", "native-sol", "native-translation-fallback"])
         self.assertEqual(after["routing"]["context_analyzers"], ["native-context", "native-luna"])
         self.assertEqual(after["providers"], before["providers"])
         for role, previous in (("strong-review", "native-sol"), ("review-fallback", "deepseek")):
@@ -99,7 +101,13 @@ class PromptModelPolicyTests(unittest.TestCase):
 
     def test_translation_fallback_replaces_only_external_slot_preserving_retry_budget(self):
         before = load_config(self.work)
-        before["routing"]["translator_retries"]["deepseek"] = 2
+        before["native_workflow"]["external_provider_roles"] = ["translation_fallback"]
+        before["providers"] = [{
+            "name": "external", "type": "compatible_chat", "model": "fixture/exact",
+            "api_key_env": "EXPLICIT_PROVIDER_TOKEN", "allowed_roles": ["translation_fallback"],
+        }]
+        before["routing"]["translators"].append("external")
+        before["routing"]["translator_retries"]["external"] = 2
         _write_config(self.work, before)
         lock = (self.work / MODE_LOCK_PATH).read_bytes()
         self.bind(role_models={"translation-fallback": self.model}, user_requested_models=True)
@@ -109,7 +117,7 @@ class PromptModelPolicyTests(unittest.TestCase):
                          ["native-luna", "native-sol", "native-translation-fallback"])
         self.assertEqual(after["routing"]["translator_retries"], {
             **{route: retries for route, retries in before["routing"]["translator_retries"].items()
-               if route != "deepseek"},
+               if route != "external"},
             "native-translation-fallback": 2,
         })
         self.assertEqual(after["providers"], before["providers"])
@@ -125,7 +133,7 @@ class PromptModelPolicyTests(unittest.TestCase):
         self.assertEqual(runtime["models"]["native-sol"], "fixture/operator-sol")
         self.assertEqual(runtime["models"]["native-translation"], "fixture/translator")
         self.assertEqual(runtime["models"]["native-triage"], "fixture/triager")
-        self.assertEqual(load_config(self.work)["routing"]["reviewers"], ["native-sol", "deepseek"])
+        self.assertEqual(load_config(self.work)["routing"]["reviewers"], ["native-sol"])
 
     def test_role_selection_needs_explicit_user_authorization(self):
         self.bind()
@@ -167,6 +175,7 @@ class PromptModelPolicyTests(unittest.TestCase):
     def test_presets_do_not_freeze_topology_counts_or_adapter_identity(self):
         from game_l10n.provider_policy import validate_provider_policy
         config = load_config(self.work)
+        config["native_workflow"]["external_provider_roles"] = ["translation_fallback", "judge_fallback", "selective_rewrite"]
         config["providers"] = [
             {"name": "explicit-fallback", "type": "compatible_chat", "model": "fixture/exact",
              "api_key_env": "EXPLICIT_PROVIDER_TOKEN", "allowed_roles": ["translation_fallback", "judge_fallback"]},

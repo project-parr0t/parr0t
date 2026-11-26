@@ -39,7 +39,7 @@ test("nonpositive fallback settings and counts without a model cannot produce a 
 
 test("invalid native model selections are rejected before producing executable instructions", () => {
   for (const value of [String.raw`C:\Fixture Game\Data`, "/tmp/fixture-game", "fixture/*", "fixture/../model", "default", "inherit", "task", "smol", "slow", "luna", "sol", "@fixture"]) {
-    for (const role of ["baseModel", "triageModel", "strongModel", "rewriteModel", "contextModel", "fallbackModel"]) {
+    for (const role of ["baseModel", "triageModel", "strongModel", "rewriteModel", "contextModel", "fallbackModel", "reviewFallbackModel"]) {
       assert.throws(() => buildPrompt({ [role]: value, ...(role === "fallbackModel" ? { fallbackAttempts: "2" } : {}) }),
         /폴더 경로나 별칭 대신 정확한 모델 ID/);
     }
@@ -102,6 +102,7 @@ test("explicit models produce exact role override and fallback policy commands i
       "--role-model", `strong-review=${options.strongModel}`,
       "--role-model", `rewrite=${options.rewriteModel}`,
       "--role-model", `context=${options.contextModel}`,
+      "--role-model", `translation-fallback=${options.fallbackModel}`,
       "--role-model", `review-fallback=${options.fallbackModel}`,
       "--user-requested-models",
     ]);
@@ -126,17 +127,36 @@ test("sparse role selections never fill unspecified roles with preset defaults",
   }
 });
 
-test("fallback-only selection binds the requested model and count without changing other roles or transport", () => {
+test("a shared fallback supplies translation, review, and rewrite without changing primary models", () => {
   const model = "fixture/fallback@fixture-proxy:high";
   const prompt = buildPrompt({ fallbackModel: model, fallbackAttempts: "4", fallbackViaOpenCodex: true,
     analyzeContext: false, contextModel: "fixture/stale-context" });
   assert.deepEqual(commandArgs(prompt, "native-runtime"), [
-    "--workspace", "<workspace>", "--host", "<current-native-host>", "--role-model", `review-fallback=${model}`, "--user-requested-models",
+    "--workspace", "<workspace>", "--host", "<current-native-host>",
+    "--role-model", `rewrite=${model}`, "--role-model", `translation-fallback=${model}`,
+    "--role-model", `review-fallback=${model}`, "--user-requested-models",
   ]);
   assert.deepEqual(commandArgs(prompt, "review-policy"), [
     "--workspace", "<workspace>", "--fallback-model", model, "--max-calls", "4", "--user-requested",
   ]);
   assert.ok(!prompt.includes("fixture/stale-context"));
+});
+
+test("a separately named review fallback overrides the shared selector and owns the call limit", () => {
+  const prompt = buildPrompt({
+    fallbackModel: "fixture/shared@route:high", reviewFallbackModel: "fixture/independent:low",
+    rewriteModel: "fixture/editor", fallbackAttempts: "5",
+  });
+  assert.deepEqual(commandArgs(prompt, "native-runtime"), [
+    "--workspace", "<workspace>", "--host", "<current-native-host>",
+    "--role-model", "rewrite=fixture/editor",
+    "--role-model", "translation-fallback=fixture/shared@route:high",
+    "--role-model", "review-fallback=fixture/independent:low", "--user-requested-models",
+  ]);
+  assert.deepEqual(commandArgs(prompt, "review-policy"), [
+    "--workspace", "<workspace>", "--fallback-model", "fixture/independent:low",
+    "--max-calls", "5", "--user-requested",
+  ]);
 });
 
 test("proxy catalogs require the bound schema and only replace defaults with valid model IDs", () => {
@@ -280,10 +300,13 @@ test("PowerShell stages exact selected models as additive command-scoped operato
   assert.equal(result.status, 0, result.error?.message ?? result.stderr);
   assert.deepEqual(Object.keys(received.config), ["modelRoles"]);
   const roles = received.config.modelRoles;
-  assert.equal(Object.keys(roles).length, 5);
-  assert.ok(Object.keys(roles).every(key => /^parr0t_requested_[0-9a-f]{32}_(?:translation|triage|strong_review|rewrite|review_fallback)$/.test(key)));
-  assert.deepEqual(Object.values(roles).sort(), [selections.baseModel, selections.triageModel,
-    selections.strongModel, selections.rewriteModel, selections.fallbackModel].sort());
+  const bySlot = Object.fromEntries(Object.entries(roles).map(([key, value]) =>
+    [key.replace(/^parr0t_requested_[0-9a-f]{32}_/, ""), value]));
+  assert.deepEqual(bySlot, {
+    translation: selections.baseModel, triage: selections.triageModel,
+    strong_review: selections.strongModel, rewrite: selections.rewriteModel,
+    translation_fallback: selections.fallbackModel, review_fallback: selections.fallbackModel,
+  });
   assert.ok(!Object.hasOwn(roles, "default"));
   assert.ok(!received.argv.includes("--model"));
   const configPath = received.argv[received.argv.indexOf("--config") + 1];

@@ -8,32 +8,51 @@ const policies = {
   rewrite: "기존 한국어는 의도된 교체 대상이므로 존재한다는 이유로 중단하지 마라. 원어와 기존 번역의 ID·순서·장면·UI 기능을 대응시키고, 원어를 뜻의 기준으로 다시 번역하라. 기존 번역은 용어·누락·오역의 대조 자료로만 사용하고 오역을 계승하지 마라.",
 };
 
+function selectedRoleModels(options) {
+  const roles = [
+    ["translation", "기초 번역 모델", options.baseModel],
+    ["triage", "약검수 모델", options.triageModel],
+    ["strong-review", "강검수 모델", options.strongModel],
+    ["rewrite", "수정 모델", options.rewriteModel],
+    ...((options.analyzeContext ?? true) ? [["context", "문맥 파악 모델", options.contextModel]] : []),
+    ["translation-fallback", "번역 폴백 모델", options.fallbackModel],
+    ["review-fallback", "폴백 검수 모델", options.reviewFallbackModel],
+  ];
+  for (const role of roles) {
+    const raw = String(role[2] ?? "");
+    if (/[\r\n]/.test(raw)) throw new Error("모델 ID는 한 줄로 입력하세요.");
+    role[2] = raw.trim();
+    if (role[2] && !exactModelSelector(role[2])) {
+      throw new Error(`${role[1]}: 폴더 경로나 별칭 대신 정확한 모델 ID를 입력하세요.`);
+    }
+  }
+  const fallback = roles.find(([role]) => role === "translation-fallback")[2];
+  for (const role of roles) {
+    if (!role[2] && (role[0] === "rewrite" || role[0] === "review-fallback")) role[2] = fallback;
+  }
+  return roles.filter(([, , model]) => model);
+}
+
 export function buildPrompt(options = {}) {
+  return composePrompt(options, selectedRoleModels(options));
+}
+
+function composePrompt(options, roleModels) {
   const {
     host = "codex", operation = "localize", repositoryUrl = "",
     gameType = "dialogue", koreanPolicy = "check", delivery = "patch",
-    fonts = false, images = false, gamePath = "", fallbackModel = "", fallbackAttempts = "",
-    baseModel = "", triageModel = "", strongModel = "", rewriteModel = "", analyzeContext = true, contextModel = "",
+    fonts = false, images = false, gamePath = "", fallbackAttempts = "", analyzeContext = true,
   } = options;
   if (!["codex", "omp"].includes(host)) throw new Error("지원하는 호스트를 선택하세요.");
   if (!["localize", "migrate"].includes(operation) || !["dialogue", "logic"].includes(gameType) || !Object.hasOwn(policies, koreanPolicy) || !["patch", "mod"].includes(delivery)) {
     throw new Error("선택 항목을 확인하세요.");
   }
-  const model = String(fallbackModel).trim();
+  const model = roleModels.find(([role]) => role === "review-fallback")?.[2];
   const requestedAttempts = String(fallbackAttempts).trim();
   const attempts = requestedAttempts || (model ? String(DEFAULT_REVIEW_FALLBACK_CALLS) : "");
   if (attempts && !model) throw new Error("횟수를 지정할 폴백 모델을 선택하세요.");
   if (attempts && (!/^\d+$/.test(attempts) || BigInt(attempts) < 1n)) throw new Error("폴백 횟수는 1 이상의 정수로 지정하세요.");
-  if (/[\r\n]/.test(model)) throw new Error("모델 ID는 한 줄로 입력하세요.");
-  const roleModels = [["translation", "기초 번역 모델", baseModel], ["triage", "약검수 모델", triageModel], ["strong-review", "강검수 모델", strongModel], ["rewrite", "수정 모델", rewriteModel]];
-  if (analyzeContext) roleModels.push(["context", "문맥 파악 모델", contextModel]);
-  if (roleModels.some(([, , value]) => /[\r\n]/.test(String(value)))) throw new Error("모델 ID는 한 줄로 입력하세요.");
-  for (const [, label, value] of [...roleModels, ["review-fallback", "폴백 검수 모델", model]]) {
-    const id = String(value).trim();
-    if (id && !exactModelSelector(id)) {
-      throw new Error(`${label}: 폴더 경로나 별칭 대신 정확한 모델 ID를 입력하세요.`);
-    }
-  }
+  const sharedFallback = roleModels.some(([role]) => role === "translation-fallback");
   const reviewLimits = [
     ["triageMaxCalls", "최대 약검수", "triage_max_calls"],
     ["strongMaxCalls", "최대 강검수", "strong_max_calls"],
@@ -86,19 +105,16 @@ export function buildPrompt(options = {}) {
       : "외부 bootstrap 제어 디렉터리는 실제 게임 작업 workspace가 아니다. 기존 작업이 있으면 먼저 status·요청 바인딩을 확인하고 재초기화하지 마라. 새 작업에만 게임과 Core 밖의 별도 workspace를 초기화하고 최초 요청 원문을 UTF-8 파일로 보존·바인딩하라.",
     "필수 초기화 또는 기존 상태 확인과 user-request 바인딩·검증을 완료한 뒤, 실제 작업의 절대 workspace로 parr0t_session({workspace: <실제 작업 절대 경로>, user_requested: true})을 자동 호출하여 첫 공식 제어 세션에 진입하라. 이미 요청한 자동화의 같은 모델·작업에 추가 사람 확인을 요구하지 마라. model은 생략해 실제 현재 root 모델·thinking을 보존하고 역할 모델로 root를 추측·대체하지 마라. 별도 제어 세션의 실행 또는 등록 상태를 이 요청의 차단 조건으로 쓰지 마라. 호출 결과의 실제 준비·오류 증거를 확인하고, 초기 bootstrap에서 현지화 워커를 직접 실행하지 마라.",
   );
-  const specifiedModels = roleModels.filter(([, , value]) => String(value).trim());
-  const nativeRoleModels = specifiedModels.map(([role, , value]) => [role, String(value).trim()]);
-  if (model) nativeRoleModels.push(["review-fallback", model]);
-  if (nativeRoleModels.length) {
-    const bindings = nativeRoleModels.map(([role, value]) => `--role-model ${JSON.stringify(`${role}=${value}`)}`).join(" ");
+  if (roleModels.length) {
+    const bindings = roleModels.map(([role, , value]) => `--role-model ${JSON.stringify(`${role}=${value}`)}`).join(" ");
     sections.push([
-      ...specifiedModels.map(([, label, value]) => `${label}: ${String(value).trim()}`),
+      ...roleModels.filter(([role]) => role !== "review-fallback").map(([, label, value]) => `${label}: ${value}`),
       "모델 선택 우선순위: 이 초기 사용자 프롬프트·템플릿의 명시적 역할별 모델 선택이 preset 모델 기본값보다 우선한다. preset은 기본값이지 모델 선택을 고정하는 권한이 아니다. 정확한 ID(제공자·경로·접미사 포함)를 보존하고 지정한 역할 슬롯만 교체하라. 미지정 역할과 나머지 경로는 기존 설정을 유지하라.",
       host === "omp"
         ? "명시 선택한 OMP의 허용된 역할만 다음 native-runtime 명령으로 기록하라. API 역할에 적용하거나 API/native를 암묵적으로 교환하지 마라:"
         : "현재 네이티브 호스트에서 허용된 역할의 명시 선택은 다음 native-runtime 명령으로 기록하라. <current-native-host>는 이미 선택한 codex 또는 omp로 채우고, API 역할에 이 명령을 적용하거나 API/native를 암묵적으로 교환하지 마라:",
       `game-l10n native-runtime --workspace <workspace> --host ${host === "omp" ? "omp" : "<current-native-host>"} ${bindings} --user-requested-models`,
-      "선택한 호스트·허용된 전송 경로와 호환되지 않거나 호스트가 아직 바인딩되지 않았으면 정확한 요청을 보존한 pending으로 유지하라. 다른 모델이나 기본 DeepSeek로 대체하거나 실패·거부·경로 소진으로 해석하지 마라. provider mode, 제공자 역할 권한, 엔드포인트·자격 증명, 대상별 호출 상한, 시작된 워커의 바인딩·실행 증거와 완료 결과를 변경하지 마라.",
+      "선택한 호스트·허용된 전송 경로와 호환되지 않거나 호스트가 아직 바인딩되지 않았으면 정확한 요청을 보존한 pending으로 유지하라. 다른 모델이나 제공자로 대체하거나 실패·거부·경로 소진으로 해석하지 마라. provider mode, 제공자 역할 권한, 엔드포인트·자격 증명, 대상별 호출 상한, 시작된 워커의 바인딩·실행 증거와 완료 결과를 변경하지 마라.",
     ].join("\n"));
   }
   sections.push(analyzeContext
@@ -116,9 +132,9 @@ export function buildPrompt(options = {}) {
     : "외부 작업 폴더에 적용·복원 정보가 포함된 복원 가능한 패치를 만들어라.");
   sections.push("검수 횟수는 명시한 대상별 상한과 기존 설정을 따르고 모델 이름으로 추가 상한을 만들지 마라. 최초 호출·오류·거부 재시도·수정 후 확인과 재개에서도 같은 정확한 경로의 호출을 합산하라. 성공한 대상은 잠그고 다시 검수하지 마라.");
   sections.push(model
-    ? `폴백 검수 모델: ${model}\n폴백 검수 최대 횟수: ${requestedAttempts ? `${BigInt(attempts)}회` : `기존 명시 상한 유지, 없으면 ${DEFAULT_REVIEW_FALLBACK_CALLS}회`} (대상당 최초 호출 포함). 명시 값을 preset 기본값보다 우선하여 보존하고 같은 값을 다시 묻지 마라.\n폴백 모델과 대상별 총 호출 정책을 기록하라:\ngame-l10n review-policy --workspace <workspace> --fallback-model ${JSON.stringify(model)}${requestedAttempts ? ` --max-calls ${BigInt(attempts)}` : ""} --user-requested\n기존 기본 DeepSeek 모델과 일치하는지 확인하는 데 그치지 마라. 현재 네이티브 preset/호스트의 허용된 review-fallback 역할이면 native-review-fallback으로 정확히 바인딩하고, 호스트·허용 전송이 호환되지 않거나 아직 바인딩되지 않았으면 요청한 모델과 횟수를 보존한 pending으로 유지하라. 네이티브 요청 모델을 DeepSeek API에 대신 보내지 마라.`
+    ? `폴백 검수 모델: ${model}\n폴백 검수 최대 횟수: ${requestedAttempts ? `${BigInt(attempts)}회` : `기존 명시 상한 유지, 없으면 ${DEFAULT_REVIEW_FALLBACK_CALLS}회`} (대상당 최초 호출 포함). 명시 값을 preset 기본값보다 우선하여 보존하고 같은 값을 다시 묻지 마라.\n폴백 모델과 대상별 총 호출 정책을 기록하라:\ngame-l10n review-policy --workspace <workspace> --fallback-model ${JSON.stringify(model)}${requestedAttempts ? ` --max-calls ${BigInt(attempts)}` : ""} --user-requested\n현재 호스트의 허용된 review-fallback 역할이면 native-review-fallback으로 정확히 바인딩하라. 호스트·허용 전송이 호환되지 않거나 아직 바인딩되지 않았으면 요청한 모델과 횟수를 보존한 pending으로 유지하라. 네이티브 요청 모델을 다른 API에 대신 보내지 마라.`
     : `명시한 폴백 모델·횟수는 기존 기본값보다 우선하고 다시 묻지 마라. 횟수를 생략한 폴백 경로는 문서화된 기본값 ${DEFAULT_REVIEW_FALLBACK_CALLS}회(대상당 최초 호출 포함)를 사용한다. 호스트·전송·제공자 역할의 승인 경계는 유지하고 임의의 모델로 대체하지 마라.`);
-  if (options.fallbackViaOpenCodex && model) sections.push("폴백 모델은 감지된 OpenCodex 프록시 카탈로그에서 선택했다. 정확한 모델 ID와 허용된 프록시 경로를 보존하고 직접 API나 다른 모델로 몰래 전환하지 마라. 카탈로그 표시는 실제 가용성·모델 호출 권한의 증거가 아니므로 실행 전 바인딩과 지원 여부를 검증하라.");
+  if (options.fallbackViaOpenCodex && sharedFallback) sections.push("공통 폴백 모델은 감지된 OpenCodex 프록시 카탈로그에서 선택했다. 해당 모델의 정확한 ID와 허용된 프록시 경로를 보존하고 직접 API나 다른 모델로 몰래 전환하지 마라. 카탈로그 표시는 실제 가용성·모델 호출 권한의 증거가 아니므로 실행 전 바인딩과 지원 여부를 검증하라.");
   sections.push("폴백은 성공을 보존한 채 실패한 항목에만 적용하라. 설정 누락·호스트 미바인딩·호환되지 않는 전송은 모델 실패·거부·경로 소진·source_preserved가 아니며 정확한 요청을 보존하라. preset은 초기 기본값이며 명시한 역할 모델·경로·재시도 횟수가 우선한다. 전송·자격 증명·제공자 역할의 승인 경계와 시작된 워커의 정확한 바인딩은 유지하라. 모델 인수는 정확한 argv 값으로 전달하고 셸 문자열로 해석하지 마라. 확인된 제공자·가드 운영 오류는 원래 증거를 보존하고 코어가 만든 새 manifest의 이미 승인된 다음 경로로 미완료 항목만 진행하라. 실제 사용자 중지와 변경된 작업 범위의 승인 경계는 지켜라. 별도 승인 없이 커밋·푸시·릴리스 게시나 실제 게임 설치·실행을 하지 말고 로컬 결과물과 검증 범위를 먼저 보고하라.");
   if (String(gamePath).trim()) sections.push(`게임 폴더:\n${String(gamePath).trim()}`);
   else if (operation === "localize") sections.push("게임 폴더는 이 요청에 첨부한 폴더를 사용하라.");
@@ -136,20 +152,15 @@ function base64Lines(value) {
 
 // Only request/options data is encoded here; the composer never opens game files.
 export function buildOmpCommand(options = {}) {
-  const request = buildPrompt({ ...options, host: "omp" });
+  const roleModels = selectedRoleModels(options);
+  const request = composePrompt({ ...options, host: "omp" }, roleModels);
   const corePath = String(options.corePath ?? "").trim();
   if (corePath && (!/^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+|\/)/.test(corePath) || corePath.includes("\0"))) {
     throw new Error("현재 Core 체크아웃의 절대 경로를 입력하세요.");
   }
-  const selectedModels = {};
-  for (const [key, role] of [
-    ["baseModel", "translation"], ["triageModel", "triage"], ["strongModel", "strong_review"],
-    ["rewriteModel", "rewrite"], ["fallbackModel", "review_fallback"],
-    ...(options.analyzeContext === undefined || options.analyzeContext ? [["contextModel", "context"]] : []),
-  ]) {
-    const model = String(options[key] === undefined ? "" : options[key]).trim();
-    if (model) selectedModels[role] = model;
-  }
+  const selectedModels = Object.fromEntries(
+    roleModels.map(([role, , model]) => [role.replaceAll("-", "_"), model]),
+  );
   const data = base64Lines(JSON.stringify({ corePath, selectedModels }));
   const requestData = base64Lines(request);
   return `# PowerShell (Windows PowerShell 5.1+ / PowerShell 7+)

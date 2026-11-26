@@ -84,7 +84,10 @@ def model_selection_authorization(config: dict[str, Any], route: str, model: str
 
 def apply_native_role_models(config: dict[str, Any], models: dict[str, str]) -> dict[str, Any]:
     """Replace named role slots only; preserve unspecified roles and provider settings."""
-    if config.get("provider_preset") not in {"codex-app-deepseek", "custom"}:
+    from .provider_policy import CODEX_APP_PRESETS
+
+    preset = config.get("provider_preset")
+    if preset not in CODEX_APP_PRESETS and preset != "custom":
         raise ConfigurationError("E_MODEL_POLICY_TRANSPORT_UNSUPPORTED: native role models require a native workflow")
     if not models or set(models) - NATIVE_ROLE_ROUTES.keys() or not all(
         exact_native_model(model) for model in models.values()
@@ -107,11 +110,14 @@ def apply_native_role_models(config: dict[str, Any], models: dict[str, str]) -> 
                 adapters = {provider["name"] for provider in updated.get("providers", [])
                             if "translation_fallback" in provider.get("allowed_roles", [])}
                 slots = [i for i, value in enumerate(routes) if i > 0 and value in adapters]
-                if len(slots) != 1:
+                if len(slots) == 1:
+                    index = slots[0]
+                elif not slots and routes and all(value.startswith("native-") for value in routes):
+                    index = len(routes)
+                else:
                     raise ConfigurationError(
-                        "E_MODEL_POLICY_ROLE_UNAVAILABLE: expected one configured external translation fallback"
+                        "E_MODEL_POLICY_ROLE_UNAVAILABLE: ambiguous or missing configured translation fallback"
                     )
-                index = slots[0]
         else:
             key, index = _ROLE_SLOTS[role]
         routes = routing.get(key)

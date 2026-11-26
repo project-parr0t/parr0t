@@ -7,6 +7,8 @@ from .model_policy import native_role_models
 
 
 CODEX_APP_PRESET = "codex-app-deepseek"
+DEFAULT_PROVIDER_PRESET = "codex-app-native"
+CODEX_APP_PRESETS = frozenset({DEFAULT_PROVIDER_PRESET, CODEX_APP_PRESET})
 CODEX_APP_EXECUTION_MODE = "codex_app_native"
 MODE_LOCK_VERSION = 1
 MODE_LOCK_PATH = ".game-l10n/provider-mode.json"
@@ -41,10 +43,13 @@ CODEX_APP_EXTERNAL_ROLES = {
 }
 
 _PRESET_EXECUTION_MODES = {
+    DEFAULT_PROVIDER_PRESET: CODEX_APP_EXECUTION_MODE,
     "openai-deepseek": "api",
     CODEX_APP_PRESET: CODEX_APP_EXECUTION_MODE,
     "custom": "custom_provider",
 }
+PROVIDER_PRESETS = tuple(_PRESET_EXECUTION_MODES)
+_PRESET_ERROR = "provider_preset must be one of: " + ", ".join(PROVIDER_PRESETS)
 
 
 def provider_mode_lock(config: dict[str, Any]) -> dict[str, Any]:
@@ -63,10 +68,7 @@ def effective_execution_mode(config: dict[str, Any]) -> str:
     preset = str(config.get("provider_preset", ""))
     expected = _PRESET_EXECUTION_MODES.get(preset)
     if expected is None:
-        raise ConfigurationError(
-            "E_PROVIDER_MODE_DRIFT: provider_preset must be openai-deepseek, "
-            "codex-app-deepseek, or custom"
-        )
+        raise ConfigurationError(f"E_PROVIDER_MODE_DRIFT: {_PRESET_ERROR}")
     return str(config.get("execution_mode") or expected)
 
 
@@ -85,9 +87,7 @@ def validate_provider_policy(
     preset = str(config.get("provider_preset", ""))
     expected_mode = _PRESET_EXECUTION_MODES.get(preset)
     if expected_mode is None:
-        _mode_drift(
-            "provider_preset must be openai-deepseek, codex-app-deepseek, or custom"
-        )
+        _mode_drift(_PRESET_ERROR)
     mode = effective_execution_mode(config)
     if mode != expected_mode:
         _mode_drift(
@@ -118,10 +118,10 @@ def validate_provider_policy(
         if mode_lock.get("execution_mode") != mode:
             _mode_drift("execution_mode differs from the workspace provider-mode lock")
 
-    if native_role_models(config) and preset not in {CODEX_APP_PRESET, "custom"}:
+    if native_role_models(config) and preset not in CODEX_APP_PRESETS and preset != "custom":
         _mode_drift("native role model overrides require a native workflow")
 
-    if preset != CODEX_APP_PRESET:
+    if preset not in CODEX_APP_PRESETS:
         return
 
     if not policy:
