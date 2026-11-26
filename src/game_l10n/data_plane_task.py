@@ -3651,11 +3651,13 @@ def prepare_data_plane_task(
             binding["argv"][0] == encoder for binding in private_payload["offline_processing"]
         ):
             private_payload["requirements"].extend([
-                "stage_edited_8_bit_noninterlaced_rgba_png_in_output_image_root_as_asset_NNNN_png",
+                "run_the_bound_webp_encoder_argv_with_--prepare-only_to_create_original_scale_pngs",
+                "visually_read_asset-NNNN.source.png_and_render_only_the_bound_text_rectangles",
+                "stage_edited_8_bit_noninterlaced_rgba_png_in_output_image_root_as_asset-NNNN.png",
                 "use_1_based_asset_order_in_input_image_inventory_for_NNNN_and_preserve_original_dimensions",
-                "run_bound_webp_encoder_using_exact_python_executable_then_-I_-B_then_complete_offline_processing_argv",
-                "use_corresponding_asset_NNNN_webp_as_output_and_verify_decoded_pixels_alpha_and_engine_structure",
-                "encoder_success_does_not_prove_pixel_preservation_or_independent_visual_review",
+                "run_the_bound_webp_encoder_argv_without_--prepare-only_using_parr0t_process_with_python_-I_-B",
+                "use_asset-NNNN.webp_as_output_only_if_exact_decoded_alpha_and_outside_region_pixels_are_verified",
+                "retain_required_engine_structure_evidence_and_do_not_claim_independent_visual_review",
             ])
     if source_policy["semantic_content_generation"]:
         private_payload["runtime_model"] = (

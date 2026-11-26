@@ -1,7 +1,8 @@
-"""Encode the checked RGBA PNG staging files of one Windows image relay."""
+"""Prepare and encode the exact WebP assets bound to a Windows image relay."""
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -14,6 +15,71 @@ from tempfile import TemporaryDirectory
 
 PURPOSE = "Lossless WebP encoding of validated local PNGs for approved game image regions and synthetic fixtures"
 DATA_SCOPE = "Local workspace validated PNG input and separate WebP output only; no network, credentials, game-root writes, installation, or redistribution"
+
+_DECODE = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+Add-Type -AssemblyName PresentationCore, WindowsBase
+$dimensions = (ConvertFrom-Json ([Console]::In.ReadLine()))
+$stream = [IO.File]::OpenRead('input.webp')
+try {
+  $decoder = [Windows.Media.Imaging.BitmapDecoder]::Create($stream, 'PreservePixelFormat', 'OnLoad')
+  if ($decoder.Frames.Count -ne 1) { throw 'frame count' }
+  $f = $decoder.Frames[0]
+  if ($f.PixelWidth -ne $dimensions[0] -or $f.PixelHeight -ne $dimensions[1]) { throw 'dimensions' }
+  $frame = [Windows.Media.Imaging.FormatConvertedBitmap]::new($f, [Windows.Media.PixelFormats]::Bgra32, $null, 0)
+  $stride = 4 * $frame.PixelWidth
+  $pixels = [byte[]]::new($stride * $frame.PixelHeight)
+  $frame.CopyPixels($pixels, $stride, 0)
+  [Console]::OpenStandardOutput().Write($pixels, 0, $pixels.Length)
+} finally { $stream.Dispose() }
+"""
+
+
+def _read_webp(body: bytes, dimensions: tuple[int, int], env: dict[str, str], cwd: Path) -> bytearray:
+    width, height = dimensions
+    if (len(body) < 26 or body[:4] != b"RIFF" or body[8:12] != b"WEBP"
+            or int.from_bytes(body[4:8], "little") + 8 != len(body)
+            or body[12:16] not in {b"VP8 ", b"VP8L", b"VP8X"}
+            or (body[12:16] == b"VP8X" and body[20] & 2)
+            or width < 1 or height < 1 or width * height > 16_777_216):
+        raise ValueError("E_BOUND_WEBP_SOURCE_INVALID")
+    # Use a private snapshot; never let the decoder follow a source path from a process argument.
+    with TemporaryDirectory(dir=cwd) as temporary:
+        source = Path(temporary) / "input.webp"
+        source.write_bytes(body)
+        shell = Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        proc = subprocess.run([str(shell), "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                               base64.b64encode(_DECODE.encode("utf-16le")).decode("ascii")],
+                              cwd=temporary, env=env, input=(json.dumps(dimensions) + "\n").encode("ascii"),
+                              capture_output=True, check=False)
+    if proc.returncode or len(proc.stdout) != width * height * 4:
+        raise ValueError("E_BOUND_WEBP_DECODE_FAILED")
+    result = bytearray(proc.stdout)
+    result[0::4], result[2::4] = result[2::4], result[0::4]
+    return result
+
+
+def _check_pixels(before: bytearray, after: bytearray, width: int, regions: list[list[int]]) -> None:
+    if before[3::4] != after[3::4]:
+        raise ValueError("E_BOUND_WEBP_ALPHA_CHANGED")
+    if before == after:
+        raise ValueError("E_BOUND_WEBP_UNCHANGED")
+    original, edited = memoryview(before), memoryview(after)
+    stride = width * 4
+    for row in range(len(before) // stride):
+        start = row * stride
+        end = start + stride
+        if original[start:end] == edited[start:end]:
+            continue
+        cursor = start
+        for left, right in sorted((start + x * 4, start + (x + w) * 4)
+                                  for x, y, w, h in regions if y <= row < y + h):
+            if cursor < left and original[cursor:left] != edited[cursor:left]:
+                raise ValueError("E_BOUND_WEBP_OUTSIDE_TEXT_CHANGED")
+            cursor = max(cursor, right)
+        if original[cursor:end] != edited[cursor:end]:
+            raise ValueError("E_BOUND_WEBP_OUTSIDE_TEXT_CHANGED")
 
 
 def _encode(executable: Path, source: Path, output: Path, env: dict[str, str]) -> None:
@@ -42,6 +108,11 @@ def _canonical_png(body: bytes, dimensions: tuple[int, int]) -> bytes:
     data = _decode_png(body, dimensions)
     width, height = dimensions
     data[::width * 4 + 1] = bytes(height)
+    return _png(data, dimensions)
+
+
+def _png(data: bytearray, dimensions: tuple[int, int]) -> bytes:
+    width, height = dimensions
 
     def chunk(kind: bytes, payload: bytes) -> bytes:
         return (struct.pack(">I", len(payload)) + kind + payload
@@ -56,6 +127,7 @@ def main() -> None:
     from game_l10n.data_plane_task import _load_bound_data_plane_relay
     from game_l10n.image_region_pixels import _MAX_FILE
     from game_l10n.third_party_approval import require_third_party_approval
+    from game_l10n.image_localization import _validate_inventory
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path, required=True)
@@ -63,6 +135,7 @@ def main() -> None:
     parser.add_argument("--approval", type=Path, required=True)
     parser.add_argument("--executable", type=Path, required=True)
     parser.add_argument("--sha256", required=True)
+    parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
     work = args.workspace.resolve()
     relay_path = (work / args.relay).resolve()
@@ -88,15 +161,36 @@ def main() -> None:
     if hashlib.sha256(inventory_body).hexdigest() != task["input_image_inventory_sha256"]:
         raise ValueError("E_BOUND_WEBP_INVENTORY_CHANGED")
     output = work / task["output_image_root"]
-    if output.resolve() != output or not output.is_relative_to(work) or not output.is_dir():
+    if output.resolve() != output or not output.is_relative_to(work):
         raise ValueError("E_BOUND_WEBP_OUTPUT_INVALID")
+    output.mkdir(parents=True, exist_ok=True)
     env = {key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP") if key in os.environ}
     encoded = 0
-    assets = json.loads(inventory_body)["assets"]
+    _, inventory, _, sources = _validate_inventory(work, inventory_path, [Path(item) for item in task["source_roots"]])
+    assets = inventory["assets"]
     for index, asset in enumerate(assets, 1):
         if asset["format"].casefold() not in {"webp", "image/webp"}:
             continue
         name = f"asset-{index:04d}"
+        original = sources.roots[asset["source_root_index"]] / asset["relative_path"]
+        with original.open("rb") as stream:
+            original_body = stream.read(_MAX_FILE + 1)
+        if len(original_body) > _MAX_FILE or hashlib.sha256(original_body).hexdigest() != asset["source_sha256"]:
+            raise ValueError("E_BOUND_WEBP_SOURCE_CHANGED")
+        dimensions = asset["width"], asset["height"]
+        before = _read_webp(original_body, dimensions, env, output)
+        if args.prepare_only:
+            width, height = dimensions
+            stride = width * 4
+            scanlines = bytearray((stride + 1) * height)
+            for row in range(height):
+                start = row * (stride + 1) + 1
+                scanlines[start:start + stride] = before[row * stride:(row + 1) * stride]
+            preview = output / (name + ".source.png")
+            with preview.open("xb") as stream:
+                stream.write(_png(scanlines, dimensions))
+            encoded += 1
+            continue
         source, destination = output / (name + ".png"), output / (name + ".webp")
         if not source.is_file():
             continue
@@ -106,7 +200,6 @@ def main() -> None:
             png = stream.read(_MAX_FILE + 1)
         if len(png) > _MAX_FILE:
             raise ValueError("E_BOUND_WEBP_PNG_TOO_LARGE")
-        dimensions = asset["width"], asset["height"]
         png = _canonical_png(png, dimensions)
         with TemporaryDirectory(dir=output) as temporary:
             stage = Path(temporary)
@@ -123,11 +216,14 @@ def main() -> None:
                 result = stream.read(_MAX_FILE + 1)
             if len(result) > _MAX_FILE or _dimensions(result) != dimensions:
                 raise ValueError("E_BOUND_WEBP_DIMENSIONS_CHANGED")
+            _check_pixels(before, _read_webp(result, dimensions, env, stage), dimensions[0],
+                          [region["bbox"] for region in asset["text_regions"]])
             packed.rename(destination)
         encoded += 1
     if not encoded:
         raise ValueError("E_BOUND_WEBP_NO_STAGED_PNG")
-    print(json.dumps({"encoded_webp": encoded, "status": "encoded_not_visually_reviewed"}))
+    print(json.dumps({"prepared_source_pngs": encoded} if args.prepare_only else
+                     {"encoded_webp": encoded, "status": "pixel_checked_not_visually_reviewed"}))
 
 
 if __name__ == "__main__":
