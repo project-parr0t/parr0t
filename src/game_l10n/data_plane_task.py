@@ -3647,15 +3647,23 @@ def prepare_data_plane_task(
                 "save_observed_classifications_and_remain_partial_if_a_preview_or_its_original_text_region_was_not_visible",
             ])
         encoder = str(Path(__file__).with_name("bound_webp_encode.py").resolve())
-        if worker_role == "image_localizer" and any(
-            binding["argv"][0] == encoder for binding in private_payload["offline_processing"]
-        ):
+        encoder_args = [binding["argv"] for binding in private_payload["offline_processing"] if binding["argv"][0] == encoder]
+        if worker_role == "image_localizer" and encoder_args:
+            if any("--retry-task-id" in argv for argv in encoder_args):
+                private_payload["requirements"].extend([
+                    "run_the_exact_webp_encoder_argv_with_--retry-task-id_first_using_parr0t_process_with_python_-I_-B",
+                    "reuse_only_prior_staged_pixels_verified_by_the_bound_processor_never_claim_new_translation",
+                    "do_not_overwrite_existing_drafts_or_repeat_semantic_work_if_the_retry_encode_is_blocked",
+                ])
+            else:
+                private_payload["requirements"].extend([
+                    "run_the_bound_webp_encoder_argv_with_--prepare-only_to_create_original_scale_pngs",
+                    "visually_read_asset-NNNN.source.png_and_render_only_the_bound_text_rectangles",
+                    "stage_edited_8_bit_noninterlaced_rgba_png_in_output_image_root_as_asset-NNNN.png",
+                    "use_1_based_asset_order_in_input_image_inventory_for_NNNN_and_preserve_original_dimensions",
+                    "run_the_bound_webp_encoder_argv_without_--prepare-only_using_parr0t_process_with_python_-I_-B",
+                ])
             private_payload["requirements"].extend([
-                "run_the_bound_webp_encoder_argv_with_--prepare-only_to_create_original_scale_pngs",
-                "visually_read_asset-NNNN.source.png_and_render_only_the_bound_text_rectangles",
-                "stage_edited_8_bit_noninterlaced_rgba_png_in_output_image_root_as_asset-NNNN.png",
-                "use_1_based_asset_order_in_input_image_inventory_for_NNNN_and_preserve_original_dimensions",
-                "run_the_bound_webp_encoder_argv_without_--prepare-only_using_parr0t_process_with_python_-I_-B",
                 "use_asset-NNNN.webp_as_output_only_if_exact_decoded_alpha_and_outside_region_pixels_are_verified",
                 "retain_required_engine_structure_evidence_and_do_not_claim_independent_visual_review",
             ])

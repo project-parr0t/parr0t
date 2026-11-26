@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -102,13 +103,15 @@ def _dimensions(body: bytes) -> tuple[int, int]:
     return (bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1
 
 
-def _canonical_png(body: bytes, dimensions: tuple[int, int]) -> bytes:
+def _canonical_png(body: bytes, dimensions: tuple[int, int], original: bytearray,
+                   regions: list[list[int]]) -> bytes:
     from game_l10n.image_region_pixels import _decode_png
 
-    data = _decode_png(body, dimensions)
+    scanlines = _decode_png(body, dimensions)
     width, height = dimensions
-    data[::width * 4 + 1] = bytes(height)
-    return _png(data, dimensions)
+    _check_pixels(original, _pixels(scanlines, width, height), width, regions)
+    scanlines[::width * 4 + 1] = bytes(height)
+    return _png(scanlines, dimensions)
 
 
 def _png(data: bytearray, dimensions: tuple[int, int]) -> bytes:
@@ -122,12 +125,48 @@ def _png(data: bytearray, dimensions: tuple[int, int]) -> bytes:
             + chunk(b"IDAT", zlib.compress(data)) + chunk(b"IEND", b""))
 
 
+def _retry_inputs(work: Path, stage: Path, task: dict, task_id: str) -> dict:
+    from game_l10n.store import stable_hash
+
+    if not re.fullmatch("[0-9a-f]{64}", task_id):
+        raise ValueError("E_BOUND_WEBP_RETRY_NOT_BOUND")
+    history = stage / "history" / task_id
+    if history.resolve() != history:
+        raise ValueError("E_BOUND_WEBP_RETRY_NOT_BOUND")
+    old = json.loads((history / "task.json").read_bytes())
+    sealed = json.loads((history / "receipt.json").read_bytes())
+    if (old.pop("task_id") != task_id or stable_hash(old) != task_id
+            or old.get("worker_role") != "image_localizer" or not old.get("image_draft_scope")
+            or any(old.get(field) != task.get(field) for field in
+                   ("control_generation", "language_binding", "runtime_model", "source_roots"))
+            or sealed.get("task_id") != task_id or sealed.get("status") not in {"error", "partial"}
+            or sealed.get("execution", {}).get("complete") is not True):
+        raise ValueError("E_BOUND_WEBP_RETRY_NOT_BOUND")
+    prior_root = work / old["output_image_root"]
+    prior_inventory = work / old["input_image_inventory"]
+    if (prior_root.resolve() != prior_root or prior_root.parent != stage or not prior_root.name.endswith("-assets")
+            or prior_inventory.resolve() != prior_inventory or not prior_inventory.is_relative_to(work)):
+        raise ValueError("E_BOUND_WEBP_RETRY_NOT_BOUND")
+    body = prior_inventory.read_bytes()
+    if hashlib.sha256(body).hexdigest() != old["input_image_inventory_sha256"]:
+        raise ValueError("E_BOUND_WEBP_INVENTORY_CHANGED")
+    return {asset["id"]: (asset, prior_root / f"asset-{ordinal:04d}.png")
+            for ordinal, asset in enumerate(json.loads(body)["assets"], 1)}
+
+
+def _pixels(scanlines: bytearray, width: int, height: int) -> bytearray:
+    stride = width * 4
+    result = bytearray(stride * height)
+    for row in range(height):
+        start = row * (stride + 1) + 1
+        result[row * stride:(row + 1) * stride] = scanlines[start:start + stride]
+    return result
+
+
 def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from game_l10n.data_plane_task import _load_bound_data_plane_relay
-    from game_l10n.image_region_pixels import _MAX_FILE
-    from game_l10n.third_party_approval import require_third_party_approval
-    from game_l10n.image_localization import _validate_inventory
+    from game_l10n.data_plane_task import _atomic_json, _load_bound_data_plane_relay
+    from game_l10n.errors import ConfigurationError
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path, required=True)
@@ -135,7 +174,9 @@ def main() -> None:
     parser.add_argument("--approval", type=Path, required=True)
     parser.add_argument("--executable", type=Path, required=True)
     parser.add_argument("--sha256", required=True)
-    parser.add_argument("--prepare-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--prepare-only", action="store_true")
+    mode.add_argument("--retry-task-id")
     args = parser.parse_args()
     work = args.workspace.resolve()
     relay_path = (work / args.relay).resolve()
@@ -164,6 +205,27 @@ def main() -> None:
     if output.resolve() != output or not output.is_relative_to(work):
         raise ValueError("E_BOUND_WEBP_OUTPUT_INVALID")
     output.mkdir(parents=True, exist_ok=True)
+
+    status = output / ("webp-prepare-status.json" if args.prepare_only else "webp-encoding-status.json")
+    try:
+        result = _process(work, relay_path, task, args, output, inventory_path, executable, approval, identity)
+    except (ConfigurationError, ValueError, OSError, KeyError) as exc:
+        code = str(exc).split(":", 1)[0]
+        if not re.fullmatch(r"E_(?:BOUND_WEBP|PNG|THIRD_PARTY_APPROVAL)_[A-Z_]+", code):
+            code = "E_BOUND_WEBP_PROCESSING_FAILED"
+        _atomic_json(status, {"task_id": task["task_id"], "status": "error", "issue_code": code})
+        raise SystemExit(code) from None
+    _atomic_json(status, {"task_id": task["task_id"], **result})
+    print(json.dumps(result))
+
+
+def _process(work: Path, relay_path: Path, task: dict, args: argparse.Namespace, output: Path,
+             inventory_path: Path, executable: Path, approval: Path, identity: dict) -> dict:
+    from game_l10n.image_localization import _validate_inventory
+    from game_l10n.image_region_pixels import _MAX_FILE
+    from game_l10n.third_party_approval import require_third_party_approval
+
+    retry = _retry_inputs(work, relay_path.parent, task, args.retry_task_id) if args.retry_task_id else {}
     env = {key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP") if key in os.environ}
     encoded = 0
     _, inventory, _, sources = _validate_inventory(work, inventory_path, [Path(item) for item in task["source_roots"]])
@@ -172,6 +234,17 @@ def main() -> None:
         if asset["format"].casefold() not in {"webp", "image/webp"}:
             continue
         name = f"asset-{index:04d}"
+        source, destination = output / (name + ".png"), output / (name + ".webp")
+        if args.retry_task_id:
+            prior = retry.get(asset["id"])
+            if prior is None or prior[0] != asset:
+                continue
+            source = prior[1]
+        if not args.prepare_only:
+            if not source.is_file():
+                continue
+            if source.resolve() != source or destination.resolve() != destination or destination.exists():
+                raise ValueError("E_BOUND_WEBP_OUTPUT_INVALID")
         original = sources.roots[asset["source_root_index"]] / asset["relative_path"]
         with original.open("rb") as stream:
             original_body = stream.read(_MAX_FILE + 1)
@@ -191,16 +264,12 @@ def main() -> None:
                 stream.write(_png(scanlines, dimensions))
             encoded += 1
             continue
-        source, destination = output / (name + ".png"), output / (name + ".webp")
-        if not source.is_file():
-            continue
-        if source.resolve() != source or destination.resolve() != destination or destination.exists():
-            raise ValueError("E_BOUND_WEBP_OUTPUT_INVALID")
         with source.open("rb") as stream:
             png = stream.read(_MAX_FILE + 1)
         if len(png) > _MAX_FILE:
             raise ValueError("E_BOUND_WEBP_PNG_TOO_LARGE")
-        png = _canonical_png(png, dimensions)
+        regions = [region["bbox"] for region in asset["text_regions"]]
+        png = _canonical_png(png, dimensions, before, regions)
         with TemporaryDirectory(dir=output) as temporary:
             stage = Path(temporary)
             validated, packed = stage / "input.png", stage / "encoded.webp"
@@ -216,14 +285,13 @@ def main() -> None:
                 result = stream.read(_MAX_FILE + 1)
             if len(result) > _MAX_FILE or _dimensions(result) != dimensions:
                 raise ValueError("E_BOUND_WEBP_DIMENSIONS_CHANGED")
-            _check_pixels(before, _read_webp(result, dimensions, env, stage), dimensions[0],
-                          [region["bbox"] for region in asset["text_regions"]])
+            _check_pixels(before, _read_webp(result, dimensions, env, stage), dimensions[0], regions)
             packed.rename(destination)
         encoded += 1
     if not encoded:
         raise ValueError("E_BOUND_WEBP_NO_STAGED_PNG")
-    print(json.dumps({"prepared_source_pngs": encoded} if args.prepare_only else
-                     {"encoded_webp": encoded, "status": "pixel_checked_not_visually_reviewed"}))
+    return ({"prepared_source_pngs": encoded, "status": "prepared"} if args.prepare_only else
+            {"encoded_webp": encoded, "status": "pixel_checked_not_visually_reviewed"})
 
 
 if __name__ == "__main__":
